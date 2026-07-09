@@ -38,7 +38,11 @@ from utils.util import TomlValue, render_toml_document
 DEFAULT_CODEX_PERSONALITY = "friendly"
 
 
-def convert_settings(scope: ScopePaths) -> ConversionResult:
+def convert_settings(
+    scope: ScopePaths,
+    *,
+    codex_hooks_enabled: bool = True,
+) -> ConversionResult:
     settings = load_scope_settings(scope.source)
     mcp_servers = read_claude_mcp_servers(scope.source)
     if not settings and not mcp_servers:
@@ -54,7 +58,7 @@ def convert_settings(scope: ScopePaths) -> ConversionResult:
         enabled_mcp_servers=enabled_mcp_servers,
         disabled_mcp_servers=disabled_mcp_servers,
         mcp_servers=mcp_servers,
-        codex_hooks_enabled=has_convertible_hooks(scope.source),
+        codex_hooks_enabled=codex_hooks_enabled and has_convertible_hooks(scope.source),
     )
     if not config_toml.strip():
         return ConversionResult()

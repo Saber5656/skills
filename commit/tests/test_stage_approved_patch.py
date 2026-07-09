@@ -114,6 +114,36 @@ class StageApprovedPatchTest(unittest.TestCase):
             self.assertEqual(payload["reason"], "path_scope_mismatch")
             self.assertIn("other.md", payload["paths"])
 
+    def test_accepts_git_diff_paths_with_spaces(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self.init_repo(Path(tmp))
+            path = repo / "file name.txt"
+            path.write_text("before\n", encoding="utf-8")
+            self.assertEqual(run(["git", "add", "file name.txt"], cwd=repo).returncode, 0)
+            self.assertEqual(run(["git", "commit", "-m", "add spaced path"], cwd=repo).returncode, 0)
+            path.write_text("after\n", encoding="utf-8")
+            diff = run(["git", "diff", "--", "file name.txt"], cwd=repo)
+            patch = repo / "approved.patch"
+            patch.write_text(diff.stdout, encoding="utf-8")
+
+            completed = run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    "--repo",
+                    str(repo),
+                    "--patch",
+                    str(patch),
+                    "--owned-path",
+                    "file name.txt",
+                ]
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr + completed.stdout)
+            self.assertEqual(json.loads(completed.stdout)["result"], "staged")
+            staged = run(["git", "diff", "--cached", "--", "file name.txt"], cwd=repo).stdout
+            self.assertIn("after", staged)
+
 
 if __name__ == "__main__":
     unittest.main()

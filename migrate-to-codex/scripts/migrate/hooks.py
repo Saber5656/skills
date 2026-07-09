@@ -204,6 +204,16 @@ def has_convertible_hooks(scope_root: Path) -> bool:
 def report_hooks(scope: ScopePaths) -> ConversionResult:
     claude_hooks = ClaudeHooks.from_scope(scope.source)
     if not claude_hooks.matcher_groups:
+        if claude_hooks.unsupported_fields:
+            return ConversionResult(
+                report_items=[
+                    MigrationReportItem(
+                        "manual_fix_required",
+                        CODEX_HOOKS_PATH,
+                        claude_hooks.report_detail(),
+                    )
+                ]
+            )
         return ConversionResult()
 
     return ConversionResult(

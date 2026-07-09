@@ -32,10 +32,12 @@ class MergeManagedReposTest(unittest.TestCase):
         subprocess.check_call(["git", "clone", str(remote), str(seed)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         git(seed, "config", "user.email", "test@example.com")
         git(seed, "config", "user.name", "Test User")
+        git(seed, "switch", "-c", "main")
         write(seed / "README.md", "initial\n")
         git(seed, "add", "README.md")
         git(seed, "commit", "-m", "initial")
         git(seed, "push", "origin", "main")
+        git(remote, "symbolic-ref", "HEAD", "refs/heads/main")
 
         local = self.root / "local"
         subprocess.check_call(["git", "clone", str(remote), str(local)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

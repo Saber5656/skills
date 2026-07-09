@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import posixpath
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -32,13 +33,35 @@ def path_matches_scope(path: str, scope: str) -> bool:
     return path == scope or path.startswith(scope.rstrip("/") + "/")
 
 
+def diff_git_paths(line: str) -> list[str]:
+    raw = line.removeprefix("diff --git ").strip()
+    try:
+        parts = shlex.split(raw)
+    except ValueError:
+        parts = raw.split()
+    if len(parts) == 2:
+        return [normalize_repo_path(part) for part in parts]
+
+    if raw.startswith("a/"):
+        marker_index = raw.rfind(" b/")
+        if marker_index != -1:
+            return [
+                normalize_repo_path(raw[:marker_index]),
+                normalize_repo_path(raw[marker_index + 1 :]),
+            ]
+
+    return [
+        normalize_repo_path(part)
+        for part in raw.split()
+        if part.startswith(("a/", "b/"))
+    ]
+
+
 def patch_paths(patch_text: str) -> list[str]:
     paths: set[str] = set()
     for line in patch_text.splitlines():
         if line.startswith("diff --git "):
-            parts = line.split()
-            if len(parts) >= 4:
-                paths.add(normalize_repo_path(parts[3]))
+            paths.update(diff_git_paths(line))
             continue
         if line.startswith("+++ ") or line.startswith("--- "):
             raw = line[4:].split("\t", 1)[0].strip()
