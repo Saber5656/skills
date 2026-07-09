@@ -1,0 +1,65 @@
+{
+  "skill_name": "pr-review-fix-policy",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "現在のワークツリーのブランチから出したPRに指摘が来ている。未解決コメントの修正方針だけ確認して、まだ実装しないで。",
+      "expected_output": "current branch PRを特定し、unresolvedかつnot outdatedのreview threadsだけを対象にし、ファイル単位でクラスタリングした方針確認を出す。各コメントに現状の問題/デメリットと対応メリット/解決される課題を含める。実装・commit・push・GitHub返信はしない。",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "CodeRabbitとCodexのPRコメントが残ってる。ファイルごとにまとめて、各コメントの指摘が分かるように修正方針を出して。",
+      "expected_output": "ファイル単位クラスタとコメント単位の指摘一覧を両立し、重複・説明のみ・actionableを分類する。各コメントで、既存記述/コードの問題点と対応後の改善点を明記する。",
+      "files": []
+    },
+    {
+      "id": 3,
+      "prompt": "PR #42 の unresolved comments を見て、直すべきか返信でよいか判断して。まだGitHubには返信しないで。",
+      "expected_output": "明示PR番号を使い、review threadsをthread-awareに確認し、accept/explanation-onlyなどの方針を提示する。方針には現状の問題/デメリットと対応メリット/解決される課題を含める。GitHub write actionをしない。",
+      "files": []
+    },
+    {
+      "id": 4,
+      "prompt": "PRのコメントを全部直してpushして。",
+      "expected_output": "このスキル単体では方針確認までであることを示し、まず未解決有効コメントの方針確認を行う。承認後の実装handoffには、実装・検証・push・remote-head確認後に、対応した指摘ごとへ個別の対応内容コメントを返すことを含める。",
+      "files": []
+    },
+    {
+      "id": 5,
+      "prompt": "ghが認証できてないっぽいけど、PRレビューの指摘方針を想像でまとめて。",
+      "expected_output": "PR候補の特定までは行ってよいが、コメント取得不能なら内容を推測せず停止し、認証またはPR情報が必要と伝える。",
+      "files": []
+    },
+    {
+      "id": 6,
+      "prompt": "outdatedなレビューコメントも含めて全部対応方針に入れて。",
+      "expected_output": "既定対象はunresolvedかつnot outdatedであることを明示し、outdated commentsは補足扱いにする。ユーザーが強く要求する場合は対象拡張のリスクを確認する。",
+      "files": []
+    },
+    {
+      "id": 7,
+      "prompt": "PRのsecurity-sensitiveな指摘がある。方針を確認したい。",
+      "expected_output": "high-riskとして個別確認に回し、現状放置した場合のリスク、対応によるリスク低減、通常より強い検証、owner sign-off、後続handoffの要否を明示する。",
+      "files": []
+    },
+    {
+      "id": 8,
+      "prompt": "このPRのレビューコメント、解決済みかどうか関係なくざっと要約して。",
+      "expected_output": "このスキルの主対象ではないことを明示しつつ、方針確認が目的ならunresolved/not outdatedに絞る。単なる要約なら別のGitHubレビュー確認フローを提案する。",
+      "files": []
+    },
+    {
+      "id": 9,
+      "prompt": "方針Aで進めて。直してpushした後は、それぞれの指摘コメントに何を直したか返信して。",
+      "expected_output": "承認済みhandoffとして、後続実装スキルへ実装・検証・commit・push・remote-head確認を渡し、push確認後に対応済みreview thread/commentごとへ個別返信することを必須にする。各返信には対応commitまたは差分、指摘ごとの具体的な対応内容、検証結果を含め、thread resolveは明示承認がない限り行わない。",
+      "files": []
+    },
+    {
+      "id": 10,
+      "prompt": "同じ修正で3つのCodeRabbit指摘を直せそう。返信はまとめて1つでいい？",
+      "expected_output": "同じ修正で複数指摘を解決する場合でも、対応したreview thread/commentごとに個別返信する方針を示す。共通のcommitや検証結果は使い回してよいが、各返信にはその指摘に対する具体的な対応内容を含める。",
+      "files": []
+    }
+  ]
+}

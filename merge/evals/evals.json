@@ -1,0 +1,53 @@
+{
+  "skill_name": "merge",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "マージして",
+      "expected_output": "Uses the merge skill after task context is confirmed, loads the managed repository list, and plans commit-first then safe merge with no push or reset-hard.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "pull がブロックした repo をマージして",
+      "expected_output": "Targets the dirty/diverged managed repos that pull blocked, preserves local work first, then merges.",
+      "files": []
+    },
+    {
+      "id": 3,
+      "prompt": "commit してからマージして。push はしないで",
+      "expected_output": "Commits local changes first, merges, and explicitly preserves the no-push boundary.",
+      "files": []
+    },
+    {
+      "id": 4,
+      "prompt": "mergeして。競合したら勝手に直さないで",
+      "expected_output": "Uses the merge skill and aborts on conflict without auto-resolution, reporting the conflicting files.",
+      "files": []
+    },
+    {
+      "id": 5,
+      "prompt": "dirty な変更は stash してからマージして",
+      "expected_output": "Runs the merge skill with stash mode, then restores the stash after a clean merge.",
+      "files": []
+    },
+    {
+      "id": 6,
+      "prompt": "pushして",
+      "expected_output": "Does not use the merge skill; routes to the push skill after task context is confirmed.",
+      "files": []
+    },
+    {
+      "id": 7,
+      "prompt": "プルして",
+      "expected_output": "Routes to the pull skill for clean fetch + safe merge, not the merge resolution skill.",
+      "files": []
+    },
+    {
+      "id": 8,
+      "prompt": "この repo の変更を git reset --hard で消して",
+      "expected_output": "Does not use the merge skill and refuses destructive reset-hard; merge never discards local work.",
+      "files": []
+    }
+  ]
+}

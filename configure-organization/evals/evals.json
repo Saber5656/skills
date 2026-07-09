@@ -1,0 +1,71 @@
+{
+  "skill_name": "configure-organization",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "COMMON-AGENTS.md の組織運用ルールを薄くして configure-organization に寄せたい",
+      "expected_output": "Skill triggers, chooses maintenance, preserves task_required=true, and points to Agent-Teams-Viewer as source of truth.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "Hook が stale queue で止まるので observer 化したい",
+      "expected_output": "Skill triggers, chooses maintenance, and states hooks must not hard-block normal assistance.",
+      "files": []
+    },
+    {
+      "id": 3,
+      "prompt": "最近の天気予報を調べる",
+      "expected_output": "Skill should not be required by trigger alone; if classify is run, missing location should keep task recording and avoid pretending strict role flow is complete.",
+      "files": []
+    },
+    {
+      "id": 4,
+      "prompt": "この小さな typo を直して",
+      "expected_output": "Classify as fast only if low-risk and single-step; task_required remains true.",
+      "files": []
+    },
+    {
+      "id": 5,
+      "prompt": "認証ロジックを変更してテストとレビューまで実行して",
+      "expected_output": "Classify as strict with role dispatch and review required, while keeping concrete role routing and policy ownership inside the configure-organization / Agent-Teams-Viewer contract rather than utility skills.",
+      "files": []
+    },
+    {
+      "id": 6,
+      "prompt": "Agent-Teams-Viewer に role 定義と policy を集約する",
+      "expected_output": "Skill triggers, chooses maintenance, points to Agent-Teams-Viewer as the source of truth, and allows mirrored organization member role skills to be removed from skills-repo when the deletion scope is task-approved.",
+      "files": []
+    },
+    {
+      "id": 7,
+      "prompt": "組織運用を一時的に無効化して壊れた Gate を直したい",
+      "expected_output": "Skill triggers, uses disabled or maintenance state, keeps task_required=true, and allows main-agent execution.",
+      "files": []
+    },
+    {
+      "id": 8,
+      "prompt": "fast と strict の違いを説明して",
+      "expected_output": "Skill triggers and explains fast still creates task records while strict requires role dispatch/review/final evidence through the organization contract.",
+      "files": []
+    },
+    {
+      "id": 9,
+      "prompt": "archive-shutdown runtime を co 経由に統一したい",
+      "expected_output": "Skill triggers, chooses maintenance, treats configure-organization as the runtime facade, and routes archive shutdown through configure_organization.py itb archive-shutdown rather than a skills-repo-owned runtime. It may note that a top-level archive-shutdown alias is a future ATV contract.",
+      "files": []
+    },
+    {
+      "id": 10,
+      "prompt": "commit skill から publication owner や reviewer role を決めないようにしたい",
+      "expected_output": "Skill triggers and states utility skills must consume task context, manifest, and policy decisions from configure-organization / Agent-Teams-Viewer instead of hard-coding role names, routing rules, approval owners, mode policy, or publication ownership.",
+      "files": []
+    },
+    {
+      "id": 11,
+      "prompt": "AGENT_TEAMS_VIEWER_ROOT が未設定の環境で configure-organization を使う。DEV_REPO_ROOT は設定済み。",
+      "expected_output": "Resolve the Agent-Teams-Viewer root through ${DEV_REPO_ROOT}/Agent-Teams-Viewer instead of expanding the unset AGENT_TEAMS_VIEWER_ROOT again. If no configured or fallback candidate exists, stop with a missing-root diagnostic.",
+      "files": []
+    }
+  ]
+}
