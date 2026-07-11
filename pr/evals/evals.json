@@ -1,0 +1,285 @@
+{
+  "skill_name": "pr",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "このローカル変更をPR作成して。main直pushは避けて、Codex reviewも付けて。",
+      "expected_output": "The workflow creates or uses a codex branch, avoids direct default-branch push, creates a non-draft PR, assigns the current user, verifies branch ownership against the remote base, pushes the branch when needed, detects current-head Codex review results, uses @codex review only as fallback/manual trigger, and reports review intake status.",
+      "files": [],
+      "expectations": [
+        "Creates a ready PR rather than a draft PR by default",
+        "Assigns the current GitHub user",
+        "Checks branch commits and changed paths against the remote base",
+        "Detects current-head Codex review by matching review commit_id to headRefOid",
+        "Uses @codex review only as an optional fallback/manual trigger",
+        "Does not push directly to main"
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "このブランチはもうpush済み。PRだけ作って、レビューもCodexに依頼して。",
+      "expected_output": "The workflow reuses the current pushed branch, creates or reuses the PR, applies assignee and remote-head verification, observes current-head Codex review results, and avoids unnecessary commit, push, branch creation, or duplicate @codex review comments.",
+      "files": [],
+      "expectations": [
+        "Reuses an existing branch instead of creating a duplicate branch",
+        "Creates a non-draft PR and does not allow draft PR creation",
+        "Verifies remote PR head and current-head Codex review status",
+        "Avoids duplicate @codex review comments when automatic review is observed"
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "draft PRで作って。まだレビュー準備前だけど @codex review は投げておきたい。",
+      "expected_output": "The workflow refuses to create a draft PR, stops before PR creation, and asks whether to create a ready PR or pause publication. It does not pass --draft or trigger @codex review on an unpublished draft.",
+      "files": [],
+      "expectations": [
+        "Does not honor draft PR creation requests",
+        "Stops before PR creation when the user asks for draft",
+        "Asks whether to create a ready PR or pause publication",
+        "Does not pass --draft",
+        "Does not trigger @codex review on an unpublished draft"
+      ]
+    },
+    {
+      "id": 4,
+      "prompt": "@codex review が返ってきていたら見て、修正までやって。",
+      "expected_output": "The workflow fetches Codex review feedback for the current PR head and stops at a human confirmation gate with a proposed fix plan instead of editing immediately.",
+      "files": [],
+      "expectations": [
+        "Fetches and classifies current-head Codex review feedback",
+        "Presents a fix plan",
+        "Asks the user for confirmation before code edits",
+        "Does not implement review feedback automatically"
+      ]
+    },
+    {
+      "id": 5,
+      "prompt": "PRのコメントを軽く要約して。作成やpushはしなくていい。",
+      "expected_output": "The workflow should not trigger as the primary skill; a GitHub triage or PR summary workflow is more appropriate.",
+      "files": [],
+      "expectations": [
+        "Does not run the PR publication flow",
+        "Does not create, edit, or push a PR",
+        "Routes toward PR summary or GitHub triage"
+      ]
+    },
+    {
+      "id": 6,
+      "prompt": "PRのGitHub Actionsが落ちてるから原因調べて直して。",
+      "expected_output": "The workflow should defer to the CI-fix skill rather than the PR publication workflow.",
+      "files": [],
+      "expectations": [
+        "Does not create a new PR",
+        "Routes toward the CI-specific workflow",
+        "Focuses on failing checks rather than publication gates"
+      ]
+    },
+    {
+      "id": 7,
+      "prompt": "PR作成して。もし chatgpt-codex-connector[bot] をreviewerに追加できなかったらそのまま進めていいよ。",
+      "expected_output": "The workflow does not treat reviewer-request failure as a hard blocker when a submitted current-head Codex review is observed, but it also does not mark acknowledgement comments or missing reviews as success.",
+      "files": [],
+      "expectations": [
+        "Does not require pending reviewRequests as the success gate",
+        "Accepts submitted current-head Codex reviews as verification",
+        "Reports review_pending or review_timeout when no current-head review appears",
+        "Does not treat acknowledgements as successful review evidence"
+      ]
+    },
+    {
+      "id": 8,
+      "prompt": "PR作って。レビュー返ってくるまでずっと待って、返ったら勝手に直してpushして。",
+      "expected_output": "The workflow limits waiting to a resumable polling window and refuses to implement review feedback without user confirmation.",
+      "files": [],
+      "expectations": [
+        "Uses bounded polling instead of waiting forever",
+        "Reports resumable state on timeout",
+        "Requires user confirmation before implementing feedback"
+      ]
+    },
+    {
+      "id": 9,
+      "prompt": "worktreeはcleanだけど、このブランチには前の別タスクcommitも残ってるかも。PR作成して。",
+      "expected_output": "The workflow fetches the remote base, inspects remote_base..HEAD commits and remote_base...HEAD changed paths before opening the PR, then asks for clarification or a clean branch when unrelated commits are present.",
+      "files": [],
+      "expectations": [
+        "Fetches and uses the remote base rather than a possibly divergent local base branch",
+        "Checks git log over remote_base..HEAD before PR creation",
+        "Checks git diff/stat over remote_base...HEAD before PR creation",
+        "Stops or asks when branch commits are unrelated or ambiguous"
+      ]
+    },
+    {
+      "id": 10,
+      "prompt": "ローカルでcommit済みだけどまだpushしてないブランチでPR作って。",
+      "expected_output": "The workflow detects the no-upstream or ahead state and pushes the branch before invoking gh pr create --head.",
+      "files": [],
+      "expectations": [
+        "Detects no upstream or ahead-of-upstream branch state",
+        "Pushes the branch before gh pr create --head",
+        "Does not assume gh pr create --head will push the branch"
+      ]
+    },
+    {
+      "id": 11,
+      "prompt": "Codex reviewが返ってるのにreviewRequestsが空になってる。PR workflowとして失敗扱い？",
+      "expected_output": "The workflow treats a submitted non-diagnostic Codex review for the current head as successful Codex verification even if pending reviewRequests is empty.",
+      "files": [],
+      "expectations": [
+        "Accepts submitted non-diagnostic Codex reviews as verification",
+        "Requires review commit_id to match the current headRefOid",
+        "Rejects diagnostic-only review objects such as environment setup notes",
+        "Does not require pending reviewRequests to remain populated after review submission"
+      ]
+    },
+    {
+      "id": 12,
+      "prompt": "既存PRにもう @codex review コメントがある状態でもう一度PRフローを流して。",
+      "expected_output": "The workflow reuses an exact @codex review trigger only when it belongs to the current review-attempt timestamp window, otherwise it does not let a historical trigger stand in for the current head.",
+      "files": [],
+      "expectations": [
+        "Inspects existing PR comments before adding @codex review fallback",
+        "Reuses an existing trigger only when it was created after the current review attempt began",
+        "Does not reuse stale historical @codex review comments for a newer head",
+        "Avoids starting duplicate fallback reviews for the same attempt"
+      ]
+    },
+    {
+      "id": 13,
+      "prompt": "Codex reviewの指摘を直したら、pushしてから各指摘コメントに返信して。",
+      "expected_output": "The workflow commits and pushes the selected fixes, verifies the remote PR head contains the pushed fix commit, and only then posts addressed/fixed replies to the review comments.",
+      "files": [],
+      "expectations": [
+        "Commits and pushes selected review fixes before replying",
+        "Verifies the remote PR head contains the fix commit before posting fixed/addressed replies",
+        "Uses gh pr view headRefOid or git ls-remote rather than local-only git log/status as sufficient verification",
+        "Does not claim review feedback is fixed while changes are local-only"
+      ]
+    },
+    {
+      "id": 14,
+      "prompt": "ローカルブランチが upstream より behind だけど、worktree は clean。既存PRを再利用して進めて。",
+      "expected_output": "The workflow fetches upstream, detects behind or diverged state, and stops or safely fast-forwards and reruns ownership checks before creating or reusing the PR.",
+      "files": [],
+      "expectations": [
+        "Fetches upstream before deciding remote head readiness",
+        "Detects behind state even when local ahead count is zero",
+        "Stops or fast-forwards safely before PR creation/reuse",
+        "Reruns remote-base ownership checks after any fast-forward"
+      ]
+    },
+    {
+      "id": 15,
+      "prompt": "CodexのAutomatic reviewsを有効にしてあるrepoでPRを作って。@codex reviewコメントは不要なら投稿しないで。",
+      "expected_output": "The workflow records the review attempt, polls GitHub PR reviews for chatgpt-codex-connector[bot] with commit_id equal to headRefOid, verifies the review is non-diagnostic, and skips @codex review when automatic current-head review is observed.",
+      "files": [],
+      "expectations": [
+        "Does not store or mirror the remote automatic-review setting locally",
+        "Polls GitHub review objects for current-head Codex review evidence",
+        "Matches review commit_id to headRefOid",
+        "Rejects environment/setup-only review objects as diagnostics",
+        "Skips @codex review when automatic review is observed"
+      ]
+    },
+    {
+      "id": 16,
+      "prompt": "Automatic reviewが来なかったら @codex review を1回だけfallbackで投げて。",
+      "expected_output": "The workflow posts @codex review only after the current-head review polling window fails, and only when no current-attempt exact trigger comment already exists.",
+      "files": [],
+      "expectations": [
+        "Polls for current-head Codex review before fallback",
+        "Checks paginated PR comments for an exact current-attempt @codex review trigger",
+        "Does not reuse historical trigger comments from older heads",
+        "Posts at most one fallback trigger per review attempt"
+      ]
+    },
+    {
+      "id": 17,
+      "prompt": "Codexから環境案内っぽいtop-levelコメントや空本文review objectだけ来た。PR workflowとしてレビュー成功扱いでいい？",
+      "expected_output": "The workflow treats acknowledgements, environment notes, reactions, top-level trigger responses, and diagnostic-only review objects as diagnostics only; success requires a submitted non-diagnostic current-head Codex review.",
+      "files": [],
+      "expectations": [
+        "Does not treat acknowledgement comments as success",
+        "Does not treat environment setup notes as success",
+        "Does not treat diagnostic-only review objects as success",
+        "Requires submitted non-diagnostic current-head Codex review evidence",
+        "Reports review_pending or blocker when only diagnostics are present"
+      ]
+    },
+    {
+      "id": 18,
+      "prompt": "reviewer requestでCodexレビューが先に来て、その後に @codex review fallback コメントが付いたPRの指摘を取り込んで。",
+      "expected_output": "The workflow uses the earliest relevant review-window timestamp and always includes submitted current-head Codex reviews, so direct-request feedback before a later trigger comment is not missed.",
+      "files": [],
+      "expectations": [
+        "Uses the earliest of review_window_start, reviewer-request timestamp, and fallback trigger timestamp",
+        "Includes submitted Codex reviews whose commit_id matches headRefOid",
+        "Does not filter out actionable feedback merely because it arrived before @codex review",
+        "Fetches review threads and comments for the current review attempt"
+      ]
+    },
+    {
+      "id": 19,
+      "prompt": "issue #2 の対応PRを作成して。",
+      "expected_output": "The workflow recognizes the issue-scoped PR and uses an English PR title starting with [issue #2] without including [codex], while still listing other related issues in the English body if needed.",
+      "files": [],
+      "expectations": [
+        "Detects known issue context from the user request or equivalent PR scope",
+        "Prefixes the PR title with [issue #N] for issue-scoped work",
+        "Does not include [codex] in the PR title",
+        "Writes the PR title and body in English",
+        "Lists secondary issue references in the PR body rather than overcrowding the title"
+      ]
+    },
+    {
+      "id": 20,
+      "prompt": "日本語のタスクメモをもとにPR作成して。issue番号が分かるならタイトルにつけて。",
+      "expected_output": "The workflow translates Japanese task context into an English PR title and body, prefixes the title with [issue #N] when a primary issue is known, and never uses [codex] as a title marker.",
+      "files": [],
+      "expectations": [
+        "Translates Japanese task context into English PR-facing content",
+        "Writes both PR title and PR body in English",
+        "Prefixes the title with [issue #N] when the primary issue is known",
+        "Asks for the issue number when the task is clearly issue-scoped but no number can be determined",
+        "Does not include [codex] in the PR title"
+      ]
+    },
+    {
+      "id": 21,
+      "prompt": "issue #12 の対応PRを作成して。labelは documentation と skill を付けて。",
+      "expected_output": "The workflow validates that documentation and skill already exist as repository labels, creates or reuses the ready PR, applies both labels to the PR and primary linked issue #12, then verifies both resources contain the labels before reporting completion.",
+      "files": [],
+      "expectations": [
+        "Treats user-provided labels as the highest-priority label source",
+        "Validates requested labels against existing repository labels",
+        "Applies the final label set to the PR",
+        "Applies the final label set to the primary linked issue",
+        "Reports label status with applied labels and verification result"
+      ]
+    },
+    {
+      "id": 22,
+      "prompt": "このブランチの既存issueに bug と regression label が付いている。PR作成時にlabelも揃えて。",
+      "expected_output": "The workflow reads labels from the primary linked issue, mirrors the safe existing label set to the PR, ensures the primary issue still has the same labels, and verifies PR and issue labels before completion.",
+      "files": [],
+      "expectations": [
+        "Uses primary issue labels when user labels are not explicitly provided",
+        "Mirrors existing issue labels to the PR",
+        "Does not modify secondary linked issues by default",
+        "Verifies labels on both the PR and the primary issue"
+      ]
+    },
+    {
+      "id": 23,
+      "prompt": "PR作成して。labelはよしなに付けておいて。",
+      "expected_output": "The workflow checks user/task/issue/repository label sources and, if no safe existing label set can be determined, asks the user for labels instead of inventing or creating labels silently.",
+      "files": [],
+      "expectations": [
+        "Does not invent labels from vague input",
+        "Does not create new labels unless explicitly requested",
+        "Asks the user for labels when no safe label set is available",
+        "Does not report label application success until labels are verified"
+      ]
+    }
+  ]
+}
