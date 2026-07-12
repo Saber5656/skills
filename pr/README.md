@@ -10,7 +10,7 @@ Local GitHub PR publication workflow with Codex review gating.
 - Applies existing repository labels to the PR and the primary linked issue.
 - Assigns the current GitHub user.
 - Verifies the pushed PR head and detects non-diagnostic Codex review results for the current head SHA.
-- Uses `@codex review` only as an optional fallback/manual trigger when automatic review is not observed.
+- Relies on repository-configured automatic Codex review and never posts a manual review-trigger comment.
 - Waits for Codex review feedback when feasible.
 - Stops before review-driven code changes and asks the user to approve the fix plan.
 - Pushes approved fixes before posting addressed/fixed replies to review threads.
@@ -28,8 +28,9 @@ PR作成して
 ## Important Boundary
 
 This skill does not merge PRs and does not implement Codex review feedback without human confirmation.
-It also does not mirror Codex automatic-review settings locally; it observes GitHub PR review objects and
-falls back to `@codex review` only when configured or explicitly requested.
+It also does not mirror Codex automatic-review settings locally. If the automatic current-head review is
+delayed or unavailable, it reports a resumable pending or timeout state without posting a trigger comment.
+Existing optional direct reviewer-request compatibility remains separate from this removed comment fallback.
 If the user asks for a draft PR, the workflow stops before PR creation and asks whether to create a ready PR
 or pause publication.
 The workflow uses existing labels only and reports a blocker instead of inventing or creating labels silently.
