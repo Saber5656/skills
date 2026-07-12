@@ -82,7 +82,7 @@
       "id": 8,
       "name": "task_context_missing_prevents_git_operations",
       "prompt": "ユーザーが「コミットして」と言ったが、task record、task scope、approved_scope、approved_diff_snapshot が揃っていない。commit skill としてどう進める？",
-      "expected_output": "git status、git add、git commit に進まず、task_scope_missing または unscoped_commit_forbidden として停止する。必要な task context / approved snapshot の不足を明示し、configure-organization が必要な場合はそちらへ戻す。",
+      "expected_output": "git status、git add、git commit に進まず、task_scope_missing または unscoped_commit_forbidden として停止する。必要な caller-supplied Saihai task context / approved snapshot の不足を明示して caller へ差し戻し、commit skill 自身は role、routing、approval owner を推測しない。",
       "assertions": {
         "must_include": ["task_scope_missing", "approved", "不足", "停止"],
         "must_not_include": ["git status を実行する", "git add を実行する", "git commit を実行する"],
