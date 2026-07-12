@@ -22,8 +22,14 @@
     {
       "id": 4,
       "prompt": "PRのコメントを全部直してpushして。",
-      "expected_output": "このスキル単体では方針確認までであることを示し、まず未解決有効コメントの方針確認を行う。承認後の実装handoffには、実装・検証・push・remote-head確認後に、対応した指摘ごとへ個別の対応内容コメントを返すことを含める。",
-      "files": []
+      "expected_output": "このスキル単体では方針確認までであることを示し、まず未解決有効コメントの方針確認を行う。承認後の実装handoffには、実装・検証・commit・push・remote-head確認後、対応したreview threadごとに個別返信し、返信成功後に同じthreadをresolveし、isResolvedを再確認することを含める。",
+      "files": [],
+      "expectations": [
+        "Does not edit, commit, push, reply, or resolve before user approval",
+        "Approved handoff orders remote-head verification before per-thread reply",
+        "Approved handoff resolves each addressed review thread only after reply success",
+        "Approved handoff verifies isResolved after resolution"
+      ]
     },
     {
       "id": 5,
@@ -52,14 +58,92 @@
     {
       "id": 9,
       "prompt": "方針Aで進めて。直してpushした後は、それぞれの指摘コメントに何を直したか返信して。",
-      "expected_output": "承認済みhandoffとして、後続実装スキルへ実装・検証・commit・push・remote-head確認を渡し、push確認後に対応済みreview thread/commentごとへ個別返信することを必須にする。各返信には対応commitまたは差分、指摘ごとの具体的な対応内容、検証結果を含め、thread resolveは明示承認がない限り行わない。",
-      "files": []
+      "expected_output": "方針Aの承認を返信・resolve双方への明示承認として記録する。後続実装スキルへ実装・検証・commit・push・remote-head確認を渡し、push確認後に対応済みreview threadごとへ個別返信し、返信成功後に同じthreadをresolveしてisResolvedを再確認する。各返信には対応commitまたは差分、具体的な対応内容、検証結果を含める。",
+      "files": [],
+      "expectations": [
+        "Treats option A approval as explicit authorization for per-thread replies and resolution",
+        "Replies to each addressed review thread after remote-head verification",
+        "Resolves each thread only after its reply succeeds",
+        "Re-reads thread-aware isResolved state before reporting completion"
+      ]
     },
     {
       "id": 10,
       "prompt": "同じ修正で3つのCodeRabbit指摘を直せそう。返信はまとめて1つでいい？",
-      "expected_output": "同じ修正で複数指摘を解決する場合でも、対応したreview thread/commentごとに個別返信する方針を示す。共通のcommitや検証結果は使い回してよいが、各返信にはその指摘に対する具体的な対応内容を含める。",
-      "files": []
+      "expected_output": "同じ修正で複数指摘を解決する場合でも、対応したreview threadごとに個別返信し、各返信成功後にそのthreadを個別resolveする方針を示す。共通のcommitや検証結果は使い回してよいが、各返信にはその指摘に対する具体的な対応内容を含め、各isResolved状態を確認する。",
+      "files": [],
+      "expectations": [
+        "Does not collapse multiple addressed review threads into one reply",
+        "Resolves each addressed thread individually after its own reply succeeds",
+        "Allows shared commit and validation evidence while keeping thread-specific explanations"
+      ]
+    },
+    {
+      "id": 11,
+      "prompt": "方針Aは承認済み。1つのthreadだけ返信APIが失敗したけど、resolveだけ先にして完了にして。",
+      "expected_output": "返信に失敗したthreadはresolveせず、reply_failedかつunresolvedとしてblockerを報告する。他のthreadの成功状態とは分け、全thread完了を主張しない。",
+      "files": [],
+      "expectations": [
+        "Does not resolve a review thread whose reply failed",
+        "Reports reply success and resolution status separately per thread",
+        "Does not claim full completion while an approved thread remains unresolved"
+      ]
+    },
+    {
+      "id": 12,
+      "prompt": "通常のPRコメントにも返信したらresolveしておいて。",
+      "expected_output": "top-level PR commentはreview threadではなくresolve mutationの対象外であることを明示する。承認済み返信は行えてもresolve_statusはnot_applicableとし、review-thread resolve mutationを呼ばない。",
+      "files": [],
+      "expectations": [
+        "Classifies top-level PR comment resolution as not_applicable",
+        "Does not call a review-thread resolve mutation for a top-level comment",
+        "Keeps approved top-level reply behavior separate from thread resolution"
+      ]
+    },
+    {
+      "id": 13,
+      "prompt": "コード変更なしで説明返信だけにするthreadも、方針Aで対応したらresolveまでして。",
+      "expected_output": "承認済みexplanation-only review threadでは新規commit、push、remote-head確認をnot_applicableとして空commitを作らない。説明内容と根拠を検証し、thread stateを再取得して個別返信する。返信成功後に再取得し、安全条件を満たす場合だけresolveしてisResolvedを確認する。",
+      "files": [],
+      "expectations": [
+        "Allows an approved explanation-only review thread to be addressed without a code change",
+        "Does not create an empty commit or require a new push for explanation-only work",
+        "Resolves the explanation-only thread only after its specific reply succeeds",
+        "Verifies isResolved before marking the thread complete"
+      ]
+    },
+    {
+      "id": 14,
+      "prompt": "返信は成功したけどresolveReviewThreadが失敗した。返信済みだから解決扱いでいい？",
+      "expected_output": "reply済みとresolve失敗を分けて記録し、threadはunresolvedのままと判定する。resolve mutationのエラーをblockerとして返し、isResolvedがtrueになるまで完了扱いしない。",
+      "files": [],
+      "expectations": [
+        "Distinguishes successful reply from failed resolution",
+        "Keeps the thread unresolved when resolve mutation or verification fails",
+        "Does not mark completion until isResolved is confirmed true"
+      ]
+    },
+    {
+      "id": 15,
+      "prompt": "修正のpush後、返信直前にthreadを再取得したらoutdatedになっていました。古いnode IDのまま返信とresolveを続けていい？",
+      "expected_output": "reply直前のthread-aware再取得でrepo、PR、GraphQL thread node ID、承認scope、isResolved、isOutdatedを照合する。outdatedなら返信もresolveも実行せず、取得時の状態を変更しないままstate_changedとして報告する。",
+      "files": [],
+      "expectations": [
+        "Re-fetches and validates thread identity, scope, and state immediately before replying",
+        "Does not reply to or resolve a thread that became outdated",
+        "Preserves and reports the fetched state instead of claiming the thread is open or complete"
+      ]
+    },
+    {
+      "id": 16,
+      "prompt": "個別返信は成功しましたが、resolve直前の再取得で他の人が既にthreadをresolve済みでした。resolveReviewThreadをもう一度呼ぶ？",
+      "expected_output": "resolve直前にthread identityとstateを再取得する。既にisResolvedがtrueならresolve mutationを重ねず、reply済み、resolve_status already_resolved、isResolved trueとして正確に報告する。",
+      "files": [],
+      "expectations": [
+        "Re-fetches thread identity and state immediately before resolution",
+        "Does not invoke a duplicate resolve mutation when isResolved is already true",
+        "Reports the successful reply and already_resolved final state without claiming it performed the resolution"
+      ]
     }
   ]
 }
