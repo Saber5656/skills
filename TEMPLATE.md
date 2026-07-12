@@ -258,8 +258,11 @@ const patterns = {
 ## Template 3: 複合ワークフロースキル
 
 複数ステップの作業手順、外部ツール連携、またはローカル運用をまとめるスキル。
-role、policy、mode、routing の定義は skills-repo に置かず、必要に応じて `configure-organization` で正本を確認する。
-skills-repo では必要な場合でも `configure-organization` を入口にした橋渡しだけを置く。
+role、policy、mode、routing の定義は skills-repo に置かない。
+組織上の判断が必要なスキルは、呼び出し元から明示的に渡された caller-supplied Saihai task context、
+または `Branch Plan`、`Task Change Manifest`、`Publication Manifest` などの typed artifact を入力にする。
+utility skill は入力を検証してローカル責務だけを実行し、control plane を探索・起動したり、
+role、approval owner、review provider、routing、publication ownership を独自に決めたりしない。
 
 ### SKILL.md
 
@@ -282,7 +285,9 @@ purpose: 〇〇作業の手順と安全境界を定義する
 ## Scope
 
 このスキルが担当するローカル作業と、担当しない判断を1〜2文で説明する。
-外部フロー上の承認、routing、policy 判定が必要な場合は、このスキル内で判断せず `configure-organization` から渡された task context を使う。
+外部フロー上の承認、routing、policy 判定が必要な場合は、このスキル内で判断せず、
+呼び出し元から明示的に渡された caller-supplied Saihai task context または typed artifact を使う。
+必要な入力がない場合は control plane の探索や推測をせず、typed missing-context result を返して停止する。
 
 ## Input Contract
 

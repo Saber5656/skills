@@ -23,7 +23,9 @@ commit、PR 作成、branch 作成、GitHub ruleset 設定は担当しない。
 
 人間起点で呼ばれた場合でも、task context または Publication Manifest が必要。
 未起票・scope 不明の依頼では `task_scope_missing` として停止する。
-外部フロー上の承認、routing、publication 判断はこのスキルでは決めず、必要な場合は `configure-organization` から渡された manifest を使う。
+承認、routing、publication 判断を含む caller-supplied Saihai task context または `Publication Manifest` が、
+呼び出し元から明示的に渡されていなければならない。このスキルは受け取った typed artifact と branch policy を
+検証して push だけを実行し、role、approval owner、review provider、publication ownership を独自に決めない。
 
 ## When I Activate
 

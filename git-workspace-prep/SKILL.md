@@ -28,7 +28,8 @@ branch 名や repo profile は決めず、task context に記録された `Branc
 ## Task Context Precondition
 
 task record と `Branch Plan` が必要。
-外部フロー上の起票、承認、routing が必要な場合は、このスキル内で判断せず `configure-organization` から渡された task context を使う。
+`Branch Plan` を含む caller-supplied Saihai task context が、呼び出し元から明示的に渡されていなければならない。
+外部フロー上の起票、承認、routing、role 選択はこのスキル内で決めず、受け取った typed artifact の検証と実行だけを行う。
 未起票または Branch Plan 不足の場合は、git 操作を行わず停止する。
 
 ## When I Activate

@@ -31,7 +31,9 @@ git の未コミット変更を解析し、Task Change Manifest の `approved_sc
 `/commit`、`コミットして`、`変更をコミット` のような人間起点の依頼でも、まず task record と task-owned scope を確認する。
 
 外部フロー上の起票、承認、routing、publication 判断はこのスキルでは決めない。
-必要な場合は `configure-organization` から渡された Task Change Manifest、Publication Manifest、または同等の task context を入力として扱う。
+呼び出し元から明示的に渡された caller-supplied Saihai task context、`Task Change Manifest`、
+`Publication Manifest` のいずれかを入力として扱う。このスキルは typed artifact を検証して commit だけを実行し、
+role、approval owner、review provider、routing、publication ownership を独自に決めない。
 
 次の全項目が確認できるまで、`git status`、`git add`、`git commit` を含む git 操作に進まない。
 
@@ -156,8 +158,8 @@ scope 外 hunk を分離できない場合は `scope_mismatch` として停止�
 コミット実行前に、全コミット対象差分について `Security Commit Review` contract を必ず満たす。
 この review は「コミット計画の人間確認」の代替ではなく、秘密情報や重大リスク混入を止めるための自動ゲートである。
 
-review provider は task context または `configure-organization` から渡された方針に従う。
-スキル側は provider 名を固定せず、ステージ予定のファイル、差分概要、security-sensitive な変更点、除外予定差分に対して次の fields が揃っていることだけを検証する。
+review provider の決定は caller-supplied Saihai task context に記録された方針に従う。
+スキル側は provider を選択・推測・fallback せず、ステージ予定のファイル、差分概要、security-sensitive な変更点、除外予定差分に対して次の fields が揃っていることだけを検証する。
 
 | Field | Required | 内容 |
 |---|---:|---|
@@ -377,7 +379,7 @@ modified: README.md          ← インストール手順を更新
 ## Related Tools
 
 - `push`: commit 後の branch push 可否判定と実行
-- `configure-organization`: task context / policy / publication flow を確認する入口
+- Saihai caller: task context / typed artifact / policy decision を明示的に供給する control plane
 
 - **simplify skill**: コミット前にコードを整理したい場合
 - **`/code-review` skill**: PR作成前にコードをレビューしたい場合

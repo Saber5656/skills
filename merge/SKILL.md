@@ -30,7 +30,8 @@ argument-hint: "[--dry-run | --execute] [--stash] [--message <text>]"
 ## Task Context Precondition
 
 人間起点で呼ばれた場合でも、task record と実行 scope を確認する。
-外部フロー上の起票、承認、routing が必要な場合は、このスキル内で判断せず `configure-organization` から渡された task context を使う。
+実行 scope と決定済みの policy を含む caller-supplied Saihai task context が、呼び出し元から明示的に渡されていなければならない。
+外部フロー上の起票、承認、routing、role 選択はこのスキル内で決めず、受け取った context の検証と merge 実行だけを行う。
 task context がない場合は、git 操作をせず `task_scope_missing` として停止する。
 
 次の境界を常に守る。
