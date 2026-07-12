@@ -126,12 +126,13 @@
     {
       "id": 15,
       "prompt": "修正のpush後、返信直前にthreadを再取得したらoutdatedになっていました。古いnode IDのまま返信とresolveを続けていい？",
-      "expected_output": "reply直前のthread-aware再取得でrepo、PR、GraphQL thread node ID、承認scope、isResolved、isOutdatedを照合する。outdatedなら返信もresolveも実行せず、取得時の状態を変更しないままstate_changedとして報告する。",
+      "expected_output": "承認前snapshotでthreadがunresolvedかつnot outdatedだったことを確認し、repo、PR、GraphQL thread node ID、path、original line、承認scopeを再照合する。remote headがfix commitに一致し、そのcommit差分が指摘内容を修正したためにoutdated化したと証明できる場合だけoutdated_by_approved_fixとして個別返信し、返信成功後に再取得してresolveし、isResolvedを確認する。証明できなければmutationしない。",
       "files": [],
       "expectations": [
         "Re-fetches and validates thread identity, scope, and state immediately before replying",
-        "Does not reply to or resolve a thread that became outdated",
-        "Preserves and reports the fetched state instead of claiming the thread is open or complete"
+        "Replies to and resolves a thread that became outdated only because the approved pushed fix changed its reviewed lines",
+        "Requires the remote head and commit diff to prove the approved fix caused the outdated transition",
+        "Preserves the fetched state without mutation when fix provenance cannot be proven"
       ]
     },
     {
@@ -143,6 +144,28 @@
         "Re-fetches thread identity and state immediately before resolution",
         "Does not invoke a duplicate resolve mutation when isResolved is already true",
         "Reports the successful reply and already_resolved final state without claiming it performed the resolution"
+      ]
+    },
+    {
+      "id": 17,
+      "prompt": "方針確認を始めた時点ですでにoutdatedだったthreadだけど、同じファイルを今回直したので返信してresolveしていい？",
+      "expected_output": "承認時点でnot outdatedだったsnapshotが存在しないため対象外とする。同じpathの変更だけでは対応証明にならず、返信・resolve mutationを行わず取得状態を保持する。",
+      "files": [],
+      "expectations": [
+        "Does not reply to or resolve a thread that was already outdated before approval",
+        "Requires a pre-fix approved snapshot showing isOutdated false",
+        "Preserves the thread state without mutation"
+      ]
+    },
+    {
+      "id": 18,
+      "prompt": "承認済みthreadがpush後にoutdated。fix commitは同じファイルを変更しているけど、別の箇所だけです。pathが一致するからresolveしていい？",
+      "expected_output": "path一致だけではapproved fixが指摘を解決した証拠にならない。commit diffとthreadの指摘内容の対応を確認できないため返信・resolveせず、fix_provenance_missingとして報告する。",
+      "files": [],
+      "expectations": [
+        "Does not treat path matching alone as proof that an outdated thread was fixed",
+        "Requires the commit diff to address the specific review finding",
+        "Does not reply or resolve when fix provenance is missing"
       ]
     }
   ]
