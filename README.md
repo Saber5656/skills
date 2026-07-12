@@ -33,9 +33,19 @@ Use the clean public clone as the local skill root:
 
 ```bash
 SKILLS_REPO_ROOT="${SKILLS_REPO_ROOT:-$HOME/dev/skills}"
-ln -sfn "$SKILLS_REPO_ROOT" "$HOME/.claude/skills"
-ln -sfn "$SKILLS_REPO_ROOT" "$HOME/.codex/skills"
+mkdir -p "$HOME/.claude" "$HOME/.codex"
+
+for SKILLS_LINK in "$HOME/.claude/skills" "$HOME/.codex/skills"; do
+  if [ -e "$SKILLS_LINK" ] && [ ! -L "$SKILLS_LINK" ]; then
+    printf 'Refusing to replace existing directory: %s\n' "$SKILLS_LINK" >&2
+    exit 1
+  fi
+  ln -sfn "$SKILLS_REPO_ROOT" "$SKILLS_LINK"
+done
 ```
+
+If the command reports an existing directory, back up or remove that directory
+manually, then rerun the setup. The setup never deletes existing skill files.
 
 ## Public and private data boundary
 
