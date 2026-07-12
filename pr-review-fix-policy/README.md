@@ -18,7 +18,8 @@
 - この方針確認スキル自身はGitHubコメント返信やthread resolveはしない。
 - handoff後の実装用スキルは、ユーザーが承認したreview threadごとに対応内容、commitまたは差分、検証結果を返信し、その返信成功後にthreadをresolveする。
 - explanation-onlyではcommit/push/remote-head確認を`not_applicable`とし、空commitを作らない。
-- reply直前とresolve直前にthread identityと`isResolved`/`isOutdated`を再取得し、対象が変化していたら次のmutationを行わない。
+- reply直前とresolve直前にthread identityと`isResolved`/`isOutdated`を再取得する。承認時は有効だったthreadがapproved fixのpushによってoutdated化した場合は、承認前snapshotとremote fix provenanceを照合できるときだけ返信・resolveを続行する。
+- 承認時点ですでにoutdated、未対応、除外、identity不一致、またはfix provenanceを証明できないthreadにはmutationを行わない。
 - top-level PR commentsはreview threadではないためresolve対象外とし、`not_applicable`として報告する。
 - reply、resolve、`isResolved`確認のどこかが失敗したthreadを完了扱いしない。
 - コメント取得に失敗した状態で内容を推測しない。

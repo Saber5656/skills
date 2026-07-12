@@ -45,11 +45,12 @@ argument-hint: "[任意: PR番号/URL or 方針確認メモ]"
 9. ユーザーが推奨方針の実装を承認した場合、後続handoffには「対応したreview threadごとに対応内容コメントを返信し、返信成功後に同じthreadをresolveして`isResolved`を再確認する」を標準で含める。確認選択肢にはこのGitHub write actionを明記し、ユーザーの選択を返信・resolve双方への明示承認として残す。
 10. 複数threadを1クラスタとして実装する場合でも、GitHub返信はクラスタ単位でまとめず、対応した指摘ごとに個別返信する。共通修正で複数指摘を解決した場合も、それぞれのthreadに同じcommitと該当する対応内容を返す。`explanation-only`ではcommitの代わりに、コード変更不要と判断した具体的な根拠を返す。
 11. 後続作業は対応種別で分岐する。
-    - code change: `implement → validate → commit → push → verify remote head → refresh thread state → reply → refresh thread state → resolve → verify isResolved`
+    - code change: `capture approved thread snapshot → implement → validate → commit → push → verify remote head → refresh thread state and prove fix provenance → reply → refresh thread state → resolve → verify isResolved`
     - explanation-only: `validate explanation → mark commit/push/remote-head not_applicable → refresh thread state → reply → refresh thread state → resolve → verify isResolved`
     コード変更がない場合に空commitや不要なpushを作らない。コード変更があるのにfixがremoteに存在しない、またはthread返信が失敗した状態ではresolveしない。
-12. Resolve対象は承認済みかつ対応済みのreview threadだけとする。top-level PR commentsはresolve不能なので`not_applicable`とする。除外・未対応・outdated threadにはreply/resolve mutationを行わず、取得時の状態を変更しない。resolve mutationまたは最終確認が失敗した場合は完了を主張せず、threadごとのblockerを返す。
-13. reply直前とresolve直前にthread-aware stateを再取得し、repo、PR、GraphQL thread node ID、承認scopeが一致し、`isResolved == false`かつ`isOutdated == false`であることを確認する。確認失敗またはscope/state変化時は次のmutationを行わない。reply後に他者がresolveしていた場合はresolve mutationを省略し、`already_resolved`と最終状態を正確に報告する。
+12. Resolve対象は承認済みかつ対応済みのreview threadだけとする。top-level PR commentsはresolve不能なので`not_applicable`とする。除外・未対応・承認時点ですでにoutdatedだったthreadにはreply/resolve mutationを行わず、取得時の状態を変更しない。resolve mutationまたは最終確認が失敗した場合は完了を主張せず、threadごとのblockerを返す。
+13. code changeでは実装前に、承認対象threadのrepo、PR、GraphQL thread node ID、path、original line、`isResolved == false`、`isOutdated == false`、pre-fix headをsnapshotとして固定する。push後にthreadがoutdatedになっていても、同じidentityと承認scopeで、remote headがfix commitに一致し、そのcommitの差分がthreadのpathと指摘内容に対応することを証明できる場合は`outdated_by_approved_fix`として返信・resolveを続行してよい。単にoutdatedであることやpath一致だけを対応証明にしてはならない。
+14. reply直前とresolve直前にthread-aware stateを再取得する。通常は`isResolved == false`かつ`isOutdated == false`を要求する。`outdated_by_approved_fix`では、固定snapshotとのidentity/scope一致、remote fix provenance、`isResolved == false`を要求し、outdated化だけを許容する。その他の確認失敗やstate変化時は次のmutationを行わない。reply後に他者がresolveしていた場合はresolve mutationを省略し、`already_resolved`と最終状態を正確に報告する。
 
 ## Workflow
 
@@ -72,6 +73,7 @@ argument-hint: "[任意: PR番号/URL or 方針確認メモ]"
   - author
   - body summary
   - related review state if available
+- code changeの承認時には、後続でpush起因のoutdated化を判定できるよう、thread identity、path、original line、pre-fix head、承認scopeをsnapshotとしてhandoffへ残す。
 - FlatなPR commentsだけを完全なreview thread情報として扱わない。
 
 ### 3. 対象コメントを分類する
@@ -113,7 +115,7 @@ argument-hint: "[任意: PR番号/URL or 方針確認メモ]"
 - 実装に進む場合の担当スキルまたは後続ワークフロー。
 - 各threadがcode changeか`explanation-only`か。後者は新規commit、push、remote-head確認を`not_applicable`とし、空commitを作らない。
 - 実装後に返信すべきreview threadと返信方針。返信は指摘ごとに個別に行い、「どのcommit/差分で何を直したか」「その指摘に対する具体的な対応内容」「検証結果」「説明で対応する場合の理由」を含める。
-- 返信後にresolveすべきreview threadと完了判定。reply直前とresolve直前にidentity/scope/stateを再取得し、各threadは返信成功後にだけresolveする。mutation後はthread-awareに`isResolved == true`を1回以上再取得し、一時的な取得失敗を再試行する場合も最大5回で停止する。top-level PR commentsは`not_applicable`とする。
+- 返信後にresolveすべきreview threadと完了判定。reply直前とresolve直前にidentity/scope/stateを再取得し、各threadは返信成功後にだけresolveする。pushでthreadがoutdatedになった場合は、承認前snapshotとremote fix provenanceの両方で`outdated_by_approved_fix`を証明できるときだけ続行する。mutation後はthread-awareに`isResolved == true`を1回以上再取得し、一時的な取得失敗を再試行する場合も最大5回で停止する。top-level PR commentsは`not_applicable`とする。
 - テストまたは確認観点。
 - リスクと未決事項。
 
@@ -172,13 +174,14 @@ Recommended: A
 - Excluded threads: T5 intentionally excluded
 - Required reasoning fields: current problem/downside and benefit after fix for each approved thread
 - Required checks: unit tests, `git diff --check`, project-specific checks
+- Approved thread snapshot: repo, PR, GraphQL thread node ID, path, original line, pre-fix head, pre-fix `isResolved`, pre-fix `isOutdated`, approved scope
 - GitHub write authorization: approval of this handoff explicitly authorizes per-thread replies and resolution for the approved review threads only
 - Work type per thread: `code-change` or `explanation-only`; for explanation-only work, record `commit_status`, `push_status`, and `remote_head_status` as `not_applicable` and do not create an empty commit
-- GitHub write actions: for a code change, reply only after implementation, validation, push, and remote-head verification; for explanation-only work, reply after the explanation and evidence are validated. Immediately before each reply and resolve, re-fetch and match repo, PR, GraphQL thread node ID, approved scope, `isResolved == false`, and `isOutdated == false`. After each reply succeeds, resolve that same thread with a thread-aware mutation such as `resolveReviewThread`, then re-read state and require `isResolved == true`
+- GitHub write actions: for a code change, reply only after implementation, validation, push, remote-head verification, and fix-provenance verification; for explanation-only work, reply after the explanation and evidence are validated. Immediately before each reply and resolve, re-fetch and match repo, PR, GraphQL thread node ID, approved scope, and `isResolved == false`. Require `isOutdated == false` unless the fixed pre-change snapshot and remote commit prove `outdated_by_approved_fix`. After each reply succeeds, resolve that same thread with a thread-aware mutation such as `resolveReviewThread`, then re-read state and require `isResolved == true`
 - Non-resolvable comments: top-level PR comments may receive an approved reply but have `resolve_status: not_applicable`; do not call a review-thread resolve mutation for them
-- State-change contract: excluded, unaddressed, or outdated threads keep their fetched state without mutation. If a thread becomes resolved before reply, skip both mutations; if it becomes resolved after reply, skip the resolve mutation and report `already_resolved`; any other identity/scope/state mismatch is a blocker
+- State-change contract: excluded, unaddressed, or pre-existing outdated threads keep their fetched state without mutation. A thread that becomes outdated because the approved pushed fix changed its reviewed lines may proceed only with snapshot and remote-fix provenance evidence. If a thread becomes resolved before reply, skip both mutations; if it becomes resolved after reply, skip the resolve mutation and report `already_resolved`; any other identity/scope/state mismatch is a blocker
 - Partial failure contract: if preflight or reply fails, do not resolve; if resolve or final verification fails, report the thread as unresolved and keep the task incomplete for that thread
-- Required completion evidence per item: thread/comment id, work type, commit/push/remote-head applicability, reply status and URL when available, resolve status, verified `isResolved`/`isOutdated` value or `not_applicable`, and blocker when incomplete
+- Required completion evidence per item: thread/comment id, work type, commit/push/remote-head applicability, reply status and URL when available, resolve status, verified `isResolved`/`isOutdated` value or `not_applicable`, and blocker when incomplete. For `outdated_by_approved_fix`, also require pre-fix head, fix commit, verified remote head, matched diff/hunk or lines, finding-to-fix rationale, and provenance verdict
 - Vault update: required / not required / blocked
 ```
 
@@ -200,9 +203,9 @@ Recommended: A
 - handoff後の実装用スキルは、対応済みthreadごとの返信とresolveを標準後続作業として扱う。返信内容には対応commitまたは差分、指摘ごとの具体的な対応内容、検証結果を含める。複数指摘を同じ修正で解決した場合も、それぞれのthreadへ個別に返信し、個別にresolveする。
 - 方針確認の選択肢に返信・resolveを明記する。ユーザーがその選択肢を承認したことを、`gh-address-comments`など後続スキルが要求する明示的なGitHub write承認としてhandoffへ記録する。
 - コード変更がある場合はfix commitのremote-head確認前にreply/resolveしない。`explanation-only`では新規commit、push、remote-head確認を`not_applicable`として空commitを作らず、説明内容の検証後にGitHub writeへ進む。
-- reply直前とresolve直前にthread identity、承認scope、`isResolved`、`isOutdated`を再取得する。確認できない場合や対象が変化した場合は次のmutationを実行しない。
+- reply直前とresolve直前にthread identity、承認scope、`isResolved`、`isOutdated`を再取得する。code changeでpush起因のoutdated化を許容する場合は、承認前snapshotとremote fix provenanceも照合する。確認できない場合や対象が許容範囲外で変化した場合は次のmutationを実行しない。
 - thread返信成功前にresolveしない。reply → pre-resolve refresh → resolve → `isResolved`再取得の順序を崩さない。最終確認の一時的エラーを再試行する場合も最大5回で停止する。
-- top-level PR comments、除外thread、未対応thread、outdated threadにはresolve mutationを実行せず、取得時の状態を変更しない。
+- top-level PR comments、除外thread、未対応thread、承認時点ですでにoutdatedだったthread、fix provenanceを証明できないoutdated threadにはresolve mutationを実行せず、取得時の状態を変更しない。
 - reply/resolve/verificationのいずれかが失敗した場合は、成功済み操作と未完了操作をthreadごとに分け、未解決のままblockerを報告する。
 
 ## Failure Modes
@@ -217,9 +220,10 @@ Recommended: A
 | security-sensitive変更を含む | リスクを明示し、通常より強い検証またはowner sign-off要否を確認する |
 | pushまたはremote-head確認が失敗 | 返信もresolveも実行せず、local fixとblockerを報告する |
 | explanation-only | 新規commit/push/remote-head確認を`not_applicable`とし、説明と根拠の検証後にthread preflightへ進む |
-| reply直前の再取得でidentity/scope不一致、resolved、outdated | 返信もresolveも実行せず、取得状態とblockerまたは`already_resolved`を報告する |
+| reply直前の再取得でidentity/scope不一致、resolved、またはprovenance不明のoutdated | 返信もresolveも実行せず、取得状態とblockerまたは`already_resolved`を報告する |
+| 承認時は有効で、approved fixのpushによりoutdated化 | snapshot、remote head、commit diff、指摘との対応を照合し、`outdated_by_approved_fix`を証明できる場合だけ返信へ進む |
 | thread返信が失敗 | そのthreadはresolveせず、返信失敗として残す |
-| resolve直前の再取得でidentity/scope不一致またはoutdated | resolveせず、返信済みと状態変化を分けて報告する |
+| resolve直前の再取得でidentity/scope不一致またはprovenance外のoutdated | resolveせず、返信済みと状態変化を分けて報告する |
 | resolve直前の再取得で既にresolved | resolve mutationを省略し、`already_resolved`と`isResolved == true`を報告する |
 | resolve mutationまたは`isResolved`確認が失敗 | reply済み・unresolvedとして報告し、完了扱いしない |
 | top-level PR comment | resolve対象外として`not_applicable`を返し、review-thread mutationを呼ばない |
