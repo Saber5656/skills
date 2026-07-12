@@ -4,17 +4,18 @@ description: >
   GitHub pull request publication workflow for local code changes. Use this skill when the user asks to
   create a PR, open a pull request, PR作成, PR出して, pushしてPR, publish changes, or wants a Codex-reviewed
   PR flow. This skill creates ready-for-review, non-draft PRs only, writes PR titles and bodies in English,
-  applies existing repository labels to the PR and primary linked issue, assigns the current GitHub user, requests
-  Codex review by detecting current-head GitHub review results first, uses `@codex review` only as an
-  optional fallback/manual trigger, waits for Codex review feedback when feasible, then stops at a human
-  confirmation gate with a proposed fix plan. Do not use for merely summarizing an existing PR, fixing CI
-  only, or addressing already-selected review comments.
+  applies existing repository labels to the PR and primary linked issue, assigns the current GitHub user, relies
+  on repository-configured automatic Codex review, detects current-head GitHub review results, never posts a
+  manual Codex review-trigger comment, waits for Codex review feedback when feasible, then stops at a human
+  confirmation gate with a proposed fix
+  plan. Do not use for merely summarizing an existing PR, fixing CI only, or addressing already-selected
+  review comments.
 user-invocable: true
 allowed-tools: Read, Write, Edit, Bash, Grep, Glob
 category: Dev
 created: 2026-06-21
 status: active
-purpose: GitHub PR作成からCodex review依頼とHOTL修正方針確認までを標準化する
+purpose: GitHub PR作成から自動Codex review観測とHOTL修正方針確認までを標準化する
 argument-hint: "[PR対象の説明、base/head、追加制約]"
 ---
 
@@ -24,8 +25,8 @@ This skill publishes local changes as a GitHub PR and wires in the Codex review 
 stricter than a simple `gh pr create`: branch contents are checked against the remote base, the pushed PR
 head is verified, and any actionable Codex review feedback must pass through a human-in-the-loop
 confirmation before code is changed. Codex automatic review settings live in Codex/GitHub, so this skill
-does not mirror them locally; it observes whether a current-head Codex review appears and uses
-`@codex review` only as an optional fallback/manual trigger.
+does not mirror them locally. It observes whether a current-head Codex review appears and never posts a
+comment-based fallback to trigger another Codex review.
 
 ## When I Activate
 
@@ -53,8 +54,8 @@ This skill owns the publication and Codex review workflow:
 6. Resolve a label plan from user-provided labels, task context, primary issue labels, or existing repository labels, then apply the final label set to the PR and primary linked issue when available.
 7. Start a review attempt by recording the PR head SHA and review window start before PR creation or push.
 8. Poll GitHub for a submitted `chatgpt-codex-connector[bot]` review whose `commit_id` matches the current PR head.
-9. If no current-head Codex review appears in the polling window, optionally post exactly `@codex review`
-   once as a fallback/manual trigger and continue polling.
+9. If no current-head Codex review appears in the polling window, report `review_pending` or
+   `review_timeout` without posting a manual review-trigger comment or starting a comment-triggered attempt.
 10. Summarize actionable feedback and ask the user to approve the fix plan before editing.
 11. After approved review fixes are implemented, commit, push, and verify the remote PR head contains the fix before posting any GitHub reply that says feedback was addressed.
 
@@ -215,19 +216,18 @@ Verify:
   every label in the final label set.
 - Final output includes `Label status` with applied labels or the blocker.
 
-### Codex Review Detection And Fallback
+### Automatic Codex Review Observation
 
-After the PR exists, Codex review must be observed for the current PR head when feasible. Do not store a
-local `auto/manual` flag that tries to mirror Codex's repository code-review settings. The local behavior
-is `review_trigger_fallback`, which controls what the skill does if automatic current-head review is not
-observed.
+After the PR exists, observe Codex review for the current PR head when feasible. Repository configuration
+owns the normal review trigger. This skill must not mirror that setting locally, post a manual trigger
+comment, or start a comment-triggered second review attempt.
 
 Required outcomes:
 
 1. A submitted, non-diagnostic PR review from `chatgpt-codex-connector[bot]` exists with
    `commit_id == headRefOid` for the current PR head.
 2. If the submitted current-head review does not appear within the polling window, report `review_pending`
-   and use the configured fallback: post exactly `@codex review` once, wait longer, or stop for user input.
+   or `review_timeout` and return a resumable observation state without posting a trigger comment.
 3. A reviewer assignment, requested-reviewer entry, top-level acknowledgement comment, environment note, or
    review object whose only content is an environment/setup note is diagnostic only. It is not successful
    review evidence.
@@ -253,20 +253,13 @@ Accept a candidate when the review body contains the Codex review summary (for e
 `Reviewed commit`) or when its associated review comments contain actionable review feedback. Reject
 diagnostic-only candidates such as an environment setup note with no review suggestions.
 
-Optional fallback trigger:
+Manual trigger comments are forbidden in this publication workflow. Even when the user asks for a
+Codex-reviewed PR or automatic review is delayed, do not translate that request into a PR comment.
 
-```bash
-# Only when fallback is enabled and no current-head Codex review is observed.
-gh api --paginate "repos/$repo/issues/$pr/comments" --jq \
-  ".[] | select(.body == \"@codex review\" and .created_at >= \"$review_window_start\") |
-    {id, created_at, user: .user.login, html_url}"
-gh pr comment "$pr" --repo "$repo" --body '@codex review'  # only when no current-attempt trigger exists
-```
-
-Direct reviewer requests are optional compatibility behavior. They may be attempted when the repository
+Direct reviewer requests remain optional compatibility behavior. They may be attempted when the repository
 supports them or when the user explicitly asks, but failure to keep `chatgpt-codex-connector[bot]` in
 `reviewRequests` is not itself a workflow failure. GitHub can remove requested reviewers after they submit
-a review, and observed Codex behavior may associate the bot only after review comments are complete.
+a review, and a reviewer assignment alone is never successful review evidence.
 
 Verify:
 
@@ -275,8 +268,8 @@ Verify:
 - PR labels are applied and verified, or `label_status` explains why labeling is blocked.
 - If a primary issue is linked, issue labels are applied and verified, or `label_status` explains why labeling is blocked.
 - Remote PR head matches the intended pushed commit.
-- `reviews` contains a submitted, non-diagnostic `chatgpt-codex-connector[bot]` review for the current `headRefOid`, or the workflow clearly reports `review_pending` / `review_timeout` and the fallback decision.
-- If fallback comment mode is used, a top-level PR comment exactly matching `@codex review` exists for the current review attempt timestamp window, not merely somewhere in PR history.
+- `reviews` contains a submitted, non-diagnostic `chatgpt-codex-connector[bot]` review for the current `headRefOid`, or the workflow clearly reports `review_pending` / `review_timeout` without posting a trigger comment.
+- No PR comment was used to trigger Codex review; a reviewer request, when explicitly used for compatibility, is not treated as review success.
 
 ## Codex Review Feedback Intake
 
@@ -287,13 +280,11 @@ Default behavior:
 - Poll for up to 10 minutes when the user asked for a complete PR creation flow in the current turn.
 - If no Codex response arrives in time, report the PR URL and the exact command/context needed to resume.
 - Capture `review_window_start` before the PR creation, ready-for-review transition, or push that should
-  trigger Codex review. If a direct reviewer request or fallback `@codex review` comment is attempted, keep
-  their timestamps too.
+  trigger automatic Codex review. If a direct reviewer request is attempted, keep its timestamp too.
 - When a response appears, fetch top-level PR comments, reviews, and review threads created after the
-  earliest relevant event timestamp: `review_window_start`, reviewer-request timestamp, or fallback trigger timestamp.
+  earliest relevant event timestamp: `review_window_start` or reviewer-request timestamp.
 - Always inspect submitted `chatgpt-codex-connector[bot]` reviews whose `commit_id` matches the current
-  `headRefOid`, even if they arrived before a later fallback `@codex review` comment. Exclude
-  diagnostic-only reviews from success status while still reporting them as diagnostics.
+  `headRefOid`. Exclude diagnostic-only reviews from success status while still reporting them as diagnostics.
 
 Feedback source priority:
 
@@ -366,11 +357,10 @@ Rules:
 | No safe label set | Ask the user for labels before reporting PR publication complete |
 | Label application blocked | Report the exact missing label, permission, or API error; do not claim labels were applied |
 | Review reply requested before push | Commit, push, and verify the PR branch first; if blocked, draft but do not post the reply |
-| PR already exists | Reuse it and apply assignee, remote-head, current-head review detection, and fallback-comment gates |
+| PR already exists | Reuse it and apply assignee, remote-head verification, and automatic current-head review observation |
 | Local base diverges from remote base | Fetch and compare against the remote base; stop if the branch contents cannot be proven task-owned |
 | Local branch behind or diverged from upstream | Stop or safely fast-forward, then rerun remote-base ownership checks before PR create/reuse |
-| Codex review cannot be verified | Stop or report resumable `review_pending` only when no submitted current-head Codex review exists after the polling/fallback window |
-| `@codex review` fallback comment fails | Report the fallback failure; do not treat acknowledgements or environment notes as review success |
+| Codex review cannot be verified | Report resumable `review_pending` only when no submitted current-head Codex review exists after the polling window; do not post a trigger comment |
 | Codex review times out | Report resumable state; do not fabricate review results |
 
 ## Output
@@ -386,7 +376,6 @@ Final response must include:
 | PR title/body language | English |
 | Label status | Applied labels for PR and primary issue, skipped only with reason, or blocked |
 | Codex review status | current-head review observed, review pending, timed out, or not requested |
-| `@codex review` fallback status | posted, reused for current attempt, skipped because automatic review was observed, disabled, or failed |
 | Codex review intake status | Responded, timed out, or not requested |
 | Checks run | Yes |
 | Fix push status | Required when review feedback was implemented |
@@ -413,7 +402,7 @@ Expected behavior:
 - Assign current GitHub user.
 - Record the review attempt before PR creation/push.
 - Detect a current-head Codex review from GitHub PR reviews.
-- Post `@codex review` only if fallback is enabled and automatic current-head review is not observed.
+- Never post a manual Codex review-trigger comment; repository automation owns normal review creation.
 - Wait briefly for Codex review and stop at fix-plan confirmation if feedback arrives.
 
 ### Existing pushed branch
@@ -424,11 +413,11 @@ Expected behavior:
 
 - Do not create a duplicate branch.
 - Create or reuse the PR.
-- Apply assignee, remote-head verification, current-head Codex review detection, and fallback trigger rules.
+- Apply assignee, remote-head verification, and automatic current-head Codex review observation.
 
 ### Review feedback returns
 
-User: `@codex review 返ってきてたら見て`
+User: `Codex reviewが返ってきていたら見て`
 
 Expected behavior:
 
@@ -443,7 +432,7 @@ Expected behavior:
 **Works with sandboxing:** Requires escalation for git writes and GitHub network operations
 
 - **Filesystem**: Reads repo state; writes git index/refs when committing or pushing.
-- **Network**: Uses GitHub via `gh` for PR creation, optional reviewer requests, comments, and polling.
+- **Network**: Uses GitHub via `gh` for PR creation, optional reviewer requests, label/assignee updates, feedback replies, and review polling.
 - **Configuration**: Requires authenticated `gh` with sufficient repository permissions.
 
 ## Related Skills
