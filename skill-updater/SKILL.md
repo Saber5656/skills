@@ -77,7 +77,7 @@ argument-hint: "[対象スキル名または改善内容]"
 
 7. **レビュー**
    - 独立レビュー観点で、要件充足、回帰リスク、テスト妥当性を確認する。
-   - スキル修正がセキュリティ、秘密情報、権限、外部サービス利用に関わる場合は `security-professor` など利用可能な安全性レビュー観点も加える。
+   - スキル修正がセキュリティ、秘密情報、権限、外部サービス利用に関わる場合は、caller-supplied Saihai task context または typed artifact が指定する security review provider を使う。provider が指定されていない場合は独自に選ばず、review context 不足として差し戻す。
 
 8. **ドキュメント更新**
    - 設定済みの task/evidence vault に、改善ブリーフ、修正内容、テスト結果、残課題を記録する。

@@ -37,10 +37,10 @@
     {
       "id": 4,
       "name": "minimum_concern_split_across_skills",
-      "prompt": "skills/commit/SKILL.md の自動コミット方針変更、skills/security-professor/SKILL.md の安全性レビュー追記、skills/commit/evals/evals.json の eval 追加が混在している。Security Commit Review は max_priority none。commit skill としてどう分割する？",
-      "expected_output": "単に skills-repo や複数スキル更新として一括コミットしない。commit skill の挙動変更、security-professor のレビュー観点追加、commit eval 更新を最小関心事として分ける。同一コミットにまとめられるのは、同じ目的に対する本体変更と直接対応するテスト/eval に限り、その理由を task record に記録する場合だけ。",
+      "prompt": "skills/commit/SKILL.md の自動コミット方針変更、Saihai tech-security のWeb security checklist追記、skills/commit/evals/evals.json の eval 追加が混在している。Security Commit Review は max_priority none。commit skill としてどう分割する？",
+      "expected_output": "単に複数repository更新として一括コミットしない。commit skill の挙動変更、tech-security のレビュー観点追加、commit eval 更新をrepositoryと最小関心事ごとに分ける。同一コミットにまとめられるのは、同じ目的に対する本体変更と直接対応するテスト/eval に限り、その理由を task record に記録する場合だけ。",
       "assertions": {
-        "must_include": ["一括コミットしない", "最小関心事", "commit skill", "security-professor", "eval"],
+        "must_include": ["一括コミットしない", "最小関心事", "commit skill", "tech-security", "eval"],
         "must_not_include": ["skills-repo current diff", "全部まとめる", "複数スキル更新として一括コミットする"],
         "blocking_expected": false
       }
