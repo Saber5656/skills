@@ -36,6 +36,12 @@ class SecurityProfessorRetirementTest(unittest.TestCase):
         self.assertIn("tech-security", contract)
         self.assertNotIn(LEGACY_NAME, contract)
 
+    def test_skill_updater_does_not_select_a_security_review_provider(self) -> None:
+        contract = (REPO_ROOT / "skill-updater/SKILL.md").read_text(encoding="utf-8")
+        self.assertIn("caller-supplied Saihai task context", contract)
+        self.assertIn("provider が指定されていない場合は独自に選ばず", contract)
+        self.assertNotIn("`tech-security`", contract)
+
 
 if __name__ == "__main__":
     unittest.main()
