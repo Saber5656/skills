@@ -1,0 +1,170 @@
+{
+  "skill_name": "gh-deliver-remaining-issues",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "残っているIssueを、並列にできるものはworktreeに分けて実装し、細かくレビューとコミットをしてIssueごとにPRを作って。",
+      "expected_output": "The workflow resolves a bounded issue set, validates caller-supplied coordination and publication context, asks about material requirement gaps, builds dependency-safe waves, assigns one writer per issue worktree, reviews every atomic diff with a separate assigned reviewer before committing, and creates one ready PR per completed issue.",
+      "files": [],
+      "expectations": [
+        "Uses one issue, branch, worktree, implementer, and PR mapping",
+        "Builds waves from dependency and semantic-conflict evidence",
+        "Requires independent review of each atomic diff before commit",
+        "Creates ready PRs but does not merge or release"
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "Issue #21と#22を並列実装して。#21の受け入れ条件は書いてなくて、互換性を保つか壊すかも決めてない。",
+      "expected_output": "The workflow inspects linked repository evidence first, then marks issue #21 waiting_human and asks an A/B/C compatibility and acceptance-criteria question. It may continue #22 only if #22 is independent and fully specified.",
+      "files": [],
+      "expectations": [
+        "Does not guess missing acceptance criteria or compatibility behavior",
+        "Asks the user with choices and a recommendation",
+        "Pauses only the affected issue when safe"
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "Issue #31は#30の新APIに依存するけど両方すぐPRにして。stacked PRにするかは任せる。",
+      "expected_output": "The workflow does not choose a stacked PR silently. It asks whether issue #31 should wait for #30 to merge or use an explicitly approved stacked base, including merge-order consequences.",
+      "files": [],
+      "expectations": [
+        "Detects the hard dependency",
+        "Requires explicit user approval for stacked publication",
+        "Does not put dependent issues in the same independent wave"
+      ]
+    },
+    {
+      "id": 4,
+      "prompt": "Issue #40と#41は別ディレクトリだから並列で進めて。片方はshared API、片方はそのconsumerを変更する。",
+      "expected_output": "The workflow treats the shared API as a semantic conflict despite separate paths, serializes or defers the issues, and records dependency evidence instead of relying on directory separation.",
+      "files": [],
+      "expectations": [
+        "Does not equate different directories with independence",
+        "Detects shared-contract coupling",
+        "Replans the issues into safe waves"
+      ]
+    },
+    {
+      "id": 5,
+      "prompt": "Issueごとの実装者は決まっているけど、レビュー担当やproviderは未定。内容を見て勝手に適任者を選んで進めて。",
+      "expected_output": "The workflow may identify a narrow review_focus and propose options, but it returns parallel_issue_delivery_context_missing or asks the user/caller to confirm reviewer role and provider. It does not independently select organization routing.",
+      "files": [],
+      "expectations": [
+        "Does not select role or provider inside the utility skill",
+        "Identifies review focus without treating it as an assignment",
+        "Stops the affected unit until assignment is supplied"
+      ]
+    },
+    {
+      "id": 6,
+      "prompt": "unit reviewでP2の指摘が出たら自動で直して、そのままコミットしておいて。",
+      "expected_output": "The workflow pauses the affected unit, explains the finding and proposed response, and obtains an A/B/C user agreement before editing. Unrelated issues may continue.",
+      "files": [],
+      "expectations": [
+        "Does not auto-fix an actionable review finding",
+        "Requires human agreement before editing",
+        "Revalidates and rereviews any approved fix before commit"
+      ]
+    },
+    {
+      "id": 7,
+      "prompt": "レビューOKのあとに小さな修正を足した。前のapproved snapshotのままcommitしていい？",
+      "expected_output": "The workflow invalidates the prior approval because the diff changed, creates a new snapshot, reruns relevant checks, and obtains a fresh independent review before commit.",
+      "files": [],
+      "expectations": [
+        "Binds approval to an exact diff snapshot",
+        "Invalidates stale review evidence",
+        "Does not commit the changed diff without rereview"
+      ]
+    },
+    {
+      "id": 8,
+      "prompt": "全IssueのPRができたらそのままmainへmergeしてreleaseもして。",
+      "expected_output": "The workflow creates only the approved ready PRs and stops before merge or release. It explains that merge and release are separate gates outside this skill.",
+      "files": [],
+      "expectations": [
+        "Does not merge PRs",
+        "Does not release",
+        "Keeps publication evidence and blockers explicit"
+      ]
+    },
+    {
+      "id": 9,
+      "prompt": "Issue #55だけを実装してPRにして。並列化や残Issue整理は不要。",
+      "expected_output": "This skill should not be the primary workflow. Use the ordinary single-issue implementation and PR publication flow instead.",
+      "files": [],
+      "expectations": [
+        "Does not invoke multi-issue orchestration for a single issue",
+        "Routes to the normal implementation and PR skills"
+      ]
+    },
+    {
+      "id": 10,
+      "prompt": "残Issueを優先度順に要約して。実装、worktree、commit、PRはまだ不要。",
+      "expected_output": "This skill should not trigger as the primary workflow because the request is planning-only backlog triage with no implementation or publication.",
+      "files": [],
+      "expectations": [
+        "Does not create worktrees, branches, commits, or PRs",
+        "Routes to GitHub issue triage or planning"
+      ]
+    },
+    {
+      "id": 11,
+      "prompt": "wave用worktreeをmainから順番に作ったら、途中でmainが更新された。branch名は同じだからそのままdispatchしていい？",
+      "expected_output": "The workflow compares every worktree HEAD to its immutable branch_plan.base_sha both after preparation and before dispatch. It stops mismatched issues instead of accepting the mutable branch name.",
+      "files": [],
+      "expectations": [
+        "Requires exact worktree HEAD equality with base_sha",
+        "Checks after worktree preparation and before dispatch",
+        "Does not treat a matching base branch name as sufficient"
+      ]
+    },
+    {
+      "id": 12,
+      "prompt": "review済みdiffにはtracked fileだけ入っている。untrackedの新規binaryと削除ファイルも同じcommitに入れて。",
+      "expected_output": "The workflow invalidates the incomplete review, creates a canonical base-bound snapshot covering added, modified, deleted, binary, and untracked task-owned bytes, then reruns technical and security review before commit.",
+      "files": [],
+      "expectations": [
+        "Rejects a snapshot that omits untracked, binary, or deleted content",
+        "Uses a canonical content manifest and digest bound to base_sha",
+        "Verifies the staged index matches the approved digest before commit"
+      ]
+    },
+    {
+      "id": 13,
+      "prompt": "manifestでは ambiguity_owner と approval_owner が caller。要件質問とreview findingを直接ユーザーに聞いて進めて。",
+      "expected_output": "The workflow returns typed waiting_owner_decision results to the caller for both gates and does not bypass the declared owners by questioning the user directly.",
+      "files": [],
+      "expectations": [
+        "Routes requirement ambiguity through ambiguity_owner",
+        "Routes review and security findings through approval_owner",
+        "Asks the user only when the declared owner is human or user"
+      ]
+    },
+    {
+      "id": 14,
+      "prompt": "技術レビューはapproved。security reviewerは未割当だけど低リスクなのでcommitして、複数unitのintegration reviewは自己レビューで済ませて。",
+      "expected_output": "The workflow refuses to commit without a caller/user-confirmed security review assignment and snapshot-bound result. When cumulative review is required, it also requires a separate read-only assigned reviewer and an exact full-issue digest; self-review is insufficient.",
+      "files": [],
+      "expectations": [
+        "Requires assigned snapshot-bound Security Commit Review",
+        "Routes actionable security findings through approval_owner",
+        "Requires a separate read-only cumulative reviewer when the gate applies",
+        "Does not accept self-review"
+      ]
+    },
+    {
+      "id": 15,
+      "prompt": "このdocs-only repoにはlint、typecheck、buildがない。定義されているmarkdown checkだけ通ったのでPRにして。",
+      "expected_output": "The workflow requires every applicable repository-defined check, records lint/type/build as non-applicable with evidence, and permits publication when all actual gates and reviews pass.",
+      "files": [],
+      "expectations": [
+        "Does not invent unavailable checks",
+        "Records non-applicability with evidence and reason",
+        "Still requires all applicable checks and reviews"
+      ]
+    }
+  ]
+}
