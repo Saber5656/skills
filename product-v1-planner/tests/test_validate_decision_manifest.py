@@ -19,7 +19,7 @@ def valid_manifest():
         "bundle_id": "p1", "repository": "owner/repo", "base_sha": "b" * 40,
         "evidence_binding": "bound_repository", "generated_at": "2026-07-16T00:00:00Z",
         "source_manifest_digest": digest,
-        "artifacts": [{"artifact_id": "design", "media_type": "text/markdown", "resolver": "repository_relative_file", "locator": "docs/design.md", "exact_bytes_sha256": digest}],
+        "artifacts": [{"artifact_id": "design", "media_type": "text/markdown", "resolver": "repository_relative_file", "locator": "proposals/v1.md", "exact_bytes_sha256": digest}],
     }
     proposal["bundle_digest"] = MODULE.canonical_bundle_digest(proposal)
     return {
@@ -38,7 +38,7 @@ def valid_manifest():
         "mutations": [{
             "id": "m1", "action": "create_doc", "exact_target": "docs/v1.md",
             "allowed": True, "decision_ids": ["d1"], "expected_before": {"state": "absent", "digest": None},
-            "proposed_after_digest": digest,
+            "proposed_after_digest": digest, "payload_artifact_id": "design",
         }],
     }
 
@@ -86,7 +86,7 @@ class DecisionManifestTests(unittest.TestCase):
     def test_rejects_changed_locator_payload(self):
         data = valid_manifest()
         with tempfile.TemporaryDirectory() as temp:
-            target = Path(temp) / "docs" / "design.md"
+            target = Path(temp) / "proposals" / "v1.md"
             target.parent.mkdir()
             target.write_bytes(b"approved")
             data["proposal"]["artifacts"][0]["exact_bytes_sha256"] = hashlib.sha256(b"approved").hexdigest()
@@ -109,9 +109,9 @@ class DecisionManifestTests(unittest.TestCase):
     def test_rejects_symlink_escape_and_missing_payload(self):
         data = valid_manifest()
         with tempfile.TemporaryDirectory() as temp, tempfile.TemporaryDirectory() as outside:
-            link = Path(temp) / "docs"
+            link = Path(temp) / "proposals"
             link.symlink_to(Path(outside), target_is_directory=True)
-            data["proposal"]["artifacts"][0]["locator"] = "docs/design.md"
+            data["proposal"]["artifacts"][0]["locator"] = "proposals/v1.md"
             self.assertIn("proposal.artifacts[0] locator escapes repository.root", MODULE.validate_artifact_payloads(data["proposal"], Path(temp)))
             link.unlink()
             self.assertTrue(any("payload is unreadable" in item for item in MODULE.validate_artifact_payloads(data["proposal"], Path(temp))))
@@ -144,6 +144,56 @@ class DecisionManifestTests(unittest.TestCase):
         self.assertIn("proposal.artifacts must be a non-empty array", payload["errors"])
         self.assertNotIn("Traceback", completed.stderr)
 
+    def test_cli_returns_structured_error_for_malformed_artifact_id(self):
+        data = valid_manifest()
+        data["proposal"]["artifacts"][0]["artifact_id"] = {}
+        with tempfile.TemporaryDirectory() as temp:
+            manifest = Path(temp) / "manifest.json"
+            manifest.write_text(json.dumps(data))
+            completed = subprocess.run([sys.executable, str(MODULE_PATH), str(manifest)], capture_output=True, text=True)
+        self.assertEqual(1, completed.returncode)
+        payload = json.loads(completed.stdout)
+        self.assertFalse(payload["valid"])
+        self.assertNotIn("Traceback", completed.stderr)
+
+    def test_cli_returns_structured_errors_for_malformed_enum_values(self):
+        mutations = [
+            lambda data: data["approval"].update(owner={}),
+            lambda data: data["approval"]["source"].update(kind={}),
+            lambda data: data["decisions"][0].update(category={}),
+            lambda data: data["mutations"][0].update(action={}),
+            lambda data: data["mutations"][0]["expected_before"].update(state={}),
+        ]
+        for mutate in mutations:
+            with self.subTest(mutate=mutate):
+                data = valid_manifest()
+                mutate(data)
+                with tempfile.TemporaryDirectory() as temp:
+                    manifest = Path(temp) / "manifest.json"
+                    manifest.write_text(json.dumps(data))
+                    completed = subprocess.run([sys.executable, str(MODULE_PATH), str(manifest)], capture_output=True, text=True)
+                self.assertEqual(1, completed.returncode)
+                self.assertFalse(json.loads(completed.stdout)["valid"])
+                self.assertNotIn("Traceback", completed.stderr)
+
+    def test_cli_returns_structured_errors_for_unsafe_path_values(self):
+        mutations = [
+            lambda data: data["repository"].update(root=1),
+            lambda data: data["repository"].update(root="/tmp/abc\x00x"),
+            lambda data: data["proposal"]["artifacts"][0].update(locator="proposals/x\x00.md"),
+        ]
+        for mutate in mutations:
+            with self.subTest(mutate=mutate):
+                data = valid_manifest()
+                mutate(data)
+                with tempfile.TemporaryDirectory() as temp:
+                    manifest = Path(temp) / "manifest.json"
+                    manifest.write_text(json.dumps(data))
+                    completed = subprocess.run([sys.executable, str(MODULE_PATH), str(manifest)], capture_output=True, text=True)
+                self.assertEqual(1, completed.returncode)
+                self.assertFalse(json.loads(completed.stdout)["valid"])
+                self.assertNotIn("Traceback", completed.stderr)
+
     def test_rejects_proposal_bound_to_another_base(self):
         data = valid_manifest()
         data["proposal"]["base_sha"] = "c" * 40
@@ -171,6 +221,141 @@ class DecisionManifestTests(unittest.TestCase):
     def test_audit_and_apply_still_require_immutable_repository(self):
         contract = (Path(__file__).parents[1] / "SKILL.md").read_text()
         self.assertIn("audit/apply lacks repository, explicit mode, immutable base", contract)
+
+    def test_malformed_approval_id_arrays_return_errors(self):
+        for field, value in (("approved_decision_ids", None), ("approved_mutation_ids", 1)):
+            with self.subTest(field=field):
+                data = valid_manifest()
+                data["approval"][field] = value
+                errors = MODULE.validate(data)
+                self.assertTrue(any(field.split("approved_")[1].replace("_ids", "") in error for error in errors))
+
+    def test_rejects_issue_target_in_another_repository_and_missing_observation(self):
+        data = valid_manifest()
+        data["mutations"][0].update(action="create_issue", exact_target="other/repo#new")
+        data["constraints"]["github_actions_allowed"] = ["create_issue"]
+        data["repository"]["observed_at"] = None
+        errors = MODULE.validate(data)
+        self.assertTrue(any("timezone-aware repository.observed_at" in error for error in errors))
+        self.assertTrue(any("target must belong to repository.owner_repo" in error for error in errors))
+
+    def test_rejects_unbound_doc_payload(self):
+        data = valid_manifest()
+        data["mutations"][0]["payload_artifact_id"] = "missing"
+        self.assertTrue(any("doc payload is not bound" in error for error in MODULE.validate(data)))
+
+    def test_rejects_doc_target_outside_repository(self):
+        for target in ("../outside.md", "/tmp/outside.md"):
+            with self.subTest(target=target):
+                data = valid_manifest()
+                data["mutations"][0]["exact_target"] = target
+                data["constraints"]["exact_paths"] = [target]
+                self.assertTrue(any("escapes repository.root" in error for error in MODULE.validate(data)))
+
+    def test_rejects_non_string_mutation_decision_ids_without_crashing(self):
+        data = valid_manifest()
+        data["mutations"][0]["decision_ids"] = [{}]
+        errors = MODULE.validate(data)
+        self.assertIn("mutations[0].decision_ids must be a string array", errors)
+
+    def test_runtime_rejects_changed_head_and_stale_doc_target(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=root, check=True)
+            (root / "seed.txt").write_text("seed")
+            subprocess.run(["git", "add", "seed.txt"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-qm", "seed"], cwd=root, check=True)
+            data = valid_manifest()
+            data["repository"]["root"] = str(root)
+            data["repository"]["base_sha"] = "b" * 40
+            data["proposal"]["base_sha"] = "b" * 40
+            data["proposal"]["bundle_digest"] = MODULE.canonical_bundle_digest(data["proposal"])
+            target = root / "docs" / "v1.md"
+            target.parent.mkdir()
+            target.write_text("changed")
+            errors = MODULE.validate_runtime_state(data)
+            self.assertIn("repository HEAD does not match repository.base_sha", errors)
+            self.assertTrue(any("target precondition is stale" in error for error in errors))
+
+    def test_runtime_accepts_current_head_and_idempotent_doc(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=root, check=True)
+            target = root / "docs" / "v1.md"
+            target.parent.mkdir()
+            target.write_bytes(b"approved")
+            subprocess.run(["git", "add", "."], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-qm", "seed"], cwd=root, check=True)
+            head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root, check=True, capture_output=True, text=True).stdout.strip()
+            data = valid_manifest()
+            digest = hashlib.sha256(b"approved").hexdigest()
+            data["repository"].update(root=str(root), base_sha=head)
+            data["proposal"].update(repository="owner/repo", base_sha=head)
+            data["proposal"]["artifacts"][0]["exact_bytes_sha256"] = digest
+            data["mutations"][0]["proposed_after_digest"] = digest
+            data["proposal"]["bundle_digest"] = MODULE.canonical_bundle_digest(data["proposal"])
+            self.assertEqual([], MODULE.validate_runtime_state(data))
+
+    def test_cli_accepts_pending_doc_create_with_distinct_payload_source(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=root, check=True)
+            payload = root / "proposals" / "v1.md"
+            payload.parent.mkdir()
+            payload.write_bytes(b"approved")
+            subprocess.run(["git", "add", "."], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-qm", "seed"], cwd=root, check=True)
+            head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root, check=True, capture_output=True, text=True).stdout.strip()
+            data = valid_manifest()
+            digest = hashlib.sha256(b"approved").hexdigest()
+            data["repository"].update(root=str(root), base_sha=head)
+            data["proposal"].update(base_sha=head)
+            data["proposal"]["artifacts"][0]["exact_bytes_sha256"] = digest
+            data["mutations"][0]["proposed_after_digest"] = digest
+            data["proposal"]["bundle_digest"] = MODULE.canonical_bundle_digest(data["proposal"])
+            manifest = root / "manifest.json"
+            manifest.write_text(json.dumps(data))
+            completed = subprocess.run([sys.executable, str(MODULE_PATH), str(manifest)], capture_output=True, text=True)
+            self.assertEqual(0, completed.returncode, completed.stdout + completed.stderr)
+            self.assertTrue(json.loads(completed.stdout)["valid"])
+
+    def test_cli_accepts_pending_doc_update_with_distinct_payload_source(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=root, check=True)
+            payload = root / "proposals" / "v1.md"
+            target = root / "docs" / "v1.md"
+            payload.parent.mkdir()
+            target.parent.mkdir()
+            payload.write_bytes(b"after")
+            target.write_bytes(b"before")
+            subprocess.run(["git", "add", "."], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-qm", "seed"], cwd=root, check=True)
+            head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root, check=True, capture_output=True, text=True).stdout.strip()
+            data = valid_manifest()
+            after_digest = hashlib.sha256(b"after").hexdigest()
+            before_digest = hashlib.sha256(b"before").hexdigest()
+            data["repository"].update(root=str(root), base_sha=head)
+            data["proposal"].update(base_sha=head)
+            data["proposal"]["artifacts"][0]["exact_bytes_sha256"] = after_digest
+            data["mutations"][0].update(
+                action="update_doc", expected_before={"state": "present", "digest": before_digest},
+                proposed_after_digest=after_digest,
+            )
+            data["proposal"]["bundle_digest"] = MODULE.canonical_bundle_digest(data["proposal"])
+            manifest = root / "manifest.json"
+            manifest.write_text(json.dumps(data))
+            completed = subprocess.run([sys.executable, str(MODULE_PATH), str(manifest)], capture_output=True, text=True)
+            self.assertEqual(0, completed.returncode, completed.stdout + completed.stderr)
+            self.assertTrue(json.loads(completed.stdout)["valid"])
 
 
 if __name__ == "__main__":

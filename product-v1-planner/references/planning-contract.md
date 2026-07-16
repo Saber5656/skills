@@ -92,11 +92,15 @@ decision_owner: caller | user
 ## Apply semantics
 
 - Exact targets only; no glob or directory-wide authority.
+- Immediately before approved apply, require the checkout's actual `HEAD` to equal `repository.base_sha`; a moved or unreadable worktree is stale and authorizes no mutation.
 - Each mutation has its own `allowed: true`, action, target, approved decision IDs, explicit expected-before state, and proposed after digest.
+- Every doc target and constraint path is repository-relative and resolves beneath `repository.root`. A doc mutation names `payload_artifact_id`; that proposal artifact is the immutable source payload and its exact-byte digest must equal the mutation's proposed-after digest. The artifact locator is not the destination path.
 - Use `create_doc` only with `{state: absent, digest: null}` and `update_doc` only with `{state: present, digest: <sha256>}`. Apply must compare current existence and exact bytes immediately before writing.
 - If a target already has the proposed-after digest, record an idempotent skip. Any other state/digest mismatch is `stale_target`; do not write that mutation or any later derived Issue mutation.
 - Docs apply before derived Issue sync.
 - A docs mutation cannot authorize `create_issue` or `update_issue`.
 - Issue create and Issue update are distinct permissions.
+- Issue targets must belong to `repository.owner_repo`, and Issue writes require a non-null timezone-aware `observed_at` plus the bound Issue snapshot digest.
 - If base, source, proposal, target, or Issue snapshot is stale, do not write anything after the stale point.
+- Validation is not a transferable write capability. The apply executor must re-open the parent/target without following symlinks, repeat containment and before-state checks at the write boundary, write through a same-directory temporary file, and atomically replace the destination. Abort on any inode/path change; never separate validation from a later unsafe write.
 - Never implement product code, commit, push, create a PR, merge, or release.

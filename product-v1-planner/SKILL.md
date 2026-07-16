@@ -91,7 +91,9 @@ Require a complete Decision Manifest that validates against the bundled schema a
 4. Validate every approved decision and mutation ID, exact target, before/after digest, action-specific authorization, and exclusion.
 5. Stop with `stale_decision_manifest` or `decision_manifest_invalid` on any mismatch; never rebase intent automatically.
 
-Apply canonical docs first, recompute their digests, then execute only individually approved derived Issue mutations. Approval to write docs never implies Issue creation or update authority. `create_doc` requires an explicit absent precondition; `update_doc` and `update_issue` require a present exact-byte digest. Recheck existence/digest immediately before mutation, idempotently skip an already-applied after digest, and fail closed on every other mismatch.
+Apply canonical docs first, recompute their digests, then execute only individually approved derived Issue mutations. Approval to write docs never implies Issue creation or update authority. A doc mutation must bind its proposed-after digest to a distinct approved source artifact through `payload_artifact_id`; the artifact locator is not the destination. `create_doc` requires an explicit absent precondition; `update_doc` and `update_issue` require a present exact-byte digest. Recheck existence/digest immediately before mutation, idempotently skip an already-applied after digest, and fail closed on every other mismatch.
+
+Do not treat validator success as a reusable write capability. At the write boundary, open the destination parent/target without following symlinks, repeat root containment and before-state checks, write through a same-directory temporary file, and atomically replace the target. Abort if the resolved path or inode changes between observation and mutation.
 
 Return an applied/skipped/blocked mapping. Partial GitHub failure is resumable evidence, not permission to roll back canonical docs or broaden mutation scope.
 
