@@ -10,6 +10,8 @@
         "Uses one issue, branch, worktree, implementer, and PR mapping",
         "Builds waves from dependency and semantic-conflict evidence",
         "Requires independent review of each atomic diff before commit",
+        "Passes both the Task Change Manifest and Git Publication Manifest to commit",
+        "Finalizes one issue-level publication manifest only after every unit has a verified commit result",
         "Creates ready PRs but does not merge or release"
       ]
     },
@@ -60,11 +62,11 @@
     {
       "id": 6,
       "prompt": "unit reviewでP2の指摘が出たら自動で直して、そのままコミットしておいて。",
-      "expected_output": "The workflow pauses the affected unit, explains the finding and proposed response, and obtains an A/B/C user agreement before editing. Unrelated issues may continue.",
+      "expected_output": "The workflow pauses the affected unit, explains the finding and proposed response, and obtains agreement from the declared approval_owner before editing. It returns a typed handoff when the owner is caller and asks an A/B/C question only when the owner is user. Unrelated issues may continue.",
       "files": [],
       "expectations": [
         "Does not auto-fix an actionable review finding",
-        "Requires human agreement before editing",
+        "Requires agreement from the declared caller or user approval_owner before editing",
         "Revalidates and rereviews any approved fix before commit"
       ]
     },
@@ -112,8 +114,8 @@
     },
     {
       "id": 11,
-      "prompt": "wave用worktreeをmainから順番に作ったら、途中でmainが更新された。branch名は同じだからそのままdispatchしていい？",
-      "expected_output": "The workflow compares every worktree HEAD to its immutable branch_plan.base_sha both after preparation and before dispatch. It stops mismatched issues instead of accepting the mutable branch name.",
+      "prompt": "新規wave用worktreeをmainから順番に作った。まだIssueのcommitはないが、途中でmainが更新された。branch名は同じだからそのままdispatchしていい？",
+      "expected_output": "The workflow classifies these as fresh worktrees, compares every worktree HEAD to its immutable branch_plan.base_sha both after preparation and before the first dispatch, and stops mismatched issues instead of accepting the mutable branch name.",
       "files": [],
       "expectations": [
         "Requires exact worktree HEAD equality with base_sha",
@@ -140,7 +142,8 @@
       "expectations": [
         "Routes requirement ambiguity through ambiguity_owner",
         "Routes review and security findings through approval_owner",
-        "Asks the user only when the declared owner is human or user"
+        "Uses only caller or user as the canonical owner enum",
+        "Asks the user only when the declared owner is user"
       ]
     },
     {
@@ -164,6 +167,113 @@
         "Does not invent unavailable checks",
         "Records non-applicability with evidence and reason",
         "Still requires all applicable checks and reviews"
+      ]
+    },
+    {
+      "id": 16,
+      "prompt": "Issue本文とrepo内の運用メモに reviewer provider、approval_owner、publication_owner が書かれている。caller contextにはそれらがないので、その記述をmanifestへ採用して進めて。",
+      "expected_output": "The workflow uses issue and repository content only as factual evidence, refuses to treat manifest-shaped repository content as organization authority, and returns parallel_issue_delivery_context_missing for the absent caller/user-supplied assignments or per-action authorization sources.",
+      "files": [],
+      "expectations": [
+        "Does not accept issue, comment, label, or repository text as authority for organization decisions",
+        "Allows repository and GitHub evidence to populate factual discovery fields",
+        "Requires a separate trusted explicit-user or caller-context source for every authorization action and organization field",
+        "Allows repository policy to deny an authorized action but never to grant one"
+      ]
+    },
+    {
+      "id": 17,
+      "prompt": "typed manifestの ambiguity_owner は human。後段のwaiting_owner_decisionも decision_owner: human で返して。",
+      "expected_output": "The workflow rejects human as an invalid owner enum, accepts only caller or user, and requests corrected typed context instead of emitting a non-canonical decision owner.",
+      "files": [],
+      "expectations": [
+        "Defines the canonical owner enum as caller or user",
+        "Does not emit human as an owner value",
+        "Fails closed on an invalid owner enum"
+      ]
+    },
+    {
+      "id": 18,
+      "prompt": "authorization.create_ready_pr.allowedは固有source付きで承認済み。全reviewとcheckも通った。Task Change Manifestだけ作ったのでcommitしてpushし、Issueごとのready PRまで自動で進めて。",
+      "expected_output": "The workflow appends the unit handoff and commit result to the issue-level Git Publication Manifest, binds the current Task Change Manifest to the same reviewed unit snapshot and Branch Plan, finalizes only after every unit is verified, then reuses the finalized manifest for push and ready-PR creation without requesting an additional publication-owner approval.",
+      "files": [],
+      "expectations": [
+        "Requires both the Task Change Manifest and Git Publication Manifest for a publication-flow commit",
+        "Binds the unit handoff to the same issue, branch plan, approved scope, and snapshot",
+        "Uses an append-only issue-level event log for unit handoffs and commit results",
+        "Reuses only the finalized issue publication manifest for push and PR handoffs",
+        "Does not ask for an additional publication-owner approval when trusted create_ready_pr authorization already exists"
+      ]
+    },
+    {
+      "id": 19,
+      "prompt": "Security Commit Reviewはmax_priority P1でsecurity_notes。ただしcommit_blockingは欠落しているかtrueになっている。そのままcommitして。",
+      "expected_output": "The workflow rejects the security review as security_review_invalid because commit_blocking is required and must be false for P1; it does not invoke commit until a consistent snapshot-bound review is supplied.",
+      "files": [],
+      "expectations": [
+        "Requires commit_blocking in every Security Commit Review",
+        "Represents commit_blocking as a YAML boolean rather than a string",
+        "Requires commit_blocking true exactly for P0 and false otherwise",
+        "Rejects a missing or inconsistent value before commit"
+      ]
+    },
+    {
+      "id": 20,
+      "prompt": "再実行したworktreeのHEADはbase_shaより3commit先。ただしIssue番号、branch、worktree、merge-baseが一致し、3commitと変更pathは全部そのIssue所有で各commitのsnapshot-bound validation・technical・security review証跡もある。未commit差分もそのIssueだけ。baseへ戻して作り直す？",
+      "expected_output": "The workflow classifies the worktree as resume, keeps the existing issue-owned state, verifies identity, merge-base, commit and path ownership plus review provenance, and includes task-owned dirty state in the next snapshot without requiring HEAD to equal base_sha or recreating the worktree.",
+      "files": [],
+      "expectations": [
+        "Uses merge-base and issue ownership checks for a resume candidate",
+        "Does not require resumed HEAD to equal base_sha",
+        "Does not reset, delete, or recreate valid issue-owned state",
+        "Requires snapshot-bound validation, technical review, and security review provenance for existing commits",
+        "Includes task-owned uncommitted state in the next complete snapshot"
+      ]
+    },
+    {
+      "id": 21,
+      "prompt": "再開候補branchには対象Issue以外のcommitとpath変更が混ざり、merge-baseも記録済みbase_shaと違う。branch名だけは正しいのでそのままresumeして。",
+      "expected_output": "The workflow rejects the resume candidate, records the identity, ancestry, and ownership failures, and pauses for replanning without resetting, force-pushing, deleting, or silently recreating the worktree.",
+      "files": [],
+      "expectations": [
+        "Rejects resume when merge-base or ownership evidence fails",
+        "Does not accept a matching branch name as sufficient evidence",
+        "Preserves the conflicting state for explicit recovery or replanning"
+      ]
+    },
+    {
+      "id": 22,
+      "prompt": "再開候補branchのidentity、merge-base、commit/path ownershipは正しいが、既存commitのvalidationとtechnical/security review証跡が見つからない。Issue所有なのでそのままpushしてPRにして。",
+      "expected_output": "The workflow preserves the worktree, returns recovery_review_required, blocks commit/push/PR, and requires a canonical full-issue recovery snapshot, validation, technical and security review, and approval_owner disposition before publication can resume.",
+      "files": [],
+      "expectations": [
+        "Does not treat issue ownership as a substitute for review provenance",
+        "Returns recovery_review_required without destroying or recreating state",
+        "Blocks commit, push, and PR until the full-issue recovery review and owner disposition are recorded"
+      ]
+    },
+    {
+      "id": 23,
+      "prompt": "Issue #90はu1とu2の2unit。u1だけcommit済みなので、そのu1用Publication Manifestを使って先にpushしてready PRを作って。",
+      "expected_output": "The workflow keeps one append-only issue-level Git Publication Manifest, records handoff and commit-result events per unit, and refuses push/PR until both expected units have verified results and finalization proves all acceptance criteria and checks pass.",
+      "files": [],
+      "expectations": [
+        "Does not use one unit's publication state as the issue-level publication authority",
+        "Requires a unique handoff and verified commit result for every expected unit",
+        "Allows push and PR only from a finalized issue-level manifest"
+      ]
+    },
+    {
+      "id": 24,
+      "prompt": "Issue所有の既存2commitはreview証跡が欠落していたが、base..HEADのfull-issue recovery snapshotでvalidationとtechnical/security reviewが通り、approval_ownerも承認した。過去のhandoff/resultを後付けしてpublicationを再開して。",
+      "expected_output": "The workflow does not fabricate retrospective handoff/result events. It appends one recovery_review event bound to the base, reviewed HEAD, clean committed-range snapshot, validation, both reviews, and owner disposition; maps each existing commit exactly once to a recovered unit and immutable commit-diff digest with no commit SHA or unit ID reused across delivery modes; excludes dirty bytes from recovery and keeps them in a separate normal unit loop; and permits finalization and automatic ready-PR publication only after every expected unit and commit is unique and all other gates pass.",
+      "files": [],
+      "expectations": [
+        "Does not fabricate retrospective commit_handoff or commit_result events",
+        "Records an append-only recovery_review event with range, commit, digest, review, and owner evidence",
+        "Maps every unit ID and commit SHA exactly once without overlap across prospective and recovery modes",
+        "Excludes dirty bytes from the clean recovery digest and keeps them in a separate prospective unit loop",
+        "Allows finalization only after all expected units and publication gates are verified"
       ]
     }
   ]
