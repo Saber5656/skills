@@ -25,8 +25,21 @@ CONSUMER = load("consumer", "scripts/consume_review_signal.py")
 class BatchTests(unittest.TestCase):
     def test_requires_explicit_owner_repo_number(self):
         self.assertEqual(("owner", "repo", 12), BATCH.parse_ref("owner/repo#12"))
+        self.assertEqual(("Owner", "Repo", 12), BATCH.parse_ref("https://github.com/Owner/Repo/pull/12"))
         with self.assertRaises(ValueError):
             BATCH.parse_ref("#12")
+
+    @patch.object(BATCH, "run_comment_graphql")
+    def test_paginates_all_thread_comments(self, graphql):
+        thread = {"id": "T1", "comments": {
+            "nodes": [{"id": "C1", "body": "first"}],
+            "pageInfo": {"hasNextPage": True, "endCursor": "next"},
+        }}
+        graphql.return_value = {"data": {"node": {"comments": {
+            "nodes": [{"id": "C2", "body": "latest"}],
+            "pageInfo": {"hasNextPage": False, "endCursor": None},
+        }}}}
+        self.assertEqual(["C1", "C2"], [item["id"] for item in BATCH.complete_comments(thread)])
 
     @patch.object(BATCH, "run_graphql")
     def test_paginates_and_filters_actionable_threads(self, graphql):
@@ -75,6 +88,16 @@ class BatchTests(unittest.TestCase):
     def test_per_pr_fetch_failure_becomes_blocker(self, _graphql):
         self.assertIn("fetch_failed", BATCH.fetch_one("owner", "repo", 1)["blocker"])
 
+    @patch.object(BATCH, "run_graphql")
+    def test_final_pr_state_controls_blocker(self, graphql):
+        def payload(state):
+            return {"data": {"repository": {"pullRequest": {
+                "url": "u", "state": state, "baseRefName": "main", "headRefName": "b", "headRefOid": "a" * 40,
+                "reviewThreads": {"nodes": [], "pageInfo": {"hasNextPage": False, "endCursor": None}},
+            }}}}
+        graphql.side_effect = [payload("OPEN"), payload("CLOSED")]
+        self.assertEqual("pr_state_closed", BATCH.fetch_one("owner", "repo", 1)["blocker"])
+
 
 class SignalTests(unittest.TestCase):
     def envelope(self):
@@ -100,7 +123,29 @@ class SignalTests(unittest.TestCase):
     def test_rejects_duplicate_thread_ids(self):
         payload = self.envelope()
         payload["actionable_thread_ids"] = ["T1", "T1"]
-        self.assertIn("actionable_thread_ids must be a unique list", SIGNAL.validate(payload))
+        self.assertIn("actionable_thread_ids must be a unique string list", SIGNAL.validate(payload))
+
+    def test_rejects_malformed_envelope_shapes(self):
+        self.assertEqual(["envelope must be a JSON object"], SIGNAL.validate([]))
+        payload = self.envelope()
+        payload["review_ids"] = [["unhashable"]]
+        self.assertIn("review_ids must be a unique string list", SIGNAL.validate(payload))
+
+    def test_rejects_invalid_provenance_fields(self):
+        payload = self.envelope()
+        payload.update(observed_at=0, settled_at="2026-07-16T00:01:30", source_event={})
+        errors = SIGNAL.validate(payload)
+        self.assertTrue(any("observed_at" in item for item in errors))
+        self.assertTrue(any("settled_at" in item for item in errors))
+        self.assertTrue(any("source_event" in item for item in errors))
+
+    def test_rejects_unknown_fields_and_empty_ids(self):
+        payload = self.envelope()
+        payload["extra"] = True
+        payload["review_ids"] = [""]
+        errors = SIGNAL.validate(payload)
+        self.assertTrue(any("unexpected fields" in item for item in errors))
+        self.assertIn("review_ids must be a unique string list", errors)
 
 
 class ConsumerTests(unittest.TestCase):
@@ -173,13 +218,13 @@ class ConsumerTests(unittest.TestCase):
             {"data": {"repository": {"pullRequest": {
                 "headRefOid": "a" * 40,
                 "reviewThreads": {"nodes": [{"id": "T1", "isResolved": False, "isOutdated": False, "path": "a.py", "line": 1, "originalLine": 1}], "pageInfo": {"hasNextPage": False, "endCursor": None}},
-            }}}},
+            }, "nameWithOwner": "Owner/Repo"}}},
             {"data": {"repository": {"pullRequest": {"reviews": {
                 "nodes": [{"id": "R1", "state": "COMMENTED", "submittedAt": "2026-07-16T00:00:00Z", "updatedAt": review_updated, "commit": {"oid": "a" * 40}}],
                 "pageInfo": {"hasNextPage": False, "endCursor": None},
             }, "headRefOid": "a" * 40}}}},
             {"data": {"node": {"comments": {"nodes": [{"id": "C1", "updatedAt": comment_updated}], "pageInfo": {"hasNextPage": False, "endCursor": None}}}}},
-            {"data": {"repository": {"pullRequest": {"headRefOid": "a" * 40}}}},
+            {"data": {"repository": {"nameWithOwner": "Owner/Repo", "pullRequest": {"headRefOid": "a" * 40, "state": "OPEN"}}}},
         ]
 
     @patch.object(CONSUMER, "gh_json")
@@ -216,10 +261,38 @@ class ConsumerTests(unittest.TestCase):
     @patch.object(CONSUMER, "gh_json")
     def test_consumer_rejects_head_rollover_before_return(self, gh):
         payloads = self.state_payloads()
-        payloads[-1] = {"data": {"repository": {"pullRequest": {"headRefOid": "b" * 40}}}}
+        payloads[-1] = {"data": {"repository": {"nameWithOwner": "Owner/Repo", "pullRequest": {"headRefOid": "b" * 40, "state": "OPEN"}}}}
         gh.side_effect = payloads
         with self.assertRaisesRegex(RuntimeError, "head_changed_during_fetch"):
             CONSUMER.compute_state("owner/repo", 1)
+
+    @patch.object(CONSUMER, "gh_json")
+    def test_consumer_uses_final_pr_state(self, gh):
+        payloads = self.state_payloads()
+        payloads[-1]["data"]["repository"]["pullRequest"]["state"] = "CLOSED"
+        gh.side_effect = payloads
+        with self.assertRaisesRegex(RuntimeError, "pr_state_closed"):
+            CONSUMER.compute_state("owner/repo", 1)
+
+    @patch.object(CONSUMER, "gh_json")
+    def test_repository_case_uses_canonical_lowercase_identity(self, gh):
+        gh.side_effect = self.state_payloads()
+        state = CONSUMER.compute_state("OWNER/REPO", 1)
+        self.assertEqual("owner/repo", state["repository"])
+
+    @patch.object(CONSUMER, "gh_json")
+    def test_find_status_paginates(self, gh):
+        gh.side_effect = [
+            {"statuses": [{"context": f"other-{index}"} for index in range(100)]},
+            {"statuses": [{"context": "review-intake/signal", "description": "ready:abc"}]},
+        ]
+        self.assertEqual("ready:abc", CONSUMER.find_status("owner/repo", "a" * 40)["description"])
+        self.assertEqual(2, gh.call_count)
+
+    def test_rejects_timezone_less_expiry(self):
+        watch = self.watch()
+        watch["expires_at"] = "2099-07-16T00:00:00"
+        self.assertEqual("invalid_watch", CONSUMER.reconcile(watch)["status"])
 
     @patch.object(CONSUMER, "reconcile")
     def test_concurrent_consumers_claim_one_ready_signal(self, reconcile):
@@ -256,6 +329,8 @@ class WorkflowSafetyTests(unittest.TestCase):
         self.assertIn("reviews(first:100, after:$cursor)", workflow)
         self.assertIn("head_changed_during_fetch", workflow)
         self.assertIn("pre-delivery head lookup", workflow)
+        self.assertIn("repositoryIdentity", workflow)
+        self.assertIn("statuses.length < 100", workflow)
 
 
 if __name__ == "__main__":

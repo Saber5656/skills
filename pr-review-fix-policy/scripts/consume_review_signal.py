@@ -18,6 +18,7 @@ from typing import Any
 QUERY = r"""
 query($owner:String!, $repo:String!, $number:Int!, $cursor:String) {
   repository(owner:$owner, name:$repo) {
+    nameWithOwner
     pullRequest(number:$number) {
       headRefOid
       reviewThreads(first:100, after:$cursor) {
@@ -43,7 +44,7 @@ query($owner:String!, $repo:String!, $number:Int!, $cursor:String) {
 """
 HEAD_QUERY = r"""
 query($owner:String!, $repo:String!, $number:Int!) {
-  repository(owner:$owner, name:$repo) { pullRequest(number:$number) { headRefOid } }
+  repository(owner:$owner, name:$repo) { nameWithOwner pullRequest(number:$number) { headRefOid state } }
 }
 """
 COMMENT_QUERY = r"""
@@ -73,14 +74,21 @@ def compute_state(repository: str, pr_number: int) -> dict[str, Any]:
     threads: list[dict[str, Any]] = []
     pr = None
     fixed_head = None
+    canonical_repository = None
     while True:
         args = ["api", "graphql", "-f", f"query={QUERY}", "-F", f"owner={owner}", "-F", f"repo={repo}", "-F", f"number={pr_number}"]
         if cursor is not None:
             args.extend(["-F", f"cursor={cursor}"])
         payload = gh_json(args)
-        pr = payload.get("data", {}).get("repository", {}).get("pullRequest")
+        repository_node = payload.get("data", {}).get("repository") or {}
+        pr = repository_node.get("pullRequest")
         if pr is None:
             raise RuntimeError("PR not found or inaccessible")
+        page_repository = str(repository_node.get("nameWithOwner") or repository).lower()
+        if canonical_repository is None:
+            canonical_repository = page_repository
+        elif page_repository != canonical_repository:
+            raise RuntimeError("repository_identity_changed_during_fetch")
         page_head = str(pr.get("headRefOid") or "").lower()
         if fixed_head is None:
             fixed_head = page_head
@@ -132,9 +140,14 @@ def compute_state(repository: str, pr_number: int) -> dict[str, Any]:
             if not comment_cursor:
                 raise RuntimeError("thread comment pagination cursor is missing")
     final_args = ["api", "graphql", "-f", f"query={HEAD_QUERY}", "-F", f"owner={owner}", "-F", f"repo={repo}", "-F", f"number={pr_number}"]
-    final_pr = gh_json(final_args).get("data", {}).get("repository", {}).get("pullRequest")
+    final_repository = gh_json(final_args).get("data", {}).get("repository") or {}
+    final_pr = final_repository.get("pullRequest")
     if final_pr is None or str(final_pr.get("headRefOid") or "").lower() != head:
         raise RuntimeError("head_changed_during_fetch")
+    if str(final_repository.get("nameWithOwner") or repository).lower() != canonical_repository:
+        raise RuntimeError("repository_identity_changed_during_fetch")
+    if final_pr.get("state") != "OPEN":
+        raise RuntimeError(f"pr_state_{str(final_pr.get('state')).lower()}")
     actionable = sorted(item["id"] for item in threads if not item["isResolved"] and not item["isOutdated"])
     reviews = sorted(
         item["id"] for item in reviews_all
@@ -151,16 +164,23 @@ def compute_state(repository: str, pr_number: int) -> dict[str, Any]:
         ",".join(sorted(f"{comment['id']}@{comment['updatedAt']}" for comment in item["commentMetadata"])),
     ]) for item in threads)
     digest = hashlib.sha256("\n".join(lines).encode()).hexdigest()
-    identity = "\n".join(["2", repository, str(pr_number), head, ",".join(reviews), review_digest, ",".join(actionable), digest])
-    return {"head_sha": head, "review_ids": reviews, "actionable_thread_ids": actionable,
+    identity = "\n".join(["2", canonical_repository, str(pr_number), head, ",".join(reviews), review_digest, ",".join(actionable), digest])
+    return {"repository": canonical_repository, "head_sha": head, "review_ids": reviews, "actionable_thread_ids": actionable,
             "review_state_digest": review_digest, "thread_state_digest": digest,
             "signal_id": hashlib.sha256(identity.encode()).hexdigest()}
 
 
 def find_status(repository: str, head: str) -> dict[str, Any] | None:
-    payload = gh_json(["api", f"repos/{repository}/commits/{head}/status"])
-    matches = [item for item in payload.get("statuses", []) if item.get("context") == "review-intake/signal"]
-    return matches[0] if matches else None
+    page = 1
+    while True:
+        payload = gh_json(["api", "--method", "GET", f"repos/{repository}/commits/{head}/status", "-f", "per_page=100", "-f", f"page={page}"])
+        statuses = payload.get("statuses", [])
+        match = next((item for item in statuses if item.get("context") == "review-intake/signal"), None)
+        if match is not None:
+            return match
+        if len(statuses) < 100:
+            return None
+        page += 1
 
 
 def find_failed_delivery(watch: dict[str, Any]) -> dict[str, Any] | None:
@@ -180,7 +200,9 @@ def reconcile(watch: dict[str, Any]) -> dict[str, Any]:
     now = dt.datetime.now(dt.timezone.utc)
     try:
         expires = dt.datetime.fromisoformat(str(watch["expires_at"]).replace("Z", "+00:00"))
-    except ValueError:
+        if expires.tzinfo is None or expires.utcoffset() is None:
+            raise ValueError("timezone is required")
+    except (TypeError, ValueError):
         return {"status": "invalid_watch", "blocker": "expires_at is not an ISO timestamp"}
     if expires <= now:
         return {"status": "expired_watch", "watch_id": watch["watch_id"]}
@@ -203,7 +225,7 @@ def reconcile(watch: dict[str, Any]) -> dict[str, Any]:
                 "signal_id": state["signal_id"]}
     return {
         "status": "ready" if state["actionable_thread_ids"] or state["review_ids"] else "no_actionable_review",
-        "watch_id": watch["watch_id"], "task_id": watch["task_id"], "repository": watch["repository"],
+        "watch_id": watch["watch_id"], "task_id": watch["task_id"], "repository": state.get("repository", str(watch["repository"]).lower()),
         "pr_number": watch["pr_number"], **state, "workflow_url": status.get("target_url"),
         "reconciled_at": now.isoformat(),
     }

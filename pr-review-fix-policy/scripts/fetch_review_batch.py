@@ -13,6 +13,7 @@ import sys
 from typing import Any
 
 PR_REF = re.compile(r"^(?P<owner>[^/\s]+)/(?P<repo>[^#\s]+)#(?P<number>[1-9][0-9]*)$")
+PR_URL = re.compile(r"^https://github\.com/(?P<owner>[^/\s]+)/(?P<repo>[^/\s]+)/pull/(?P<number>[1-9][0-9]*)/?$")
 
 QUERY = r"""
 query($owner:String!, $repo:String!, $number:Int!, $cursor:String) {
@@ -23,8 +24,23 @@ query($owner:String!, $repo:String!, $number:Int!, $cursor:String) {
         pageInfo { hasNextPage endCursor }
         nodes {
           id isResolved isOutdated path line originalLine
-          comments(first:1) { nodes { author { login } body } }
+          comments(first:100) {
+            pageInfo { hasNextPage endCursor }
+            nodes { id author { login } body createdAt updatedAt }
+          }
         }
+      }
+    }
+  }
+}
+"""
+COMMENT_QUERY = r"""
+query($id:ID!, $cursor:String) {
+  node(id:$id) {
+    ... on PullRequestReviewThread {
+      comments(first:100, after:$cursor) {
+        pageInfo { hasNextPage endCursor }
+        nodes { id author { login } body createdAt updatedAt }
       }
     }
   }
@@ -33,9 +49,9 @@ query($owner:String!, $repo:String!, $number:Int!, $cursor:String) {
 
 
 def parse_ref(value: str) -> tuple[str, str, int]:
-    match = PR_REF.fullmatch(value)
+    match = PR_REF.fullmatch(value) or PR_URL.fullmatch(value)
     if not match:
-        raise ValueError(f"invalid PR reference: {value!r}; expected owner/repo#number")
+        raise ValueError(f"invalid PR reference: {value!r}; expected owner/repo#number or GitHub pull URL")
     return match["owner"], match["repo"], int(match["number"])
 
 
@@ -51,6 +67,34 @@ def run_graphql(owner: str, repo: str, number: int, cursor: str | None) -> dict[
         message = completed.stderr.strip() or completed.stdout.strip() or "gh api graphql failed"
         raise RuntimeError(message)
     return json.loads(completed.stdout)
+
+
+def run_comment_graphql(thread_id: str, cursor: str) -> dict[str, Any]:
+    command = [
+        "gh", "api", "graphql", "-f", f"query={COMMENT_QUERY}",
+        "-F", f"id={thread_id}", "-F", f"cursor={cursor}",
+    ]
+    completed = subprocess.run(command, check=False, capture_output=True, text=True)
+    if completed.returncode:
+        raise RuntimeError(completed.stderr.strip() or completed.stdout.strip() or "gh api graphql failed")
+    return json.loads(completed.stdout)
+
+
+def complete_comments(thread: dict[str, Any]) -> list[dict[str, Any]]:
+    connection = thread.get("comments") or {}
+    comments = list(connection.get("nodes") or [])
+    page = connection.get("pageInfo") or {"hasNextPage": False, "endCursor": None}
+    while page.get("hasNextPage"):
+        cursor = page.get("endCursor")
+        if not cursor:
+            raise RuntimeError("thread comment pagination cursor is missing")
+        payload = run_comment_graphql(thread["id"], cursor)
+        connection = payload.get("data", {}).get("node", {}).get("comments")
+        if connection is None:
+            raise RuntimeError("thread comments not found or inaccessible")
+        comments.extend(connection.get("nodes") or [])
+        page = connection.get("pageInfo") or {}
+    return comments
 
 
 def summarize(body: str, limit: int = 240) -> str:
@@ -89,12 +133,18 @@ def fetch_one(owner: str, repo: str, number: int) -> dict[str, Any]:
                 if thread["isOutdated"]:
                     record["ignored"]["outdated"] += 1
                     continue
-                first = (thread.get("comments") or {}).get("nodes") or [{}]
-                comment = first[0]
+                comments = complete_comments(thread)
+                latest = comments[-1] if comments else {}
                 record["actionable_threads"].append({
                     "thread_node_id": thread["id"], "path": thread.get("path"), "line": thread.get("line"),
-                    "original_line": thread.get("originalLine"), "author": (comment.get("author") or {}).get("login"),
-                    "summary": summarize(comment.get("body") or ""), "content_trust": "untrusted_review_content",
+                    "original_line": thread.get("originalLine"), "author": (latest.get("author") or {}).get("login"),
+                    "summary": summarize(latest.get("body") or ""),
+                    "comments": [{
+                        "comment_id": item.get("id"), "author": (item.get("author") or {}).get("login"),
+                        "summary": summarize(item.get("body") or ""), "created_at": item.get("createdAt"),
+                        "updated_at": item.get("updatedAt"), "content_trust": "untrusted_review_content",
+                    } for item in comments],
+                    "content_trust": "untrusted_review_content",
                     "isResolved": False, "isOutdated": False,
                 })
             page = connection["pageInfo"]
@@ -113,6 +163,7 @@ def fetch_one(owner: str, repo: str, number: int) -> dict[str, Any]:
             record["actionable_threads"] = []
             record["pagination_complete"] = False
             return record
+        record["state"] = final_pr.get("state")
         if record.get("state") != "OPEN":
             record["blocker"] = f"pr_state_{str(record.get('state')).lower()}"
         record["actionable_threads"].sort(key=lambda item: (item["path"] or "", item["original_line"] or -1, item["thread_node_id"]))

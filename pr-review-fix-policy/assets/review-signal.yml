@@ -46,6 +46,7 @@ jobs:
             const crypto = require('crypto');
             const owner = context.repo.owner;
             const repo = context.repo.repo;
+            const repositoryIdentity = `${owner}/${repo}`.toLowerCase();
             const prNumber = Number(process.env.PR_NUMBER);
             if (!Number.isInteger(prNumber) || prNumber < 1) {
               core.setFailed('A positive PR number is required.');
@@ -87,7 +88,7 @@ jobs:
               }
             }`;
             const headQuery = `query($owner:String!, $repo:String!, $number:Int!) {
-              repository(owner:$owner, name:$repo) { pullRequest(number:$number) { headRefOid } }
+              repository(owner:$owner, name:$repo) { pullRequest(number:$number) { headRefOid state } }
             }`;
             const commentQuery = `query($id:ID!, $cursor:String) {
               node(id:$id) {
@@ -165,6 +166,10 @@ jobs:
               core.setFailed('head_changed_during_fetch');
               return;
             }
+            if (finalResult.repository.pullRequest.state !== 'OPEN') {
+              core.setFailed(`pr_state_${finalResult.repository.pullRequest.state.toLowerCase()}`);
+              return;
+            }
             const actionableThreadIds = threads
               .filter(item => !item.isResolved && !item.isOutdated)
               .map(item => item.id).sort();
@@ -181,12 +186,12 @@ jobs:
               item.commentMetadata.map(comment => `${comment.id}@${comment.updatedAt}`).sort().join(',')
             ].join('|')).sort();
             const threadDigest = crypto.createHash('sha256').update(stateLines.join('\n')).digest('hex');
-            const identity = ['2', `${owner}/${repo}`, String(prNumber), head, reviewIds.join(','), reviewDigest, actionableThreadIds.join(','), threadDigest].join('\n');
+            const identity = ['2', repositoryIdentity, String(prNumber), head, reviewIds.join(','), reviewDigest, actionableThreadIds.join(','), threadDigest].join('\n');
             const signalId = crypto.createHash('sha256').update(identity).digest('hex');
             const ready = actionableThreadIds.length > 0 || reviewIds.length > 0;
             const workflowUrl = `https://github.com/${owner}/${repo}/actions/runs/${context.runId}`;
             const envelope = {
-              schema_version: '2', signal_id: signalId, repository: `${owner}/${repo}`,
+              schema_version: '2', signal_id: signalId, repository: repositoryIdentity,
               pr_number: prNumber, head_sha: head, observed_at: process.env.OBSERVED_AT,
               settled_at: new Date().toISOString(), source_event: context.eventName,
               review_ids: reviewIds, review_state_digest: reviewDigest, actionable_thread_ids: actionableThreadIds,
@@ -200,8 +205,16 @@ jobs:
                 core.setFailed('head_changed_during_fetch');
                 return;
               }
-              const combined = await retry('status lookup', () => github.rest.repos.getCombinedStatusForRef({owner, repo, ref: head, per_page: 100}));
-              const prior = combined.data.statuses.find(item => item.context === 'review-intake/signal');
+              if (immediate.data.state !== 'open') {
+                core.setFailed(`pr_state_${immediate.data.state}`);
+                return;
+              }
+              let prior = null;
+              for (let page = 1; !prior; page++) {
+                const combined = await retry('status lookup', () => github.rest.repos.getCombinedStatusForRef({owner, repo, ref: head, per_page: 100, page}));
+                prior = combined.data.statuses.find(item => item.context === 'review-intake/signal') || null;
+                if (prior || combined.data.statuses.length < 100) break;
+              }
               const description = `${envelope.delivery}:${signalId.slice(0, 16)}`;
               if (prior?.description === description) {
                 envelope.delivery = 'duplicate_suppressed';
