@@ -19,6 +19,14 @@ REPO_REQUIRED = {"name", "description", "user-invocable", "allowed-tools", "cate
 VALID_STATUS = {"active", "draft", "deprecated"}
 VALID_CATEGORY = {"Dev", "News-Data", "Obsidian", "Operation", "Review", "Security", "Utility"}
 LINK_RE = re.compile(r"\[[^\]]+\]\((?!#)([^)]+)\)")
+RULE_CATEGORIES = {
+    "provenance_unclassified": "provenance",
+    "stale_benchmark": "quality", "invalid_benchmark_json": "quality",
+    "invalid_eval_json": "quality", "invalid_eval_schema": "quality",
+    "eval_skill_mismatch": "quality", "duplicate_eval_id": "quality",
+    "missing_eval_fixture": "quality", "fixture_scope_escape": "quality",
+    "duplicate_skill_name": "duplicate",
+}
 
 
 def digest_bytes(data: bytes) -> str:
@@ -122,11 +130,12 @@ def scoped_digest(directories: list[Path], root: Path, revision_sha: str | None 
     return digest_bytes("\n".join(parts).encode())
 
 
-def finding(rule: str, severity: str, skill: str, evidence: str, impact: str) -> dict[str, Any]:
-    fid = digest_bytes(f"{rule}|{skill}|{evidence}".encode())[:12]
+def finding(rule: str, severity: str, skill: str | list[str], evidence: str, impact: str) -> dict[str, Any]:
+    skills = [skill] if isinstance(skill, str) else sorted(set(skill))
+    fid = digest_bytes(f"{rule}|{','.join(skills)}|{evidence}".encode())[:12]
     return {
-        "finding_id": f"SM-{fid}", "rule_id": rule, "category": "contract",
-        "severity": severity, "confidence": "certain", "skills": [skill],
+        "finding_id": f"SM-{fid}", "rule_id": rule, "category": RULE_CATEGORIES.get(rule, "contract"),
+        "severity": severity, "confidence": "certain", "skills": skills,
         "evidence": [evidence], "impact": impact,
         "proposed_disposition": "hand off for bounded correction",
         "handler": "skill-updater", "approval_required": True, "baseline_state": "unverified",
@@ -155,7 +164,7 @@ def scan(root: Path, audit_id: str, profile: str, include: list[str] | None = No
                 "provenance_unclassified", "medium", directory.name,
                 "no approved provenance profile", "Applicable repository policy cannot be selected safely.",
             ))
-        missing = sorted(required - metadata.keys())
+        missing = sorted(key for key in required if not metadata.get(key))
         for error in parse_errors:
             findings.append(finding("frontmatter_parse", "blocker", directory.name, error, "Skill routing metadata cannot be trusted."))
         if missing:
@@ -170,11 +179,17 @@ def scan(root: Path, audit_id: str, profile: str, include: list[str] | None = No
             names.setdefault(skill_id, []).append(directory.name)
         if len(text.splitlines()) > 500:
             findings.append(finding("skill_md_too_large", "medium", directory.name, f"lines={len(text.splitlines())}", "Progressive disclosure is weakened."))
-        for link in LINK_RE.findall(text):
+        instruction_text = re.sub(r"```.*?```|~~~.*?~~~", "", text, flags=re.DOTALL)
+        for link in LINK_RE.findall(instruction_text):
             clean = link.strip("<>").split("#", 1)[0]
-            if "://" in clean or clean.startswith("/"):
+            if "://" in clean:
+                continue
+            if any(marker in clean for marker in ("...", "$", "{", "}")):
                 continue
             if clean:
+                if Path(clean).is_absolute():
+                    findings.append(finding("reference_scope_escape", "high", directory.name, link, "A local reference escapes the audited skill boundary."))
+                    continue
                 linked = (directory / clean).resolve()
                 try:
                     linked.relative_to(directory.resolve())
@@ -192,6 +207,10 @@ def scan(root: Path, audit_id: str, profile: str, include: list[str] | None = No
             try:
                 payload = json.loads(eval_path.read_text(encoding="utf-8"))
                 evals = payload.get("evals", [])
+                if not isinstance(evals, list) or not all(isinstance(item, dict) for item in evals):
+                    eval_status = "invalid"
+                    findings.append(finding("invalid_eval_schema", "blocker", directory.name, "evals must be an array of objects", "Behavior evaluation coverage cannot be trusted."))
+                    evals = []
                 ids = [item.get("id") for item in evals if isinstance(item, dict)]
                 eval_count = len(evals)
                 assertion_count = sum(bool(item.get("expectations") or item.get("assertions")) for item in evals if isinstance(item, dict))
@@ -215,7 +234,8 @@ def scan(root: Path, audit_id: str, profile: str, include: list[str] | None = No
                             continue
                         if not resolved_fixture.is_file():
                             findings.append(finding("missing_eval_fixture", "high", directory.name, str(fixture), "An eval cannot reproduce its declared input."))
-                eval_status = "valid"
+                if eval_status != "invalid":
+                    eval_status = "valid"
             except (OSError, json.JSONDecodeError) as exc:
                 eval_status = "invalid"
                 findings.append(finding("invalid_eval_json", "blocker", directory.name, str(exc), "Behavior evaluation cannot run."))
@@ -237,8 +257,9 @@ def scan(root: Path, audit_id: str, profile: str, include: list[str] | None = No
                 findings.append(finding("invalid_benchmark_json", "high", directory.name, str(exc), "Benchmark freshness cannot be verified."))
 
         tools = metadata.get("allowed-tools", "")
+        tool_names = set(tools) if isinstance(tools, list) else {token.strip() for token in str(tools).split(",") if token.strip()}
         read_only_claim = "read-only" in text.lower() or "read only" in text.lower()
-        if read_only_claim and isinstance(tools, str) and any(token in tools.split(", ") for token in ("Write", "Edit")):
+        if read_only_claim and tool_names.intersection({"Write", "Edit"}):
             findings.append(finding("read_only_tool_mismatch", "medium", directory.name, f"allowed-tools={tools}", "Declared tools may exceed the skill mutation boundary."))
 
         inventory.append({
@@ -254,7 +275,9 @@ def scan(root: Path, audit_id: str, profile: str, include: list[str] | None = No
 
     for name, paths in names.items():
         if len(paths) > 1:
-            findings.append(finding("duplicate_skill_name", "blocker", name, f"paths={paths}", "Skill identity is ambiguous."))
+            findings.append(finding("duplicate_skill_name", "blocker", paths, f"name={name}; paths={paths}", "Skill identity is ambiguous."))
+
+    findings = list({item["finding_id"]: item for item in findings}.values())
 
     blocker_count = sum(item["severity"] == "blocker" for item in findings)
     total = len(inventory)
@@ -314,10 +337,19 @@ def load_manifest(path: Path) -> dict[str, Any]:
     return manifest
 
 
-def verify_snapshot(root: Path, revision_sha: str, directories: list[Path]) -> None:
+def revision_skill_paths(root: Path, revision_sha: str, include: list[str], exclude: list[str]) -> list[str]:
+    completed = subprocess.run(
+        ["git", "ls-tree", "-r", "--name-only", revision_sha], cwd=root,
+        capture_output=True, text=True, check=True,
+    )
+    names = {line.split("/", 1)[0] for line in completed.stdout.splitlines() if line.endswith("/SKILL.md") and "/" in line}
+    return sorted(name for name in names if (not include or any(fnmatch.fnmatch(name, pattern) for pattern in include)) and not any(fnmatch.fnmatch(name, pattern) for pattern in exclude))
+
+
+def verify_snapshot(root: Path, revision_sha: str, directories: list[Path], include: list[str] | None = None, exclude: list[str] | None = None) -> None:
     if git_revision(root) != revision_sha:
         raise ValueError("repository HEAD does not match revision_sha")
-    paths = [str(path.relative_to(root)) for path in directories]
+    paths = sorted(set([str(path.relative_to(root)) for path in directories] + revision_skill_paths(root, revision_sha, include or [], exclude or [])))
     completed = subprocess.run(["git", "status", "--porcelain", "--untracked-files=all", "--", *paths], cwd=root, capture_output=True, text=True)
     if completed.returncode or completed.stdout.strip():
         raise ValueError("audited scope is not clean at revision_sha")
@@ -360,14 +392,14 @@ def main() -> int:
         if not directories:
             raise ValueError("audit scope selects no skills")
         verify_output_paths(root, [args.json, args.markdown])
-        verify_snapshot(root, manifest["revision_sha"], directories)
+        verify_snapshot(root, manifest["revision_sha"], directories, include, exclude)
         profile_source = manifest["profile_source"]
         default_profile = profile_source.get("default", "unclassified") if isinstance(profile_source, dict) else "unclassified"
         profile_map = profile_source.get("skills", {}) if isinstance(profile_source, dict) else {}
         if default_profile not in {"repo_native", "upstream_compatible", "unclassified"} or any(value not in {"repo_native", "upstream_compatible", "unclassified"} for value in profile_map.values()):
             raise ValueError("invalid provenance profile")
         report = scan(root, manifest["audit_id"], default_profile, include, exclude, profile_map, manifest["revision_sha"])
-        verify_snapshot(root, manifest["revision_sha"], directories)
+        verify_snapshot(root, manifest["revision_sha"], directories, include, exclude)
         previous = None
         if manifest.get("previous_report"):
             previous = json.loads(Path(manifest["previous_report"]).read_text(encoding="utf-8"))

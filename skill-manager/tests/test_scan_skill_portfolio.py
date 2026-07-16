@@ -259,6 +259,80 @@ class PortfolioScannerTests(unittest.TestCase):
                 report = MODULE.scan(root, "audit-1", "repo_native", exclude=["excluded"])
             self.assertEqual(["included"], [item["path"] for item in report["inventory"]])
 
+    def test_snapshot_rejects_deleted_revision_skill(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=root, check=True)
+            self.make_skill(root, "alpha")
+            self.make_skill(root, "beta")
+            subprocess.run(["git", "add", "."], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-qm", "init"], cwd=root, check=True)
+            revision = MODULE.git_revision(root)
+            for path in (root / "beta").rglob("*"):
+                if path.is_file():
+                    path.unlink()
+            (root / "beta/evals").rmdir()
+            (root / "beta").rmdir()
+            with self.assertRaisesRegex(ValueError, "audited scope is not clean"):
+                MODULE.verify_snapshot(root, revision, [root / "alpha"], [], [])
+
+    def test_finding_categories_and_duplicate_paths_are_preserved(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self.make_skill(root, "alpha", name="same")
+            self.make_skill(root, "beta", name="same")
+            report = MODULE.scan(root, "audit-1", "unclassified")
+            provenance = next(item for item in report["findings"] if item["rule_id"] == "provenance_unclassified")
+            duplicate = next(item for item in report["findings"] if item["rule_id"] == "duplicate_skill_name")
+            self.assertEqual("provenance", provenance["category"])
+            self.assertEqual("duplicate", duplicate["category"])
+            self.assertEqual(["alpha", "beta"], duplicate["skills"])
+
+    def test_blank_required_metadata_is_missing(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self.make_skill(root, "alpha")
+            skill = root / "alpha/SKILL.md"
+            skill.write_text(skill.read_text().replace("description: Test skill", "description:"))
+            finding = next(item for item in MODULE.scan(root, "audit-1", "repo_native")["findings"] if item["rule_id"] == "required_metadata")
+            self.assertIn("description", finding["evidence"][0])
+
+    def test_reference_scan_ignores_fences_and_flags_absolute_paths(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self.make_skill(root, "alpha")
+            skill = root / "alpha/SKILL.md"
+            with skill.open("a") as handle:
+                handle.write("\n```md\n[example](Missing.md)\n```\n[absolute](/tmp/secret.md)\n")
+            findings = MODULE.scan(root, "audit-1", "repo_native")["findings"]
+            escaped = [item for item in findings if item["rule_id"] == "reference_scope_escape"]
+            self.assertEqual(1, len(escaped))
+            self.assertFalse(any(item["rule_id"] == "broken_local_reference" and "Missing.md" in item["evidence"] for item in findings))
+
+    def test_list_allowed_tools_and_invalid_eval_shape(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self.make_skill(root, "alpha")
+            skill = root / "alpha/SKILL.md"
+            skill.write_text(skill.read_text().replace("allowed-tools: Read, Grep", "allowed-tools: [Read, Write]") + "\nRead-only audit.\n")
+            eval_path = root / "alpha/evals/evals.json"
+            eval_path.write_text(json.dumps({"skill_name": "alpha", "evals": {"bad": True}}))
+            report = MODULE.scan(root, "audit-1", "repo_native")
+            rules = {item["rule_id"] for item in report["findings"]}
+            self.assertTrue({"read_only_tool_mismatch", "invalid_eval_schema"} <= rules)
+            self.assertEqual("invalid", report["inventory"][0]["eval_status"])
+
+    def test_identical_findings_are_deduplicated(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self.make_skill(root, "alpha")
+            with (root / "alpha/SKILL.md").open("a") as handle:
+                handle.write("\n[one](missing.md)\n[one](missing.md)\n")
+            findings = [item for item in MODULE.scan(root, "audit-1", "repo_native")["findings"] if item["rule_id"] == "broken_local_reference"]
+            self.assertEqual(1, len(findings))
+
 
 if __name__ == "__main__":
     unittest.main()
