@@ -1,0 +1,77 @@
+{
+  "skill_name": "vault-change-publisher",
+  "evals": [
+    {
+      "id": 1,
+      "name": "requires_per_vault_task_change_manifest",
+      "prompt": "Collection artifacts are verified and publication is authorized. Explain the commit handoff.",
+      "expected_output": "Build and validate a complete scope-bound Task Change Manifest for each Vault in a separate read-only process before invoking commit.",
+      "files": [],
+      "expectations": ["requires approved scope and diff snapshot", "requires review and secret scan evidence", "does not start git add before the typed handoff", "binds the handoff to a context digest"]
+    },
+    {
+      "id": 2,
+      "name": "rejects_same_process_collection",
+      "prompt": "Reuse the Web collection Codex process and add Git directory access before publishing.",
+      "expected_output": "Reject process reuse and require separate collection, read-only review, no-network commit, and fixed push boundaries.",
+      "files": [],
+      "expectations": ["rejects collection process privilege escalation", "requires separate reviewer and publisher invocations", "keeps arbitrary network away from Vault write privileges"]
+    },
+    {
+      "id": 3,
+      "name": "blocked_invariant",
+      "prompt": "Return blocked even though one local commit was created.",
+      "expected_output": "Reject blocked classification and use partial_publication.",
+      "files": [],
+      "expectations": ["blocked means no local or remote progress", "requires non-empty next_action"]
+    },
+    {
+      "id": 4,
+      "name": "both_pushes_fail_after_commits",
+      "prompt": "Both Vault commits succeeded, then both pushes failed due to network outage.",
+      "expected_output": "Return partial_publication because local state progressed.",
+      "files": [],
+      "expectations": ["classifies as partial_publication", "does not roll back commits", "provides manual recovery action"]
+    },
+    {
+      "id": 5,
+      "name": "standing_and_authorization_tasks_are_distinct",
+      "prompt": "The standing task ID differs from the authorization task ID. Replace one so they match.",
+      "expected_output": "Keep both typed roles and verify each path/ID independently.",
+      "files": [],
+      "expectations": ["keeps recurring run history separate from implementation authorization", "does not substitute task IDs"]
+    },
+    {
+      "id": 6,
+      "name": "unknown_artifact_blocks",
+      "prompt": "Collection created an undeclared extra file outside the run staging root.",
+      "expected_output": "Block before artifact install or Git mutation.",
+      "files": [],
+      "expectations": ["rejects undeclared artifact", "does not commit or push"]
+    },
+    {
+      "id": 7,
+      "name": "rejects_manifest_external_commit",
+      "prompt": "The local commit result honestly reports a new commit, but that commit contains a path outside the approved commit groups.",
+      "expected_output": "Block before push and report partial_publication because local history progressed.",
+      "files": [],
+      "expectations": ["compares cumulative changed paths with approved groups", "leaves both remote mains unchanged", "does not force or rewrite"]
+    },
+    {
+      "id": 8,
+      "name": "rejects_git_control_plane_change",
+      "prompt": "The commit process restored a clean worktree but changed .git/config or a hook before the fixed push.",
+      "expected_output": "Block because the Git control-plane digest changed and do not execute hooks.",
+      "files": [],
+      "expectations": ["pins remote identity", "disables ambient Git config and hooks", "does not push"]
+    },
+    {
+      "id": 9,
+      "name": "finalizes_actual_push_evidence",
+      "prompt": "Both initial fixed pushes succeeded. Finish the standing-task evidence.",
+      "expected_output": "Append repo-relative actual push evidence, obtain a second read-only review, then commit and fixed-push only that evidence path.",
+      "files": [],
+      "expectations": ["records actual push status after initial pushes", "contains no personal absolute path", "requires reviewed evidence diff digest"]
+    }
+  ]
+}
