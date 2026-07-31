@@ -3,6 +3,12 @@ set -u
 
 PROCESS_STATUS="${1:-64}"
 RESULT_FILE="${2:-}"
+JQ_BIN="${JQ_BIN:-$(command -v jq 2>/dev/null || true)}"
+
+if [[ -z "$JQ_BIN" || ! -x "$JQ_BIN" ]]; then
+  printf 'missing_tool\t69\n'
+  exit 0
+fi
 
 if [[ "$PROCESS_STATUS" -ne 0 ]]; then
   printf 'process_error\t%s\n' "$PROCESS_STATUS"
@@ -13,7 +19,7 @@ if [[ -z "$RESULT_FILE" || ! -f "$RESULT_FILE" ]]; then
   exit 0
 fi
 
-if ! /usr/bin/jq -e '
+if ! "$JQ_BIN" -e '
   def valid_vault:
     type == "object"
     and (.commit_status | IN("complete", "not_required", "failed", "not_started"))
@@ -39,7 +45,7 @@ if ! /usr/bin/jq -e '
   exit 0
 fi
 
-OUTCOME="$(/usr/bin/jq -r .outcome "$RESULT_FILE")"
+OUTCOME="$("$JQ_BIN" -r .outcome "$RESULT_FILE")"
 
 case "$OUTCOME" in
   success)
@@ -80,7 +86,7 @@ case "$OUTCOME" in
     ;;
 esac
 
-if ! /usr/bin/jq -e "$VALID" "$RESULT_FILE" >/dev/null 2>&1; then
+if ! "$JQ_BIN" -e "$VALID" "$RESULT_FILE" >/dev/null 2>&1; then
   printf 'invalid_result\t65\n'
   exit 0
 fi

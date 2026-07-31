@@ -22,9 +22,10 @@ def sha256(path: Path) -> str:
 def relative_target(root: str, target: str) -> str:
     """Return a normalized repo-relative planned target."""
     root_path = Path(root).resolve()
-    target_path = Path(target)
-    if not target_path.is_absolute():
+    raw_target = Path(target)
+    if not raw_target.is_absolute():
         raise ReviewError("planned target is not absolute")
+    target_path = raw_target.resolve()
     try:
         relative = target_path.relative_to(root_path)
     except ValueError as exc:

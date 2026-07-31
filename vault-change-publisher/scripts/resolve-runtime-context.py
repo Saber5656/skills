@@ -61,7 +61,12 @@ def parse_local_config(path: Path) -> dict[str, str]:
 def validated_relative(value: str, key: str) -> PurePosixPath:
     """Accept a normalized relative path without traversal."""
     path = PurePosixPath(value)
-    if path.is_absolute() or ".." in path.parts or "." in path.parts:
+    if (
+        not path.parts
+        or path.is_absolute()
+        or ".." in path.parts
+        or "." in path.parts
+    ):
         raise ContextError(f"invalid relative path:{key}")
     return path
 
@@ -227,7 +232,15 @@ def main(argv: list[str]) -> int:
         return 64
     try:
         context = resolve_context(Path(argv[1]), Path(argv[2]))
-    except (ContextError, OSError, subprocess.SubprocessError, KeyError) as exc:
+    except (
+        ContextError,
+        OSError,
+        ImportError,
+        AttributeError,
+        ValueError,
+        subprocess.SubprocessError,
+        KeyError,
+    ) as exc:
         print(f"runtime context resolution failed:{exc}", file=sys.stderr)
         return 78
     print(json.dumps(context, ensure_ascii=False))

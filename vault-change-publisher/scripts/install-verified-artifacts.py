@@ -126,7 +126,12 @@ def install(
 def safe_relative(value: str) -> PurePosixPath:
     """Validate a catalog-derived relative destination."""
     path = PurePosixPath(value)
-    if path.is_absolute() or ".." in path.parts or "." in path.parts:
+    if (
+        not path.parts
+        or path.is_absolute()
+        or ".." in path.parts
+        or "." in path.parts
+    ):
         raise InstallError("invalid relative destination")
     return path
 
@@ -219,7 +224,7 @@ def main(argv: list[str]) -> int:
             "summary_target": str(summary_target),
             "advisory_target": str(advisory_target),
         }
-    except (InstallError, KeyError, OSError, TypeError, json.JSONDecodeError) as exc:
+    except (InstallError, KeyError, OSError, TypeError, ValueError) as exc:
         print(f"artifact installation failed:{exc}", file=sys.stderr)
         return 75
     print(json.dumps(result, ensure_ascii=False))

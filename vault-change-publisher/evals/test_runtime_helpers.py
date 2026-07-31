@@ -9,12 +9,14 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 SKILL_ROOT = Path(__file__).parents[1]
 SCRIPTS = SKILL_ROOT / "scripts"
+sys.path.insert(0, str(SCRIPTS))
 PUSH_SPEC = importlib.util.spec_from_file_location(
     "push_committed_heads", SCRIPTS / "push-committed-heads.py"
 )
@@ -148,6 +150,40 @@ def load_environment(*, checkout_root, environ, require_catalog):
         self.assertEqual(result.returncode, 78)
         self.assertIn("standing task", result.stderr)
 
+    def test_resolver_import_failure_returns_standard_status(self) -> None:
+        """Convert missing catalog loader modules into the status-78 contract."""
+        module = self.saihai / "directory_paths.py"
+        module.rename(self.saihai / "directory_paths.missing")
+        result = subprocess.run(
+            [
+                str(SCRIPTS / "resolve-runtime-context.py"),
+                str(self.config),
+                str(self.workdir),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 78)
+        self.assertIn("runtime context resolution failed", result.stderr)
+
+    def test_resolver_malformed_config_returns_standard_status(self) -> None:
+        """Convert shlex parse failures into the status-78 contract."""
+        malformed = self.workdir / "malformed.local.env"
+        malformed.write_text("SAIHAI_CHECKOUT_ROOT='unterminated\n", encoding="utf-8")
+        result = subprocess.run(
+            [
+                str(SCRIPTS / "resolve-runtime-context.py"),
+                str(malformed),
+                str(self.workdir),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 78)
+        self.assertIn("runtime context resolution failed", result.stderr)
+
     def test_capture_includes_staged_only_path_and_index_blob(self) -> None:
         """Bind an index-only change even when the worktree matches HEAD."""
         for repo in (self.agents, self.user):
@@ -208,6 +244,61 @@ def load_environment(*, checkout_root, environ, require_catalog):
         ).strip()
         self.assertEqual(state["dirty_paths"], ["tracked.md"])
         self.assertEqual(state["dirty_entries"][0]["git_blob_oid"], expected_oid)
+        dangling = self.agents / "dangling-link"
+        dangling.symlink_to("missing-target")
+        result = subprocess.run(
+            [str(SCRIPTS / "capture-vault-state.py"), str(context)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        state = json.loads(result.stdout)["agents_vault"]
+        link_entry = next(
+            entry for entry in state["dirty_entries"] if entry["path"] == "dangling-link"
+        )
+        expected_link_oid = subprocess.run(
+            ["git", "-C", str(self.agents), "hash-object", "--stdin"],
+            input=b"missing-target",
+            check=True,
+            capture_output=True,
+        ).stdout.decode("ascii").strip()
+        self.assertEqual(link_entry["mode"], "120000")
+        self.assertEqual(link_entry["git_blob_oid"], expected_link_oid)
+
+        hook = self.agents / ".git" / "hooks" / "fixture"
+        hook.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        hook.chmod(0o644)
+        before_mode = json.loads(
+            subprocess.run(
+                [str(SCRIPTS / "capture-vault-state.py"), str(context)],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+        )["agents_vault"]["git_control_sha256"]
+        hook.chmod(0o755)
+        after_mode = json.loads(
+            subprocess.run(
+                [str(SCRIPTS / "capture-vault-state.py"), str(context)],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+        )["agents_vault"]["git_control_sha256"]
+        self.assertNotEqual(before_mode, after_mode)
+
+    def test_capture_invalid_utf8_context_fails_closed(self) -> None:
+        """Return status 75 instead of leaking a decode traceback."""
+        context = self.workdir / "invalid-context.json"
+        context.write_bytes(b"\xff")
+        result = subprocess.run(
+            [str(SCRIPTS / "capture-vault-state.py"), str(context)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 75)
+        self.assertIn("Vault state capture failed", result.stderr)
 
     def test_collection_validator_checks_hash_and_staging(self) -> None:
         """Accept verified staged files and reject a hash mismatch."""
@@ -295,6 +386,61 @@ def load_environment(*, checkout_root, environ, require_catalog):
         installed = json.loads(result.stdout)
         self.assertTrue(Path(installed["summary_target"]).is_file())
         self.assertTrue(Path(installed["advisory_target"]).is_file())
+
+        context["it_news_archive_relative"] = ""
+        context_path.write_text(json.dumps(context), encoding="utf-8")
+        rejected = subprocess.run(
+            [
+                str(SCRIPTS / "install-verified-artifacts.py"),
+                "--plan",
+                str(context_path),
+                str(collection_path),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(rejected.returncode, 75)
+
+        invalid_context = self.workdir / "invalid-install-context.json"
+        invalid_context.write_bytes(b"\xff")
+        rejected = subprocess.run(
+            [
+                str(SCRIPTS / "install-verified-artifacts.py"),
+                "--plan",
+                str(invalid_context),
+                str(collection_path),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(rejected.returncode, 75)
+
+    def test_evidence_preparer_invalid_utf8_fails_closed(self) -> None:
+        """Convert malformed runtime JSON into the status-75 contract."""
+        invalid = self.workdir / "invalid-evidence-runtime.json"
+        invalid.write_bytes(b"\xff")
+        placeholder = self.workdir / "placeholder.json"
+        placeholder.write_text("{}", encoding="utf-8")
+        output = self.workdir / "evidence-plan.json"
+        result = subprocess.run(
+            [
+                str(SCRIPTS / "prepare-publication-evidence.py"),
+                str(invalid),
+                str(placeholder),
+                str(placeholder),
+                str(placeholder),
+                "run-id",
+                "2026-07-31T04:00:00+09:00",
+                str(output),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 75)
+        self.assertIn("evidence preparation failed", result.stderr)
 
     def test_fixed_pusher_validates_and_pushes_exact_heads(self) -> None:
         """Push both validated local main heads outside the Codex process."""
@@ -470,6 +616,12 @@ def load_environment(*, checkout_root, environ, require_catalog):
             ).split()[0]
             self.assertEqual(remote, pre[key]["remote_head"])
 
+        bad_status = list(command)
+        bad_status[5] = "not-a-number"
+        rejected = subprocess.run(bad_status, check=False)
+        self.assertEqual(rejected.returncode, 75)
+        self.assertTrue(final_path.is_file())
+
         commit_path.write_text(json.dumps(commit_result), encoding="utf-8")
         result = subprocess.run(command, check=False)
         self.assertEqual(result.returncode, 0)
@@ -513,6 +665,19 @@ def load_environment(*, checkout_root, environ, require_catalog):
                 str(self.agents / "tasks" / "standing.md"),
                 "fixture-gitleaks 1.0",
             )
+
+    def test_review_canonicalizes_both_containment_paths(self) -> None:
+        """Accept a target expressed through a symlinked Vault path."""
+        real_root = self.root / "real-vault"
+        real_root.mkdir()
+        alias = self.root / "vault-alias"
+        alias.symlink_to(real_root, target_is_directory=True)
+        self.assertEqual(
+            REVIEW_MODULE.relative_target(
+                str(real_root), str(alias / "reports" / "artifact.md")
+            ),
+            "reports/artifact.md",
+        )
 
     def test_staged_evidence_digest_rebinds_reviewed_bytes(self) -> None:
         """Detect a race that substitutes evidence bytes during staging."""
@@ -710,6 +875,7 @@ def load_environment(*, checkout_root, environ, require_catalog):
             SCRIPTS / "push-committed-heads.py",
             SCRIPTS / "prepare-publication-evidence.py",
             SCRIPTS / "commit-push-publication-evidence.py",
+            SCRIPTS / "git_diff_digest.py",
             SCRIPTS / "interpret-automation-result.sh",
         ):
             shutil.copy2(source, runtime / source.name)

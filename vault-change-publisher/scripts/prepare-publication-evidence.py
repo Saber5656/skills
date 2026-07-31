@@ -11,6 +11,8 @@ import subprocess
 import sys
 from pathlib import Path, PurePosixPath
 
+from git_diff_digest import git_diff_digest
+
 
 class EvidenceError(RuntimeError):
     """Represent an unsafe or incomplete evidence preparation."""
@@ -19,7 +21,7 @@ class EvidenceError(RuntimeError):
 def relative_path(root: str, absolute: str) -> str:
     """Convert an installed artifact path to a normalized repo-relative path."""
     try:
-        relative = Path(absolute).relative_to(Path(root).resolve())
+        relative = Path(absolute).resolve().relative_to(Path(root).resolve())
     except ValueError as exc:
         raise EvidenceError("published artifact path escapes its Vault") from exc
     if not relative.parts or ".." in relative.parts:
@@ -61,16 +63,6 @@ def append_no_follow(root: Path, relative: PurePosixPath, content: bytes) -> Non
     finally:
         for descriptor in reversed(opened):
             os.close(descriptor)
-
-
-def git_diff_digest(repo: str, relative: str) -> str:
-    """Hash the exact binary diff for the evidence target."""
-    result = subprocess.run(
-        ["git", "-C", repo, "diff", "--binary", "--no-ext-diff", "--", relative],
-        check=True,
-        capture_output=True,
-    )
-    return hashlib.sha256(result.stdout).hexdigest()
 
 
 def main(argv: list[str]) -> int:
@@ -148,7 +140,7 @@ def main(argv: list[str]) -> int:
         KeyError,
         OSError,
         TypeError,
-        json.JSONDecodeError,
+        ValueError,
         subprocess.SubprocessError,
     ) as exc:
         print(f"evidence preparation failed:{exc}", file=sys.stderr)

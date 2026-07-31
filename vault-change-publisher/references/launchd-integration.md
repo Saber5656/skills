@@ -38,6 +38,7 @@ launchd 04:00
 | `scripts/push-committed-heads.py` | same workdir |
 | `scripts/prepare-publication-evidence.py` | same workdir |
 | `scripts/commit-push-publication-evidence.py` | same workdir |
+| `scripts/git_diff_digest.py` | same workdir |
 | `scripts/interpret-automation-result.sh` | same workdir |
 
 Tracked sourceがmainへmergeされた後に配備し、各source/destinationのSHA-256一致を確認する。task worktreeをproduction runtime pathとして参照しない。

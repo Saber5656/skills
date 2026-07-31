@@ -10,6 +10,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from git_diff_digest import git_diff_digest
+
 
 class FinalizationError(RuntimeError):
     """Represent a failed evidence finalization."""
@@ -55,6 +57,8 @@ def control_digest(repo: str) -> str:
                 path = Path(root) / filename
                 digest.update(str(path.relative_to(git_dir)).encode("utf-8"))
                 digest.update(b"\0")
+                digest.update(f"{path.lstat().st_mode:o}".encode("ascii"))
+                digest.update(b"\0")
                 if path.is_symlink():
                     digest.update(b"symlink\0")
                     digest.update(os.readlink(path).encode("utf-8"))
@@ -66,22 +70,12 @@ def control_digest(repo: str) -> str:
 
 def diff_digest(repo: str, relative: str) -> str:
     """Hash the exact unstaged binary evidence diff."""
-    result = git(repo, "diff", "--binary", "--no-ext-diff", "--", relative)
-    return hashlib.sha256(result.stdout.encode("utf-8")).hexdigest()
+    return git_diff_digest(repo, relative)
 
 
 def cached_diff_digest(repo: str, relative: str) -> str:
     """Hash the exact staged binary evidence diff."""
-    result = git(
-        repo,
-        "diff",
-        "--cached",
-        "--binary",
-        "--no-ext-diff",
-        "--",
-        relative,
-    )
-    return hashlib.sha256(result.stdout.encode("utf-8")).hexdigest()
+    return git_diff_digest(repo, relative, cached=True)
 
 
 def dirty_status(repo: str) -> tuple[bool, str]:

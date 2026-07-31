@@ -43,6 +43,8 @@ def capture(repo: str) -> dict[str, object]:
                 relative = path.relative_to(git_dir)
                 control.update(str(relative).encode("utf-8"))
                 control.update(b"\0")
+                control.update(f"{path.lstat().st_mode:o}".encode("ascii"))
+                control.update(b"\0")
                 if path.is_symlink():
                     control.update(b"symlink\0")
                     control.update(os.readlink(path).encode("utf-8"))
@@ -101,11 +103,22 @@ def capture(repo: str) -> dict[str, object]:
             metadata = path.lstat()
             if path.is_symlink():
                 mode = "120000"
+                blob_oid = subprocess.run(
+                    ["git", "-C", repo, "hash-object", "--stdin"],
+                    input=os.fsencode(os.readlink(path)),
+                    check=True,
+                    capture_output=True,
+                ).stdout.decode("ascii").strip()
             elif path.is_file():
                 mode = "100755" if metadata.st_mode & 0o111 else "100644"
+                blob_oid = git(
+                    repo, "hash-object", f"--path={relative}", "--", relative
+                )
             else:
                 mode = "unsupported"
-            blob_oid = git(repo, "hash-object", f"--path={relative}", "--", relative)
+                blob_oid = git(
+                    repo, "hash-object", f"--path={relative}", "--", relative
+                )
         dirty_entries.append(
             {"path": relative, "git_blob_oid": blob_oid, "mode": mode}
         )
@@ -118,7 +131,16 @@ def capture(repo: str) -> dict[str, object]:
         git(repo, "diff", "--binary", "--no-ext-diff").encode("utf-8")
     )
     for relative in untracked_paths:
-        object_id = git(repo, "hash-object", "--no-filters", "--", relative)
+        path = repo_path / relative
+        if path.is_symlink():
+            object_id = subprocess.run(
+                ["git", "-C", repo, "hash-object", "--stdin"],
+                input=os.fsencode(os.readlink(path)),
+                check=True,
+                capture_output=True,
+            ).stdout.decode("ascii").strip()
+        else:
+            object_id = git(repo, "hash-object", "--no-filters", "--", relative)
         snapshot.extend(b"\0untracked\0")
         snapshot.extend(relative.encode("utf-8"))
         snapshot.extend(b"\0")
@@ -152,7 +174,7 @@ def main(argv: list[str]) -> int:
             "agents_vault": capture(context["agents_vault_root"]),
             "user_vault": capture(context["user_vault_root"]),
         }
-    except (OSError, KeyError, json.JSONDecodeError, subprocess.SubprocessError) as exc:
+    except (OSError, KeyError, ValueError, subprocess.SubprocessError) as exc:
         print(f"Vault state capture failed:{exc}", file=sys.stderr)
         return 75
     print(json.dumps(result, ensure_ascii=False))

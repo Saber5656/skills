@@ -50,8 +50,11 @@ fi
 /usr/bin/grep -F -- '"$PUBLICATION_CONTEXT_FILE"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- '"$ARTIFACT_PLAN"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- 'mkdir "$RUN_ROOT"' "$RUNNER" >/dev/null
-/usr/bin/grep -F -- 'phase=collection_isolation' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- 'fail_run 75 collection_isolation' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- '"$EVIDENCE_FINALIZER"' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- 'git_diff_digest.py' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- 'fail_run 75 artifact_plan' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- 'COLLECTION_OUTPUT_ROOT="$STAGING_ROOT"' "$RUNNER" >/dev/null
 for forbidden in "/""Users/" "Library/Mobile"" Documents" "Yasu""'s Vault"; do
   if /usr/bin/grep -F -- "$forbidden" "$RUNNER" >/dev/null; then
     echo "tracked runner contains a personal path" >&2
@@ -59,4 +62,4 @@ for forbidden in "/""Users/" "Library/Mobile"" Documents" "Yasu""'s Vault"; do
   fi
 done
 
-echo "runner isolation contract: 20/20 passed"
+echo "runner isolation contract: 23/23 passed"

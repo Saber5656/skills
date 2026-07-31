@@ -54,7 +54,7 @@ modeまたは対応するabsolute output rootがない場合は保存せず失�
 - scheduled automationではVaultへ直接保存せず、今回run専用のstaging directoryを使う
 - 実環境のpathは`.env`や`*.local.*`などのignored fileで管理し、Git管理しない
 - 同名ファイルが既に存在する場合は末尾に `-2`, `-3` 等を付与して上書きしない
-- 本文を一時ファイルへ完成させてから`scripts/save-summary.sh <absolute output root> <YYYY-MM-DD> <content file> <collection_started_at>`で保存する
+- 本文を一時ファイルへ完成させてから`scripts/save-summary.sh <scheduled_automation|interactive_manual> <absolute output root> <YYYY-MM-DD> <content file> <collection_started_at>`で保存する
 - saverが非zeroまたは`summary_status: failed`を返した場合は、そのrunを失敗として扱う
 
 ### Step 4 — 生成結果を返す

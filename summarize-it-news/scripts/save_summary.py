@@ -49,11 +49,50 @@ def open_child_directory(parent_fd: int, name: str) -> int:
 
 
 def save_summary(
-    output_root: Path, summary_date: str, content_file: Path, started_at: str
+    mode: str,
+    output_root: Path,
+    summary_date: str,
+    content_file: Path,
+    started_at: str,
 ) -> dict[str, object]:
     """Create one collision-safe summary and return the output contract."""
+    if mode not in {"scheduled_automation", "interactive_manual"}:
+        raise SaveError("unsupported summary save mode")
     if not output_root.is_absolute():
         raise SaveError("output root must be absolute")
+    if mode == "scheduled_automation":
+        try:
+            resolved_output = output_root.resolve(strict=True)
+        except OSError as exc:
+            raise SaveError("output root must be a real directory") from exc
+        collection_root_value = os.environ.get("COLLECTION_OUTPUT_ROOT")
+        if not collection_root_value:
+            raise SaveError(
+                "scheduled automation requires COLLECTION_OUTPUT_ROOT"
+            )
+        collection_root = Path(collection_root_value).expanduser()
+        if not collection_root.is_absolute():
+            raise SaveError("COLLECTION_OUTPUT_ROOT must be absolute")
+        try:
+            resolved_output.relative_to(collection_root.resolve(strict=True))
+        except (OSError, ValueError) as exc:
+            raise SaveError(
+                "scheduled output root must stay below COLLECTION_OUTPUT_ROOT"
+            ) from exc
+        for key in ("AGENTS_VAULT_ROOT", "USER_VAULT_ROOT"):
+            configured = os.environ.get(key)
+            if not configured:
+                continue
+            vault_root = Path(configured).expanduser()
+            if not vault_root.is_absolute():
+                raise SaveError(f"{key} must be absolute when configured")
+            try:
+                resolved_output.relative_to(vault_root.resolve(strict=True))
+            except ValueError:
+                continue
+            except OSError as exc:
+                raise SaveError(f"{key} must resolve to a real directory") from exc
+            raise SaveError("scheduled automation must not save directly to a Vault")
     if not DATE_PATTERN.fullmatch(summary_date):
         raise SaveError("summary date must use YYYY-MM-DD")
     if not JST_PATTERN.fullmatch(started_at):
@@ -113,7 +152,12 @@ def save_summary(
                     copy_stream(source_fd, target_fd)
                 except Exception as exc:
                     os.close(target_fd)
-                    os.unlink(filename, dir_fd=directory_fd)
+                    try:
+                        os.unlink(filename, dir_fd=directory_fd)
+                    except OSError as cleanup_exc:
+                        raise SaveError(
+                            "could not remove incomplete summary"
+                        ) from cleanup_exc
                     if isinstance(exc, SaveError):
                         raise
                     raise SaveError("could not copy summary content") from exc
@@ -141,16 +185,21 @@ def save_summary(
 
 def main(argv: list[str]) -> int:
     """Parse CLI arguments and emit exactly one JSON result."""
-    if len(argv) != 5:
+    if len(argv) != 6:
         result = {
             "summary_status": "failed",
-            "reason": "usage: save_summary.py OUTPUT_ROOT YYYY-MM-DD CONTENT_FILE STARTED_AT",
+            "reason": (
+                "usage: save_summary.py MODE OUTPUT_ROOT YYYY-MM-DD "
+                "CONTENT_FILE STARTED_AT"
+            ),
             "summary_path": None,
         }
         print(json.dumps(result, ensure_ascii=False))
         return 64
     try:
-        result = save_summary(Path(argv[1]), argv[2], Path(argv[3]), argv[4])
+        result = save_summary(
+            argv[1], Path(argv[2]), argv[3], Path(argv[4]), argv[5]
+        )
     except SaveError as exc:
         result = {
             "summary_status": "failed",
