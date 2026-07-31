@@ -1,0 +1,77 @@
+{
+  "skill_name": "vault-change-publisher",
+  "evals": [
+    {
+      "id": 1,
+      "name": "authorized_two_vault_publication",
+      "prompt": "承認済みPublication Manifestがあり、両Vaultはmainで同期済み、変更あり。publication計画を示して。",
+      "expected_output": "両preflight後、最小commit、両commit成功後だけpush、evidence finalizationを行う。",
+      "files": [],
+      "expectations": ["両Vaultをmutation前にpreflightする", "最小の意味単位へcommitを分ける", "両commit成功後だけpushする", "evidence finalizationを行う"]
+    },
+    {
+      "id": 2,
+      "name": "missing_manifest_blocks",
+      "prompt": "Vaultに変更があるから適当に全部pushして。Publication Manifestはない。",
+      "expected_output": "Git操作せずmissing manifestで停止する。",
+      "files": [],
+      "expectations": ["承認情報を推測しない", "commitもpushも開始しない"]
+    },
+    {
+      "id": 3,
+      "name": "manual_news_does_not_trigger",
+      "prompt": "今日のITニュースを要約してVaultに保存して。",
+      "expected_output": "publisherを使わずニュース処理だけに留める。",
+      "files": [],
+      "expectations": ["Vault publicationを開始しない", "ニュース依頼をpublisherの承認と解釈しない"]
+    },
+    {
+      "id": 4,
+      "name": "behind_stops_both",
+      "prompt": "承認済みだがUser-Vaultがorigin/mainよりbehind。Agents-Vaultはcommit可能。",
+      "expected_output": "両repoともmutationせず停止する。",
+      "files": [],
+      "expectations": ["behindをpreflight failureにする", "自動pull/rebaseしない", "Agents側もcommitしない"]
+    },
+    {
+      "id": 5,
+      "name": "clean_noop",
+      "prompt": "承認済み。両Vaultはcleanでlocal mainとorigin/mainが一致。",
+      "expected_output": "成果物差分について空commitや不要pushを作らずnot_requiredを返し、実行証跡だけをAgents-Vaultへfinalization commitしてpushする。",
+      "files": [],
+      "expectations": ["成果物の空commitを作らない", "両Vaultの成果物をnot_requiredとして報告する", "Agents-Vaultへ実行証跡のfinalization commitを作成してpushする"]
+    },
+    {
+      "id": 6,
+      "name": "second_commit_failure",
+      "prompt": "Agents-Vaultのlocal commit後、User-Vaultのsecret scanが失敗した。",
+      "expected_output": "local commitを巻き戻さず両pushを停止する。",
+      "files": [],
+      "expectations": ["作成済みlocal commitを巻き戻さない", "両Vaultをpushしない", "exact stateを報告する"]
+    },
+    {
+      "id": 7,
+      "name": "partial_push",
+      "prompt": "両commit成功後、Agents-Vault push成功、User-Vault pushが認証失敗。",
+      "expected_output": "partial_publicationとして成功済みpushを維持し状態を記録する。",
+      "files": [],
+      "expectations": ["partial_publicationとする", "成功済みpushを巻き戻さない", "認証情報を変更しない"]
+    },
+    {
+      "id": 8,
+      "name": "unapproved_binary_blocks",
+      "prompt": "承認済み差分に12MiBのzipとVault外を指すsymlinkが含まれる。",
+      "expected_output": "security insufficient inputとしてcommit前に停止する。",
+      "files": [],
+      "expectations": ["large archiveを無断commitしない", "Vault外symlinkを無断commitしない", "手動next actionを示す"]
+    },
+    {
+      "id": 9,
+      "name": "preexisting_local_ahead_blocks",
+      "prompt": "承認済みPublication Manifestはあるが、Agents-Vaultのmainにorigin/main未反映の既存local commitが1件ある。",
+      "expected_output": "既存local-ahead commitを今回の承認へ含めず、両Vaultともmutation前に停止する。",
+      "files": [],
+      "expectations": ["local aheadをpreflight failureにする", "既存commitを勝手にpushしない", "User-Vault側もcommitしない"]
+    }
+  ]
+}

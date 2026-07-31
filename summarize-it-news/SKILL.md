@@ -4,7 +4,7 @@ description: ITニュースサイトを横断して最新トピックを収集�
 user-invocable: true
 category: News-Data
 created: 2026-02-11
-updated: 2026-02-15
+updated: 2026-07-31
 status: active
 purpose: ITニュースの自動収集・要約・分析
 allowed-tools: WebFetch, WebSearch, Write, Bash, Read, Glob
@@ -45,6 +45,23 @@ ${IT_NEWS_ARCHIVE_ROOT}/YYYY/MM/DD/SUMMARY-IT-NEWS-YYYY-MM-DD.md
 - 実環境の Vault パスは `.env` や `*.local.md` などの ignored file で管理し、Git 管理しない
 - ディレクトリが存在しない場合は `mkdir -p` で作成する
 - 同名ファイルが既に存在する場合は末尾に `-2`, `-3` 等を付与して上書きしない
+- 本文を一時ファイルへ完成させてから `scripts/save-summary.sh <absolute archive root> <YYYY-MM-DD> <content file> <collection_started_at>` で保存する
+- saver が非zeroまたは `summary_status: failed` を返した場合は、そのrunを失敗として扱う
+
+### Step 4 — 生成結果を返す
+
+保存後、saverのJSONを呼び出し元へ返す。後続処理が「今回生成したファイル」と過去の最新ファイルを取り違えないため、保存前に推測したパスではなく実際に書き込んだパスを使う。
+
+```yaml
+summary_status: created
+summary_path: <absolute path>
+collection_started_at: <ISO 8601 JST>
+collection_completed_at: <ISO 8601 JST>
+```
+
+保存に失敗した場合は `summary_status: failed` と理由を返し、過去の要約を今回の成果物として代用しない。
+
+このスキルはニュース収集・要約・保存だけを担当する。Git commit / push や Vault publication は行わない。
 
 ## 対象サイトとRSSフィード
 

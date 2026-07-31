@@ -1,0 +1,143 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "outcome",
+    "phase",
+    "daily_pipeline_status",
+    "summary_path",
+    "advisory_path",
+    "notification_result",
+    "agents_vault",
+    "user_vault",
+    "evidence_finalization_commit",
+    "next_action"
+  ],
+  "properties": {
+    "outcome": {
+      "enum": ["success", "blocked", "partial_publication"]
+    },
+    "phase": {
+      "type": "string"
+    },
+    "daily_pipeline_status": {
+      "enum": ["complete", "blocked"]
+    },
+    "summary_path": {
+      "type": ["string", "null"]
+    },
+    "advisory_path": {
+      "type": ["string", "null"]
+    },
+    "notification_result": {
+      "type": ["string", "null"]
+    },
+    "agents_vault": {
+      "$ref": "#/$defs/vaultResult"
+    },
+    "user_vault": {
+      "$ref": "#/$defs/vaultResult"
+    },
+    "evidence_finalization_commit": {
+      "type": ["string", "null"]
+    },
+    "next_action": {
+      "type": ["string", "null"]
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "outcome": {
+            "const": "success"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "daily_pipeline_status": {
+            "const": "complete"
+          },
+          "summary_path": {
+            "type": "string",
+            "minLength": 1
+          },
+          "advisory_path": {
+            "type": "string",
+            "minLength": 1
+          },
+          "agents_vault": {
+            "$ref": "#/$defs/successVaultResult"
+          },
+          "user_vault": {
+            "$ref": "#/$defs/successVaultResult"
+          },
+          "evidence_finalization_commit": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "vaultResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["commit_status", "commit_hashes", "push_status", "local_head", "remote_head", "clean"],
+      "properties": {
+        "commit_status": {
+          "enum": ["complete", "not_required", "failed", "not_started"]
+        },
+        "commit_hashes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "push_status": {
+          "enum": ["complete", "not_required", "failed", "not_started"]
+        },
+        "local_head": {
+          "type": ["string", "null"]
+        },
+        "remote_head": {
+          "type": ["string", "null"]
+        },
+        "clean": {
+          "type": "boolean"
+        }
+      }
+    },
+    "successVaultResult": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/vaultResult"
+        },
+        {
+          "properties": {
+            "commit_status": {
+              "enum": ["complete", "not_required"]
+            },
+            "push_status": {
+              "enum": ["complete", "not_required"]
+            },
+            "local_head": {
+              "type": "string",
+              "minLength": 1
+            },
+            "remote_head": {
+              "type": "string",
+              "minLength": 1
+            },
+            "clean": {
+              "const": true
+            }
+          }
+        }
+      ]
+    }
+  }
+}
