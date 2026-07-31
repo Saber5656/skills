@@ -67,6 +67,18 @@ def git_control_digest(repo: str) -> str:
         git(repo, "rev-parse", "--absolute-git-dir").stdout.strip()
     )
     control = hashlib.sha256()
+    git_marker = Path(repo) / ".git"
+    control.update(b"worktree-git-entry\0")
+    control.update(f"{git_marker.lstat().st_mode:o}".encode("ascii"))
+    control.update(b"\0")
+    if git_marker.is_symlink():
+        control.update(b"symlink\0")
+        control.update(os.fsencode(os.readlink(git_marker)))
+    elif git_marker.is_file():
+        control.update(b"file\0")
+        control.update(git_marker.read_bytes())
+    else:
+        control.update(b"directory\0")
     control.update(b"config\0")
     control.update((git_dir / "config").read_bytes())
     hooks = git_dir / "hooks"
