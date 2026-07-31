@@ -43,6 +43,12 @@ assert_result() {
   }
 }
 
+missing_tool="$(JQ_BIN=/definitely/missing "$INTERPRETER" 0 "$FIXTURE_ROOT/result.json")"
+[[ "$missing_tool" == $'missing_tool\t69' ]] || {
+  printf 'expected missing_tool status, got %q\n' "$missing_tool" >&2
+  exit 1
+}
+
 write_result blocked '[]' '[]' failed not_started true
 assert_result $'blocked\t75'
 
@@ -77,4 +83,4 @@ printf '{"outcome":"partial_publication"}\n' > "$FIXTURE_ROOT/result.json"
 assert_result $'invalid_result\t65'
 assert_result $'process_error\t42' 42
 
-echo "runner semantic interpretation: 10/10 passed"
+echo "runner semantic interpretation: 11/11 passed"

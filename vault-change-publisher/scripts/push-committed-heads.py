@@ -78,6 +78,8 @@ def git_control_digest(repo: str) -> str:
                 path = Path(root) / filename
                 control.update(str(path.relative_to(git_dir)).encode("utf-8"))
                 control.update(b"\0")
+                control.update(f"{path.lstat().st_mode:o}".encode("ascii"))
+                control.update(b"\0")
                 if path.is_symlink():
                     control.update(b"symlink\0")
                     control.update(os.readlink(path).encode("utf-8"))
@@ -527,6 +529,7 @@ def main(argv: list[str]) -> int:
         KeyError,
         OSError,
         TypeError,
+        ValueError,
         json.JSONDecodeError,
         subprocess.SubprocessError,
         PushError,
