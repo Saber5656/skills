@@ -4,7 +4,7 @@ description: ITニュースサイトを横断して最新トピックを収集�
 user-invocable: true
 category: News-Data
 created: 2026-02-11
-updated: 2026-02-15
+updated: 2026-07-31
 status: active
 purpose: ITニュースの自動収集・要約・分析
 allowed-tools: WebFetch, WebSearch, Write, Bash, Read, Glob
@@ -45,6 +45,14 @@ ${IT_NEWS_ARCHIVE_ROOT}/YYYY/MM/DD/SUMMARY-IT-NEWS-YYYY-MM-DD.md
 - 実環境の Vault パスは `.env` や `*.local.md` などの ignored file で管理し、Git 管理しない
 - ディレクトリが存在しない場合は `mkdir -p` で作成する
 - 同名ファイルが既に存在する場合は末尾に `-2`, `-3` 等を付与して上書きしない
+
+### Step 4 — 定期実行への結果引き渡し
+
+通常の手動実行は Step 3 で終了し、Git commit / push を行わない。
+
+standing task と scheduled automation prompt が両方とも Vault publication を明示承認している複合ワークフローでは、ニュース要約の保存パスを呼び出し元へ返す。呼び出し元は advisory、task evidence、通知 payload など同一 run の全 Vault 出力を完成させた後、[`references/scheduled-vault-publication.md`](references/scheduled-vault-publication.md) に従って publication phase を実行する。
+
+publication phase はニュース収集の途中に挟まない。2つの Vault の commit phase が両方成功した後にだけ push phase へ進むため、片方だけ先に公開して evidence が分断されるのを避ける。
 
 ## 対象サイトとRSSフィード
 

@@ -1,0 +1,84 @@
+{
+  "skill_name": "summarize-it-news",
+  "evals": [
+    {
+      "id": 1,
+      "name": "authorized_scheduled_two_vault_publication",
+      "prompt": "毎日4時の standing task と automation prompt で、ニュースと advisory 保存後に AGENTS_VAULT_ROOT と USER_VAULT_ROOT の全未コミット差分を最小単位で commit し、両方の main を push することが明示承認されている。実行計画と最終報告項目を示して。",
+      "expected_output": "両Vaultをcatalogから解決し、全差分を最小関心事へ分割してcommit、両commit phase成功後にmainをpushし、hash/statusを報告する。自動pull/rebase/force pushはしない。",
+      "files": [],
+      "expectations": [
+        "AGENTS_VAULT_ROOT と USER_VAULT_ROOT の2つを対象にする",
+        "両Vaultのcommit phaseが成功してからpush phaseへ進む",
+        "最小の意味ある関心事ごとにcommitを分割する",
+        "push対象を各Vaultのmainに限定しforce pushを禁止する",
+        "commit hashとpush statusをVaultごとに報告する"
+      ]
+    },
+    {
+      "id": 2,
+      "name": "manual_news_run_has_no_git_side_effects",
+      "prompt": "summarize-it-news を手動で実行して、今日のITニュースを保存して。Git操作の追加承認やstanding taskはない。",
+      "expected_output": "通常のニュース収集・保存だけを行い、commitやpushを実行・提案済み扱いにしない。",
+      "files": [],
+      "expectations": [
+        "ニュース収集と既存ルールでの保存を行う",
+        "明示承認がないためcommitしない",
+        "明示承認がないためpushしない"
+      ]
+    },
+    {
+      "id": 3,
+      "name": "preflight_failure_stops_both_publications",
+      "prompt": "承認済みの朝4時処理。Agents-Vaultはmainでcleanにcommit可能だが、USER_VAULT_ROOTはorigin/mainよりbehindしている。どう処理する？",
+      "expected_output": "両repoのcommit前preflightで停止し、自動pull/rebase等をせず、どちらもcommit/pushせずに状態と手動対応を報告する。",
+      "files": [],
+      "expectations": [
+        "USER_VAULT_ROOTのbehindをpreflight failureと判定する",
+        "自動pull、merge、rebaseを行わない",
+        "片方だけcommitまたはpushせず両方を停止する",
+        "停止理由と手動の次アクションを報告する"
+      ]
+    },
+    {
+      "id": 4,
+      "name": "clean_noop_has_no_empty_commit",
+      "prompt": "承認済みpublication phaseを開始したが、両Vaultとも変更がなく、local mainとorigin/mainも一致している。どのGit操作と報告を行う？",
+      "expected_output": "空commitや不要なpushを作らず、両Vaultをcommit_status/push_status not_requiredとして報告する。",
+      "files": [],
+      "expectations": [
+        "両Vaultのcommit_statusをnot_requiredとする",
+        "空commitを作らない",
+        "remoteが同一ならpush_statusをnot_requiredとする",
+        "両Vaultのcleanとlocal/remote HEAD一致を報告する"
+      ]
+    },
+    {
+      "id": 5,
+      "name": "second_commit_failure_stops_all_pushes",
+      "prompt": "両Vaultのpreflightは通過。Agents-Vaultの最小単位commitは成功したが、User-VaultのSecurity Commit Reviewがsecurity_insufficient_inputで停止した。次にどうする？",
+      "expected_output": "作成済みlocal commitを巻き戻さず、どちらのpushも開始せず、exact stateと手動対応を報告する。",
+      "files": [],
+      "expectations": [
+        "User-Vaultのcommit phaseを失敗として扱う",
+        "Agents-Vaultの作成済みlocal commitを巻き戻さない",
+        "Agents-VaultとUser-Vaultの両方をpushしない",
+        "local/remote HEADと停止理由を報告する"
+      ]
+    },
+    {
+      "id": 6,
+      "name": "second_push_failure_reports_partial_publication",
+      "prompt": "両Vaultのcommit phaseとclean確認は成功。1つ目のVaultのmain pushは成功したが、2つ目は認証エラーで失敗した。evidence finalizationを含めてどう扱う？",
+      "expected_output": "成功済みremoteを巻き戻さずpartial_publicationとし、可能な範囲でfinal evidenceを記録・commit/push、exact stateと手動復旧を返す。",
+      "files": [],
+      "expectations": [
+        "outcomeをpartial_publicationとする",
+        "成功済みpushを巻き戻さない",
+        "両Vaultのlocal/remote HEADとpush statusを記録する",
+        "evidence finalizationの成功または失敗を明示する",
+        "認証情報を生成・変更せず手動次アクションを示す"
+      ]
+    }
+  ]
+}
