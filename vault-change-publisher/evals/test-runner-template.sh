@@ -49,6 +49,9 @@ fi
 /usr/bin/grep -F -- '"$REVIEW_RESULT"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- '"$PUBLICATION_CONTEXT_FILE"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- '"$ARTIFACT_PLAN"' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- 'mkdir "$RUN_ROOT"' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- 'phase=collection_isolation' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- '"$EVIDENCE_FINALIZER"' "$RUNNER" >/dev/null
 for forbidden in "/""Users/" "Library/Mobile"" Documents" "Yasu""'s Vault"; do
   if /usr/bin/grep -F -- "$forbidden" "$RUNNER" >/dev/null; then
     echo "tracked runner contains a personal path" >&2
