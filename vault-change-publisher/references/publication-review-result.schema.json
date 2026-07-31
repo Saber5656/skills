@@ -1,0 +1,170 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "outcome",
+    "publication_context_sha256",
+    "agents_vault",
+    "user_vault",
+    "next_action"
+  ],
+  "properties": {
+    "outcome": {"enum": ["approved", "blocked"]},
+    "publication_context_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "agents_vault": {"$ref": "#/$defs/taskChangeManifest"},
+    "user_vault": {"$ref": "#/$defs/taskChangeManifest"},
+    "next_action": {"type": ["string", "null"]}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"outcome": {"const": "approved"}}},
+      "then": {
+        "properties": {
+          "agents_vault": {"$ref": "#/$defs/approvedManifest"},
+          "user_vault": {"$ref": "#/$defs/approvedManifest"},
+          "next_action": {"type": "null"}
+        }
+      },
+      "else": {
+        "properties": {
+          "next_action": {"type": "string", "minLength": 1}
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "artifactReview": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["role", "source_sha256", "target_path"],
+      "properties": {
+        "role": {"enum": ["user_it_news_summary", "agents_security_advisory"]},
+        "source_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "target_path": {"type": "string", "minLength": 1}
+      }
+    },
+    "commitGroup": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["message", "paths"],
+      "properties": {
+        "message": {"type": "string", "minLength": 1},
+        "paths": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1}
+        }
+      }
+    },
+    "taskChangeManifest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "repo_root",
+        "task_id",
+        "owned_paths",
+        "excluded_paths",
+        "approved_diff_snapshot_sha256",
+        "approved_dirty_entries",
+        "reviewed_artifacts",
+        "validation_evidence",
+        "review_or_validation_status",
+        "commit_required",
+        "unrelated_dirty_paths",
+        "commit_groups",
+        "evidence_finalization"
+      ],
+      "properties": {
+        "repo_root": {"type": "string", "minLength": 1},
+        "task_id": {"type": "string", "minLength": 1},
+        "owned_paths": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1}
+        },
+        "excluded_paths": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1}
+        },
+        "approved_diff_snapshot_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "approved_dirty_entries": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["path", "git_blob_oid", "mode"],
+            "properties": {
+              "path": {"type": "string", "minLength": 1},
+              "git_blob_oid": {
+                "type": ["string", "null"],
+                "pattern": "^[0-9a-f]{40,64}$"
+              },
+              "mode": {"enum": ["100644", "100755", null]}
+            }
+          }
+        },
+        "reviewed_artifacts": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/artifactReview"}
+        },
+        "validation_evidence": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "file_guard",
+            "secret_scan",
+            "secret_scan_tool",
+            "secret_scan_tool_version",
+            "reviewed_snapshot_sha256"
+          ],
+          "properties": {
+            "file_guard": {"const": "passed"},
+            "secret_scan": {"const": "passed"},
+            "secret_scan_tool": {"const": "gitleaks"},
+            "secret_scan_tool_version": {"type": "string", "minLength": 1},
+            "reviewed_snapshot_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+          }
+        },
+        "review_or_validation_status": {"enum": ["quality_ok", "blocked"]},
+        "commit_required": {"type": "boolean"},
+        "unrelated_dirty_paths": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1}
+        },
+        "commit_groups": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/commitGroup"}
+        },
+        "evidence_finalization": {
+          "oneOf": [
+            {"type": "null"},
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["target_path", "template"],
+              "properties": {
+                "target_path": {"type": "string", "minLength": 1},
+                "template": {"const": "daily_publication_v1"}
+              }
+            }
+          ]
+        }
+      }
+    },
+    "approvedManifest": {
+      "allOf": [
+        {"$ref": "#/$defs/taskChangeManifest"},
+        {
+          "properties": {
+            "review_or_validation_status": {"const": "quality_ok"},
+            "unrelated_dirty_paths": {"maxItems": 0}
+          }
+        }
+      ]
+    }
+  }
+}

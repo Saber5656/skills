@@ -1,0 +1,132 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "outcome",
+    "phase",
+    "daily_pipeline_status",
+    "summary_path",
+    "advisory_path",
+    "notification_result",
+    "agents_vault",
+    "user_vault",
+    "evidence_finalization_commit",
+    "next_action"
+  ],
+  "properties": {
+    "outcome": {"enum": ["ready_to_push", "blocked", "partial_publication"]},
+    "phase": {"const": "local_commit"},
+    "daily_pipeline_status": {"enum": ["complete", "blocked"]},
+    "summary_path": {"type": ["string", "null"]},
+    "advisory_path": {"type": ["string", "null"]},
+    "notification_result": {"type": ["string", "null"]},
+    "agents_vault": {"$ref": "#/$defs/vaultResult"},
+    "user_vault": {"$ref": "#/$defs/vaultResult"},
+    "evidence_finalization_commit": {"type": ["string", "null"]},
+    "next_action": {"type": ["string", "null"]}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"outcome": {"const": "ready_to_push"}}},
+      "then": {
+        "properties": {
+          "daily_pipeline_status": {"const": "complete"},
+          "summary_path": {"type": "string", "minLength": 1},
+          "advisory_path": {"type": "string", "minLength": 1},
+          "agents_vault": {"$ref": "#/$defs/readyVaultResult"},
+          "user_vault": {"$ref": "#/$defs/readyVaultResult"},
+          "evidence_finalization_commit": {"type": "null"},
+          "next_action": {"type": "null"}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"outcome": {"const": "blocked"}}},
+      "then": {
+        "properties": {
+          "agents_vault": {"$ref": "#/$defs/blockedVaultResult"},
+          "user_vault": {"$ref": "#/$defs/blockedVaultResult"},
+          "evidence_finalization_commit": {"type": "null"},
+          "next_action": {"type": "string", "minLength": 1}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"outcome": {"const": "partial_publication"}}},
+      "then": {
+        "properties": {
+          "next_action": {"type": "string", "minLength": 1}
+        },
+        "anyOf": [
+          {"properties": {"agents_vault": {"$ref": "#/$defs/progressedVaultResult"}}},
+          {"properties": {"user_vault": {"$ref": "#/$defs/progressedVaultResult"}}}
+        ]
+      }
+    }
+  ],
+  "$defs": {
+    "vaultResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "commit_status",
+        "commit_hashes",
+        "pre_local_head",
+        "local_head",
+        "pre_dirty_digest",
+        "post_dirty_digest",
+        "clean"
+      ],
+      "properties": {
+        "commit_status": {"enum": ["complete", "not_required", "failed", "not_started"]},
+        "commit_hashes": {"type": "array", "items": {"type": "string", "pattern": "^[0-9a-f]{40}$"}},
+        "pre_local_head": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "local_head": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "pre_dirty_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "post_dirty_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "clean": {"type": "boolean"}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"commit_status": {"const": "complete"}}},
+          "then": {"properties": {"commit_hashes": {"minItems": 1}}}
+        }
+      ]
+    },
+    "readyVaultResult": {
+      "allOf": [
+        {"$ref": "#/$defs/vaultResult"},
+        {
+          "properties": {
+            "commit_status": {"enum": ["complete", "not_required"]},
+            "post_dirty_digest": {"const": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"},
+            "clean": {"const": true}
+          }
+        }
+      ]
+    },
+    "blockedVaultResult": {
+      "allOf": [
+        {"$ref": "#/$defs/vaultResult"},
+        {
+          "properties": {
+            "commit_status": {"enum": ["failed", "not_started", "not_required"]},
+            "commit_hashes": {"maxItems": 0}
+          }
+        }
+      ]
+    },
+    "progressedVaultResult": {
+      "allOf": [
+        {"$ref": "#/$defs/vaultResult"},
+        {
+          "anyOf": [
+            {"properties": {"commit_hashes": {"minItems": 1}}},
+            {"properties": {"clean": {"const": false}}}
+          ]
+        }
+      ]
+    }
+  }
+}
