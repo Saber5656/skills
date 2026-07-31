@@ -4,7 +4,7 @@ description: ITニュースサイトを横断して最新トピックを収集�
 user-invocable: true
 category: News-Data
 created: 2026-02-11
-updated: 2026-02-15
+updated: 2026-07-31
 status: active
 purpose: ITニュースの自動収集・要約・分析
 allowed-tools: WebFetch, WebSearch, Write, Bash, Read, Glob
@@ -35,16 +35,40 @@ Step 1の全トピックを俯瞰した上で以下を実行:
 
 ### Step 3 — ファイル保存
 
-要約結果を以下のパスに保存する:
+最初に実行modeを固定する。
 
-```
-${IT_NEWS_ARCHIVE_ROOT}/YYYY/MM/DD/SUMMARY-IT-NEWS-YYYY-MM-DD.md
+| Mode | Required input | Save boundary |
+|---|---|---|
+| `scheduled_automation` | caller-supplied `COLLECTION_OUTPUT_ROOT` | 今回run専用stagingだけ。Vaultへ直接保存しない |
+| `interactive_manual` | caller-supplied `SUMMARY_OUTPUT_ROOT` | ユーザーが指定した保存root。Git commit/pushはしない |
+
+modeまたは対応するabsolute output rootがない場合は保存せず失敗を返す。`scheduled_automation`でVault rootまたはVault配下が渡された場合もfail closedとする。
+
+要約結果を選択したoutput root以下へ保存する:
+
+```text
+<selected output root>/SUMMARY-IT-NEWS-YYYY-MM-DD.md
 ```
 
-- YYYY/MM/DD は今日の日付（JST）
-- 実環境の Vault パスは `.env` や `*.local.md` などの ignored file で管理し、Git 管理しない
-- ディレクトリが存在しない場合は `mkdir -p` で作成する
+- YYYY-MM-DDは今日の日付（JST）
+- scheduled automationではVaultへ直接保存せず、今回run専用のstaging directoryを使う
+- 実環境のpathは`.env`や`*.local.*`などのignored fileで管理し、Git管理しない
 - 同名ファイルが既に存在する場合は末尾に `-2`, `-3` 等を付与して上書きしない
+- 本文を一時ファイルへ完成させてから`scripts/save-summary.sh <absolute output root> <YYYY-MM-DD> <content file> <collection_started_at>`で保存する
+- saverが非zeroまたは`summary_status: failed`を返した場合は、そのrunを失敗として扱う
+
+### Step 4 — 生成結果を返す
+
+保存後、saverのJSONを呼び出し元へ返す。保存前に推測したpathや過去の最新ファイルを返さない。
+
+```yaml
+summary_status: created
+summary_path: <absolute staged path>
+collection_started_at: <ISO 8601 JST>
+collection_completed_at: <ISO 8601 JST>
+```
+
+保存失敗時は`summary_status: failed`と理由を返し、過去要約を今回の成果物として代用しない。scheduled modeは収集・要約・staging保存だけを担当し、Vault working treeやGitを変更しない。interactive modeもGit操作を行わない。
 
 ## 対象サイトとRSSフィード
 
