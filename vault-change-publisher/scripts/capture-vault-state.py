@@ -30,6 +30,18 @@ def capture(repo: str) -> dict[str, object]:
         for marker in ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "rebase-merge", "rebase-apply")
     )
     control = hashlib.sha256()
+    git_marker = Path(repo) / ".git"
+    control.update(b"worktree-git-entry\0")
+    control.update(f"{git_marker.lstat().st_mode:o}".encode("ascii"))
+    control.update(b"\0")
+    if git_marker.is_symlink():
+        control.update(b"symlink\0")
+        control.update(os.fsencode(os.readlink(git_marker)))
+    elif git_marker.is_file():
+        control.update(b"file\0")
+        control.update(git_marker.read_bytes())
+    else:
+        control.update(b"directory\0")
     config_path = git_dir / "config"
     control.update(b"config\0")
     control.update(config_path.read_bytes())

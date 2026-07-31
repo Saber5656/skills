@@ -72,7 +72,7 @@ def validated_relative(value: str, key: str) -> PurePosixPath:
 
 
 def git_directory(repo_root: Path) -> str:
-    """Return repo/.git only for a direct, non-symlink working tree."""
+    """Return a direct or safely detached Git directory for one Vault."""
     top_level = subprocess.run(
         ["git", "-C", str(repo_root), "rev-parse", "--show-toplevel"],
         check=True,
@@ -89,13 +89,30 @@ def git_directory(repo_root: Path) -> str:
     )
     git_dir = Path(result.stdout.strip())
     expected = repo_root / ".git"
+    if expected.is_symlink():
+        raise ContextError("Vault .git entry must not be a symlink")
+    resolved_git_dir = git_dir.resolve()
+    if expected.is_dir():
+        if resolved_git_dir != expected.resolve():
+            raise ContextError("Vault Git directory resolution mismatch")
+        return str(resolved_git_dir)
+    if not expected.is_file():
+        raise ContextError("Vault .git entry is not a directory or regular file")
+    try:
+        lines = expected.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ContextError("Vault gitdir file is not valid UTF-8") from exc
+    if len(lines) != 1 or not lines[0].startswith("gitdir: "):
+        raise ContextError("Vault gitdir file is malformed")
+    declared = Path(lines[0][len("gitdir: ") :])
     if (
-        expected.is_symlink()
-        or not expected.is_dir()
-        or git_dir.resolve() != expected.resolve()
+        not declared.is_absolute()
+        or declared.is_symlink()
+        or not declared.is_dir()
+        or resolved_git_dir != declared.resolve()
     ):
-        raise ContextError("Vault Git directory must be a real repo-root/.git directory")
-    return str(git_dir.resolve())
+        raise ContextError("Vault detached Git directory is unsafe or mismatched")
+    return str(resolved_git_dir)
 
 
 def remote_url(repo_root: Path) -> str:

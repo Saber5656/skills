@@ -132,6 +132,64 @@ def load_environment(*, checkout_root, environ, require_catalog):
         self.assertEqual(context["standing_task_id"], "TSK-STANDING")
         self.assertTrue(Path(context["agents_git_dir"]).is_absolute())
 
+    def test_resolver_accepts_bound_absolute_gitdir_file(self) -> None:
+        """Support the Vault layout while binding its indirection file."""
+        marker = self.agents / ".git"
+        detached = self.root / "agents-detached.git"
+        marker.rename(detached)
+        marker.write_text(f"gitdir: {detached}\n", encoding="utf-8")
+        marker.chmod(0o644)
+        result = subprocess.run(
+            [
+                str(SCRIPTS / "resolve-runtime-context.py"),
+                str(self.config),
+                str(self.workdir),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        context = json.loads(result.stdout)
+        self.assertEqual(context["agents_git_dir"], str(detached.resolve()))
+        push_before = PUSH_MODULE.git_control_digest(str(self.agents))
+        final_before = FINALIZER_MODULE.control_digest(str(self.agents))
+        self.assertEqual(push_before, final_before)
+        marker.chmod(0o600)
+        push_after = PUSH_MODULE.git_control_digest(str(self.agents))
+        final_after = FINALIZER_MODULE.control_digest(str(self.agents))
+        self.assertEqual(push_after, final_after)
+        self.assertNotEqual(push_before, push_after)
+
+        marker.unlink()
+        marker.symlink_to(detached, target_is_directory=True)
+        rejected = subprocess.run(
+            [
+                str(SCRIPTS / "resolve-runtime-context.py"),
+                str(self.config),
+                str(self.workdir),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(rejected.returncode, 78)
+        self.assertIn("must not be a symlink", rejected.stderr)
+
+        marker.unlink()
+        for invalid_content in ("gitdir: relative.git\n", "not-a-gitdir\n"):
+            marker.write_text(invalid_content, encoding="utf-8")
+            rejected = subprocess.run(
+                [
+                    str(SCRIPTS / "resolve-runtime-context.py"),
+                    str(self.config),
+                    str(self.workdir),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(rejected.returncode, 78)
+
     def test_resolver_rejects_symlink_standing_task(self) -> None:
         """Reject a deferred evidence target that cannot be safely updated."""
         standing = self.agents / "tasks" / "standing.md"

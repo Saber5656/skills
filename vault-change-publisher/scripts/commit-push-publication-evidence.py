@@ -46,6 +46,18 @@ def control_digest(repo: str) -> str:
     """Hash local config and hooks before the network-enabled push."""
     git_dir = Path(git(repo, "rev-parse", "--absolute-git-dir").stdout.strip())
     digest = hashlib.sha256()
+    git_marker = Path(repo) / ".git"
+    digest.update(b"worktree-git-entry\0")
+    digest.update(f"{git_marker.lstat().st_mode:o}".encode("ascii"))
+    digest.update(b"\0")
+    if git_marker.is_symlink():
+        digest.update(b"symlink\0")
+        digest.update(os.fsencode(os.readlink(git_marker)))
+    elif git_marker.is_file():
+        digest.update(b"file\0")
+        digest.update(git_marker.read_bytes())
+    else:
+        digest.update(b"directory\0")
     digest.update(b"config\0")
     digest.update((git_dir / "config").read_bytes())
     hooks = git_dir / "hooks"
