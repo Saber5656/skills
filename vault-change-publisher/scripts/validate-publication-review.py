@@ -56,10 +56,20 @@ def validate_manifest(
         raise ReviewError("pre-publication Git state is not safe")
     artifact_target = relative_target(repo_root, artifact["target_path"])
     initial_paths = sorted(set(state["dirty_paths"]) | {artifact_target})
+    if any(
+        path == ".obsidian" or path.startswith(".obsidian/")
+        for path in initial_paths
+    ):
+        raise ReviewError("publication scope contains a forbidden .obsidian path")
     expected_owned = set(initial_paths)
     expected_evidence = None
     if evidence_target is not None:
         expected_evidence = relative_target(repo_root, evidence_target)
+        if (
+            expected_evidence == ".obsidian"
+            or expected_evidence.startswith(".obsidian/")
+        ):
+            raise ReviewError("evidence target is a forbidden .obsidian path")
         expected_owned.add(expected_evidence)
     if sorted(manifest["owned_paths"]) != sorted(expected_owned):
         raise ReviewError("owned paths do not cover the exact publication scope")

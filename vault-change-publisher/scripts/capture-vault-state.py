@@ -50,7 +50,21 @@ def capture(repo: str) -> dict[str, object]:
                     control.update(path.read_bytes())
                 control.update(b"\0")
     status = git(repo, "status", "--porcelain=v1", "--untracked-files=all")
-    tracked_paths = [
+    staged_paths = [
+        value
+        for value in git(
+            repo, "diff", "--cached", "--name-only", "--no-renames", "-z"
+        ).split("\0")
+        if value
+    ]
+    worktree_paths = [
+        value
+        for value in git(
+            repo, "diff", "--name-only", "--no-renames", "-z"
+        ).split("\0")
+        if value
+    ]
+    head_worktree_paths = [
         value
         for value in git(
             repo, "diff", "--name-only", "--no-renames", "-z", "HEAD"
@@ -64,7 +78,7 @@ def capture(repo: str) -> dict[str, object]:
         ).split("\0")
         if value
     ]
-    dirty_paths = sorted(set(tracked_paths + untracked_paths))
+    dirty_paths = sorted(set(staged_paths + worktree_paths + untracked_paths))
     dirty_entries = []
     repo_path = Path(repo)
     for relative in dirty_paths:
@@ -74,19 +88,34 @@ def capture(repo: str) -> dict[str, object]:
                 {"path": relative, "git_blob_oid": None, "mode": None}
             )
             continue
-        metadata = path.lstat()
-        if path.is_symlink():
-            mode = "120000"
-        elif path.is_file():
-            mode = "100755" if metadata.st_mode & 0o111 else "100644"
+        if relative in staged_paths and relative not in head_worktree_paths:
+            index_entry = git(repo, "ls-files", "--stage", "--", relative).split()
+            if len(index_entry) < 4:
+                dirty_entries.append(
+                    {"path": relative, "git_blob_oid": None, "mode": None}
+                )
+                continue
+            mode = index_entry[0]
+            blob_oid = index_entry[1]
         else:
-            mode = "unsupported"
-        blob_oid = git(repo, "hash-object", f"--path={relative}", "--", relative)
+            metadata = path.lstat()
+            if path.is_symlink():
+                mode = "120000"
+            elif path.is_file():
+                mode = "100755" if metadata.st_mode & 0o111 else "100644"
+            else:
+                mode = "unsupported"
+            blob_oid = git(repo, "hash-object", f"--path={relative}", "--", relative)
         dirty_entries.append(
             {"path": relative, "git_blob_oid": blob_oid, "mode": mode}
         )
-    snapshot = bytearray(
-        git(repo, "diff", "--binary", "--no-ext-diff", "HEAD").encode("utf-8")
+    snapshot = bytearray(b"cached\0")
+    snapshot.extend(
+        git(repo, "diff", "--cached", "--binary", "--no-ext-diff").encode("utf-8")
+    )
+    snapshot.extend(b"\0worktree\0")
+    snapshot.extend(
+        git(repo, "diff", "--binary", "--no-ext-diff").encode("utf-8")
     )
     for relative in untracked_paths:
         object_id = git(repo, "hash-object", "--no-filters", "--", relative)

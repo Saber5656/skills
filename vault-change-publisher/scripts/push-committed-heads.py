@@ -456,6 +456,11 @@ def main(argv: list[str]) -> int:
         )
         if committed.get("evidence_finalization_commit") is not None:
             raise PushError("evidence must be finalized after the first fixed pushes")
+        if (
+            committed.get("summary_path") != plan["summary_target"]
+            or committed.get("advisory_path") != plan["advisory_target"]
+        ):
+            raise PushError("reported artifact paths differ from the approved plan")
         scan_commits(
             runtime["gitleaks_bin"],
             runtime["agents_vault_root"],

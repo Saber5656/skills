@@ -70,6 +70,20 @@ def diff_digest(repo: str, relative: str) -> str:
     return hashlib.sha256(result.stdout.encode("utf-8")).hexdigest()
 
 
+def cached_diff_digest(repo: str, relative: str) -> str:
+    """Hash the exact staged binary evidence diff."""
+    result = git(
+        repo,
+        "diff",
+        "--cached",
+        "--binary",
+        "--no-ext-diff",
+        "--",
+        relative,
+    )
+    return hashlib.sha256(result.stdout.encode("utf-8")).hexdigest()
+
+
 def dirty_status(repo: str) -> tuple[bool, str]:
     """Return clean state and the contract's porcelain digest."""
     status = git(repo, "status", "--porcelain=v1", "--untracked-files=all").stdout
@@ -208,6 +222,8 @@ def main(argv: list[str]) -> int:
         ]:
             raise FinalizationError("evidence worktree diff differs from review")
         git(repo, "add", "--", target)
+        if cached_diff_digest(repo, target) != plan["evidence_diff_sha256"]:
+            raise FinalizationError("staged evidence differs from reviewed diff")
         if git(repo, "diff", "--cached", "--check", check=False).returncode != 0:
             raise FinalizationError("staged evidence failed diff check")
         scan_staged(runtime["gitleaks_bin"], repo)

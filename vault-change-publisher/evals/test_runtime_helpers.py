@@ -21,6 +21,19 @@ PUSH_SPEC = importlib.util.spec_from_file_location(
 assert PUSH_SPEC and PUSH_SPEC.loader
 PUSH_MODULE = importlib.util.module_from_spec(PUSH_SPEC)
 PUSH_SPEC.loader.exec_module(PUSH_MODULE)
+REVIEW_SPEC = importlib.util.spec_from_file_location(
+    "validate_publication_review", SCRIPTS / "validate-publication-review.py"
+)
+assert REVIEW_SPEC and REVIEW_SPEC.loader
+REVIEW_MODULE = importlib.util.module_from_spec(REVIEW_SPEC)
+REVIEW_SPEC.loader.exec_module(REVIEW_MODULE)
+FINALIZER_SPEC = importlib.util.spec_from_file_location(
+    "commit_push_publication_evidence",
+    SCRIPTS / "commit-push-publication-evidence.py",
+)
+assert FINALIZER_SPEC and FINALIZER_SPEC.loader
+FINALIZER_MODULE = importlib.util.module_from_spec(FINALIZER_SPEC)
+FINALIZER_SPEC.loader.exec_module(FINALIZER_MODULE)
 
 
 class RuntimeHelperTests(unittest.TestCase):
@@ -116,6 +129,85 @@ def load_environment(*, checkout_root, environ, require_catalog):
         self.assertEqual(context["agents_vault_root"], str(self.agents.resolve()))
         self.assertEqual(context["standing_task_id"], "TSK-STANDING")
         self.assertTrue(Path(context["agents_git_dir"]).is_absolute())
+
+    def test_resolver_rejects_symlink_standing_task(self) -> None:
+        """Reject a deferred evidence target that cannot be safely updated."""
+        standing = self.agents / "tasks" / "standing.md"
+        standing.unlink()
+        standing.symlink_to("auth.md")
+        result = subprocess.run(
+            [
+                str(SCRIPTS / "resolve-runtime-context.py"),
+                str(self.config),
+                str(self.workdir),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 78)
+        self.assertIn("standing task", result.stderr)
+
+    def test_capture_includes_staged_only_path_and_index_blob(self) -> None:
+        """Bind an index-only change even when the worktree matches HEAD."""
+        for repo in (self.agents, self.user):
+            subprocess.run(
+                ["git", "-C", str(repo), "config", "user.name", "Fixture"],
+                check=True,
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repo),
+                    "config",
+                    "user.email",
+                    "fixture@example.invalid",
+                ],
+                check=True,
+            )
+            (repo / "tracked.md").write_text("head\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(repo), "add", "--all"], check=True)
+            subprocess.run(
+                ["git", "-C", str(repo), "commit", "-q", "-m", "initial"],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(repo), "branch", "-M", "main"], check=True
+            )
+            subprocess.run(
+                ["git", "-C", str(repo), "push", "-q", "-u", "origin", "main"],
+                check=True,
+            )
+        tracked = self.agents / "tracked.md"
+        tracked.write_text("staged\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "-C", str(self.agents), "add", "tracked.md"], check=True
+        )
+        tracked.write_text("head\n", encoding="utf-8")
+        context = self.workdir / "capture-context.json"
+        context.write_text(
+            json.dumps(
+                {
+                    "agents_vault_root": str(self.agents),
+                    "user_vault_root": str(self.user),
+                }
+            ),
+            encoding="utf-8",
+        )
+        result = subprocess.run(
+            [str(SCRIPTS / "capture-vault-state.py"), str(context)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        state = json.loads(result.stdout)["agents_vault"]
+        expected_oid = subprocess.check_output(
+            ["git", "-C", str(self.agents), "rev-parse", ":tracked.md"],
+            text=True,
+        ).strip()
+        self.assertEqual(state["dirty_paths"], ["tracked.md"])
+        self.assertEqual(state["dirty_entries"][0]["git_blob_oid"], expected_oid)
 
     def test_collection_validator_checks_hash_and_staging(self) -> None:
         """Accept verified staged files and reject a hash mismatch."""
@@ -279,8 +371,8 @@ def load_environment(*, checkout_root, environ, require_catalog):
             "outcome": "ready_to_push",
             "phase": "local_commit",
             "daily_pipeline_status": "complete",
-            "summary_path": "summary",
-            "advisory_path": "advisory",
+            "summary_path": str(self.user / "published.md"),
+            "advisory_path": str(self.agents / "published.md"),
             "notification_result": "none",
             "agents_vault": commits["agents_vault"],
             "user_vault": commits["user_vault"],
@@ -331,7 +423,15 @@ def load_environment(*, checkout_root, environ, require_catalog):
             "user_vault": manifest(self.user),
             "next_action": None,
         }
-        plan_path.write_text("{}", encoding="utf-8")
+        plan_path.write_text(
+            json.dumps(
+                {
+                    "summary_target": str(self.user / "published.md"),
+                    "advisory_target": str(self.agents / "published.md"),
+                }
+            ),
+            encoding="utf-8",
+        )
         commit_path.write_text(json.dumps(commit_result), encoding="utf-8")
         command = [
             str(SCRIPTS / "push-committed-heads.py"),
@@ -357,7 +457,20 @@ def load_environment(*, checkout_root, environ, require_catalog):
             ).split()[0]
             self.assertEqual(remote, pre[key]["remote_head"])
 
+        wrong_paths = json.loads(json.dumps(commit_result))
+        wrong_paths["summary_path"] = str(self.user / "wrong.md")
+        commit_path.write_text(json.dumps(wrong_paths), encoding="utf-8")
         review_path.write_text(json.dumps(review_payload), encoding="utf-8")
+        rejected = subprocess.run(command, check=False)
+        self.assertEqual(rejected.returncode, 75)
+        for key, repo in (("agents_vault", self.agents), ("user_vault", self.user)):
+            remote = subprocess.check_output(
+                ["git", "-C", str(repo), "ls-remote", "origin", "refs/heads/main"],
+                text=True,
+            ).split()[0]
+            self.assertEqual(remote, pre[key]["remote_head"])
+
+        commit_path.write_text(json.dumps(commit_result), encoding="utf-8")
         result = subprocess.run(command, check=False)
         self.assertEqual(result.returncode, 0)
         final = json.loads(final_path.read_text(encoding="utf-8"))
@@ -365,6 +478,81 @@ def load_environment(*, checkout_root, environ, require_catalog):
         self.assertEqual(
             final["agents_vault"]["local_head"],
             final["agents_vault"]["remote_head"],
+        )
+
+    def test_review_rejects_forbidden_obsidian_scope(self) -> None:
+        """Reject forbidden Vault metadata before any write-capable phase."""
+        state = {
+            "repo_root": str(self.agents),
+            "branch": "main",
+            "upstream": "origin/main",
+            "local_head": "a" * 40,
+            "remote_head": "a" * 40,
+            "operation_in_progress": False,
+            "dirty_paths": [".obsidian/workspace.json"],
+            "dirty_entries": [
+                {
+                    "path": ".obsidian/workspace.json",
+                    "git_blob_oid": "b" * 40,
+                    "mode": "100644",
+                }
+            ],
+            "diff_snapshot_sha256": "c" * 64,
+        }
+        with self.assertRaises(REVIEW_MODULE.ReviewError):
+            REVIEW_MODULE.validate_manifest(
+                {"repo_root": str(self.agents), "task_id": "TSK-AUTH"},
+                state,
+                str(self.agents),
+                "TSK-AUTH",
+                {
+                    "role": "agents_security_advisory",
+                    "source_sha256": "d" * 64,
+                    "target_path": str(self.agents / "advisory.md"),
+                },
+                str(self.agents / "tasks" / "standing.md"),
+                "fixture-gitleaks 1.0",
+            )
+
+    def test_staged_evidence_digest_rebinds_reviewed_bytes(self) -> None:
+        """Detect a race that substitutes evidence bytes during staging."""
+        repo = self.agents
+        subprocess.run(
+            ["git", "-C", str(repo), "config", "user.name", "Fixture"], check=True
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo),
+                "config",
+                "user.email",
+                "fixture@example.invalid",
+            ],
+            check=True,
+        )
+        target = repo / "evidence.md"
+        target.write_text("before\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "evidence.md"], check=True)
+        subprocess.run(
+            ["git", "-C", str(repo), "commit", "-q", "-m", "initial"], check=True
+        )
+        target.write_text("reviewed\n", encoding="utf-8")
+        reviewed = FINALIZER_MODULE.diff_digest(str(repo), "evidence.md")
+        subprocess.run(["git", "-C", str(repo), "add", "evidence.md"], check=True)
+        self.assertEqual(
+            FINALIZER_MODULE.cached_diff_digest(str(repo), "evidence.md"),
+            reviewed,
+        )
+        subprocess.run(
+            ["git", "-C", str(repo), "reset", "-q", "HEAD", "--", "evidence.md"],
+            check=True,
+        )
+        target.write_text("substituted\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "evidence.md"], check=True)
+        self.assertNotEqual(
+            FINALIZER_MODULE.cached_diff_digest(str(repo), "evidence.md"),
+            reviewed,
         )
 
     def test_scope_validator_rejects_group_split_and_symlink_artifact(self) -> None:

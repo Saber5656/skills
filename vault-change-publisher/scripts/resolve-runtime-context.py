@@ -165,6 +165,13 @@ def resolve_context(local_config: Path, workdir: Path) -> dict[str, str]:
     authorization_path = agents_root.joinpath(*authorization_relative.parts)
     if authorization_path.is_symlink() or not authorization_path.is_file():
         raise ContextError("authorization task is not a regular file")
+    standing_path = agents_root.joinpath(*standing_relative.parts)
+    if (
+        standing_path.is_symlink()
+        or not standing_path.is_file()
+        or not os.access(standing_path, os.R_OK | os.W_OK)
+    ):
+        raise ContextError("standing task is not a readable and writable regular file")
     authorization_digest = hashlib.sha256(authorization_path.read_bytes()).hexdigest()
     if authorization_digest != values["AUTHORIZATION_TASK_SHA256"]:
         raise ContextError("authorization task digest does not match pinned evidence")
@@ -196,9 +203,7 @@ def resolve_context(local_config: Path, workdir: Path) -> dict[str, str]:
         ),
         "advisory_archive_relative": str(advisory_relative),
         "standing_task_id": values["STANDING_TASK_ID"],
-        "standing_task_path": str(
-            agents_root.joinpath(*standing_relative.parts)
-        ),
+        "standing_task_path": str(standing_path),
         "authorization_task_id": values["AUTHORIZATION_TASK_ID"],
         "authorization_task_path": str(
             authorization_path
