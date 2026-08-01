@@ -55,6 +55,39 @@ fi
 /usr/bin/grep -F -- 'git_diff_digest.py' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- 'fail_run 75 artifact_plan' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- 'COLLECTION_OUTPUT_ROOT="$STAGING_ROOT"' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- 'local exit_code="$1"' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- 'FIXED_FETCHER="$WORKDIR/fetch-vault-main.py"' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- '"$FIXED_FETCHER" "$RUNTIME_CONTEXT_FILE"' "$RUNNER" >/dev/null
+if /usr/bin/grep -F -- 'fetch origin main' "$RUNNER" >/dev/null; then
+  echo "runner must not trust a mutable remote name or ambiguous refspec" >&2
+  exit 1
+fi
+if /usr/bin/grep -F -- 'local status="$1"' "$RUNNER" >/dev/null; then
+  echo "fail_run must not shadow zsh's read-only status parameter" >&2
+  exit 1
+fi
+FAIL_RUN_FUNCTION="$(sed -n '/^fail_run() {/,/^}/p' "$RUNNER")"
+FAIL_RUN_ROOT="$(mktemp -d)"
+if /bin/zsh -c '
+  set -u
+  RUN_ID=fixture-run
+  STARTED_AT=2026-08-01T04:00:00+09:00
+  STATUS_FILE="$1"
+  eval "$2"
+  fail_run 75 preflight fixture-reason
+' -- "$FAIL_RUN_ROOT/status.txt" "$FAIL_RUN_FUNCTION"; then
+  echo "fail_run unexpectedly returned success" >&2
+  exit 1
+else
+  FAIL_RUN_STATUS=$?
+fi
+if [[ "$FAIL_RUN_STATUS" -ne 75 ]] \
+  || ! /usr/bin/grep -Fx -- 'status=75' "$FAIL_RUN_ROOT/status.txt" >/dev/null \
+  || ! /usr/bin/grep -Fx -- 'phase=preflight' "$FAIL_RUN_ROOT/status.txt" >/dev/null; then
+  echo "fail_run did not preserve the structured status contract" >&2
+  exit 1
+fi
+rm -rf "$FAIL_RUN_ROOT"
 for forbidden in "/""Users/" "Library/Mobile"" Documents" "Yasu""'s Vault"; do
   if /usr/bin/grep -F -- "$forbidden" "$RUNNER" >/dev/null; then
     echo "tracked runner contains a personal path" >&2
@@ -62,4 +95,4 @@ for forbidden in "/""Users/" "Library/Mobile"" Documents" "Yasu""'s Vault"; do
   fi
 done
 
-echo "runner isolation contract: 23/23 passed"
+echo "runner isolation contract: 29/29 passed"

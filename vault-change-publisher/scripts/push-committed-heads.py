@@ -15,7 +15,12 @@ class PushError(RuntimeError):
     """Represent invalid local publication state or a rejected push."""
 
 
-def git(repo: str, *arguments: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+def git(
+    repo: str,
+    *arguments: str,
+    check: bool = True,
+    git_dir: str | None = None,
+) -> subprocess.CompletedProcess[str]:
     """Run Git without a shell and capture sanitized text output."""
     environment = {
         key: value
@@ -24,8 +29,13 @@ def git(repo: str, *arguments: str, check: bool = True) -> subprocess.CompletedP
     }
     environment["GIT_CONFIG_NOSYSTEM"] = "1"
     environment["GIT_CONFIG_GLOBAL"] = os.devnull
+    repository_arguments = (
+        [f"--git-dir={git_dir}", f"--work-tree={repo}"]
+        if git_dir is not None
+        else ["-C", repo]
+    )
     return subprocess.run(
-        ["git", "-C", repo, "-c", f"core.hooksPath={os.devnull}", *arguments],
+        ["git", *repository_arguments, "-c", f"core.hooksPath={os.devnull}", *arguments],
         check=check,
         capture_output=True,
         text=True,
@@ -314,10 +324,15 @@ def validate_local(
     return local_head
 
 
-def remote_head(repo: str, remote_url: str) -> str:
+def remote_head(repo: str, remote_url: str, git_dir: str | None = None) -> str:
     """Read the remote main object ID without trusting a stale local ref."""
     output = git(
-        repo, "ls-remote", "--exit-code", remote_url, "refs/heads/main"
+        repo,
+        "ls-remote",
+        "--exit-code",
+        remote_url,
+        "refs/heads/main",
+        git_dir=git_dir,
     ).stdout
     fields = output.split()
     if len(fields) != 2:
@@ -326,7 +341,12 @@ def remote_head(repo: str, remote_url: str) -> str:
 
 
 def push_one(
-    repo: str, remote_url: str, local_head: str, required: bool, before: str
+    repo: str,
+    remote_url: str,
+    local_head: str,
+    required: bool,
+    before: str,
+    git_dir: str | None = None,
 ) -> tuple[str, str]:
     """Push exactly one validated object ID to refs/heads/main."""
     if before == local_head:
@@ -339,11 +359,12 @@ def push_one(
         remote_url,
         f"{local_head}:refs/heads/main",
         check=False,
+        git_dir=git_dir,
     )
     if result.returncode != 0:
         return ("failed", before)
     try:
-        after = remote_head(repo, remote_url)
+        after = remote_head(repo, remote_url, git_dir)
     except (PushError, subprocess.SubprocessError):
         return ("failed", before)
     if after != local_head:
@@ -414,10 +435,14 @@ def main(argv: list[str]) -> int:
             if requested_outcome == "partial_publication":
                 outcome = "partial_publication"
             agents_remote = remote_head(
-                runtime["agents_vault_root"], runtime["agents_remote_url"]
+                runtime["agents_vault_root"],
+                runtime["agents_remote_url"],
+                runtime["agents_git_dir"],
             )
             user_remote = remote_head(
-                runtime["user_vault_root"], runtime["user_remote_url"]
+                runtime["user_vault_root"],
+                runtime["user_remote_url"],
+                runtime["user_git_dir"],
             )
             result = {
                 "outcome": outcome,
@@ -490,10 +515,14 @@ def main(argv: list[str]) -> int:
         if committed.get("daily_pipeline_status") != "complete":
             raise PushError("ready publication does not mark the pipeline complete")
         agents_before = remote_head(
-            runtime["agents_vault_root"], runtime["agents_remote_url"]
+            runtime["agents_vault_root"],
+            runtime["agents_remote_url"],
+            runtime["agents_git_dir"],
         )
         user_before = remote_head(
-            runtime["user_vault_root"], runtime["user_remote_url"]
+            runtime["user_vault_root"],
+            runtime["user_remote_url"],
+            runtime["user_git_dir"],
         )
         agents_push, agents_remote = push_one(
             runtime["agents_vault_root"],
@@ -501,6 +530,7 @@ def main(argv: list[str]) -> int:
             agents_head,
             committed["agents_vault"]["commit_status"] == "complete",
             agents_before,
+            runtime["agents_git_dir"],
         )
         user_push, user_remote = push_one(
             runtime["user_vault_root"],
@@ -508,6 +538,7 @@ def main(argv: list[str]) -> int:
             user_head,
             committed["user_vault"]["commit_status"] == "complete",
             user_before,
+            runtime["user_git_dir"],
         )
         success = (
             agents_push in {"complete", "not_required"}
@@ -558,10 +589,12 @@ def main(argv: list[str]) -> int:
                 agents_remote = remote_head(
                     str(runtime["agents_vault_root"]),
                     str(runtime["agents_remote_url"]),
+                    str(runtime["agents_git_dir"]),
                 )
                 user_remote = remote_head(
                     str(runtime["user_vault_root"]),
                     str(runtime["user_remote_url"]),
+                    str(runtime["user_git_dir"]),
                 )
                 progressed = any(
                     actual["local_head"] != before["local_head"]
