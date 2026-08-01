@@ -40,9 +40,13 @@ launchd 04:00
 | `scripts/prepare-publication-evidence.py` | same workdir |
 | `scripts/commit-push-publication-evidence.py` | same workdir |
 | `scripts/git_diff_digest.py` | same workdir |
+| `scripts/prepare-codex-output-schema.py` | same workdir |
+| `scripts/validate-canonical-result.py` | same workdir |
 | `scripts/interpret-automation-result.sh` | same workdir |
 
 Tracked sourceがmainへmergeされた後に配備し、各source/destinationのSHA-256一致を確認する。task worktreeをproduction runtime pathとして参照しない。
+
+正本のresult schemaはstate-dependent constraintを保持する。runnerは各run配下へCodex Structured Outputs対応subsetを生成してAPIへ渡し、生成結果は各phaseのdeterministic validatorで正本契約に照合する。互換schemaだけをpublication可否の判定に使わない。
 
 ## Local Configuration
 

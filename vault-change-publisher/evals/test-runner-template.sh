@@ -58,6 +58,10 @@ fi
 /usr/bin/grep -F -- 'local exit_code="$1"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- 'FIXED_FETCHER="$WORKDIR/fetch-vault-main.py"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- '"$FIXED_FETCHER" "$RUNTIME_CONTEXT_FILE"' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- 'SCHEMA_PROJECTOR="$WORKDIR/prepare-codex-output-schema.py"' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- 'CANONICAL_VALIDATOR="$WORKDIR/validate-canonical-result.py"' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- '--output-schema "$CODEX_COLLECTION_SCHEMA"' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- 'INTERPRETER_PROCESS_STATUS=75' "$RUNNER" >/dev/null
 if /usr/bin/grep -F -- 'fetch origin main' "$RUNNER" >/dev/null; then
   echo "runner must not trust a mutable remote name or ambiguous refspec" >&2
   exit 1
