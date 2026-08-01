@@ -18,6 +18,32 @@ class EvidenceError(RuntimeError):
     """Represent an unsafe or incomplete evidence preparation."""
 
 
+def read_regular_nofollow(path: Path) -> bytes:
+    """Read stable bytes from one regular file without following its final link."""
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags)
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise EvidenceError("input is not a regular file")
+        content = b""
+        while chunk := os.read(descriptor, 1024 * 1024):
+            content += chunk
+        after = os.fstat(descriptor)
+        if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+        ):
+            raise EvidenceError("input changed while being read")
+        return content
+    finally:
+        os.close(descriptor)
+
+
 def relative_path(root: str, absolute: str) -> str:
     """Convert an installed artifact path to a normalized repo-relative path."""
     try:
@@ -67,17 +93,20 @@ def append_no_follow(root: Path, relative: PurePosixPath, content: bytes) -> Non
 
 def main(argv: list[str]) -> int:
     """Prepare one deterministic evidence hunk and emit its review plan."""
-    if len(argv) != 8:
+    if len(argv) != 9:
         print(
             "usage: prepare-publication-evidence.py RUNTIME CONTEXT REVIEW "
-            "INITIAL_RESULT RUN_ID STARTED_AT PLAN_OUTPUT",
+            "INITIAL_RESULT RUN_ID STARTED_AT REVIEW_SHA256 PLAN_OUTPUT",
             file=sys.stderr,
         )
         return 64
     try:
         runtime = json.loads(Path(argv[1]).read_text(encoding="utf-8"))
         context_path = Path(argv[2])
-        review = json.loads(Path(argv[3]).read_text(encoding="utf-8"))
+        review_bytes = read_regular_nofollow(Path(argv[3]))
+        if hashlib.sha256(review_bytes).hexdigest() != argv[7]:
+            raise EvidenceError("approved review digest mismatch")
+        review = json.loads(review_bytes.decode("utf-8"))
         initial = json.loads(Path(argv[4]).read_text(encoding="utf-8"))
         if not all(
             initial[key]["push_status"] in {"complete", "not_required"}
@@ -132,7 +161,7 @@ def main(argv: list[str]) -> int:
             ),
             "marker": marker,
         }
-        Path(argv[7]).write_text(
+        Path(argv[8]).write_text(
             json.dumps(plan, ensure_ascii=False), encoding="utf-8"
         )
     except (

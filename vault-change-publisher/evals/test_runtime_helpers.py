@@ -61,6 +61,12 @@ DIRTY_STAGER_SPEC = importlib.util.spec_from_file_location(
 assert DIRTY_STAGER_SPEC and DIRTY_STAGER_SPEC.loader
 DIRTY_STAGER_MODULE = importlib.util.module_from_spec(DIRTY_STAGER_SPEC)
 DIRTY_STAGER_SPEC.loader.exec_module(DIRTY_STAGER_MODULE)
+COMMITTER_SPEC = importlib.util.spec_from_file_location(
+    "commit_reviewed_publication", SCRIPTS / "commit-reviewed-publication.py"
+)
+assert COMMITTER_SPEC and COMMITTER_SPEC.loader
+COMMITTER_MODULE = importlib.util.module_from_spec(COMMITTER_SPEC)
+COMMITTER_SPEC.loader.exec_module(COMMITTER_MODULE)
 
 
 class RuntimeHelperTests(unittest.TestCase):
@@ -443,6 +449,242 @@ def load_environment(*, checkout_root, environ, require_catalog):
                 ],
             )
             self.assertNotIn("-C", command)
+
+    def test_local_committer_uses_explicit_git_paths_and_no_network_overrides(self) -> None:
+        """Keep local mutation independent of a Vault process cwd or ambient Git config."""
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="main\n", stderr=""
+        )
+        with mock.patch.dict(
+            os.environ,
+            {"GIT_DIR": "/attacker/git", "GIT_ASKPASS": "/attacker/askpass"},
+        ), mock.patch.object(COMMITTER_MODULE.subprocess, "run", return_value=completed) as run:
+            COMMITTER_MODULE.git(
+                "/vault/worktree", "/vault/gitdir", "branch", "--show-current"
+            )
+        command = run.call_args.args[0]
+        environment = run.call_args.kwargs["env"]
+        self.assertEqual(
+            command[:3],
+            ["git", "--git-dir=/vault/gitdir", "--work-tree=/vault/worktree"],
+        )
+        self.assertEqual(run.call_args.kwargs["cwd"], "/")
+        self.assertNotIn("GIT_DIR", environment)
+        self.assertNotIn("GIT_ASKPASS", environment)
+        self.assertEqual(environment["GIT_NO_LAZY_FETCH"], "1")
+        self.assertEqual(environment["GIT_NO_REPLACE_OBJECTS"], "1")
+        self.assertEqual(environment["GIT_OPTIONAL_LOCKS"], "0")
+
+    def test_local_committer_rejects_unsafe_paths(self) -> None:
+        """Reject absolute, traversal, and Obsidian-control paths."""
+        for path in (
+            "/absolute.md",
+            "../escape.md",
+            "a/../escape.md",
+            ".obsidian/config",
+        ):
+            with self.assertRaises(COMMITTER_MODULE.CommitError):
+                COMMITTER_MODULE.safe_path(path)
+        self.assertEqual(
+            COMMITTER_MODULE.safe_path("reports/advisory.md"),
+            "reports/advisory.md",
+        )
+
+    def test_local_committer_scans_binary_blobs_and_allows_deletion(self) -> None:
+        """Reject a home path in raw bytes without treating deletion as a blob."""
+        repo = self.agents
+        git_dir = str(repo / ".git")
+        (repo / "delete.md").write_text("delete me\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "delete.md"], check=True)
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo),
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "-q",
+                "-m",
+                "base",
+            ],
+            check=True,
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            binary_index = str(Path(temporary) / "binary.index")
+            COMMITTER_MODULE.git(
+                str(repo), git_dir, "read-tree", "HEAD", index_file=binary_index
+            )
+            binary_oid = COMMITTER_MODULE.write_blob(
+                str(repo), git_dir, b"\x00" + os.fsencode(str(Path.home()))
+            )
+            COMMITTER_MODULE.update_index_entry(
+                str(repo),
+                git_dir,
+                "binary.dat",
+                ("100644", binary_oid),
+                index_file=binary_index,
+            )
+            with self.assertRaises(COMMITTER_MODULE.CommitError):
+                COMMITTER_MODULE.scan_staged(
+                    str(self.fake_gitleaks),
+                    str(repo),
+                    git_dir,
+                    ["binary.dat"],
+                    binary_index,
+                )
+
+            deletion_index = str(Path(temporary) / "deletion.index")
+            COMMITTER_MODULE.git(
+                str(repo), git_dir, "read-tree", "HEAD", index_file=deletion_index
+            )
+            COMMITTER_MODULE.update_index_entry(
+                str(repo),
+                git_dir,
+                "delete.md",
+                None,
+                index_file=deletion_index,
+            )
+            COMMITTER_MODULE.scan_staged(
+                str(self.fake_gitleaks),
+                str(repo),
+                git_dir,
+                ["delete.md"],
+                deletion_index,
+            )
+
+    def test_local_committer_malformed_input_emits_blocked_result(self) -> None:
+        """Convert malformed early input into status 75 and structured JSON."""
+        invalid = self.workdir / "invalid-committer-runtime.json"
+        invalid.write_bytes(b"\xff")
+        placeholder = self.workdir / "committer-placeholder.json"
+        placeholder.write_text("{}", encoding="utf-8")
+        output = self.workdir / "committer-result.json"
+        result = subprocess.run(
+            [
+                str(SCRIPTS / "commit-reviewed-publication.py"),
+                str(invalid),
+                str(placeholder),
+                str(placeholder),
+                str(placeholder),
+                str(placeholder),
+                str(placeholder),
+                "/missing-installer",
+                "/missing-capture",
+                "review-digest",
+                str(output),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 75)
+        self.assertEqual(json.loads(output.read_text())["outcome"], "blocked")
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_local_committer_rejects_staged_only_before_head_changes(self) -> None:
+        """Fail before commit when reviewed index bytes differ from the worktree."""
+        repo = self.agents
+        subprocess.run(
+            ["git", "-C", str(repo), "config", "user.name", "Fixture"], check=True
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo),
+                "config",
+                "user.email",
+                "fixture@example.invalid",
+            ],
+            check=True,
+        )
+        staged = repo / "staged.md"
+        staged.write_text("base\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "staged.md"], check=True)
+        subprocess.run(
+            ["git", "-C", str(repo), "commit", "-q", "-m", "base"], check=True
+        )
+        before = subprocess.check_output(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True
+        ).strip()
+        staged.write_text("reviewed staged bytes\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "staged.md"], check=True)
+        reviewed_oid = subprocess.check_output(
+            ["git", "-C", str(repo), "rev-parse", ":staged.md"], text=True
+        ).strip()
+        staged.write_text("base\n", encoding="utf-8")
+        artifact = repo / "artifact.md"
+        artifact.write_text("artifact\n", encoding="utf-8")
+        manifest = {
+            "approved_dirty_entries": [
+                {
+                    "path": "staged.md",
+                    "git_blob_oid": reviewed_oid,
+                    "mode": "100644",
+                }
+            ],
+            "commit_groups": [
+                {
+                    "message": "approved staged",
+                    "paths": ["staged.md", "artifact.md"],
+                }
+            ],
+        }
+        with self.assertRaises(COMMITTER_MODULE.CommitError):
+            COMMITTER_MODULE.validate_final_worktree(
+                str(repo),
+                str(repo / ".git"),
+                manifest,
+                "artifact.md",
+                hashlib.sha256(b"artifact\n").hexdigest(),
+                self.workdir,
+            )
+        after = subprocess.check_output(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True
+        ).strip()
+        self.assertEqual(after, before)
+
+        deleted = repo / "deleted.md"
+        deleted.write_text("tracked\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "deleted.md"], check=True)
+        subprocess.run(
+            ["git", "-C", str(repo), "commit", "-q", "-m", "tracked deletion"],
+            check=True,
+        )
+        deletion_head = subprocess.check_output(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True
+        ).strip()
+        subprocess.run(["git", "-C", str(repo), "rm", "-q", "deleted.md"], check=True)
+        deleted.write_text("tracked\n", encoding="utf-8")
+        deletion_manifest = {
+            "approved_dirty_entries": [
+                {"path": "deleted.md", "git_blob_oid": None, "mode": None}
+            ],
+            "commit_groups": [
+                {
+                    "message": "approved deletion",
+                    "paths": ["deleted.md", "artifact.md"],
+                }
+            ],
+        }
+        with self.assertRaises(COMMITTER_MODULE.CommitError):
+            COMMITTER_MODULE.validate_final_worktree(
+                str(repo),
+                str(repo / ".git"),
+                deletion_manifest,
+                "artifact.md",
+                hashlib.sha256(b"artifact\n").hexdigest(),
+                self.workdir,
+            )
+        self.assertEqual(
+            subprocess.check_output(
+                ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True
+            ).strip(),
+            deletion_head,
+        )
 
     def test_fixed_fetch_pins_remote_refspec_and_environment(self) -> None:
         """Reject mutable remote/config behavior in the preflight transport."""
@@ -865,6 +1107,7 @@ def load_environment(*, checkout_root, environ, require_catalog):
                 str(placeholder),
                 "run-id",
                 "2026-07-31T04:00:00+09:00",
+                hashlib.sha256(placeholder.read_bytes()).hexdigest(),
                 str(output),
             ],
             check=False,
@@ -873,6 +1116,30 @@ def load_environment(*, checkout_root, environ, require_catalog):
         )
         self.assertEqual(result.returncode, 75)
         self.assertIn("evidence preparation failed", result.stderr)
+
+    def test_evidence_preparer_rejects_changed_review_bytes(self) -> None:
+        """Bind evidence generation to the exact review already used for push."""
+        placeholder = self.workdir / "evidence-placeholder.json"
+        placeholder.write_text("{}", encoding="utf-8")
+        output = self.workdir / "changed-review-plan.json"
+        result = subprocess.run(
+            [
+                str(SCRIPTS / "prepare-publication-evidence.py"),
+                str(placeholder),
+                str(placeholder),
+                str(placeholder),
+                str(placeholder),
+                "run-id",
+                "2026-07-31T04:00:00+09:00",
+                hashlib.sha256(b"different review").hexdigest(),
+                str(output),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 75)
+        self.assertIn("approved review digest mismatch", result.stderr)
 
     def test_fixed_pusher_validates_and_pushes_exact_heads(self) -> None:
         """Push both validated local main heads outside the Codex process."""
@@ -1023,11 +1290,13 @@ def load_environment(*, checkout_root, environ, require_catalog):
             str(context_path),
             str(review_path),
             str(plan_path),
+            "review-digest-placeholder",
         ]
         rejected_review = json.loads(json.dumps(review_payload))
         for key in ("agents_vault", "user_vault"):
             rejected_review[key]["commit_groups"][0]["paths"] = ["approved.md"]
         review_path.write_text(json.dumps(rejected_review), encoding="utf-8")
+        command[-1] = hashlib.sha256(review_path.read_bytes()).hexdigest()
         rejected = subprocess.run(command, check=False)
         self.assertEqual(rejected.returncode, 75)
         for key, repo in (("agents_vault", self.agents), ("user_vault", self.user)):
@@ -1041,6 +1310,7 @@ def load_environment(*, checkout_root, environ, require_catalog):
         wrong_paths["summary_path"] = str(self.user / "wrong.md")
         commit_path.write_text(json.dumps(wrong_paths), encoding="utf-8")
         review_path.write_text(json.dumps(review_payload), encoding="utf-8")
+        command[-1] = hashlib.sha256(review_path.read_bytes()).hexdigest()
         rejected = subprocess.run(command, check=False)
         self.assertEqual(rejected.returncode, 75)
         for key, repo in (("agents_vault", self.agents), ("user_vault", self.user)):
@@ -1306,6 +1576,7 @@ def load_environment(*, checkout_root, environ, require_catalog):
             SCRIPTS / "capture-vault-state.py",
             SCRIPTS / "validate-collection-result.py",
             SCRIPTS / "install-verified-artifacts.py",
+            SCRIPTS / "commit-reviewed-publication.py",
             SCRIPTS / "validate-publication-review.py",
             SCRIPTS / "push-committed-heads.py",
             SCRIPTS / "prepare-publication-evidence.py",
@@ -1520,7 +1791,7 @@ output.write_text(json.dumps(result))
         self.assertEqual(len(invocation_logs), 1)
         self.assertEqual(
             invocation_logs[0].read_text(encoding="utf-8").splitlines(),
-            ["collection", "review", "publication", "evidence_review"],
+            ["collection", "review", "evidence_review"],
         )
         status_files = list(runtime.glob("last-status.txt"))
         self.assertEqual(len(status_files), 1)

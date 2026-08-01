@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -13,6 +14,36 @@ from pathlib import Path
 
 class PushError(RuntimeError):
     """Represent invalid local publication state or a rejected push."""
+
+
+def read_regular_nofollow(path: Path) -> bytes:
+    """Read one stable regular control file without following a symlink."""
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise PushError("publication review is not a regular file")
+        chunks: list[bytes] = []
+        while chunk := os.read(descriptor, 65536):
+            chunks.append(chunk)
+        after = os.fstat(descriptor)
+        if (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        ) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        ):
+            raise PushError("publication review changed while being read")
+        return b"".join(chunks)
+    finally:
+        os.close(descriptor)
 
 
 def git(
@@ -390,10 +421,10 @@ def final_vault(
 
 def main(argv: list[str]) -> int:
     """Validate a ready result, perform fixed pushes, and emit final JSON."""
-    if len(argv) != 9:
+    if len(argv) != 10:
         print(
             "usage: push-committed-heads.py RUNTIME PRE_STATE COMMIT_RESULT "
-            "RESULT PROCESS_STATUS CONTEXT REVIEW PLAN",
+            "RESULT PROCESS_STATUS CONTEXT REVIEW PLAN REVIEW_SHA",
             file=sys.stderr,
         )
         return 64
@@ -406,7 +437,10 @@ def main(argv: list[str]) -> int:
         pre = json.loads(Path(argv[2]).read_text(encoding="utf-8"))
         context_path = Path(argv[6])
         context = json.loads(context_path.read_text(encoding="utf-8"))
-        review = json.loads(Path(argv[7]).read_text(encoding="utf-8"))
+        review_bytes = read_regular_nofollow(Path(argv[7]))
+        if hashlib.sha256(review_bytes).hexdigest() != argv[9]:
+            raise PushError("publication review changed after validation")
+        review = json.loads(review_bytes)
         plan = json.loads(Path(argv[8]).read_text(encoding="utf-8"))
         if review.get("publication_context_sha256") != hashlib.sha256(
             context_path.read_bytes()

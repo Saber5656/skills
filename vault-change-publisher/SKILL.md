@@ -62,6 +62,8 @@ Saihai primary checkoutの`directory-path.env`だけをsourceにし、空mapping
 
 review済み`install-verified-artifacts.py --plan`でmutation前にexact destinationを決定し、Task Change Manifestへ固定する。承認後は同helperへplanを渡し、artifact roleに対応するcatalog-derived destinationへdescriptor-relativeかつ`O_EXCL`で配置する。collision/stateがplan後に変化したら上書きや再計画をせず停止する。
 
+定期バッチでは、read-only publication reviewが承認した`commit_groups`を`commit-reviewed-publication.py`が順序通りにlocal commitする。実行器はVaultの現状態がreview前snapshotと完全一致することを再検証し、network、hook、署名、forceを使わない。commit後の固定pusherが各commitのpath/message/blobとmanifestを再検証してから、両Vaultの`main`へ一度ずつnon-force pushする。自然言語agentへVault mutationを委譲しない。
+
 配置後、Manifest外の新規・変更pathが増えていたら両Vaultのcommit前に停止する。
 
 ## Per-Vault Task Change Manifest
