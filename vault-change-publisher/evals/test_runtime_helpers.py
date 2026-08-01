@@ -212,6 +212,64 @@ def load_environment(*, checkout_root, environ, require_catalog):
         with self.assertRaises(CANONICAL_MODULE.CanonicalValidationError):
             CANONICAL_MODULE.validate(result, schema, schema)
 
+    def test_standing_task_snapshot_is_exclusive_and_nofollow(self) -> None:
+        staging = self.workdir / "snapshot-staging"
+        staging.mkdir()
+        source = self.agents / "standing-source.md"
+        source.write_text("# Standing task\n", encoding="utf-8")
+        runtime = self.workdir / "snapshot-runtime.json"
+        runtime.write_text(
+            json.dumps(
+                {
+                    "agents_vault_root": str(self.agents),
+                    "standing_task_path": str(source),
+                }
+            ),
+            encoding="utf-8",
+        )
+        destination = staging / "standing-task.md"
+        command = [
+            str(SCRIPTS / "stage-standing-task.py"),
+            str(runtime),
+            str(staging),
+        ]
+        self.assertEqual(subprocess.run(command, check=False).returncode, 0)
+        self.assertEqual(destination.read_text(encoding="utf-8"), "# Standing task\n")
+        self.assertEqual(destination.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(subprocess.run(command, check=False).returncode, 75)
+
+        destination.unlink()
+        linked = self.agents / "standing-link.md"
+        linked.symlink_to(source)
+        runtime.write_text(
+            json.dumps(
+                {
+                    "agents_vault_root": str(self.agents),
+                    "standing_task_path": str(linked),
+                }
+            ),
+            encoding="utf-8",
+        )
+        self.assertEqual(subprocess.run(command, check=False).returncode, 75)
+        self.assertFalse(destination.exists())
+
+        outside = self.workdir / "outside-standing"
+        outside.mkdir()
+        (outside / "task.md").write_text("outside\n", encoding="utf-8")
+        linked_parent = self.agents / "linked-parent"
+        linked_parent.symlink_to(outside, target_is_directory=True)
+        runtime.write_text(
+            json.dumps(
+                {
+                    "agents_vault_root": str(self.agents),
+                    "standing_task_path": str(linked_parent / "task.md"),
+                }
+            ),
+            encoding="utf-8",
+        )
+        self.assertEqual(subprocess.run(command, check=False).returncode, 75)
+        self.assertFalse(destination.exists())
+
     def test_network_git_keeps_process_cwd_outside_vault(self) -> None:
         """Use explicit Git metadata/work-tree arguments for transport commands."""
         completed = subprocess.CompletedProcess(
@@ -1103,6 +1161,7 @@ def load_environment(*, checkout_root, environ, require_catalog):
             SCRIPTS / "git_diff_digest.py",
             SCRIPTS / "prepare-codex-output-schema.py",
             SCRIPTS / "validate-canonical-result.py",
+            SCRIPTS / "stage-standing-task.py",
             SCRIPTS / "interpret-automation-result.sh",
         ):
             shutil.copy2(source, runtime / source.name)
@@ -1153,6 +1212,10 @@ with (output.parent/"invocations.log").open("a") as log:
     log.write(stage+"\\n")
 if "--search" in args:
     staging=Path(context["collection_output_root"])
+    standing=Path(context["standing_task"])
+    assert standing.parent == staging
+    assert standing.name == "standing-task.md"
+    assert standing.read_text()
     run_date=context["started_at"][:10]
     summary=staging/f"SUMMARY-IT-NEWS-{run_date}.md"
     advisory=staging/f"Personal-Vulnerability-Advisory-{run_date}.md"
