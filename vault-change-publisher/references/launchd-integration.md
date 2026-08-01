@@ -9,6 +9,7 @@ launchd 04:00
   -> collection Codex process (Web/search, run staging write only)
   -> deterministic artifact validation
   -> post-collection authorization snapshot into isolated review input
+  -> captured dirty Git blobs into isolated review input
   -> publication review Codex process (read-only, no search/network)
   -> local commit Codex process (Vault/Git write, no search/network)
   -> initial fixed runner pushes (manifest-bound object IDs -> refs/heads/main)
@@ -45,6 +46,7 @@ launchd 04:00
 | `scripts/prepare-codex-output-schema.py` | same workdir |
 | `scripts/validate-canonical-result.py` | same workdir |
 | `scripts/stage-standing-task.py` | same workdir |
+| `scripts/stage-dirty-review-inputs.py` | same workdir |
 | `scripts/interpret-automation-result.sh` | same workdir |
 
 Tracked sourceがmainへmergeされた後に配備し、各source/destinationのSHA-256一致を確認する。task worktreeをproduction runtime pathとして参照しない。
@@ -54,6 +56,8 @@ Tracked sourceがmainへmergeされた後に配備し、各source/destinationの
 collection Codex processへiCloud上のstanding taskを直接読ませない。resolverが検証した正本taskをrunner側の専用helperでrun stagingへ0600・exclusive createし、collection contextにはsnapshot pathだけを渡す。これによりcollectionのVault非アクセス境界を維持し、launchd配下のNode/CodexにVault全体のTCC権限を要求しない。
 
 authorization taskはnetwork-enabled collection終了後に別のreview input directoryへ0600・exclusive createし、no-network publication phaseへsnapshot pathだけを渡す。collection processからauthorization evidenceを参照可能にしない。
+
+pre-collection時点のdirty fileは、capture済みGit blob OIDからreview inputへ0600・exclusive createする。publication reviewはVault上のdirty fileを直接読まず、manifestでpath・mode・OID・SHA-256に結合されたsnapshotだけを検査する。
 
 ## Local Configuration
 
