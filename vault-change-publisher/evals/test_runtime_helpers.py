@@ -584,6 +584,37 @@ def load_environment(*, checkout_root, environ, require_catalog):
         self.assertEqual(json.loads(output.read_text())["outcome"], "blocked")
         self.assertNotIn("Traceback", result.stderr)
 
+        runtime = {
+            "agents_vault_root": str(self.agents),
+            "agents_git_dir": str(self.agents / ".git"),
+            "user_vault_root": str(self.user),
+            "user_git_dir": str(self.user / ".git"),
+        }
+        invalid.write_text(json.dumps(runtime), encoding="utf-8")
+        malformed_pre = self.workdir / "committer-list-pre.json"
+        malformed_pre.write_text("[]", encoding="utf-8")
+        result = subprocess.run(
+            [
+                str(SCRIPTS / "commit-reviewed-publication.py"),
+                str(invalid),
+                str(malformed_pre),
+                str(placeholder),
+                str(placeholder),
+                str(placeholder),
+                str(placeholder),
+                "/missing-installer",
+                "/missing-capture",
+                hashlib.sha256(placeholder.read_bytes()).hexdigest(),
+                str(output),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 75)
+        self.assertEqual(json.loads(output.read_text())["outcome"], "blocked")
+        self.assertNotIn("Traceback", result.stderr)
+
     def test_local_committer_rejects_staged_only_before_head_changes(self) -> None:
         """Fail before commit when reviewed index bytes differ from the worktree."""
         repo = self.agents
@@ -640,7 +671,6 @@ def load_environment(*, checkout_root, environ, require_catalog):
                 manifest,
                 "artifact.md",
                 hashlib.sha256(b"artifact\n").hexdigest(),
-                self.workdir,
             )
         after = subprocess.check_output(
             ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True
@@ -677,7 +707,6 @@ def load_environment(*, checkout_root, environ, require_catalog):
                 deletion_manifest,
                 "artifact.md",
                 hashlib.sha256(b"artifact\n").hexdigest(),
-                self.workdir,
             )
         self.assertEqual(
             subprocess.check_output(

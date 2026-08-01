@@ -333,7 +333,6 @@ def validate_final_worktree(
     manifest: dict[str, object],
     artifact_path: str,
     artifact_source_sha256: str,
-    temporary_directory: Path,
 ) -> None:
     """Prove every final approved entry matches the worktree before any commit."""
     entries = {
@@ -530,7 +529,7 @@ def result_after_failure(
                 str(runtime[f"{prefix}_git_dir"]),
                 pre[key],
             )
-        except (KeyError, OSError, subprocess.SubprocessError):
+        except (KeyError, TypeError, OSError, subprocess.SubprocessError):
             before = pre.get(key, {}) if isinstance(pre, dict) else {}
             state = {
                 "commit_status": "not_started",
@@ -616,7 +615,6 @@ def main(argv: list[str]) -> int:
                 )
             ),
             str(collection["advisory_sha256"]),
-            output.parent,
         )
         validate_final_worktree(
             str(runtime["user_vault_root"]),
@@ -628,7 +626,6 @@ def main(argv: list[str]) -> int:
                 )
             ),
             str(collection["summary_sha256"]),
-            output.parent,
         )
         agents = commit_groups(
             str(runtime["agents_vault_root"]),

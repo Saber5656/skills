@@ -32,11 +32,18 @@ def read_regular_nofollow(path: Path) -> bytes:
         while chunk := os.read(descriptor, 1024 * 1024):
             content += chunk
         after = os.fstat(descriptor)
-        if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
+        if (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        ) != (
             after.st_dev,
             after.st_ino,
             after.st_size,
             after.st_mtime_ns,
+            after.st_ctime_ns,
         ):
             raise EvidenceError("input changed while being read")
         return content

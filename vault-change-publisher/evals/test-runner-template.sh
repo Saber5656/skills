@@ -107,4 +107,4 @@ for forbidden in "/""Users/" "Library/Mobile"" Documents" "Yasu""'s Vault"; do
   fi
 done
 
-echo "runner isolation contract: 29/29 passed"
+echo "runner isolation contract: 28/28 passed"
