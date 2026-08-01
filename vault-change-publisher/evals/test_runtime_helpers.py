@@ -55,6 +55,12 @@ CANONICAL_SPEC = importlib.util.spec_from_file_location(
 assert CANONICAL_SPEC and CANONICAL_SPEC.loader
 CANONICAL_MODULE = importlib.util.module_from_spec(CANONICAL_SPEC)
 CANONICAL_SPEC.loader.exec_module(CANONICAL_MODULE)
+DIRTY_STAGER_SPEC = importlib.util.spec_from_file_location(
+    "stage_dirty_review_inputs", SCRIPTS / "stage-dirty-review-inputs.py"
+)
+assert DIRTY_STAGER_SPEC and DIRTY_STAGER_SPEC.loader
+DIRTY_STAGER_MODULE = importlib.util.module_from_spec(DIRTY_STAGER_SPEC)
+DIRTY_STAGER_SPEC.loader.exec_module(DIRTY_STAGER_MODULE)
 
 
 class RuntimeHelperTests(unittest.TestCase):
@@ -327,6 +333,94 @@ def load_environment(*, checkout_root, environ, require_catalog):
         link.symlink_to(snapshot)
         with self.assertRaises(OSError):
             REVIEW_MODULE.sha256_regular_nofollow(link)
+
+    def test_dirty_review_inputs_are_bound_to_captured_git_blobs(self) -> None:
+        git_environment = DIRTY_STAGER_MODULE.clean_git_environment()
+        self.assertEqual(git_environment["GIT_NO_LAZY_FETCH"], "1")
+        self.assertEqual(git_environment["GIT_NO_REPLACE_OBJECTS"], "1")
+        self.assertEqual(git_environment["GIT_OPTIONAL_LOCKS"], "0")
+        content = b"captured dirty bytes\n"
+        oid = subprocess.run(
+            ["git", "-C", str(self.agents), "hash-object", "--stdin"],
+            input=content,
+            check=True,
+            capture_output=True,
+        ).stdout.decode().strip()
+        agents_git_dir = subprocess.check_output(
+            ["git", "-C", str(self.agents), "rev-parse", "--absolute-git-dir"],
+            text=True,
+        ).strip()
+        user_git_dir = subprocess.check_output(
+            ["git", "-C", str(self.user), "rev-parse", "--absolute-git-dir"],
+            text=True,
+        ).strip()
+        runtime = self.workdir / "dirty-runtime.json"
+        runtime.write_text(
+            json.dumps(
+                {
+                    "agents_git_dir": agents_git_dir,
+                    "user_git_dir": user_git_dir,
+                    "agents_vault_root": str(self.agents),
+                    "user_vault_root": str(self.user),
+                }
+            ),
+            encoding="utf-8",
+        )
+        pre = self.workdir / "dirty-pre.json"
+        pre.write_text(
+            json.dumps(
+                {
+                    "agents_vault": {
+                        "dirty_entries": [
+                            {
+                                "path": "tasks/dirty.md",
+                                "git_blob_oid": oid,
+                                "mode": "100644",
+                            }
+                        ]
+                    },
+                    "user_vault": {"dirty_entries": []},
+                }
+            ),
+            encoding="utf-8",
+        )
+        review_input = self.workdir / "dirty-review-input"
+        review_input.mkdir()
+        (self.agents / "tasks" / "dirty.md").write_bytes(content)
+        command = [
+            str(SCRIPTS / "stage-dirty-review-inputs.py"),
+            str(runtime),
+            str(pre),
+            str(review_input),
+        ]
+        self.assertEqual(subprocess.run(command, check=False).returncode, 0)
+        self.assertEqual(review_input.stat().st_mode & 0o777, 0o000)
+        review_input.chmod(0o700)
+        snapshot = review_input / "dirty-snapshots" / "agents" / "0000.blob"
+        self.assertEqual(snapshot.read_bytes(), content)
+        self.assertEqual(snapshot.stat().st_mode & 0o777, 0o600)
+        manifest_path = review_input / "dirty-snapshots.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        self.assertEqual(manifest["vaults"]["agents_vault"][0]["git_blob_oid"], oid)
+        context = {
+            "dirty_snapshot_manifest_file": str(manifest_path),
+            "dirty_snapshot_manifest_sha256": hashlib.sha256(
+                manifest_path.read_bytes()
+            ).hexdigest(),
+        }
+        REVIEW_MODULE.validate_dirty_snapshots(context, json.loads(pre.read_text()))
+
+        snapshot.write_text("substituted\n", encoding="utf-8")
+        with self.assertRaises(REVIEW_MODULE.ReviewError):
+            REVIEW_MODULE.validate_dirty_snapshots(context, json.loads(pre.read_text()))
+
+        snapshot.write_bytes(content)
+        agents_directory = snapshot.parent
+        real_agents_directory = agents_directory.with_name("real-agents")
+        agents_directory.rename(real_agents_directory)
+        agents_directory.symlink_to(real_agents_directory, target_is_directory=True)
+        with self.assertRaises(OSError):
+            REVIEW_MODULE.validate_dirty_snapshots(context, json.loads(pre.read_text()))
 
     def test_network_git_keeps_process_cwd_outside_vault(self) -> None:
         """Use explicit Git metadata/work-tree arguments for transport commands."""
@@ -1220,6 +1314,7 @@ def load_environment(*, checkout_root, environ, require_catalog):
             SCRIPTS / "prepare-codex-output-schema.py",
             SCRIPTS / "validate-canonical-result.py",
             SCRIPTS / "stage-standing-task.py",
+            SCRIPTS / "stage-dirty-review-inputs.py",
             SCRIPTS / "interpret-automation-result.sh",
         ):
             shutil.copy2(source, runtime / source.name)
@@ -1289,6 +1384,9 @@ elif stage=="review":
     assert authorization.name == "authorization-task.md"
     assert authorization.parent.name == "review-input"
     assert hashlib.sha256(authorization.read_bytes()).hexdigest() == publication["authorization_task_sha256"]
+    dirty_manifest=Path(publication["dirty_snapshot_manifest_file"])
+    assert hashlib.sha256(dirty_manifest.read_bytes()).hexdigest() == publication["dirty_snapshot_manifest_sha256"]
+    assert json.loads(dirty_manifest.read_text())["version"] == 1
     runtime_context=publication["runtime"]
     pre=publication["pre_collection_state"]
     plan=context["artifact_plan"]

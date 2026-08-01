@@ -9,6 +9,7 @@ import os
 import stat
 import sys
 from pathlib import Path
+from pathlib import PurePosixPath
 from typing import Optional
 
 
@@ -21,16 +22,16 @@ def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def sha256_regular_nofollow(path: Path) -> str:
-    """Hash a regular snapshot without following a final-component symlink."""
+def read_regular_nofollow(path: Path) -> bytes:
+    """Read a stable regular snapshot without following a final-component symlink."""
     descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     try:
         metadata = os.fstat(descriptor)
         if not stat.S_ISREG(metadata.st_mode):
             raise ReviewError("authorization snapshot is not a regular file")
-        digest = hashlib.sha256()
+        chunks: list[bytes] = []
         while chunk := os.read(descriptor, 65536):
-            digest.update(chunk)
+            chunks.append(chunk)
         after = os.fstat(descriptor)
         if (
             metadata.st_dev,
@@ -46,9 +47,99 @@ def sha256_regular_nofollow(path: Path) -> str:
             after.st_ctime_ns,
         ):
             raise ReviewError("authorization snapshot changed while being validated")
-        return digest.hexdigest()
+        return b"".join(chunks)
     finally:
         os.close(descriptor)
+
+
+def sha256_regular_nofollow(path: Path) -> str:
+    """Hash one stable regular snapshot."""
+    return hashlib.sha256(read_regular_nofollow(path)).hexdigest()
+
+
+def read_regular_beneath(root: Path, relative: PurePosixPath) -> bytes:
+    """Read a stable regular file without following any relative path component."""
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    opened = [os.open(root, flags)]
+    try:
+        current = opened[-1]
+        for component in relative.parts[:-1]:
+            current = os.open(component, flags, dir_fd=current)
+            opened.append(current)
+        descriptor = os.open(
+            relative.parts[-1],
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=current,
+        )
+        try:
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(metadata.st_mode):
+                raise ReviewError("dirty snapshot is not a regular file")
+            chunks: list[bytes] = []
+            while chunk := os.read(descriptor, 65536):
+                chunks.append(chunk)
+            after = os.fstat(descriptor)
+            if (
+                metadata.st_dev,
+                metadata.st_ino,
+                metadata.st_size,
+                metadata.st_mtime_ns,
+                metadata.st_ctime_ns,
+            ) != (
+                after.st_dev,
+                after.st_ino,
+                after.st_size,
+                after.st_mtime_ns,
+                after.st_ctime_ns,
+            ):
+                raise ReviewError("dirty snapshot changed while being validated")
+            return b"".join(chunks)
+        finally:
+            os.close(descriptor)
+    finally:
+        for descriptor in reversed(opened):
+            os.close(descriptor)
+
+
+def validate_dirty_snapshots(
+    context: dict[str, object], pre: dict[str, object]
+) -> None:
+    """Bind staged dirty blobs to the runner-captured pre-collection entries."""
+    manifest_path = Path(context["dirty_snapshot_manifest_file"])
+    expected_manifest_digest = context["dirty_snapshot_manifest_sha256"]
+    manifest_bytes = read_regular_nofollow(manifest_path)
+    if hashlib.sha256(manifest_bytes).hexdigest() != expected_manifest_digest:
+        raise ReviewError("dirty snapshot manifest digest mismatch")
+    manifest = json.loads(manifest_bytes.decode("utf-8"))
+    if manifest.get("version") != 1 or set(manifest.get("vaults", {})) != {
+        "agents_vault",
+        "user_vault",
+    }:
+        raise ReviewError("dirty snapshot manifest shape mismatch")
+    for label, state_key in (("agents", "agents_vault"), ("user", "user_vault")):
+        actual_entries = manifest["vaults"][state_key]
+        expected_entries = pre[state_key]["dirty_entries"]
+        if len(actual_entries) != len(expected_entries):
+            raise ReviewError("dirty snapshot entry count mismatch")
+        for index, (actual, expected) in enumerate(zip(actual_entries, expected_entries)):
+            if {
+                "path": actual.get("path"),
+                "git_blob_oid": actual.get("git_blob_oid"),
+                "mode": actual.get("mode"),
+            } != expected:
+                raise ReviewError("dirty snapshot identity mismatch")
+            if expected["mode"] is None and expected["git_blob_oid"] is None:
+                if actual.get("snapshot") is not None or actual.get("sha256") is not None:
+                    raise ReviewError("deleted dirty entry unexpectedly has snapshot bytes")
+                continue
+            expected_relative = f"dirty-snapshots/{label}/{index:04d}.blob"
+            if actual.get("snapshot") != expected_relative:
+                raise ReviewError("dirty snapshot path mismatch")
+            snapshot_bytes = read_regular_beneath(
+                manifest_path.parent, PurePosixPath(expected_relative)
+            )
+            if hashlib.sha256(snapshot_bytes).hexdigest() != actual.get("sha256"):
+                raise ReviewError("dirty snapshot content digest mismatch")
 
 
 def relative_target(root: str, target: str) -> str:
@@ -176,6 +267,7 @@ def main(argv: list[str]) -> int:
             raise ReviewError("authorization evidence digest mismatch")
         if sha256_regular_nofollow(Path(context["authorization_task"])) != argv[5]:
             raise ReviewError("authorization snapshot digest mismatch")
+        validate_dirty_snapshots(context, pre)
         manifest = context["publication_manifest"]["artifact_manifest"]
         gitleaks_version = context["runtime"]["gitleaks_version"]
         validate_manifest(
