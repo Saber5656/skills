@@ -262,6 +262,8 @@ def main(argv: list[str]) -> int:
         context = json.loads(Path(argv[2]).read_text(encoding="utf-8"))
         pre = json.loads(Path(argv[3]).read_text(encoding="utf-8"))
         plan = json.loads(Path(argv[4]).read_text(encoding="utf-8"))
+        if pre != context["pre_collection_state"] or plan != context["artifact_plan"]:
+            raise ReviewError("mutable publication inputs differ from reviewed context")
         if review.get("outcome") != "approved":
             raise ReviewError("publication review is not approved")
         if review["publication_context_sha256"] != sha256(Path(argv[2])):

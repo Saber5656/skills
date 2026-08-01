@@ -474,6 +474,79 @@ def load_environment(*, checkout_root, environ, require_catalog):
         self.assertEqual(environment["GIT_NO_LAZY_FETCH"], "1")
         self.assertEqual(environment["GIT_NO_REPLACE_OBJECTS"], "1")
         self.assertEqual(environment["GIT_OPTIONAL_LOCKS"], "0")
+        self.assertEqual(environment["GIT_AUTHOR_NAME"], "Codex Vault Publisher")
+        self.assertEqual(
+            environment["GIT_AUTHOR_EMAIL"], "codex-vault-publisher@localhost"
+        )
+        self.assertEqual(environment["GIT_COMMITTER_NAME"], "Codex Vault Publisher")
+        self.assertEqual(
+            environment["GIT_COMMITTER_EMAIL"], "codex-vault-publisher@localhost"
+        )
+
+    def test_local_committer_binds_inputs_and_complete_installed_scope(self) -> None:
+        """Reject standalone JSON substitution and manifest-external dirty paths."""
+        runtime = {"runtime": "reviewed"}
+        pre = {"pre": "reviewed"}
+        collection = {"collection": "reviewed"}
+        plan = {"plan": "reviewed"}
+        context = {
+            "runtime": runtime,
+            "pre_collection_state": pre,
+            "verified_collection": collection,
+            "artifact_plan": plan,
+        }
+        self.assertEqual(
+            COMMITTER_MODULE.reviewed_inputs(
+                context, runtime, pre, collection, plan
+            ),
+            (runtime, pre, collection, plan),
+        )
+        with self.assertRaises(COMMITTER_MODULE.CommitError):
+            COMMITTER_MODULE.reviewed_inputs(
+                context, runtime, pre, {"collection": "substituted"}, plan
+            )
+
+        fixed = {
+            "repo_root": "vault",
+            "branch": "main",
+            "upstream": "origin/main",
+            "local_head": "a" * 40,
+            "remote_head": "a" * 40,
+            "operation_in_progress": False,
+            "git_control_sha256": "b" * 64,
+        }
+        empty = {
+            **fixed,
+            "dirty_lines": [],
+            "dirty_paths": [],
+            "dirty_entries": [],
+            "dirty_digest": hashlib.sha256(b"").hexdigest(),
+            "diff_snapshot_sha256": hashlib.sha256(b"").hexdigest(),
+        }
+        current = {
+            **empty,
+            "dirty_lines": ["?? artifact.md"],
+            "dirty_paths": ["artifact.md"],
+            "dirty_entries": [
+                {"path": "artifact.md", "git_blob_oid": "c" * 40, "mode": "100644"}
+            ],
+        }
+        COMMITTER_MODULE.validate_installed_scope(
+            {"agents_vault": empty, "user_vault": empty},
+            {"agents_vault": current, "user_vault": current},
+            {"agents_vault": "artifact.md", "user_vault": "artifact.md"},
+        )
+        external = json.loads(json.dumps(current))
+        external["dirty_paths"].append("external.md")
+        external["dirty_entries"].append(
+            {"path": "external.md", "git_blob_oid": "d" * 40, "mode": "100644"}
+        )
+        with self.assertRaises(COMMITTER_MODULE.CommitError):
+            COMMITTER_MODULE.validate_installed_scope(
+                {"agents_vault": empty, "user_vault": empty},
+                {"agents_vault": external, "user_vault": current},
+                {"agents_vault": "artifact.md", "user_vault": "artifact.md"},
+            )
 
     def test_local_committer_rejects_unsafe_paths(self) -> None:
         """Reject absolute, traversal, and Obsidian-control paths."""
@@ -713,6 +786,63 @@ def load_environment(*, checkout_root, environ, require_catalog):
                 ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True
             ).strip(),
             deletion_head,
+        )
+
+    def test_local_committer_barrier_failure_keeps_head_unchanged(self) -> None:
+        """Build commit objects first but never advance HEAD after a scope race."""
+        repo = self.agents
+        subprocess.run(
+            ["git", "-C", str(repo), "config", "user.name", "Fixture"], check=True
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo),
+                "config",
+                "user.email",
+                "fixture@example.invalid",
+            ],
+            check=True,
+        )
+        base = repo / "base.md"
+        base.write_text("base\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "base.md"], check=True)
+        subprocess.run(
+            ["git", "-C", str(repo), "commit", "-q", "-m", "base"], check=True
+        )
+        before = subprocess.check_output(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True
+        ).strip()
+        artifact = repo / "artifact.md"
+        artifact.write_text("artifact\n", encoding="utf-8")
+        manifest = {
+            "approved_dirty_entries": [],
+            "commit_groups": [
+                {"message": "publish artifact", "paths": ["artifact.md"]}
+            ],
+        }
+
+        def reject_race() -> None:
+            raise COMMITTER_MODULE.CommitError("fixture scope race")
+
+        with self.assertRaises(COMMITTER_MODULE.CommitError):
+            COMMITTER_MODULE.commit_groups(
+                str(repo),
+                str(repo / ".git"),
+                str(self.fake_gitleaks),
+                {"local_head": before, "dirty_digest": hashlib.sha256(b"").hexdigest()},
+                manifest,
+                "artifact.md",
+                hashlib.sha256(b"artifact\n").hexdigest(),
+                self.workdir,
+                before_update=reject_race,
+            )
+        self.assertEqual(
+            subprocess.check_output(
+                ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True
+            ).strip(),
+            before,
         )
 
     def test_fixed_fetch_pins_remote_refspec_and_environment(self) -> None:

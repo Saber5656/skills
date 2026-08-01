@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path, PurePosixPath
+from typing import Callable
 
 
 CLEAN_DIGEST = hashlib.sha256(b"").hexdigest()
@@ -32,6 +33,10 @@ def clean_environment() -> dict[str, str]:
             "GIT_NO_LAZY_FETCH": "1",
             "GIT_NO_REPLACE_OBJECTS": "1",
             "GIT_OPTIONAL_LOCKS": "0",
+            "GIT_AUTHOR_NAME": "Codex Vault Publisher",
+            "GIT_AUTHOR_EMAIL": "codex-vault-publisher@localhost",
+            "GIT_COMMITTER_NAME": "Codex Vault Publisher",
+            "GIT_COMMITTER_EMAIL": "codex-vault-publisher@localhost",
         }
     )
     return environment
@@ -124,6 +129,124 @@ def capture_exact(capture: str, runtime_file: str, expected: dict[str, object]) 
     )
     if json.loads(completed.stdout) != expected:
         raise CommitError("Vault state changed after the approved review")
+
+
+def capture_state(capture: str, runtime_file: str) -> dict[str, object]:
+    """Capture the complete current state for both Vaults."""
+    completed = subprocess.run(
+        [capture, runtime_file],
+        cwd="/",
+        check=True,
+        capture_output=True,
+        text=True,
+        env=clean_environment(),
+    )
+    return json.loads(completed.stdout)
+
+
+def validate_installed_scope(
+    before: dict[str, object],
+    current: dict[str, object],
+    artifact_paths: dict[str, str],
+) -> None:
+    """Allow only the two installed artifacts beyond the reviewed dirty scope."""
+    mutable_fields = {
+        "dirty_lines",
+        "dirty_paths",
+        "dirty_entries",
+        "dirty_digest",
+        "diff_snapshot_sha256",
+    }
+    for key in ("agents_vault", "user_vault"):
+        expected_state = before[key]
+        current_state_value = current[key]
+        if {
+            field: value
+            for field, value in current_state_value.items()
+            if field not in mutable_fields
+        } != {
+            field: value
+            for field, value in expected_state.items()
+            if field not in mutable_fields
+        }:
+            raise CommitError("Vault control state changed during artifact installation")
+        artifact = artifact_paths[key]
+        expected_paths = sorted([*expected_state["dirty_paths"], artifact])
+        if current_state_value["dirty_paths"] != expected_paths:
+            raise CommitError("manifest-external path changed during artifact installation")
+        expected_entries = {
+            entry["path"]: entry for entry in expected_state["dirty_entries"]
+        }
+        current_entries = {
+            entry["path"]: entry for entry in current_state_value["dirty_entries"]
+        }
+        if any(current_entries.get(path) != entry for path, entry in expected_entries.items()):
+            raise CommitError("reviewed dirty entry changed during artifact installation")
+        artifact_entry = current_entries.get(artifact)
+        if artifact_entry is None or artifact_entry.get("mode") != "100644" or not artifact_entry.get(
+            "git_blob_oid"
+        ):
+            raise CommitError("installed artifact is not the only approved regular addition")
+
+
+def capture_installed_scope(
+    capture: str,
+    runtime_file: str,
+    before: dict[str, object],
+    artifact_paths: dict[str, str],
+) -> dict[str, object]:
+    """Recapture both complete Vaults after installation and before any commit."""
+    current = capture_state(capture, runtime_file)
+    validate_installed_scope(before, current, artifact_paths)
+    return current
+
+
+def reviewed_inputs(
+    context: dict[str, object],
+    runtime: object,
+    pre: object,
+    collection: object,
+    plan: object,
+) -> tuple[dict[str, object], dict[str, object], dict[str, object], dict[str, object]]:
+    """Return only context-bound publication inputs or reject mutable substitutes."""
+    bound = (
+        context["runtime"],
+        context["pre_collection_state"],
+        context["verified_collection"],
+        context["artifact_plan"],
+    )
+    if (runtime, pre, collection, plan) != bound:
+        raise CommitError("mutable publication inputs differ from reviewed context")
+    return bound
+
+
+def write_bound_json(directory: Path, name: str, value: object) -> tuple[Path, bytes]:
+    """Create one context-derived, no-follow control input for child helpers."""
+    content = json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    path = directory / name
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags, 0o400)
+    try:
+        view = memoryview(content)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise CommitError("could not write bound publication input")
+            view = view[written:]
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    return path, content
+
+
+def require_bound_bytes(path: Path, content: bytes) -> None:
+    """Reject any change to a context-derived helper input."""
+    if stable_regular_bytes(path) != content:
+        raise CommitError("bound publication input changed during helper execution")
 
 
 def require_filter_free(repo: str, git_dir: str, paths: list[str]) -> None:
@@ -389,6 +512,7 @@ def commit_groups(
     artifact_path: str,
     artifact_source_sha256: str,
     temporary_directory: Path,
+    before_update: Callable[[], None] | None = None,
 ) -> dict[str, object]:
     """Create the ordered, minimal commits declared by the approved manifest."""
     if git(repo, git_dir, "branch", "--show-current").stdout.strip() != "main":
@@ -499,10 +623,12 @@ def commit_groups(
             raise CommitError("created commit differs from its approved path group")
         if git(repo, git_dir, "show", "-s", "--format=%s", commit).stdout.strip() != message:
             raise CommitError("created commit message differs from approval")
-        git(repo, git_dir, "update-ref", "HEAD", commit, current_head)
-        for path in paths:
-            update_index_entry(repo, git_dir, path, entries[path])
         current_head = commit
+    if before_update is not None:
+        before_update()
+    git(repo, git_dir, "update-ref", "HEAD", current_head, str(pre["local_head"]))
+    for path, entry in entries.items():
+        update_index_entry(repo, git_dir, path, entry)
     result = current_state(repo, git_dir, pre)
     if not result["clean"] or len(result["commit_hashes"]) != len(groups):
         raise CommitError("approved local commits did not leave a clean Vault")
@@ -580,6 +706,20 @@ def main(argv: list[str]) -> int:
         collection = json.loads(Path(argv[3]).read_text(encoding="utf-8"))
         plan = json.loads(Path(argv[4]).read_text(encoding="utf-8"))
         context_path = Path(argv[5])
+        context_bytes = stable_regular_bytes(context_path)
+        context = json.loads(context_bytes)
+        runtime, pre, collection, plan = reviewed_inputs(
+            context, runtime, pre, collection, plan
+        )
+        bound_runtime, bound_runtime_bytes = write_bound_json(
+            output.parent, "bound-runtime.json", runtime
+        )
+        bound_collection, bound_collection_bytes = write_bound_json(
+            output.parent, "bound-collection.json", collection
+        )
+        bound_plan, bound_plan_bytes = write_bound_json(
+            output.parent, "bound-artifact-plan.json", plan
+        )
         review_path = Path(argv[6])
         review_bytes = stable_regular_bytes(review_path)
         if hashlib.sha256(review_bytes).hexdigest() != argv[9]:
@@ -587,12 +727,17 @@ def main(argv: list[str]) -> int:
         review = json.loads(review_bytes)
         if review.get("outcome") != "approved" or review.get(
             "publication_context_sha256"
-        ) != hashlib.sha256(context_path.read_bytes()).hexdigest():
+        ) != hashlib.sha256(context_bytes).hexdigest():
             raise CommitError("publication review is not approved and context-bound")
-        capture_exact(argv[8], argv[1], pre)
+        capture_exact(argv[8], str(bound_runtime), pre)
         installed = json.loads(
             subprocess.run(
-                [argv[7], argv[1], argv[3], argv[4]],
+                [
+                    argv[7],
+                    str(bound_runtime),
+                    str(bound_collection),
+                    str(bound_plan),
+                ],
                 cwd="/",
                 check=True,
                 capture_output=True,
@@ -600,31 +745,38 @@ def main(argv: list[str]) -> int:
                 env=clean_environment(),
             ).stdout
         )
+        require_bound_bytes(bound_runtime, bound_runtime_bytes)
+        require_bound_bytes(bound_collection, bound_collection_bytes)
+        require_bound_bytes(bound_plan, bound_plan_bytes)
         if installed != {
             "summary_target": plan["summary_target"],
             "advisory_target": plan["advisory_target"],
         }:
             raise CommitError("installed artifacts differ from the approved plan")
+        agents_artifact = str(
+            Path(plan["advisory_target"]).relative_to(runtime["agents_vault_root"])
+        )
+        user_artifact = str(
+            Path(plan["summary_target"]).relative_to(runtime["user_vault_root"])
+        )
+        installed_state = capture_installed_scope(
+            argv[8],
+            str(bound_runtime),
+            pre,
+            {"agents_vault": agents_artifact, "user_vault": user_artifact},
+        )
         validate_final_worktree(
             str(runtime["agents_vault_root"]),
             str(runtime["agents_git_dir"]),
             review["agents_vault"],
-            str(
-                Path(plan["advisory_target"]).relative_to(
-                    runtime["agents_vault_root"]
-                )
-            ),
+            agents_artifact,
             str(collection["advisory_sha256"]),
         )
         validate_final_worktree(
             str(runtime["user_vault_root"]),
             str(runtime["user_git_dir"]),
             review["user_vault"],
-            str(
-                Path(plan["summary_target"]).relative_to(
-                    runtime["user_vault_root"]
-                )
-            ),
+            user_artifact,
             str(collection["summary_sha256"]),
         )
         agents = commit_groups(
@@ -640,7 +792,16 @@ def main(argv: list[str]) -> int:
             ),
             str(collection["advisory_sha256"]),
             output.parent,
+            before_update=lambda: capture_exact(
+                argv[8], str(bound_runtime), installed_state
+            ),
         )
+        after_agents = capture_state(argv[8], str(bound_runtime))
+        if (
+            after_agents["agents_vault"]["dirty_paths"]
+            or after_agents["agents_vault"]["local_head"] != agents["local_head"]
+        ):
+            raise CommitError("Agents Vault changed after its approved commits")
         user = commit_groups(
             str(runtime["user_vault_root"]),
             str(runtime["user_git_dir"]),
@@ -654,6 +815,9 @@ def main(argv: list[str]) -> int:
             ),
             str(collection["summary_sha256"]),
             output.parent,
+            before_update=lambda: capture_exact(
+                argv[8], str(bound_runtime), after_agents
+            ),
         )
         if agents["post_dirty_digest"] != CLEAN_DIGEST or user[
             "post_dirty_digest"
