@@ -270,6 +270,64 @@ def load_environment(*, checkout_root, environ, require_catalog):
         self.assertEqual(subprocess.run(command, check=False).returncode, 75)
         self.assertFalse(destination.exists())
 
+    def test_authorization_task_snapshot_uses_distinct_destination(self) -> None:
+        review_input = self.workdir / "review-input"
+        review_input.mkdir()
+        source = self.agents / "authorization-source.md"
+        source.write_text("# Approved authorization\n", encoding="utf-8")
+        pinned_digest = hashlib.sha256(source.read_bytes()).hexdigest()
+        runtime = self.workdir / "authorization-runtime.json"
+        runtime.write_text(
+            json.dumps(
+                {
+                    "agents_vault_root": str(self.agents),
+                    "authorization_task_path": str(source),
+                    "authorization_task_sha256": pinned_digest,
+                }
+            ),
+            encoding="utf-8",
+        )
+        completed = subprocess.run(
+            [
+                str(SCRIPTS / "stage-standing-task.py"),
+                str(runtime),
+                str(review_input),
+                "authorization",
+            ],
+            check=False,
+        )
+        destination = review_input / "authorization-task.md"
+        self.assertEqual(completed.returncode, 0)
+        self.assertEqual(destination.read_text(encoding="utf-8"), "# Approved authorization\n")
+        self.assertEqual(destination.stat().st_mode & 0o777, 0o600)
+
+        destination.unlink()
+        source.write_text("# Changed after resolver\n", encoding="utf-8")
+        self.assertEqual(
+            subprocess.run(
+                [
+                    str(SCRIPTS / "stage-standing-task.py"),
+                    str(runtime),
+                    str(review_input),
+                    "authorization",
+                ],
+                check=False,
+            ).returncode,
+            75,
+        )
+        self.assertFalse(destination.exists())
+
+    def test_publication_validator_hashes_authorization_snapshot_nofollow(self) -> None:
+        snapshot = self.workdir / "authorization-task.md"
+        snapshot.write_text("approved\n", encoding="utf-8")
+        expected = hashlib.sha256(snapshot.read_bytes()).hexdigest()
+        self.assertEqual(REVIEW_MODULE.sha256_regular_nofollow(snapshot), expected)
+
+        link = self.workdir / "authorization-link.md"
+        link.symlink_to(snapshot)
+        with self.assertRaises(OSError):
+            REVIEW_MODULE.sha256_regular_nofollow(link)
+
     def test_network_git_keeps_process_cwd_outside_vault(self) -> None:
         """Use explicit Git metadata/work-tree arguments for transport commands."""
         completed = subprocess.CompletedProcess(
@@ -1227,6 +1285,10 @@ if "--search" in args:
         result["next_action"]="must be null for a complete result"
 elif stage=="review":
     publication=context["publication_context"]
+    authorization=Path(publication["authorization_task"])
+    assert authorization.name == "authorization-task.md"
+    assert authorization.parent.name == "review-input"
+    assert hashlib.sha256(authorization.read_bytes()).hexdigest() == publication["authorization_task_sha256"]
     runtime_context=publication["runtime"]
     pre=publication["pre_collection_state"]
     plan=context["artifact_plan"]

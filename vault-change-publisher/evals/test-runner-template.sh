@@ -62,6 +62,9 @@ fi
 /usr/bin/grep -F -- 'CANONICAL_VALIDATOR="$WORKDIR/validate-canonical-result.py"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- 'STANDING_TASK_STAGER="$WORKDIR/stage-standing-task.py"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- '--arg standing_task "$STANDING_TASK_SNAPSHOT"' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- 'AUTHORIZATION_TASK_SNAPSHOT="$REVIEW_INPUT_ROOT/authorization-task.md"' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- '"$RUNTIME_CONTEXT_FILE" "$REVIEW_INPUT_ROOT" authorization' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- '--arg authorization_task "$AUTHORIZATION_TASK_SNAPSHOT"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- '--output-schema "$CODEX_COLLECTION_SCHEMA"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- 'INTERPRETER_PROCESS_STATUS=75' "$RUNNER" >/dev/null
 if /usr/bin/grep -F -- 'fetch origin main' "$RUNNER" >/dev/null; then
