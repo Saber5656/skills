@@ -248,17 +248,22 @@ def validate_manifest(
 
 def main(argv: list[str]) -> int:
     """Validate the approved review and return a fail-closed status."""
-    if len(argv) != 6:
+    if len(argv) != 7:
         print(
-            "usage: validate-publication-review.py REVIEW CONTEXT PRE_STATE PLAN AUTH_SHA",
+            "usage: validate-publication-review.py REVIEW CONTEXT PRE_STATE PLAN AUTH_SHA REVIEW_SHA",
             file=sys.stderr,
         )
         return 64
     try:
-        review = json.loads(Path(argv[1]).read_text(encoding="utf-8"))
+        review_bytes = read_regular_nofollow(Path(argv[1]))
+        if hashlib.sha256(review_bytes).hexdigest() != argv[6]:
+            raise ReviewError("publication review file digest mismatch")
+        review = json.loads(review_bytes)
         context = json.loads(Path(argv[2]).read_text(encoding="utf-8"))
         pre = json.loads(Path(argv[3]).read_text(encoding="utf-8"))
         plan = json.loads(Path(argv[4]).read_text(encoding="utf-8"))
+        if pre != context["pre_collection_state"] or plan != context["artifact_plan"]:
+            raise ReviewError("mutable publication inputs differ from reviewed context")
         if review.get("outcome") != "approved":
             raise ReviewError("publication review is not approved")
         if review["publication_context_sha256"] != sha256(Path(argv[2])):

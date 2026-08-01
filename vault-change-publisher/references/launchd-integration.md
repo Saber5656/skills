@@ -11,7 +11,7 @@ launchd 04:00
   -> post-collection authorization snapshot into isolated review input
   -> captured dirty Git blobs into isolated review input
   -> publication review Codex process (read-only, no search/network)
-  -> local commit Codex process (Vault/Git write, no search/network)
+  -> deterministic local commit helper (reviewed blobs only, no network)
   -> initial fixed runner pushes (manifest-bound object IDs -> refs/heads/main)
   -> deterministic push evidence hunk
   -> evidence review Codex process (read-only, no search/network)
@@ -25,7 +25,6 @@ launchd 04:00
 | `assets/run-daily-it-news-vulnerability-check.sh` | daily automation workdir |
 | `assets/daily-it-news.collect.prompt.md` | same workdir |
 | `assets/daily-it-news.review.prompt.md` | same workdir |
-| `assets/daily-it-news.publish.prompt.md` | same workdir |
 | `assets/daily-it-news.evidence-review.prompt.md` | same workdir |
 | `assets/automation.env.example` | copy manually to ignored `automation.local.env` and fill local values |
 | `references/collection-result.schema.json` | same workdir |
@@ -38,6 +37,7 @@ launchd 04:00
 | `scripts/capture-vault-state.py` | same workdir |
 | `scripts/validate-collection-result.py` | same workdir |
 | `scripts/install-verified-artifacts.py` | same workdir |
+| `scripts/commit-reviewed-publication.py` | same workdir |
 | `scripts/validate-publication-review.py` | same workdir |
 | `scripts/push-committed-heads.py` | same workdir |
 | `scripts/prepare-publication-evidence.py` | same workdir |
