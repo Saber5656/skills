@@ -43,6 +43,18 @@ FETCH_SPEC = importlib.util.spec_from_file_location(
 assert FETCH_SPEC and FETCH_SPEC.loader
 FETCH_MODULE = importlib.util.module_from_spec(FETCH_SPEC)
 FETCH_SPEC.loader.exec_module(FETCH_MODULE)
+SCHEMA_SPEC = importlib.util.spec_from_file_location(
+    "prepare_codex_output_schema", SCRIPTS / "prepare-codex-output-schema.py"
+)
+assert SCHEMA_SPEC and SCHEMA_SPEC.loader
+SCHEMA_MODULE = importlib.util.module_from_spec(SCHEMA_SPEC)
+SCHEMA_SPEC.loader.exec_module(SCHEMA_MODULE)
+CANONICAL_SPEC = importlib.util.spec_from_file_location(
+    "validate_canonical_result", SCRIPTS / "validate-canonical-result.py"
+)
+assert CANONICAL_SPEC and CANONICAL_SPEC.loader
+CANONICAL_MODULE = importlib.util.module_from_spec(CANONICAL_SPEC)
+CANONICAL_SPEC.loader.exec_module(CANONICAL_MODULE)
 
 
 class RuntimeHelperTests(unittest.TestCase):
@@ -121,6 +133,84 @@ def load_environment(*, checkout_root, environ, require_catalog):
     def tearDown(self) -> None:
         """Remove the isolated fixture."""
         self.temp_dir.cleanup()
+
+    def test_codex_schema_projection_preserves_canonical_contract(self) -> None:
+        source_path = SKILL_ROOT / "references" / "publication-review-result.schema.json"
+        source = json.loads(source_path.read_text(encoding="utf-8"))
+        projected = SCHEMA_MODULE.compatible_schema(source)
+        encoded = json.dumps(projected, sort_keys=True)
+
+        self.assertIn("allOf", source)
+        self.assertNotIn('"allOf"', encoded)
+        self.assertNotIn('"if"', encoded)
+        self.assertNotIn('"then"', encoded)
+        self.assertNotIn('"else"', encoded)
+        self.assertNotIn('"uniqueItems"', encoded)
+        self.assertNotIn('"oneOf"', encoded)
+        self.assertIn('"anyOf"', encoded)
+        self.assertNotIn("approvedManifest", projected["$defs"])
+        self.assertEqual(
+            projected["$defs"]["taskChangeManifest"]["properties"]
+            ["validation_evidence"]["properties"]["file_guard"]["type"],
+            "string",
+        )
+        self.assertEqual(
+            json.loads(source_path.read_text(encoding="utf-8")), source
+        )
+
+    def test_codex_schema_projection_rejects_open_root(self) -> None:
+        with self.assertRaises(SCHEMA_MODULE.SchemaProjectionError):
+            SCHEMA_MODULE.compatible_schema(
+                {"type": "object", "additionalProperties": True}
+            )
+        with self.assertRaises(SCHEMA_MODULE.SchemaProjectionError):
+            SCHEMA_MODULE.compatible_schema(
+                {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "not": {"type": "null"},
+                }
+            )
+        with self.assertRaises(SCHEMA_MODULE.SchemaProjectionError):
+            SCHEMA_MODULE.compatible_schema(
+                {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "allOf": [{"not": {"type": "null"}}],
+                }
+            )
+        with self.assertRaises(CANONICAL_MODULE.CanonicalValidationError):
+            invalid_schema = {
+                "type": "object",
+                "additionalProperties": False,
+                "allOf": [{"not": {"type": "object"}}],
+            }
+            CANONICAL_MODULE.validate({}, invalid_schema, invalid_schema)
+
+    def test_canonical_validator_rejects_projected_only_result(self) -> None:
+        schema = json.loads(
+            (SKILL_ROOT / "references" / "collection-result.schema.json")
+            .read_text(encoding="utf-8")
+        )
+        result = {
+            "daily_pipeline_status": "complete",
+            "run_id": "fixture",
+            "summary_path": "summary.md",
+            "summary_sha256": "0" * 64,
+            "advisory_path": "advisory.md",
+            "advisory_sha256": "1" * 64,
+            "notification_result": None,
+            "vault_artifacts_complete": True,
+            "next_action": None,
+        }
+        CANONICAL_MODULE.validate(result, schema, schema)
+        result["next_action"] = "canonical contract requires null"
+        with self.assertRaises(CANONICAL_MODULE.CanonicalValidationError):
+            CANONICAL_MODULE.validate(result, schema, schema)
+        result["next_action"] = None
+        result["notification_result"] = 17
+        with self.assertRaises(CANONICAL_MODULE.CanonicalValidationError):
+            CANONICAL_MODULE.validate(result, schema, schema)
 
     def test_network_git_keeps_process_cwd_outside_vault(self) -> None:
         """Use explicit Git metadata/work-tree arguments for transport commands."""
@@ -1011,9 +1101,31 @@ def load_environment(*, checkout_root, environ, require_catalog):
             SCRIPTS / "prepare-publication-evidence.py",
             SCRIPTS / "commit-push-publication-evidence.py",
             SCRIPTS / "git_diff_digest.py",
+            SCRIPTS / "prepare-codex-output-schema.py",
+            SCRIPTS / "validate-canonical-result.py",
             SCRIPTS / "interpret-automation-result.sh",
         ):
             shutil.copy2(source, runtime / source.name)
+
+        finalizer = runtime / "commit-push-publication-evidence.py"
+        real_finalizer = runtime / "commit-push-publication-evidence.real.py"
+        finalizer.rename(real_finalizer)
+        finalizer.write_text(
+            """#!/usr/bin/env python3
+import json, os, subprocess, sys
+from pathlib import Path
+real=Path(__file__).with_name("commit-push-publication-evidence.real.py")
+completed=subprocess.run([str(real),*sys.argv[1:]],check=False)
+if completed.returncode == 0 and os.environ.get("FAKE_CANONICAL_INVALID_FINAL") == "1":
+    output=Path(sys.argv[6])
+    result=json.loads(output.read_text())
+    result["unexpected_property"]=True
+    output.write_text(json.dumps(result))
+raise SystemExit(completed.returncode)
+""",
+            encoding="utf-8",
+        )
+        finalizer.chmod(0o755)
 
         for repo, key in ((self.agents, "agents"), (self.user, "user")):
             subprocess.run(["git", "-C", str(repo), "config", "user.name", "Fixture"], check=True)
@@ -1033,6 +1145,9 @@ args=sys.argv[1:]
 output=Path(args[args.index("--output-last-message")+1])
 context=json.loads(args[-1].split("Runtime context JSON:\\n",1)[1])
 schema=Path(args[args.index("--output-schema")+1]).name
+schema_document=json.loads(Path(args[args.index("--output-schema")+1]).read_text())
+schema_encoded=json.dumps(schema_document,sort_keys=True)
+assert all(f'"{keyword}"' not in schema_encoded for keyword in ("allOf","if","then","else","oneOf","uniqueItems"))
 with (output.parent/"invocations.log").open("a") as log:
     stage="collection" if "--search" in args else ("review" if schema=="publication-review-result.schema.json" else ("evidence_review" if schema=="evidence-review-result.schema.json" else "publication"))
     log.write(stage+"\\n")
@@ -1041,10 +1156,12 @@ if "--search" in args:
     run_date=context["started_at"][:10]
     summary=staging/f"SUMMARY-IT-NEWS-{run_date}.md"
     advisory=staging/f"Personal-Vulnerability-Advisory-{run_date}.md"
-    summary.write_text("summary")
-    advisory.write_text("advisory")
+    summary.write_text("summary "+context["run_id"])
+    advisory.write_text("advisory "+context["run_id"])
     digest=lambda p: hashlib.sha256(p.read_bytes()).hexdigest()
     result={"daily_pipeline_status":"complete","run_id":context["run_id"],"summary_path":str(summary),"summary_sha256":digest(summary),"advisory_path":str(advisory),"advisory_sha256":digest(advisory),"notification_result":"none","vault_artifacts_complete":True,"next_action":None}
+    if os.environ.get("FAKE_CANONICAL_INVALID_COLLECTION") == "1":
+        result["next_action"]="must be null for a complete result"
 elif stage=="review":
     publication=context["publication_context"]
     runtime_context=publication["runtime"]
@@ -1147,6 +1264,29 @@ output.write_text(json.dumps(result))
         shutil.rmtree(runtime / "logs")
         (runtime / "last-status.txt").unlink()
 
+        invalid_result = subprocess.run(
+            [str(runtime / "run-daily-it-news-vulnerability-check.sh")],
+            check=False,
+            env={
+                **os.environ,
+                "PATH": os.environ["PATH"],
+                "FAKE_CANONICAL_INVALID_COLLECTION": "1",
+            },
+        )
+        self.assertEqual(invalid_result.returncode, 75)
+        invalid_logs = list((runtime / "logs").rglob("invocations.log"))
+        self.assertEqual(len(invalid_logs), 1)
+        self.assertEqual(
+            invalid_logs[0].read_text(encoding="utf-8").splitlines(),
+            ["collection"],
+        )
+        self.assertIn(
+            "phase=collection",
+            (runtime / "last-status.txt").read_text(encoding="utf-8"),
+        )
+        shutil.rmtree(runtime / "logs")
+        (runtime / "last-status.txt").unlink()
+
         result = subprocess.run(
             [str(runtime / "run-daily-it-news-vulnerability-check.sh")],
             check=False,
@@ -1162,6 +1302,23 @@ output.write_text(json.dumps(result))
         status_files = list(runtime.glob("last-status.txt"))
         self.assertEqual(len(status_files), 1)
         self.assertIn("semantic_status=success", status_files[0].read_text())
+
+        shutil.rmtree(runtime / "logs")
+        (runtime / "last-status.txt").unlink()
+        invalid_final = subprocess.run(
+            [str(runtime / "run-daily-it-news-vulnerability-check.sh")],
+            check=False,
+            env={
+                **os.environ,
+                "PATH": os.environ["PATH"],
+                "FAKE_CANONICAL_INVALID_FINAL": "1",
+            },
+        )
+        self.assertEqual(invalid_final.returncode, 75)
+        self.assertIn(
+            "semantic_status=process_error",
+            (runtime / "last-status.txt").read_text(encoding="utf-8"),
+        )
 
 
 if __name__ == "__main__":
