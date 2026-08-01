@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Copy the validated standing task into the run staging boundary."""
+"""Copy validated standing/authorization tasks into an isolated run boundary."""
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import stat
@@ -83,14 +84,14 @@ def read_regular_beneath(root: Path, relative: Path) -> bytes:
             os.close(directory_descriptor)
 
 
-def write_exclusive(staging_root: Path, content: bytes) -> None:
+def write_exclusive(staging_root: Path, destination_name: str, content: bytes) -> None:
     directory_flags = (
         os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
     )
     staging_descriptor = os.open(staging_root, directory_flags)
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
     try:
-        descriptor = os.open("standing-task.md", flags, 0o600, dir_fd=staging_descriptor)
+        descriptor = os.open(destination_name, flags, 0o600, dir_fd=staging_descriptor)
         try:
             view = memoryview(content)
             while view:
@@ -104,12 +105,20 @@ def write_exclusive(staging_root: Path, content: bytes) -> None:
 
 
 def main(argv: list[str]) -> int:
-    if len(argv) != 3:
-        print("usage: stage-standing-task.py RUNTIME_CONTEXT DESTINATION", file=sys.stderr)
+    if len(argv) not in (3, 4):
+        print(
+            "usage: stage-standing-task.py RUNTIME_CONTEXT DESTINATION "
+            "[standing|authorization]",
+            file=sys.stderr,
+        )
         return 64
     try:
         runtime = json.loads(Path(argv[1]).read_text(encoding="utf-8"))
-        source = Path(runtime["standing_task_path"])
+        task_kind = argv[3] if len(argv) == 4 else "standing"
+        if task_kind not in ("standing", "authorization"):
+            raise SnapshotError("task kind must be standing or authorization")
+        source = Path(runtime[f"{task_kind}_task_path"])
+        destination_name = f"{task_kind}-task.md"
         agents_root = Path(runtime["agents_vault_root"])
         staging_root = Path(argv[2])
         if not source.is_absolute() or not agents_root.is_absolute() or not staging_root.is_absolute():
@@ -117,11 +126,16 @@ def main(argv: list[str]) -> int:
         try:
             relative = source.relative_to(agents_root)
         except ValueError as exc:
-            raise SnapshotError("standing task is outside Agents Vault") from exc
+            raise SnapshotError(f"{task_kind} task is outside Agents Vault") from exc
         content = read_regular_beneath(agents_root, relative)
-        write_exclusive(staging_root, content)
+        if task_kind == "authorization":
+            expected_digest = runtime["authorization_task_sha256"]
+            actual_digest = hashlib.sha256(content).hexdigest()
+            if actual_digest != expected_digest:
+                raise SnapshotError("authorization task digest does not match pinned evidence")
+        write_exclusive(staging_root, destination_name, content)
     except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError, SnapshotError) as exc:
-        print(f"standing task snapshot failed:{exc}", file=sys.stderr)
+        print(f"Vault task snapshot failed:{exc}", file=sys.stderr)
         return 75
     return 0
 

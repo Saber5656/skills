@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import stat
 import sys
 from pathlib import Path
 from typing import Optional
@@ -17,6 +19,36 @@ class ReviewError(RuntimeError):
 def sha256(path: Path) -> str:
     """Hash one runner-owned context file."""
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def sha256_regular_nofollow(path: Path) -> str:
+    """Hash a regular snapshot without following a final-component symlink."""
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ReviewError("authorization snapshot is not a regular file")
+        digest = hashlib.sha256()
+        while chunk := os.read(descriptor, 65536):
+            digest.update(chunk)
+        after = os.fstat(descriptor)
+        if (
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_size,
+            metadata.st_mtime_ns,
+            metadata.st_ctime_ns,
+        ) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        ):
+            raise ReviewError("authorization snapshot changed while being validated")
+        return digest.hexdigest()
+    finally:
+        os.close(descriptor)
 
 
 def relative_target(root: str, target: str) -> str:
@@ -142,6 +174,8 @@ def main(argv: list[str]) -> int:
             raise ReviewError("publication context digest mismatch")
         if context["authorization_task_sha256"] != argv[5]:
             raise ReviewError("authorization evidence digest mismatch")
+        if sha256_regular_nofollow(Path(context["authorization_task"])) != argv[5]:
+            raise ReviewError("authorization snapshot digest mismatch")
         manifest = context["publication_manifest"]["artifact_manifest"]
         gitleaks_version = context["runtime"]["gitleaks_version"]
         validate_manifest(

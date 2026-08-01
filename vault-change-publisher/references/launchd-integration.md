@@ -5,9 +5,10 @@
 ```text
 launchd 04:00
   -> daily dedicated runner
-  -> deterministic standing-task snapshot into run staging
+  -> deterministic standing-task snapshot into collection staging
   -> collection Codex process (Web/search, run staging write only)
   -> deterministic artifact validation
+  -> post-collection authorization snapshot into isolated review input
   -> publication review Codex process (read-only, no search/network)
   -> local commit Codex process (Vault/Git write, no search/network)
   -> initial fixed runner pushes (manifest-bound object IDs -> refs/heads/main)
@@ -51,6 +52,8 @@ Tracked sourceがmainへmergeされた後に配備し、各source/destinationの
 正本のresult schemaはstate-dependent constraintを保持する。runnerは各run配下へCodex Structured Outputs対応subsetを生成してAPIへ渡し、生成結果は各phaseのdeterministic validatorで正本契約に照合する。互換schemaだけをpublication可否の判定に使わない。
 
 collection Codex processへiCloud上のstanding taskを直接読ませない。resolverが検証した正本taskをrunner側の専用helperでrun stagingへ0600・exclusive createし、collection contextにはsnapshot pathだけを渡す。これによりcollectionのVault非アクセス境界を維持し、launchd配下のNode/CodexにVault全体のTCC権限を要求しない。
+
+authorization taskはnetwork-enabled collection終了後に別のreview input directoryへ0600・exclusive createし、no-network publication phaseへsnapshot pathだけを渡す。collection processからauthorization evidenceを参照可能にしない。
 
 ## Local Configuration
 
