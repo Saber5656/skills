@@ -60,6 +60,8 @@ fi
 /usr/bin/grep -F -- '"$FIXED_FETCHER" "$RUNTIME_CONTEXT_FILE"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- 'SCHEMA_PROJECTOR="$WORKDIR/prepare-codex-output-schema.py"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- 'CANONICAL_VALIDATOR="$WORKDIR/validate-canonical-result.py"' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- 'STANDING_TASK_STAGER="$WORKDIR/stage-standing-task.py"' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- '--arg standing_task "$STANDING_TASK_SNAPSHOT"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- '--output-schema "$CODEX_COLLECTION_SCHEMA"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- 'INTERPRETER_PROCESS_STATUS=75' "$RUNNER" >/dev/null
 if /usr/bin/grep -F -- 'fetch origin main' "$RUNNER" >/dev/null; then
