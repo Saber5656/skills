@@ -13,6 +13,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 SKILL_ROOT = Path(__file__).parents[1]
 SCRIPTS = SKILL_ROOT / "scripts"
@@ -36,6 +37,12 @@ FINALIZER_SPEC = importlib.util.spec_from_file_location(
 assert FINALIZER_SPEC and FINALIZER_SPEC.loader
 FINALIZER_MODULE = importlib.util.module_from_spec(FINALIZER_SPEC)
 FINALIZER_SPEC.loader.exec_module(FINALIZER_MODULE)
+FETCH_SPEC = importlib.util.spec_from_file_location(
+    "fetch_vault_main", SCRIPTS / "fetch-vault-main.py"
+)
+assert FETCH_SPEC and FETCH_SPEC.loader
+FETCH_MODULE = importlib.util.module_from_spec(FETCH_SPEC)
+FETCH_SPEC.loader.exec_module(FETCH_MODULE)
 
 
 class RuntimeHelperTests(unittest.TestCase):
@@ -114,6 +121,73 @@ def load_environment(*, checkout_root, environ, require_catalog):
     def tearDown(self) -> None:
         """Remove the isolated fixture."""
         self.temp_dir.cleanup()
+
+    def test_network_git_keeps_process_cwd_outside_vault(self) -> None:
+        """Use explicit Git metadata/work-tree arguments for transport commands."""
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="a" * 40 + "\trefs/heads/main\n", stderr=""
+        )
+        for module in (PUSH_MODULE, FINALIZER_MODULE):
+            with mock.patch.object(module.subprocess, "run", return_value=completed) as run:
+                remote = module.remote_head(
+                    "/vault/worktree", "ssh://git@example.invalid/repo", "/local/gitdir"
+                )
+            self.assertEqual(remote, "a" * 40)
+            command = run.call_args.args[0]
+            self.assertEqual(
+                command[:3],
+                [
+                    "git",
+                    "--git-dir=/local/gitdir",
+                    "--work-tree=/vault/worktree",
+                ],
+            )
+            self.assertNotIn("-C", command)
+
+    def test_fixed_fetch_pins_remote_refspec_and_environment(self) -> None:
+        """Reject mutable remote/config behavior in the preflight transport."""
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="", stderr=""
+        )
+        with mock.patch.dict(os.environ, {"GIT_DIR": "/attacker/git"}), mock.patch.object(
+            FETCH_MODULE.subprocess, "run", return_value=completed
+        ) as run:
+            FETCH_MODULE.fetch_main(
+                "/vault/worktree", "/local/gitdir", "ssh://git@example.invalid/repo"
+            )
+        command = run.call_args.args[0]
+        self.assertEqual(
+            command[:3],
+            ["git", "--git-dir=/local/gitdir", "--work-tree=/vault/worktree"],
+        )
+        self.assertIn("core.hooksPath=/dev/null", command)
+        self.assertEqual(
+            command[-2:],
+            [
+                "ssh://git@example.invalid/repo",
+                "refs/heads/main:refs/remotes/origin/main",
+            ],
+        )
+        self.assertNotIn("origin", command)
+        self.assertNotIn("GIT_DIR", run.call_args.kwargs["env"])
+        self.assertEqual(run.call_args.kwargs["env"]["GIT_CONFIG_NOSYSTEM"], "1")
+        self.assertEqual(
+            run.call_args.kwargs["env"]["GIT_CONFIG_GLOBAL"], os.devnull
+        )
+
+    def test_fixed_fetch_invalid_utf8_uses_standard_failure_contract(self) -> None:
+        """Convert malformed runtime bytes into status 75 without a traceback."""
+        invalid = self.workdir / "invalid-fetch-runtime.json"
+        invalid.write_bytes(b"\xff")
+        result = subprocess.run(
+            [str(SCRIPTS / "fetch-vault-main.py"), str(invalid)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 75)
+        self.assertIn("fixed fetch blocked:", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
 
     def test_resolver_uses_catalog_and_relative_config(self) -> None:
         """Resolve roots and Git directories without tracked personal paths."""
@@ -505,6 +579,8 @@ def load_environment(*, checkout_root, environ, require_catalog):
         runtime = {
             "agents_vault_root": str(self.agents),
             "user_vault_root": str(self.user),
+            "agents_git_dir": str(self.agents / ".git"),
+            "user_git_dir": str(self.user / ".git"),
             "agents_remote_url": str(self.origins["agents"]),
             "user_remote_url": str(self.origins["user"]),
             "gitleaks_bin": str(self.fake_gitleaks),
@@ -926,6 +1002,7 @@ def load_environment(*, checkout_root, environ, require_catalog):
             SKILL_ROOT / "references" / "evidence-review-result.schema.json",
             SKILL_ROOT / "references" / "automation-result.schema.json",
             SCRIPTS / "resolve-runtime-context.py",
+            SCRIPTS / "fetch-vault-main.py",
             SCRIPTS / "capture-vault-state.py",
             SCRIPTS / "validate-collection-result.py",
             SCRIPTS / "install-verified-artifacts.py",
@@ -961,8 +1038,9 @@ with (output.parent/"invocations.log").open("a") as log:
     log.write(stage+"\\n")
 if "--search" in args:
     staging=Path(context["collection_output_root"])
-    summary=staging/"SUMMARY-IT-NEWS-2026-07-31.md"
-    advisory=staging/"Personal-Vulnerability-Advisory-2026-07-31.md"
+    run_date=context["started_at"][:10]
+    summary=staging/f"SUMMARY-IT-NEWS-{run_date}.md"
+    advisory=staging/f"Personal-Vulnerability-Advisory-{run_date}.md"
     summary.write_text("summary")
     advisory.write_text("advisory")
     digest=lambda p: hashlib.sha256(p.read_bytes()).hexdigest()

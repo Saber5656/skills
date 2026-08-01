@@ -30,11 +30,19 @@ def clean_environment() -> dict[str, str]:
 
 
 def git(
-    repo: str, *arguments: str, check: bool = True
+    repo: str,
+    *arguments: str,
+    check: bool = True,
+    git_dir: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run Git with hooks and ambient configuration disabled."""
+    repository_arguments = (
+        [f"--git-dir={git_dir}", f"--work-tree={repo}"]
+        if git_dir is not None
+        else ["-C", repo]
+    )
     return subprocess.run(
-        ["git", "-C", repo, "-c", f"core.hooksPath={os.devnull}", *arguments],
+        ["git", *repository_arguments, "-c", f"core.hooksPath={os.devnull}", *arguments],
         check=check,
         capture_output=True,
         text=True,
@@ -96,10 +104,15 @@ def dirty_status(repo: str) -> tuple[bool, str]:
     return (not status, hashlib.sha256(status.encode("utf-8")).hexdigest())
 
 
-def remote_head(repo: str, remote_url: str) -> str:
+def remote_head(repo: str, remote_url: str, git_dir: str | None = None) -> str:
     """Resolve the literal remote main URL without using a mutable remote name."""
     result = git(
-        repo, "ls-remote", "--exit-code", remote_url, "refs/heads/main"
+        repo,
+        "ls-remote",
+        "--exit-code",
+        remote_url,
+        "refs/heads/main",
+        git_dir=git_dir,
     ).stdout.split()
     if len(result) != 2:
         raise FinalizationError("could not resolve remote main")
@@ -146,7 +159,9 @@ def partial_result(
         f"{pre['agents_vault']['local_head']}..{head}",
     ).stdout.splitlines()
     try:
-        remote = remote_head(repo, runtime["agents_remote_url"])
+        remote = remote_head(
+            repo, runtime["agents_remote_url"], runtime["agents_git_dir"]
+        )
     except (FinalizationError, subprocess.SubprocessError):
         remote = initial["agents_vault"]["remote_head"]
     agents = dict(initial["agents_vault"])
@@ -260,16 +275,21 @@ def main(argv: list[str]) -> int:
             runtime["agents_remote_url"],
             f"{evidence_commit}:refs/heads/main",
             check=False,
+            git_dir=runtime["agents_git_dir"],
         )
         if result.returncode != 0:
             raise FinalizationError("final evidence push failed")
-        remote = remote_head(repo, runtime["agents_remote_url"])
+        remote = remote_head(
+            repo, runtime["agents_remote_url"], runtime["agents_git_dir"]
+        )
         clean, _ = dirty_status(repo)
         if remote != evidence_commit or not clean:
             raise FinalizationError("final evidence state is not clean and published")
         user_repo = runtime["user_vault_root"]
         user_head = git(user_repo, "rev-parse", "HEAD").stdout.strip()
-        user_remote = remote_head(user_repo, runtime["user_remote_url"])
+        user_remote = remote_head(
+            user_repo, runtime["user_remote_url"], runtime["user_git_dir"]
+        )
         user_clean, _ = dirty_status(user_repo)
         if (
             git(user_repo, "branch", "--show-current").stdout.strip() != "main"

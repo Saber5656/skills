@@ -31,6 +31,7 @@ launchd 04:00
 | `references/evidence-review-result.schema.json` | same workdir |
 | `references/automation-result.schema.json` | same workdir |
 | `scripts/resolve-runtime-context.py` | same workdir |
+| `scripts/fetch-vault-main.py` | same workdir |
 | `scripts/capture-vault-state.py` | same workdir |
 | `scripts/validate-collection-result.py` | same workdir |
 | `scripts/install-verified-artifacts.py` | same workdir |
@@ -46,6 +47,8 @@ Tracked sourceがmainへmergeされた後に配備し、各source/destinationの
 ## Local Configuration
 
 personal absolute paths、Vault names、machine layoutはtracked fileへ書かない。`automation.local.env`にはSaihai primary checkout、relative destination、承認taskのSHA-256 pinだけを置き、runnerは`directory_paths.load_environment(checkout_root=..., environ={}, require_catalog=True)`でcanonical rootsを解決する。承認taskが変わった場合は自動追従せず、内容を人間が再確認してpinを更新する。
+
+File Provider配下のVaultでnetwork Git transportを起動するときは、transport subprocessのcurrent working directoryをVaultへ移さない。resolverが検証したGit directoryとworktree rootをそれぞれ`--git-dir` / `--work-tree`へ明示し、fetch、`ls-remote`、fixed pushを実行する。remote URL、object ID、`refs/heads/main`の固定契約とnon-force制約は変更しない。
 
 ## Deployment Gate
 

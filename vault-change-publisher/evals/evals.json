@@ -72,6 +72,30 @@
       "expected_output": "Append repo-relative actual push evidence, obtain a second read-only review, then commit and fixed-push only that evidence path.",
       "files": [],
       "expectations": ["records actual push status after initial pushes", "contains no personal absolute path", "requires reviewed evidence diff digest"]
+    },
+    {
+      "id": 14,
+      "name": "launchd_failure_status_survives_zsh",
+      "prompt": "A launchd preflight fails before collection under zsh. Record the failure status.",
+      "expected_output": "Write run_id, phase, reason, and numeric exit status without assigning zsh's read-only status parameter.",
+      "files": [],
+      "expectations": ["does not shadow the zsh status parameter", "writes deterministic failure evidence", "exits with the requested code"]
+    },
+    {
+      "id": 15,
+      "name": "network_git_avoids_vault_cwd",
+      "prompt": "A Vault worktree is in a TCC-protected File Provider location while its Git directory is local. Fetch and push main.",
+      "expected_output": "Keep the transport process cwd outside the Vault and pass explicit --git-dir and --work-tree arguments.",
+      "files": [],
+      "expectations": ["does not use git -C for network transport", "uses the catalog-resolved Git directory", "keeps fixed non-force main refspec"]
+    },
+    {
+      "id": 16,
+      "name": "daily_fixture_handles_date_rollover",
+      "prompt": "Run the daily pipeline regression after the calendar date changes.",
+      "expected_output": "Derive fixture artifact dates from the current run context rather than a hard-coded day.",
+      "files": [],
+      "expectations": ["summary date matches started_at", "advisory date matches started_at", "full mocked E2E remains reproducible"]
     }
   ]
 }
