@@ -1140,8 +1140,12 @@ def load_environment(*, checkout_root, environ, require_catalog):
         summary = staging / "SUMMARY-IT-NEWS-2026-07-31.md"
         advisory = staging / "Personal-Vulnerability-Advisory-2026-07-31.md"
         summary.write_text("summary", encoding="utf-8")
-        advisory.write_text("advisory", encoding="utf-8")
         digest = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
+        advisory.write_text(
+            f"- 入力ニュース: {summary.name} "
+            f"(same-run SHA-256: {digest(summary)})\n",
+            encoding="utf-8",
+        )
         result_path = self.workdir / "collection.json"
         payload = {
             "daily_pipeline_status": "complete",
@@ -1166,6 +1170,63 @@ def load_environment(*, checkout_root, environ, require_catalog):
         payload["summary_sha256"] = "0" * 64
         result_path.write_text(json.dumps(payload), encoding="utf-8")
         self.assertEqual(subprocess.run(command, check=False).returncode, 75)
+
+    def test_collection_validator_rejects_unsafe_advisory_references(self) -> None:
+        """Reject private paths, inconsistent hashes/names, and duplicate fields."""
+        staging = self.workdir / "staging"
+        staging.mkdir()
+        summary = staging / "SUMMARY-IT-NEWS-2026-07-31.md"
+        advisory = staging / "Personal-Vulnerability-Advisory-2026-07-31.md"
+        summary.write_text("summary", encoding="utf-8")
+        summary_hash = hashlib.sha256(summary.read_bytes()).hexdigest()
+        result_path = self.workdir / "collection.json"
+        payload = {
+            "daily_pipeline_status": "complete",
+            "run_id": "20260731T040000+0900",
+            "summary_path": str(summary),
+            "summary_sha256": summary_hash,
+            "advisory_path": str(advisory),
+            "advisory_sha256": "",
+            "vault_artifacts_complete": True,
+        }
+        command = [
+            str(SCRIPTS / "validate-collection-result.py"),
+            str(result_path),
+            str(staging),
+            payload["run_id"],
+            "0",
+        ]
+
+        unsafe_references = {
+            "private home": f"- 入力ニュース: {Path.home()}/news.md\n",
+            "staging path": f"- 入力ニュース: {summary}\n",
+            "wrong basename": (
+                "- 入力ニュース: SUMMARY-IT-NEWS-2026-07-30.md "
+                f"(same-run SHA-256: {summary_hash})\n"
+            ),
+            "wrong digest": (
+                f"- 入力ニュース: {summary.name} "
+                f"(same-run SHA-256: {'0' * 64})\n"
+            ),
+            "duplicate field": (
+                f"- 入力ニュース: {summary.name} "
+                f"(same-run SHA-256: {summary_hash})\n"
+                f"- 入力ニュース: {summary.name} "
+                f"(same-run SHA-256: {summary_hash})\n"
+            ),
+        }
+        for label, content in unsafe_references.items():
+            with self.subTest(label=label):
+                advisory.write_text(content, encoding="utf-8")
+                payload["advisory_sha256"] = hashlib.sha256(
+                    advisory.read_bytes()
+                ).hexdigest()
+                result_path.write_text(json.dumps(payload), encoding="utf-8")
+                validation = subprocess.run(
+                    command, check=False, capture_output=True, text=True
+                )
+                self.assertEqual(validation.returncode, 75)
+                self.assertIn("collection validation failed", validation.stderr)
 
     def test_installer_places_only_declared_roles(self) -> None:
         """Install summary and advisory below their configured Vault roots."""
@@ -1803,8 +1864,8 @@ if "--search" in args:
     summary=staging/f"SUMMARY-IT-NEWS-{run_date}.md"
     advisory=staging/f"Personal-Vulnerability-Advisory-{run_date}.md"
     summary.write_text("summary "+context["run_id"])
-    advisory.write_text("advisory "+context["run_id"])
     digest=lambda p: hashlib.sha256(p.read_bytes()).hexdigest()
+    advisory.write_text(f"- 入力ニュース: {summary.name} (same-run SHA-256: {digest(summary)})\\n")
     result={"daily_pipeline_status":"complete","run_id":context["run_id"],"summary_path":str(summary),"summary_sha256":digest(summary),"advisory_path":str(advisory),"advisory_sha256":digest(advisory),"notification_result":"none","vault_artifacts_complete":True,"next_action":None}
     if os.environ.get("FAKE_CANONICAL_INVALID_COLLECTION") == "1":
         result["next_action"]="must be null for a complete result"

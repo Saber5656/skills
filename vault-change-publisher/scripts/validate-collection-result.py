@@ -36,7 +36,7 @@ def validate_artifact(
     earliest_mtime: int,
     expected_date: str,
     role: str,
-) -> None:
+) -> str:
     """Require a same-run regular non-symlink file below staging root."""
     path = Path(path_value)
     if not path.is_absolute():
@@ -79,12 +79,34 @@ def validate_artifact(
         if actual_hash != expected_hash:
             raise ValidationError("artifact SHA-256 mismatch")
         try:
-            content.decode("utf-8")
+            decoded = content.decode("utf-8")
         except UnicodeDecodeError as exc:
             raise ValidationError("artifact is not UTF-8 text") from exc
     finally:
         for opened_descriptor in reversed(opened):
             os.close(opened_descriptor)
+    return decoded
+
+
+def validate_advisory_reference(
+    advisory: str,
+    summary_name: str,
+    summary_sha256: str,
+    staging_root: Path,
+) -> None:
+    """Require one exact path-free reference and reject private runtime paths."""
+    expected = (
+        f"- 入力ニュース: {summary_name} "
+        f"(same-run SHA-256: {summary_sha256})"
+    )
+    references = [
+        line for line in advisory.splitlines() if line.startswith("- 入力ニュース:")
+    ]
+    if references != [expected]:
+        raise ValidationError("advisory summary reference is missing or inconsistent")
+    private_paths = {str(Path(os.path.abspath(staging_root))), str(Path.home())}
+    if any(private_path in advisory for private_path in private_paths):
+        raise ValidationError("advisory contains a machine-specific path")
 
 
 def main(argv: list[str]) -> int:
@@ -108,7 +130,7 @@ def main(argv: list[str]) -> int:
             raise ValidationError("run ID does not contain a JST date")
         expected_date = "-".join(run_match.groups())
         earliest_mtime = int(argv[4])
-        validate_artifact(
+        summary_content = validate_artifact(
             result["summary_path"],
             result["summary_sha256"],
             Path(argv[2]),
@@ -116,13 +138,22 @@ def main(argv: list[str]) -> int:
             expected_date,
             "summary",
         )
-        validate_artifact(
+        advisory_content = validate_artifact(
             result["advisory_path"],
             result["advisory_sha256"],
             Path(argv[2]),
             earliest_mtime,
             expected_date,
             "advisory",
+        )
+        private_paths = {str(Path(os.path.abspath(argv[2]))), str(Path.home())}
+        if any(private_path in summary_content for private_path in private_paths):
+            raise ValidationError("summary contains a machine-specific path")
+        validate_advisory_reference(
+            advisory_content,
+            Path(result["summary_path"]).name,
+            result["summary_sha256"],
+            Path(argv[2]),
         )
     except (
         KeyError,
