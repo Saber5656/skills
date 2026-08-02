@@ -2083,6 +2083,18 @@ elif stage=="publication":
     result={"outcome":"ready_to_push","phase":"local_commit","daily_pipeline_status":"complete","summary_path":installed["summary_target"],"advisory_path":installed["advisory_target"],"notification_result":"none","agents_vault":publish("agents_vault",runtime_context["agents_vault_root"]),"user_vault":publish("user_vault",runtime_context["user_vault_root"]),"evidence_finalization_commit":None,"next_action":None}
 else:
     plan=context["evidence_plan"]
+    publication=context["publication_context"]
+    evidence_diff=subprocess.check_output(
+        ["git","-C",publication["runtime"]["agents_vault_root"],"diff","--",plan["target_path"]],
+        text=True,
+    )
+    payload_lines=[line[1:] for line in evidence_diff.splitlines() if line.startswith('+{')]
+    assert len(payload_lines) == 1
+    evidence_payload=json.loads(payload_lines[0])
+    assert set(evidence_payload) == {
+        "run_id","publication_context_sha256","agents_vault","user_vault",
+        "summary_repo_path","advisory_repo_path",
+    }
     result={"outcome":"approved","target_path":plan["target_path"],"evidence_diff_sha256":plan["evidence_diff_sha256"],"review_status":"quality_ok","next_action":None}
 output.write_text(json.dumps(result))
 """,

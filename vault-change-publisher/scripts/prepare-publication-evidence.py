@@ -298,7 +298,6 @@ def main(argv: list[str]) -> int:
         context_digest = hashlib.sha256(context_path.read_bytes()).hexdigest()
         payload = {
             "run_id": argv[5],
-            "started_at": argv[6],
             "publication_context_sha256": context_digest,
             "agents_vault": {
                 "commit_hashes": initial["agents_vault"]["commit_hashes"],
