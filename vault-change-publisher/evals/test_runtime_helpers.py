@@ -67,6 +67,12 @@ COMMITTER_SPEC = importlib.util.spec_from_file_location(
 assert COMMITTER_SPEC and COMMITTER_SPEC.loader
 COMMITTER_MODULE = importlib.util.module_from_spec(COMMITTER_SPEC)
 COMMITTER_SPEC.loader.exec_module(COMMITTER_MODULE)
+EVIDENCE_SPEC = importlib.util.spec_from_file_location(
+    "prepare_publication_evidence", SCRIPTS / "prepare-publication-evidence.py"
+)
+assert EVIDENCE_SPEC and EVIDENCE_SPEC.loader
+EVIDENCE_MODULE = importlib.util.module_from_spec(EVIDENCE_SPEC)
+EVIDENCE_SPEC.loader.exec_module(EVIDENCE_MODULE)
 
 
 class RuntimeHelperTests(unittest.TestCase):
@@ -113,7 +119,9 @@ def load_environment(*, checkout_root, environ, require_catalog):
         self.config = self.workdir / "automation.local.env"
         (self.agents / "tasks").mkdir()
         (self.agents / "tasks" / "standing.md").write_text(
-            "standing\n", encoding="utf-8"
+            "# Standing\n\n### Vault Publication Evidence\n\n"
+            "| Run ID | Push status |\n|---|---|\n\n## Reviews\n\nstanding\n",
+            encoding="utf-8",
         )
         authorization = self.agents / "tasks" / "auth.md"
         authorization.write_text("approved\n", encoding="utf-8")
@@ -1360,6 +1368,166 @@ def load_environment(*, checkout_root, environ, require_catalog):
         )
         self.assertEqual(result.returncode, 75)
         self.assertIn("approved review digest mismatch", result.stderr)
+
+    def test_evidence_block_is_inserted_inside_canonical_section(self) -> None:
+        """Place evidence before the next peer heading instead of at task EOF."""
+        task = self.agents / "tasks" / "standing.md"
+        marker = b"<!-- vault-change-publisher:fixture -->"
+        block = "\n#### Daily publication evidence — fixture\n".encode() + marker + b"\n"
+        EVIDENCE_MODULE.insert_under_evidence_section_no_follow(
+            self.agents, Path("tasks/standing.md"), block
+        )
+        text = task.read_text(encoding="utf-8")
+        self.assertLess(text.index("Daily publication evidence"), text.index("## Reviews"))
+        self.assertEqual(text.count("vault-change-publisher:fixture"), 1)
+
+    def test_evidence_block_requires_one_canonical_section(self) -> None:
+        """Fail closed when the insertion anchor is absent or ambiguous."""
+        task = self.agents / "tasks" / "standing.md"
+        marker = b"<!-- vault-change-publisher:fixture -->"
+        block = "\n#### Daily publication evidence — fixture\n".encode() + marker + b"\n"
+        for content in (
+            "# Standing\n",
+            "### Vault Publication Evidence\n### Vault Publication Evidence\n",
+        ):
+            with self.subTest(content=content):
+                task.write_text(content, encoding="utf-8")
+                with self.assertRaises(EVIDENCE_MODULE.EvidenceError):
+                    EVIDENCE_MODULE.insert_under_evidence_section_no_follow(
+                        self.agents, Path("tasks/standing.md"), block
+                    )
+
+    def test_evidence_block_ignores_headings_inside_fences(self) -> None:
+        """Treat ATX-like lines in backtick and tilde fences as content."""
+        task = self.agents / "tasks" / "standing.md"
+        task.write_text(
+            "# Standing\n\n### Vault Publication Evidence\n\n"
+            "```md\n## example inside fence\n```\n"
+            "~~~\n### another example\n~~~\n"
+            "section tail\n\n## Reviews\n",
+            encoding="utf-8",
+        )
+        block = (
+            "\n#### Daily publication evidence — fixture\n"
+            "<!-- vault-change-publisher:fixture -->\n"
+        ).encode()
+        EVIDENCE_MODULE.insert_under_evidence_section_no_follow(
+            self.agents, Path("tasks/standing.md"), block
+        )
+        text = task.read_text(encoding="utf-8")
+        self.assertLess(text.index("~~~\nsection tail"), text.index("Daily publication"))
+        self.assertLess(text.index("Daily publication"), text.index("## Reviews"))
+
+    def test_evidence_block_rejects_unterminated_fences_without_mutation(self) -> None:
+        """Do not insert evidence into an unterminated backtick or tilde fence."""
+        task = self.agents / "tasks" / "standing.md"
+        block = (
+            "\n#### Daily publication evidence — fixture\n"
+            "<!-- vault-change-publisher:fixture -->\n"
+        ).encode()
+        for fence in ("```md", "~~~"):
+            with self.subTest(fence=fence):
+                original = (
+                    "# Standing\n\n### Vault Publication Evidence\n\n"
+                    f"{fence}\nunclosed example\n## Reviews\n"
+                )
+                task.write_text(original, encoding="utf-8")
+                with self.assertRaisesRegex(
+                    EVIDENCE_MODULE.EvidenceError, "unterminated fenced block"
+                ):
+                    EVIDENCE_MODULE.insert_under_evidence_section_no_follow(
+                        self.agents, Path("tasks/standing.md"), block
+                    )
+                self.assertEqual(task.read_text(encoding="utf-8"), original)
+
+    def test_evidence_target_content_guards_fail_closed(self) -> None:
+        """Reject malformed, oversized, growing, and oversized-output targets."""
+        task = self.agents / "tasks" / "standing.md"
+        relative = Path("tasks/standing.md")
+        block = (
+            "\n#### Daily publication evidence — fixture\n"
+            "<!-- vault-change-publisher:fixture -->\n"
+        ).encode()
+
+        task.write_bytes(b"\xff")
+        with self.assertRaisesRegex(EVIDENCE_MODULE.EvidenceError, "UTF-8"):
+            EVIDENCE_MODULE.insert_under_evidence_section_no_follow(
+                self.agents, relative, block
+            )
+
+        with task.open("wb") as output:
+            output.truncate(EVIDENCE_MODULE.MAX_TASK_BYTES + 1)
+        with self.assertRaisesRegex(EVIDENCE_MODULE.EvidenceError, "size"):
+            EVIDENCE_MODULE.insert_under_evidence_section_no_follow(
+                self.agents, relative, block
+            )
+
+        task.write_text("### Vault Publication Evidence\n", encoding="utf-8")
+        one_megabyte = b"x" * (1024 * 1024)
+        with mock.patch.object(
+            EVIDENCE_MODULE.os, "read", side_effect=[one_megabyte] * 11
+        ):
+            with self.assertRaisesRegex(EVIDENCE_MODULE.EvidenceError, "grew"):
+                EVIDENCE_MODULE.insert_under_evidence_section_no_follow(
+                    self.agents, relative, block
+                )
+
+        prefix = "### Vault Publication Evidence\n"
+        padding = "x" * (
+            EVIDENCE_MODULE.MAX_TASK_BYTES - len(prefix.encode()) - 1
+        )
+        task.write_text(prefix + padding, encoding="utf-8")
+        with self.assertRaisesRegex(EVIDENCE_MODULE.EvidenceError, "updated"):
+            EVIDENCE_MODULE.insert_under_evidence_section_no_follow(
+                self.agents, relative, block
+            )
+
+    def test_evidence_atomic_failure_preserves_original_target(self) -> None:
+        """Leave the canonical task unchanged after partial or zero writes."""
+        task = self.agents / "tasks" / "standing.md"
+        relative = Path("tasks/standing.md")
+        original = task.read_bytes()
+        block = (
+            "\n#### Daily publication evidence — fixture\n"
+            "<!-- vault-change-publisher:fixture -->\n"
+        ).encode()
+        for side_effect in ([55, OSError("disk full")], [0]):
+            with self.subTest(side_effect=side_effect):
+                task.write_bytes(original)
+                with mock.patch.object(
+                    EVIDENCE_MODULE.os, "write", side_effect=side_effect
+                ):
+                    with self.assertRaises((OSError, EVIDENCE_MODULE.EvidenceError)):
+                        EVIDENCE_MODULE.insert_under_evidence_section_no_follow(
+                            self.agents, relative, block
+                        )
+                self.assertEqual(task.read_bytes(), original)
+                self.assertEqual(list(task.parent.glob("*.evidence-*.tmp")), [])
+
+    def test_evidence_concurrent_mutation_is_not_overwritten(self) -> None:
+        """Detect a target edit before replacement and preserve that edit."""
+        task = self.agents / "tasks" / "standing.md"
+        relative = Path("tasks/standing.md")
+        original = task.read_text(encoding="utf-8")
+        concurrent = original + "concurrent edit\n"
+        block = (
+            "\n#### Daily publication evidence — fixture\n"
+            "<!-- vault-change-publisher:fixture -->\n"
+        ).encode()
+        real_stat = EVIDENCE_MODULE.os.stat
+
+        def mutate_then_stat(*args, **kwargs):
+            task.write_text(concurrent, encoding="utf-8")
+            return real_stat(*args, **kwargs)
+
+        with mock.patch.object(
+            EVIDENCE_MODULE.os, "stat", side_effect=mutate_then_stat
+        ):
+            with self.assertRaisesRegex(EVIDENCE_MODULE.EvidenceError, "changed"):
+                EVIDENCE_MODULE.insert_under_evidence_section_no_follow(
+                    self.agents, relative, block
+                )
+        self.assertEqual(task.read_text(encoding="utf-8"), concurrent)
 
     def test_fixed_pusher_validates_and_pushes_exact_heads(self) -> None:
         """Push both validated local main heads outside the Codex process."""
