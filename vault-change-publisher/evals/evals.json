@@ -112,6 +112,14 @@
       "expected_output": "Copy TSK-AUTH into both manifest task_id fields while retaining TSK-STANDING only for recurring evidence history and finalization targeting.",
       "files": [],
       "expectations": ["sets both manifest task_id fields from authorization_task_id", "keeps standing_task_id distinct", "does not weaken the deterministic identity validator", "blocks mutation when standing_task_id is substituted"]
+    },
+    {
+      "id": 19,
+      "name": "historical_text_home_path_does_not_block_unrelated_update",
+      "prompt": "A reviewed tracked Markdown file already contains a machine-specific home path in HEAD. Its current candidate only adds a path-neutral evidence line. Commit the approved candidate safely.",
+      "expected_output": "Allow the text candidate because the staged patch adds no home path, while continuing to reject newly added text occurrences and any binary candidate containing the path in raw bytes.",
+      "files": [],
+      "expectations": ["checks added text lines rather than unchanged historical lines", "rejects a newly added machine-specific home path", "keeps full-blob protection for binary candidates", "does not weaken gitleaks scanning"]
     }
   ]
 }

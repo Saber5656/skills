@@ -767,6 +767,85 @@ def load_environment(*, checkout_root, environ, require_catalog):
                 deletion_index,
             )
 
+    def test_local_committer_allows_historical_home_path_but_rejects_new_text_path(
+        self,
+    ) -> None:
+        """Only newly added home paths block reviewed text candidates."""
+        repo = self.agents
+        git_dir = str(repo / ".git")
+        historical = repo / "historical.md"
+        historical.write_text(
+            f"historical evidence: {Path.home()}/old.log\n",
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "-C", str(repo), "add", "historical.md"], check=True)
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo),
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "-q",
+                "-m",
+                "historical path fixture",
+            ],
+            check=True,
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            historical_index = str(Path(temporary) / "historical.index")
+            COMMITTER_MODULE.git(
+                str(repo), git_dir, "read-tree", "HEAD", index_file=historical_index
+            )
+            historical.write_text(
+                historical.read_text(encoding="utf-8") + "reviewed update\n",
+                encoding="utf-8",
+            )
+            COMMITTER_MODULE.git(
+                str(repo),
+                git_dir,
+                "add",
+                "--",
+                "historical.md",
+                index_file=historical_index,
+            )
+            COMMITTER_MODULE.scan_staged(
+                str(self.fake_gitleaks),
+                str(repo),
+                git_dir,
+                ["historical.md"],
+                historical_index,
+            )
+
+            added_index = str(Path(temporary) / "added.index")
+            COMMITTER_MODULE.git(
+                str(repo), git_dir, "read-tree", "HEAD", index_file=added_index
+            )
+            historical.write_text(
+                historical.read_text(encoding="utf-8")
+                + f"new evidence: {Path.home()}/new.log\n",
+                encoding="utf-8",
+            )
+            COMMITTER_MODULE.git(
+                str(repo),
+                git_dir,
+                "add",
+                "--",
+                "historical.md",
+                index_file=added_index,
+            )
+            with self.assertRaises(COMMITTER_MODULE.CommitError):
+                COMMITTER_MODULE.scan_staged(
+                    str(self.fake_gitleaks),
+                    str(repo),
+                    git_dir,
+                    ["historical.md"],
+                    added_index,
+                )
+
     def test_local_committer_malformed_input_emits_blocked_result(self) -> None:
         """Convert malformed early input into status 75 and structured JSON."""
         invalid = self.workdir / "invalid-committer-runtime.json"
