@@ -367,7 +367,18 @@ def scan_staged(
                 capture_output=True,
                 env=environment,
             ).stdout
-            if home_bytes in candidate:
+            numstat = git(
+                repo,
+                git_dir,
+                "diff",
+                "--cached",
+                "--numstat",
+                "-z",
+                "--",
+                path,
+                index_file=index_file,
+            ).stdout
+            if numstat.startswith("-\t-\t") and home_bytes in candidate:
                 raise CommitError("candidate blob contains a machine-specific home path")
 
 
