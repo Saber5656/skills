@@ -16,6 +16,9 @@ artifact installation, staging, commit, or push.
    every pre-existing dirty path plus that Vault's planned artifact target. The
    Agents manifest must also include the repo-relative standing-task path as the
    `daily_publication_v1` evidence-finalization target.
+   Copy `publication_context.authorization_task_id` exactly into the `task_id`
+   field of both manifests. The standing task identifies recurring run history
+   and must not replace the authorization identity used by the validator.
    `commit_groups` must partition those paths into the smallest independently
    revertible initial-publication units; evidence finalization is reviewed again
    after the first fixed pushes. Use repo-relative paths only.

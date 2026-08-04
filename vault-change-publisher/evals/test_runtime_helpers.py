@@ -1936,6 +1936,30 @@ def load_environment(*, checkout_root, environ, require_catalog):
                 "fixture-gitleaks 1.0",
             )
 
+    def test_review_rejects_standing_task_as_manifest_identity(self) -> None:
+        """Keep recurring evidence ownership distinct from authorization."""
+        with self.assertRaisesRegex(
+            REVIEW_MODULE.ReviewError, "Task Change Manifest identity mismatch"
+        ):
+            REVIEW_MODULE.validate_manifest(
+                {"repo_root": str(self.agents), "task_id": "TSK-STANDING"},
+                {},
+                str(self.agents),
+                "TSK-AUTH",
+                {},
+                None,
+                "fixture-gitleaks 1.0",
+            )
+
+    def test_review_prompt_selects_authorization_task_for_both_manifests(self) -> None:
+        """Expose the validator's identity contract to the read-only reviewer."""
+        prompt = (SKILL_ROOT / "assets" / "daily-it-news.review.prompt.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("publication_context.authorization_task_id", prompt)
+        self.assertIn("both manifests", prompt)
+        self.assertIn("must not replace the authorization identity", prompt)
+
     def test_review_canonicalizes_both_containment_paths(self) -> None:
         """Accept a target expressed through a symlinked Vault path."""
         real_root = self.root / "real-vault"
