@@ -104,6 +104,14 @@
       "expected_output": "Use the validated private runtime Git identity for both author and committer without trusting ambient Git config or tracking personal values.",
       "files": [],
       "expectations": ["loads identity only from ignored local config", "validates and binds identity in runtime context", "overrides ambient GIT identity variables", "applies the same identity to evidence finalization", "contains no real personal identity in tracked files"]
+    },
+    {
+      "id": 18,
+      "name": "review_manifest_uses_authorization_task_id",
+      "prompt": "The publication context contains authorization_task_id TSK-AUTH and standing_task_id TSK-STANDING. Build both Vault Task Change Manifests for the read-only publication review.",
+      "expected_output": "Copy TSK-AUTH into both manifest task_id fields while retaining TSK-STANDING only for recurring evidence history and finalization targeting.",
+      "files": [],
+      "expectations": ["sets both manifest task_id fields from authorization_task_id", "keeps standing_task_id distinct", "does not weaken the deterministic identity validator", "blocks mutation when standing_task_id is substituted"]
     }
   ]
 }
