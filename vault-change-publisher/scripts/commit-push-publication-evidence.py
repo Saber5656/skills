@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -17,7 +18,44 @@ class FinalizationError(RuntimeError):
     """Represent a failed evidence finalization."""
 
 
-def clean_environment() -> dict[str, str]:
+def validated_publisher_identity(runtime: dict[str, str]) -> tuple[str, str]:
+    """Revalidate the private, context-bound Git identity at mutation time."""
+    name = runtime.get("publisher_git_name")
+    email = runtime.get("publisher_git_email")
+    if (
+        not isinstance(name, str)
+        or not name
+        or len(name) > 128
+        or any(character in name for character in "\0\r\n<>")
+        or not isinstance(email, str)
+        or not email
+        or len(email) > 254
+        or re.fullmatch(r"[^\s<>@]+@[^\s<>@]+", email) is None
+    ):
+        raise FinalizationError("publisher Git identity is invalid")
+    return name, email
+
+
+def context_bound_inputs(
+    runtime: dict[str, str],
+    pre: dict[str, object],
+    context_bytes: bytes,
+    expected_digest: str,
+) -> tuple[dict[str, str], dict[str, object]]:
+    """Reject valid-looking runtime substitutions after publication review."""
+    if hashlib.sha256(context_bytes).hexdigest() != expected_digest:
+        raise FinalizationError("publication context digest mismatch")
+    context = json.loads(context_bytes)
+    bound_runtime = context.get("runtime")
+    bound_pre = context.get("pre_collection_state")
+    if runtime != bound_runtime or pre != bound_pre:
+        raise FinalizationError("finalization inputs differ from reviewed context")
+    return bound_runtime, bound_pre
+
+
+def clean_environment(
+    publisher_identity: tuple[str, str] | None = None,
+) -> dict[str, str]:
     """Remove Git/Gitleaks override variables while preserving credentials."""
     environment = {
         key: value
@@ -26,6 +64,12 @@ def clean_environment() -> dict[str, str]:
     }
     environment["GIT_CONFIG_NOSYSTEM"] = "1"
     environment["GIT_CONFIG_GLOBAL"] = os.devnull
+    if publisher_identity is not None:
+        name, email = publisher_identity
+        environment["GIT_AUTHOR_NAME"] = name
+        environment["GIT_AUTHOR_EMAIL"] = email
+        environment["GIT_COMMITTER_NAME"] = name
+        environment["GIT_COMMITTER_EMAIL"] = email
     return environment
 
 
@@ -34,6 +78,7 @@ def git(
     *arguments: str,
     check: bool = True,
     git_dir: str | None = None,
+    publisher_identity: tuple[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run Git with hooks and ambient configuration disabled."""
     repository_arguments = (
@@ -46,7 +91,7 @@ def git(
         check=check,
         capture_output=True,
         text=True,
-        env=clean_environment(),
+        env=clean_environment(publisher_identity),
     )
 
 
@@ -194,10 +239,10 @@ def partial_result(
 
 def main(argv: list[str]) -> int:
     """Finalize reviewed evidence and emit the final automation result."""
-    if len(argv) != 8:
+    if len(argv) != 9:
         print(
             "usage: commit-push-publication-evidence.py RUNTIME PRE INITIAL "
-            "EVIDENCE_PLAN EVIDENCE_REVIEW FINAL REVIEW_STATUS",
+            "EVIDENCE_PLAN EVIDENCE_REVIEW FINAL REVIEW_STATUS CONTEXT",
             file=sys.stderr,
         )
         return 64
@@ -210,11 +255,19 @@ def main(argv: list[str]) -> int:
         pre = json.loads(Path(argv[2]).read_text(encoding="utf-8"))
         initial = json.loads(Path(argv[3]).read_text(encoding="utf-8"))
         plan = json.loads(Path(argv[4]).read_text(encoding="utf-8"))
+        runtime, pre = context_bound_inputs(
+            runtime,
+            pre,
+            Path(argv[8]).read_bytes(),
+            plan["publication_context_sha256"],
+        )
+        publisher_identity = validated_publisher_identity(runtime)
         review = json.loads(Path(argv[5]).read_text(encoding="utf-8"))
         if int(argv[7]) != 0 or review != {
             "outcome": "approved",
             "target_path": plan["target_path"],
             "evidence_diff_sha256": plan["evidence_diff_sha256"],
+            "publication_context_sha256": plan["publication_context_sha256"],
             "review_status": "quality_ok",
             "next_action": None,
         }:
@@ -249,7 +302,7 @@ def main(argv: list[str]) -> int:
             raise FinalizationError("staged evidence failed diff check")
         scan_staged(runtime["gitleaks_bin"], repo)
         message = "docs(task): record daily publication evidence"
-        git(repo, "commit", "-m", message)
+        git(repo, "commit", "-m", message, publisher_identity=publisher_identity)
         evidence_commit = git(repo, "rev-parse", "HEAD").stdout.strip()
         committed_paths = [
             value

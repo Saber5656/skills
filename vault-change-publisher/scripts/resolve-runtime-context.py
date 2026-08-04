@@ -25,6 +25,8 @@ ALLOWED_KEYS = {
     "AUTHORIZATION_TASK_ID",
     "AUTHORIZATION_TASK_RELATIVE",
     "AUTHORIZATION_TASK_SHA256",
+    "PUBLISHER_GIT_NAME",
+    "PUBLISHER_GIT_EMAIL",
 }
 REQUIRED_KEYS = ALLOWED_KEYS
 
@@ -69,6 +71,23 @@ def validated_relative(value: str, key: str) -> PurePosixPath:
     ):
         raise ContextError(f"invalid relative path:{key}")
     return path
+
+
+def validated_git_identity(name: str, email: str) -> tuple[str, str]:
+    """Accept bounded Git identity fields without control or address delimiters."""
+    if (
+        not name
+        or len(name) > 128
+        or any(character in name for character in "\0\r\n<>")
+    ):
+        raise ContextError("invalid publisher Git name")
+    if (
+        not email
+        or len(email) > 254
+        or re.fullmatch(r"[^\s<>@]+@[^\s<>@]+", email) is None
+    ):
+        raise ContextError("invalid publisher Git email")
+    return name, email
 
 
 def git_directory(repo_root: Path) -> str:
@@ -197,6 +216,9 @@ def resolve_context(local_config: Path, workdir: Path) -> dict[str, str]:
     authorization_digest = hashlib.sha256(authorization_path.read_bytes()).hexdigest()
     if authorization_digest != values["AUTHORIZATION_TASK_SHA256"]:
         raise ContextError("authorization task digest does not match pinned evidence")
+    publisher_name, publisher_email = validated_git_identity(
+        values["PUBLISHER_GIT_NAME"], values["PUBLISHER_GIT_EMAIL"]
+    )
 
     context = {
         "workdir": str(workdir.resolve()),
@@ -231,6 +253,8 @@ def resolve_context(local_config: Path, workdir: Path) -> dict[str, str]:
             authorization_path
         ),
         "authorization_task_sha256": authorization_digest,
+        "publisher_git_name": publisher_name,
+        "publisher_git_email": publisher_email,
     }
     for key, value in context.items():
         if not value:

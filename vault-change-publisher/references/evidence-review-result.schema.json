@@ -6,6 +6,7 @@
     "outcome",
     "target_path",
     "evidence_diff_sha256",
+    "publication_context_sha256",
     "review_status",
     "next_action"
   ],
@@ -13,6 +14,7 @@
     "outcome": {"enum": ["approved", "blocked"]},
     "target_path": {"type": "string", "minLength": 1},
     "evidence_diff_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "publication_context_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
     "review_status": {"enum": ["quality_ok", "blocked"]},
     "next_action": {"type": ["string", "null"]}
   },

@@ -64,6 +64,8 @@ review済み`install-verified-artifacts.py --plan`でmutation前にexact destina
 
 定期バッチでは、read-only publication reviewが承認した`commit_groups`を`commit-reviewed-publication.py`が順序通りにlocal commitする。実行器はVaultの現状態がreview前snapshotと完全一致することを再検証し、network、hook、署名、forceを使わない。commit後の固定pusherが各commitのpath/message/blobとmanifestを再検証してから、両Vaultの`main`へ一度ずつnon-force pushする。自然言語agentへVault mutationを委譲しない。
 
+local publication commitとAgents evidence finalization commitは、ambient Git configを使わず、ignoredな`automation.local.env`の`PUBLISHER_GIT_NAME` / `PUBLISHER_GIT_EMAIL`をresolverで検証し、digest-bound runtime context経由でauthor/committerへ固定する。個人identityをtracked skillへ含めず、launchdの最小環境でも設定したGitHubアカウントのContributor履歴へ一貫して帰属させる。
+
 配置後、Manifest外の新規・変更pathが増えていたら両Vaultのcommit前に停止する。
 
 ## Per-Vault Task Change Manifest

@@ -20,6 +20,14 @@ class EvidenceError(RuntimeError):
     """Represent an unsafe or incomplete evidence preparation."""
 
 
+def approved_context_digest(review: dict[str, object], context_bytes: bytes) -> str:
+    """Keep evidence bound to the context approved before the initial push."""
+    digest = hashlib.sha256(context_bytes).hexdigest()
+    if digest != review.get("publication_context_sha256"):
+        raise EvidenceError("publication context changed after approval")
+    return digest
+
+
 def read_regular_nofollow(path: Path) -> bytes:
     """Read stable bytes from one regular file without following its final link."""
     flags = os.O_RDONLY
@@ -295,10 +303,10 @@ def main(argv: list[str]) -> int:
         target_relative = PurePosixPath(finalization["target_path"])
         if target_relative.is_absolute() or ".." in target_relative.parts:
             raise EvidenceError("invalid evidence target")
-        context_digest = hashlib.sha256(context_path.read_bytes()).hexdigest()
+        context_digest = approved_context_digest(review, context_path.read_bytes())
         payload = {
             "run_id": argv[5],
-            "publication_context_sha256": context_digest,
+            "publication_context_sha256": review["publication_context_sha256"],
             "agents_vault": {
                 "commit_hashes": initial["agents_vault"]["commit_hashes"],
                 "push_status": initial["agents_vault"]["push_status"],
@@ -333,6 +341,7 @@ def main(argv: list[str]) -> int:
             "evidence_diff_sha256": git_diff_digest(
                 runtime["agents_vault_root"], str(target_relative)
             ),
+            "publication_context_sha256": context_digest,
             "marker": marker,
         }
         Path(argv[8]).write_text(

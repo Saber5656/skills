@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import stat
 import subprocess
 import sys
@@ -21,7 +22,27 @@ class CommitError(RuntimeError):
     """Represent a publication mutation that must fail closed."""
 
 
-def clean_environment() -> dict[str, str]:
+def validated_publisher_identity(runtime: dict[str, object]) -> tuple[str, str]:
+    """Revalidate the private, context-bound Git identity at mutation time."""
+    name = runtime.get("publisher_git_name")
+    email = runtime.get("publisher_git_email")
+    if (
+        not isinstance(name, str)
+        or not name
+        or len(name) > 128
+        or any(character in name for character in "\0\r\n<>")
+        or not isinstance(email, str)
+        or not email
+        or len(email) > 254
+        or re.fullmatch(r"[^\s<>@]+@[^\s<>@]+", email) is None
+    ):
+        raise CommitError("publisher Git identity is invalid")
+    return name, email
+
+
+def clean_environment(
+    publisher_identity: tuple[str, str] | None = None,
+) -> dict[str, str]:
     """Remove ambient Git overrides and prohibit lazy object retrieval."""
     environment = {
         key: value for key, value in os.environ.items() if not key.startswith("GIT_")
@@ -33,12 +54,18 @@ def clean_environment() -> dict[str, str]:
             "GIT_NO_LAZY_FETCH": "1",
             "GIT_NO_REPLACE_OBJECTS": "1",
             "GIT_OPTIONAL_LOCKS": "0",
-            "GIT_AUTHOR_NAME": "Codex Vault Publisher",
-            "GIT_AUTHOR_EMAIL": "codex-vault-publisher@localhost",
-            "GIT_COMMITTER_NAME": "Codex Vault Publisher",
-            "GIT_COMMITTER_EMAIL": "codex-vault-publisher@localhost",
         }
     )
+    if publisher_identity is not None:
+        name, email = publisher_identity
+        environment.update(
+            {
+                "GIT_AUTHOR_NAME": name,
+                "GIT_AUTHOR_EMAIL": email,
+                "GIT_COMMITTER_NAME": name,
+                "GIT_COMMITTER_EMAIL": email,
+            }
+        )
     return environment
 
 
@@ -49,9 +76,10 @@ def git(
     check: bool = True,
     index_file: str | None = None,
     input_text: str | None = None,
+    publisher_identity: tuple[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run local-only Git with explicit metadata and work-tree paths."""
-    environment = clean_environment()
+    environment = clean_environment(publisher_identity)
     if index_file is not None:
         environment["GIT_INDEX_FILE"] = index_file
     return subprocess.run(
@@ -512,6 +540,7 @@ def commit_groups(
     artifact_path: str,
     artifact_source_sha256: str,
     temporary_directory: Path,
+    publisher_identity: tuple[str, str] | None = None,
     before_update: Callable[[], None] | None = None,
 ) -> dict[str, object]:
     """Create the ordered, minimal commits declared by the approved manifest."""
@@ -597,6 +626,7 @@ def commit_groups(
                 "-p",
                 current_head,
                 input_text=message + "\n",
+                publisher_identity=publisher_identity,
             ).stdout.strip()
         finally:
             try:
@@ -711,6 +741,7 @@ def main(argv: list[str]) -> int:
         runtime, pre, collection, plan = reviewed_inputs(
             context, runtime, pre, collection, plan
         )
+        publisher_identity = validated_publisher_identity(runtime)
         bound_runtime, bound_runtime_bytes = write_bound_json(
             output.parent, "bound-runtime.json", runtime
         )
@@ -792,6 +823,7 @@ def main(argv: list[str]) -> int:
             ),
             str(collection["advisory_sha256"]),
             output.parent,
+            publisher_identity,
             before_update=lambda: capture_exact(
                 argv[8], str(bound_runtime), installed_state
             ),
@@ -815,6 +847,7 @@ def main(argv: list[str]) -> int:
             ),
             str(collection["summary_sha256"]),
             output.parent,
+            publisher_identity,
             before_update=lambda: capture_exact(
                 argv[8], str(bound_runtime), after_agents
             ),

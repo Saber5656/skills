@@ -96,6 +96,14 @@
       "expected_output": "Derive fixture artifact dates from the current run context rather than a hard-coded day.",
       "files": [],
       "expectations": ["summary date matches started_at", "advisory date matches started_at", "full mocked E2E remains reproducible"]
+    },
+    {
+      "id": 17,
+      "name": "scheduled_commits_use_github_linked_identity",
+      "prompt": "Create the reviewed Vault publication commits and the final Agents evidence commit under launchd's minimal environment.",
+      "expected_output": "Use the validated private runtime Git identity for both author and committer without trusting ambient Git config or tracking personal values.",
+      "files": [],
+      "expectations": ["loads identity only from ignored local config", "validates and binds identity in runtime context", "overrides ambient GIT identity variables", "applies the same identity to evidence finalization", "contains no real personal identity in tracked files"]
     }
   ]
 }
