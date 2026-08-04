@@ -145,6 +145,8 @@ def load_environment(*, checkout_root, environ, require_catalog):
                     "AUTHORIZATION_TASK_ID=TSK-AUTH",
                     "AUTHORIZATION_TASK_RELATIVE=tasks/auth.md",
                     f"AUTHORIZATION_TASK_SHA256={authorization_hash}",
+                    "PUBLISHER_GIT_NAME='Fixture Publisher'",
+                    "PUBLISHER_GIT_EMAIL=publisher@example.invalid",
                 )
             ),
             encoding="utf-8",
@@ -468,7 +470,11 @@ def load_environment(*, checkout_root, environ, require_catalog):
             {"GIT_DIR": "/attacker/git", "GIT_ASKPASS": "/attacker/askpass"},
         ), mock.patch.object(COMMITTER_MODULE.subprocess, "run", return_value=completed) as run:
             COMMITTER_MODULE.git(
-                "/vault/worktree", "/vault/gitdir", "branch", "--show-current"
+                "/vault/worktree",
+                "/vault/gitdir",
+                "branch",
+                "--show-current",
+                publisher_identity=("Fixture Publisher", "publisher@example.invalid"),
             )
         command = run.call_args.args[0]
         environment = run.call_args.kwargs["env"]
@@ -482,13 +488,138 @@ def load_environment(*, checkout_root, environ, require_catalog):
         self.assertEqual(environment["GIT_NO_LAZY_FETCH"], "1")
         self.assertEqual(environment["GIT_NO_REPLACE_OBJECTS"], "1")
         self.assertEqual(environment["GIT_OPTIONAL_LOCKS"], "0")
-        self.assertEqual(environment["GIT_AUTHOR_NAME"], "Codex Vault Publisher")
+        self.assertEqual(environment["GIT_AUTHOR_NAME"], "Fixture Publisher")
         self.assertEqual(
-            environment["GIT_AUTHOR_EMAIL"], "codex-vault-publisher@localhost"
+            environment["GIT_AUTHOR_EMAIL"],
+            "publisher@example.invalid",
         )
-        self.assertEqual(environment["GIT_COMMITTER_NAME"], "Codex Vault Publisher")
+        self.assertEqual(environment["GIT_COMMITTER_NAME"], "Fixture Publisher")
         self.assertEqual(
-            environment["GIT_COMMITTER_EMAIL"], "codex-vault-publisher@localhost"
+            environment["GIT_COMMITTER_EMAIL"],
+            "publisher@example.invalid",
+        )
+
+    def test_evidence_finalizer_uses_same_verified_publisher_identity(self) -> None:
+        """Attribute the final evidence commit to the same GitHub account."""
+        with mock.patch.dict(
+            os.environ,
+            {
+                "GIT_AUTHOR_NAME": "Attacker",
+                "GIT_AUTHOR_EMAIL": "attacker@example.invalid",
+                "GIT_COMMITTER_NAME": "Attacker",
+                "GIT_COMMITTER_EMAIL": "attacker@example.invalid",
+            },
+        ):
+            environment = FINALIZER_MODULE.clean_environment(
+                ("Fixture Publisher", "publisher@example.invalid")
+            )
+        self.assertEqual(environment["GIT_AUTHOR_NAME"], "Fixture Publisher")
+        self.assertEqual(
+            environment["GIT_AUTHOR_EMAIL"],
+            "publisher@example.invalid",
+        )
+        self.assertEqual(environment["GIT_COMMITTER_NAME"], "Fixture Publisher")
+        self.assertEqual(
+            environment["GIT_COMMITTER_EMAIL"],
+            "publisher@example.invalid",
+        )
+
+    def test_committers_reject_tampered_runtime_identity(self) -> None:
+        """Apply the resolver's email grammar again immediately before mutation."""
+        tampered = {
+            "publisher_git_name": "Fixture Publisher",
+            "publisher_git_email": "publisher@@example.invalid",
+        }
+        with self.assertRaises(COMMITTER_MODULE.CommitError):
+            COMMITTER_MODULE.validated_publisher_identity(tampered)
+        with self.assertRaises(FINALIZER_MODULE.FinalizationError):
+            FINALIZER_MODULE.validated_publisher_identity(tampered)
+
+    def test_finalizer_rejects_valid_identity_substitution_after_review(self) -> None:
+        """Bind finalization identity to the reviewed publication context digest."""
+        runtime = {
+            "publisher_git_name": "Fixture Publisher",
+            "publisher_git_email": "publisher@example.invalid",
+        }
+        pre = {"agents_vault": {"local_head": "a" * 40}}
+        context_bytes = json.dumps(
+            {"runtime": runtime, "pre_collection_state": pre},
+            sort_keys=True,
+        ).encode("utf-8")
+        substituted = dict(runtime)
+        substituted["publisher_git_email"] = "other@example.invalid"
+        with self.assertRaises(FINALIZER_MODULE.FinalizationError):
+            FINALIZER_MODULE.context_bound_inputs(
+                substituted,
+                pre,
+                context_bytes,
+                hashlib.sha256(context_bytes).hexdigest(),
+            )
+
+    def test_local_committer_creates_github_attributed_commit_metadata(self) -> None:
+        """Write the configured identity into an actual isolated commit object."""
+        repo = self.workdir / "identity-repo"
+        repo.mkdir()
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        (repo / "artifact.md").write_text("reviewed artifact\n", encoding="utf-8")
+        COMMITTER_MODULE.git(str(repo), str(repo / ".git"), "add", "artifact.md")
+        COMMITTER_MODULE.git(
+            str(repo),
+            str(repo / ".git"),
+            "commit",
+            "-q",
+            "-m",
+            "fixture",
+            publisher_identity=("Fixture Publisher", "publisher@example.invalid"),
+        )
+        identity = COMMITTER_MODULE.git(
+            str(repo),
+            str(repo / ".git"),
+            "show",
+            "-s",
+            "--format=%an%x00%ae%x00%cn%x00%ce",
+            "HEAD",
+        ).stdout.strip().split("\0")
+        self.assertEqual(
+            identity,
+            [
+                "Fixture Publisher",
+                "publisher@example.invalid",
+                "Fixture Publisher",
+                "publisher@example.invalid",
+            ],
+        )
+
+    def test_evidence_finalizer_creates_github_attributed_commit_metadata(self) -> None:
+        """Write the final evidence identity into an actual isolated commit object."""
+        repo = self.workdir / "evidence-identity-repo"
+        repo.mkdir()
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        (repo / "evidence.md").write_text("reviewed evidence\n", encoding="utf-8")
+        FINALIZER_MODULE.git(str(repo), "add", "evidence.md")
+        FINALIZER_MODULE.git(
+            str(repo),
+            "commit",
+            "-q",
+            "-m",
+            "fixture evidence",
+            publisher_identity=("Fixture Publisher", "publisher@example.invalid"),
+        )
+        identity = FINALIZER_MODULE.git(
+            str(repo),
+            "show",
+            "-s",
+            "--format=%an%x00%ae%x00%cn%x00%ce",
+            "HEAD",
+        ).stdout.strip().split("\0")
+        self.assertEqual(
+            identity,
+            [
+                "Fixture Publisher",
+                "publisher@example.invalid",
+                "Fixture Publisher",
+                "publisher@example.invalid",
+            ],
         )
 
     def test_local_committer_binds_inputs_and_complete_installed_scope(self) -> None:
@@ -913,7 +1044,32 @@ def load_environment(*, checkout_root, environ, require_catalog):
         context = json.loads(result.stdout)
         self.assertEqual(context["agents_vault_root"], str(self.agents.resolve()))
         self.assertEqual(context["standing_task_id"], "TSK-STANDING")
+        self.assertEqual(context["publisher_git_name"], "Fixture Publisher")
+        self.assertEqual(context["publisher_git_email"], "publisher@example.invalid")
         self.assertTrue(Path(context["agents_git_dir"]).is_absolute())
+
+    def test_resolver_rejects_invalid_private_publisher_identity(self) -> None:
+        """Fail closed before runtime context creation for malformed identity."""
+        invalid = self.workdir / "invalid-publisher.local.env"
+        invalid.write_text(
+            self.config.read_text(encoding="utf-8").replace(
+                "PUBLISHER_GIT_EMAIL=publisher@example.invalid",
+                "PUBLISHER_GIT_EMAIL=not-an-email",
+            ),
+            encoding="utf-8",
+        )
+        result = subprocess.run(
+            [
+                str(SCRIPTS / "resolve-runtime-context.py"),
+                str(invalid),
+                str(self.workdir),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 78)
+        self.assertIn("invalid publisher Git email", result.stderr)
 
     def test_resolver_accepts_bound_absolute_gitdir_file(self) -> None:
         """Support the Vault layout while binding its indirection file."""
@@ -1368,6 +1524,28 @@ def load_environment(*, checkout_root, environ, require_catalog):
         )
         self.assertEqual(result.returncode, 75)
         self.assertIn("approved review digest mismatch", result.stderr)
+
+    def test_evidence_preparer_rejects_correlated_context_substitution(self) -> None:
+        """Keep a valid alternate runtime+context pair outside the approved run."""
+        approved_context = json.dumps(
+            {
+                "runtime": {
+                    "publisher_git_name": "Fixture Publisher",
+                    "publisher_git_email": "publisher@example.invalid",
+                }
+            },
+            sort_keys=True,
+        ).encode("utf-8")
+        review = {
+            "publication_context_sha256": hashlib.sha256(
+                approved_context
+            ).hexdigest()
+        }
+        substituted_context = approved_context.replace(
+            b"publisher@example.invalid", b"other-pub@example.invalid"
+        )
+        with self.assertRaises(EVIDENCE_MODULE.EvidenceError):
+            EVIDENCE_MODULE.approved_context_digest(review, substituted_context)
 
     def test_evidence_block_is_inserted_inside_canonical_section(self) -> None:
         """Place evidence before the next peer heading instead of at task EOF."""
@@ -2095,7 +2273,7 @@ else:
         "run_id","publication_context_sha256","agents_vault","user_vault",
         "summary_repo_path","advisory_repo_path",
     }
-    result={"outcome":"approved","target_path":plan["target_path"],"evidence_diff_sha256":plan["evidence_diff_sha256"],"review_status":"quality_ok","next_action":None}
+    result={"outcome":"approved","target_path":plan["target_path"],"evidence_diff_sha256":plan["evidence_diff_sha256"],"publication_context_sha256":plan["publication_context_sha256"],"review_status":"quality_ok","next_action":None}
 output.write_text(json.dumps(result))
 """,
             encoding="utf-8",

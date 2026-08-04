@@ -11,8 +11,8 @@ This is a separate read-only, no-network review after both initial fixed pushes.
    commit hashes, actual push statuses, local/remote equality, run ID, and the
    approved publication-context digest. It must contain no credential, secret,
    personal absolute path, or unrelated hunk.
-4. Copy `target_path` and `evidence_diff_sha256` from the runner-owned evidence
-   plan exactly.
+4. Copy `target_path`, `evidence_diff_sha256`, and
+   `publication_context_sha256` from the runner-owned evidence plan exactly.
 5. Return `approved` with `quality_ok` only when the single evidence hunk is
    complete and accurate. Otherwise return `blocked` with a concrete next action.
 6. Return only JSON matching the supplied schema. Do not write, stage, commit,
