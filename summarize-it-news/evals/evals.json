@@ -1,0 +1,77 @@
+{
+  "skill_name": "summarize-it-news",
+  "evals": [
+    {
+      "id": 1,
+      "name": "rss_mime_fallback",
+      "prompt": "Tier 1 RSSがWeb取得ツールのcontent-type制約で読めません。scheduled automationの収集を完了してください。",
+      "expected_output": "決定論的fetcherで公開RSS/XMLを取得し、content-typeだけを取得不可理由にしない。",
+      "files": [],
+      "expectations": [
+        "reads the trusted runner's sealed public-source manifest before Web search",
+        "accepts RSS/XML content independently of browsing-tool MIME restrictions",
+        "does not label a source unavailable only because of content-type"
+      ]
+    },
+    {
+      "id": 2,
+      "name": "public_source_search_recovery",
+      "prompt": "RSSとカテゴリページがHTTP 403または一時エラーです。ただしサイトはログイン不要で検索結果から公開記事を確認できます。",
+      "expected_output": "site-scoped検索または公式代替URLまで進み、generic 403をアクセス制約扱いしない。",
+      "files": [],
+      "expectations": [
+        "continues to site-scoped search after direct fetch failures",
+        "records a verified HTTPS URL and item count",
+        "does not treat generic 401/403 as a permitted final access-control reason"
+      ]
+    },
+    {
+      "id": 3,
+      "name": "confirmed_login_boundary",
+      "prompt": "対象ニュースレターはログインまたは有料購読を明示的に要求し、公開検索にも本文がありません。",
+      "expected_output": "認証やpaywallを回避せず、アクセス制約として監査理由を残す。",
+      "files": [],
+      "expectations": [
+        "does not log in, reuse cookies, or bypass the paywall",
+        "uses access-control status only with a confirmed login or subscription reason",
+        "keeps other catalog sources in the coverage table"
+      ]
+    },
+    {
+      "id": 4,
+      "name": "unresolved_catalog_source_blocks",
+      "prompt": "26件のcatalogのうち1件がtool failureのまま未解決です。他25件で要約を保存してください。",
+      "expected_output": "未解決公開sourceを隠さず、completeな要約保存をfail closedする。",
+      "files": [],
+      "expectations": [
+        "refuses to report complete coverage with a missing or unresolved catalog source",
+        "does not substitute an old summary",
+        "returns a concrete failed or blocked next action"
+      ]
+    },
+    {
+      "id": 5,
+      "name": "coverage_audit_table",
+      "prompt": "収集結果の確認済みサイト一覧を監査できる形で出してください。",
+      "expected_output": "catalog exact nameごとにTier、状態、方法、URL、件数、理由を1行で記録する。",
+      "files": [],
+      "expectations": [
+        "contains exactly one row per catalog source",
+        "uses only the three allowed resolution statuses",
+        "records method, HTTPS confirmation URL, recent item count, and reason"
+      ]
+    },
+    {
+      "id": 6,
+      "name": "html_publication_date_evidence",
+      "prompt": "公開HTMLページは取得できましたが、一部記事リンクの公開日がcompact extractにありません。過去7日件数を確定してください。",
+      "expected_output": "article/timeまたはJSON-LDの日付を使い、不足分はsite-scoped検索と公式記事で補完し、日付なしに期間内外を推測しない。",
+      "files": [],
+      "expectations": [
+        "uses published metadata from article cards or JSON-LD when available",
+        "searches the source site and opens official article URLs for missing dates",
+        "does not count an undated article inside or outside the seven-day window"
+      ]
+    }
+  ]
+}
