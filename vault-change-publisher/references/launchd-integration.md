@@ -26,6 +26,8 @@ launchd 04:00
 | `assets/daily-it-news.collect.prompt.md` | same workdir |
 | `assets/daily-it-news.review.prompt.md` | same workdir |
 | `assets/daily-it-news.evidence-review.prompt.md` | same workdir |
+| `summarize-it-news/scripts/collect-public-sources.py` | daily automation workdir |
+| `summarize-it-news/references/it-news-sources.json` | same workdir |
 | `assets/automation.env.example` | copy manually to ignored `automation.local.env` and fill local values |
 | `references/collection-result.schema.json` | same workdir |
 | `references/publication-review-result.schema.json` | same workdir |

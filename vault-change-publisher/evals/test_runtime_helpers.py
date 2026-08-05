@@ -16,6 +16,8 @@ from pathlib import Path
 from unittest import mock
 
 SKILL_ROOT = Path(__file__).parents[1]
+REPO_ROOT = SKILL_ROOT.parent
+SOURCE_CATALOG = REPO_ROOT / "summarize-it-news" / "references" / "it-news-sources.json"
 SCRIPTS = SKILL_ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 PUSH_SPEC = importlib.util.spec_from_file_location(
@@ -73,6 +75,73 @@ EVIDENCE_SPEC = importlib.util.spec_from_file_location(
 assert EVIDENCE_SPEC and EVIDENCE_SPEC.loader
 EVIDENCE_MODULE = importlib.util.module_from_spec(EVIDENCE_SPEC)
 EVIDENCE_SPEC.loader.exec_module(EVIDENCE_MODULE)
+
+
+def source_coverage_markdown() -> str:
+    """Build a valid complete source-audit table from the tracked catalog."""
+    catalog = json.loads(SOURCE_CATALOG.read_text(encoding="utf-8"))
+    lines = [
+        "## 確認済みサイト一覧",
+        "",
+        "| サイト | Tier | 状態 | 取得方法 | 確認URL | 期間内件数 | 理由 |",
+        "|---|---:|---|---|---|---:|---|",
+    ]
+    for index, source in enumerate(catalog["sources"]):
+        url = source["feed_url"] or source["page_url"]
+        method = "RSS" if source["feed_url"] else "公開ページ"
+        if index == 0:
+            status, count, reason = "取得済み", 1, "fixture記事確認"
+        elif index == len(catalog["sources"]) - 1:
+            status, count, reason = "アクセス制約", 0, "robotsで取得禁止"
+        else:
+            status, count, reason = "対象期間記事なし", 0, "fixture確認"
+        lines.append(
+            f"| {source['name']} | {source['tier']} | {status} | "
+            f"{method} | {url} | {count} | {reason} |"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def write_source_manifest(root: Path) -> Path:
+    """Create deterministic collector evidence matching the positive fixture."""
+    catalog = json.loads(SOURCE_CATALOG.read_text(encoding="utf-8"))
+    source_root = root / "source-inputs"
+    source_root.mkdir()
+    sources = []
+    for index, source in enumerate(catalog["sources"]):
+        url = source["feed_url"] or source["page_url"]
+        method = "rss" if source["feed_url"] else "public_page"
+        if index == len(catalog["sources"]) - 1:
+            sources.append({
+                "name": source["name"], "tier": source["tier"],
+                "status": "needs_search_fallback", "attempts": [
+                    {"method": method, "url": url, "status": "failed", "reason": "robots_disallowed"}
+                ],
+            })
+        else:
+            evidence = {
+                "name": source["name"], "tier": source["tier"], "status": "fetched",
+                "method": method, "final_url": url, "attempts": [],
+            }
+            if index == 0:
+                evidence["extract_file"] = "first.extract.json"
+                (source_root / "first.extract.json").write_text(json.dumps({
+                    "entries": [{"published": "2026-07-31T00:00:00Z"}]
+                }), encoding="utf-8")
+            sources.append(evidence)
+    path = source_root / "source-manifest.json"
+    path.write_text(json.dumps({
+        "catalog_sha256": hashlib.sha256(SOURCE_CATALOG.read_bytes()).hexdigest(),
+        "sources": sources,
+    }), encoding="utf-8")
+    return path
+
+
+def write_verified_resolutions(root: Path) -> Path:
+    """Create an empty verified fallback set for the robots-only fixture."""
+    path = root / "verified-source-resolutions.json"
+    path.write_text(json.dumps({"version": 1, "resolutions": [], "date_evidence": []}), encoding="utf-8")
+    return path
 
 
 class RuntimeHelperTests(unittest.TestCase):
@@ -1380,9 +1449,11 @@ def load_environment(*, checkout_root, environ, require_catalog):
         """Accept verified staged files and reject a hash mismatch."""
         staging = self.workdir / "staging"
         staging.mkdir()
+        source_manifest = write_source_manifest(staging)
+        verified_resolutions = write_verified_resolutions(staging)
         summary = staging / "SUMMARY-IT-NEWS-2026-07-31.md"
         advisory = staging / "Personal-Vulnerability-Advisory-2026-07-31.md"
-        summary.write_text("summary", encoding="utf-8")
+        summary.write_text(source_coverage_markdown(), encoding="utf-8")
         digest = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
         advisory.write_text(
             f"- 入力ニュース: {summary.name} "
@@ -1408,6 +1479,9 @@ def load_environment(*, checkout_root, environ, require_catalog):
             str(staging),
             "20260731T040000+0900",
             "0",
+            str(SOURCE_CATALOG),
+            str(source_manifest),
+            str(verified_resolutions),
         ]
         self.assertEqual(subprocess.run(command, check=False).returncode, 0)
         payload["summary_sha256"] = "0" * 64
@@ -1418,9 +1492,11 @@ def load_environment(*, checkout_root, environ, require_catalog):
         """Reject private paths, inconsistent hashes/names, and duplicate fields."""
         staging = self.workdir / "staging"
         staging.mkdir()
+        source_manifest = write_source_manifest(staging)
+        verified_resolutions = write_verified_resolutions(staging)
         summary = staging / "SUMMARY-IT-NEWS-2026-07-31.md"
         advisory = staging / "Personal-Vulnerability-Advisory-2026-07-31.md"
-        summary.write_text("summary", encoding="utf-8")
+        summary.write_text(source_coverage_markdown(), encoding="utf-8")
         summary_hash = hashlib.sha256(summary.read_bytes()).hexdigest()
         result_path = self.workdir / "collection.json"
         payload = {
@@ -1438,6 +1514,9 @@ def load_environment(*, checkout_root, environ, require_catalog):
             str(staging),
             payload["run_id"],
             "0",
+            str(SOURCE_CATALOG),
+            str(source_manifest),
+            str(verified_resolutions),
         ]
 
         unsafe_references = {
@@ -1470,6 +1549,75 @@ def load_environment(*, checkout_root, environ, require_catalog):
                 )
                 self.assertEqual(validation.returncode, 75)
                 self.assertIn("collection validation failed", validation.stderr)
+
+    def test_collection_validator_rejects_unresolved_or_missing_sources(self) -> None:
+        """Block complete publication when any catalog source lacks a resolved row."""
+        staging = self.workdir / "staging"
+        staging.mkdir()
+        source_manifest = write_source_manifest(staging)
+        verified_resolutions = write_verified_resolutions(staging)
+        summary = staging / "SUMMARY-IT-NEWS-2026-07-31.md"
+        advisory = staging / "Personal-Vulnerability-Advisory-2026-07-31.md"
+        result_path = self.workdir / "collection.json"
+        digest = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
+        valid = source_coverage_markdown()
+        fabricated_rows = []
+        for line in valid.splitlines():
+            if line.startswith("|") and "https://" in line:
+                cells = [cell.strip() for cell in line.strip("|").split("|")]
+                cells[2:7] = [
+                    "対象期間記事なし", "公式代替URL",
+                    "https://example.invalid/fake", "42", "根拠なし",
+                ]
+                line = "| " + " | ".join(cells) + " |"
+            fabricated_rows.append(line)
+        invalid_summaries = {
+            "unresolved status": valid.replace("対象期間記事なし", "取得不可", 1),
+            "missing source": "\n".join(valid.splitlines()[:-1]) + "\n",
+            "generic access error": valid.replace(
+                "対象期間記事なし | RSS",
+                "アクセス制約 | RSS",
+                1,
+            ).replace("fixture確認", "HTTP 403", 1),
+            "fabricated complete table": "\n".join(fabricated_rows) + "\n",
+        }
+        for label, content in invalid_summaries.items():
+            with self.subTest(label=label):
+                summary.write_text(content, encoding="utf-8")
+                advisory.write_text(
+                    f"- 入力ニュース: {summary.name} "
+                    f"(same-run SHA-256: {digest(summary)})\n",
+                    encoding="utf-8",
+                )
+                payload = {
+                    "daily_pipeline_status": "complete",
+                    "run_id": "20260731T040000+0900",
+                    "summary_path": str(summary),
+                    "summary_sha256": digest(summary),
+                    "advisory_path": str(advisory),
+                    "advisory_sha256": digest(advisory),
+                    "notification_result": "none",
+                    "vault_artifacts_complete": True,
+                    "next_action": None,
+                }
+                result_path.write_text(json.dumps(payload), encoding="utf-8")
+                validation = subprocess.run(
+                    [
+                        str(SCRIPTS / "validate-collection-result.py"),
+                        str(result_path),
+                        str(staging),
+                        payload["run_id"],
+                        "0",
+                        str(SOURCE_CATALOG),
+                        str(source_manifest),
+                        str(verified_resolutions),
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(validation.returncode, 75)
+                self.assertRegex(validation.stderr, r"source|access-control")
 
     def test_installer_places_only_declared_roles(self) -> None:
         """Install summary and advisory below their configured Vault roots."""
@@ -2256,8 +2404,33 @@ def load_environment(*, checkout_root, environ, require_catalog):
             SCRIPTS / "stage-standing-task.py",
             SCRIPTS / "stage-dirty-review-inputs.py",
             SCRIPTS / "interpret-automation-result.sh",
+            REPO_ROOT / "summarize-it-news" / "scripts" / "collect-public-sources.py",
+            SOURCE_CATALOG,
         ):
             shutil.copy2(source, runtime / source.name)
+
+        (runtime / "collect-public-sources.py").write_text(
+            """#!/usr/bin/env python3
+import hashlib, json, os, sys
+from pathlib import Path
+if sys.argv[1] == "--verify-resolutions":
+    request=json.loads(Path(sys.argv[4]).read_text())
+    Path(sys.argv[5]).write_text(json.dumps({"version":1,"resolutions":request["resolutions"],"date_evidence":[]}))
+    raise SystemExit(0)
+catalog_path=Path(sys.argv[1]); output=Path(sys.argv[2]); output.mkdir()
+catalog=json.loads(catalog_path.read_text())
+sources=[]
+for source in catalog["sources"]:
+    url=source["feed_url"] or source["page_url"]
+    method="rss" if source["feed_url"] else "public_page"
+    sources.append({"name":source["name"],"tier":source["tier"],"status":"fetched","method":method,"final_url":url,"attempts":[]})
+manifest={"catalog_sha256":hashlib.sha256(catalog_path.read_bytes()).hexdigest(),"sources":sources}
+(output/"source-manifest.json").write_text(json.dumps(manifest))
+print(json.dumps(manifest))
+""",
+            encoding="utf-8",
+        )
+        (runtime / "collect-public-sources.py").chmod(0o755)
 
         finalizer = runtime / "commit-push-publication-evidence.py"
         real_finalizer = runtime / "commit-push-publication-evidence.real.py"
@@ -2312,7 +2485,16 @@ if "--search" in args:
     run_date=context["started_at"][:10]
     summary=staging/f"SUMMARY-IT-NEWS-{run_date}.md"
     advisory=staging/f"Personal-Vulnerability-Advisory-{run_date}.md"
-    summary.write_text("summary "+context["run_id"])
+    catalog=json.loads(Path(context["source_catalog"]).read_text())
+    manifest=json.loads(Path(context["source_manifest"]).read_text())
+    assert len(manifest["sources"]) == len(catalog["sources"])
+    (staging/"source-resolutions.json").write_text(json.dumps({"version":1,"resolutions":[],"date_evidence":[]}))
+    lines=["summary "+context["run_id"],"","## 確認済みサイト一覧","","| サイト | Tier | 状態 | 取得方法 | 確認URL | 期間内件数 | 理由 |","|---|---:|---|---|---|---:|---|"]
+    for source in catalog["sources"]:
+        url=source["feed_url"] or source["page_url"]
+        method="RSS" if source["feed_url"] else "公開ページ"
+        lines.append(f"| {source['name']} | {source['tier']} | 対象期間記事なし | {method} | {url} | 0 | fixture確認 |")
+    summary.write_text("\\n".join(lines)+"\\n")
     digest=lambda p: hashlib.sha256(p.read_bytes()).hexdigest()
     advisory.write_text(f"- 入力ニュース: {summary.name} (same-run SHA-256: {digest(summary)})\\n")
     result={"daily_pipeline_status":"complete","run_id":context["run_id"],"summary_path":str(summary),"summary_sha256":digest(summary),"advisory_path":str(advisory),"advisory_sha256":digest(advisory),"notification_result":"none","vault_artifacts_complete":True,"next_action":None}
@@ -2436,12 +2618,15 @@ output.write_text(json.dumps(result))
             check=True,
             capture_output=True,
         )
+        subprocess.run(["chmod", "-R", "u+w", str(runtime / "logs")], check=True)
         shutil.rmtree(runtime / "logs")
         (runtime / "last-status.txt").unlink()
 
         invalid_result = subprocess.run(
             [str(runtime / "run-daily-it-news-vulnerability-check.sh")],
             check=False,
+            capture_output=True,
+            text=True,
             env={
                 **os.environ,
                 "PATH": os.environ["PATH"],
@@ -2450,7 +2635,11 @@ output.write_text(json.dumps(result))
         )
         self.assertEqual(invalid_result.returncode, 75)
         invalid_logs = list((runtime / "logs").rglob("invocations.log"))
-        self.assertEqual(len(invalid_logs), 1)
+        self.assertEqual(
+            len(invalid_logs),
+            1,
+            msg=f"stdout={invalid_result.stdout}\nstderr={invalid_result.stderr}\nstatus={(runtime / 'last-status.txt').read_text(encoding='utf-8')}\ncollection_stderr={[path.read_text(encoding='utf-8') for path in (runtime / 'logs').rglob('collection.stderr.log')]}",
+        )
         self.assertEqual(
             invalid_logs[0].read_text(encoding="utf-8").splitlines(),
             ["collection"],
@@ -2459,6 +2648,7 @@ output.write_text(json.dumps(result))
             "phase=collection",
             (runtime / "last-status.txt").read_text(encoding="utf-8"),
         )
+        subprocess.run(["chmod", "-R", "u+w", str(runtime / "logs")], check=True)
         shutil.rmtree(runtime / "logs")
         (runtime / "last-status.txt").unlink()
 
@@ -2478,6 +2668,7 @@ output.write_text(json.dumps(result))
         self.assertEqual(len(status_files), 1)
         self.assertIn("semantic_status=success", status_files[0].read_text())
 
+        subprocess.run(["chmod", "-R", "u+w", str(runtime / "logs")], check=True)
         shutil.rmtree(runtime / "logs")
         (runtime / "last-status.txt").unlink()
         invalid_final = subprocess.run(
