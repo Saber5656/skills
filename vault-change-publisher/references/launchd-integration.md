@@ -6,10 +6,14 @@
 launchd 04:00
   -> daily dedicated runner
   -> deterministic standing-task snapshot into collection staging
+  -> fixed fetch + lightweight Vault isolation snapshot (no local commit patches)
   -> collection Codex process (Web/search, run staging write only)
   -> deterministic artifact validation
+  -> exact lightweight Vault recapture and comparison
+  -> allow equal/local-ahead Vault publication; block remote-ahead/diverged publication
+  -> materialize local-only commit metadata and patches for publication only
   -> post-collection authorization snapshot into isolated review input
-  -> captured dirty Git blobs into isolated review input
+  -> captured dirty Git blobs and local-only commit patches into isolated review input
   -> publication review Codex process (read-only, no search/network)
   -> deterministic local commit helper (reviewed blobs only, no network)
   -> initial fixed runner pushes (manifest-bound object IDs -> refs/heads/main)
@@ -57,7 +61,9 @@ collection Codex processへiCloud上のstanding taskを直接読ませない。r
 
 authorization taskはnetwork-enabled collection終了後に別のreview input directoryへ0600・exclusive createし、no-network publication phaseへsnapshot pathだけを渡す。collection processからauthorization evidenceを参照可能にしない。
 
-pre-collection時点のdirty fileは、capture済みGit blob OIDからreview inputへ0600・exclusive createする。publication reviewはVault上のdirty fileを直接読まず、manifestでpath・mode・OID・SHA-256に結合されたsnapshotだけを検査する。
+pre/post-collectionの軽量captureはlocal-only commit patchを生成しない。collection成功とVault不変性を確認した後だけ、pre-collection時点のdirty fileをcapture済みGit blob OIDからreview inputへ0600・exclusive createし、local-ahead commitのhash、parents、tree、message、changed paths、first-parent patch digestとpatchを同じisolated review inputへ0600・exclusive createする。publication reviewはVault上のdirty fileやlocal-only historyを直接読まず、manifestでidentityとSHA-256に結合されたsnapshotだけを検査する。
+
+fetch後のhistory relationは収集の可否には使わない。ニュース収集とVault不変性の検証を先に完了し、その後のpublication phaseでは`equal`または`local_ahead`だけを許可する。local-aheadは既存commit境界を維持したままreview・secret scan・fixed pushへ含める。`remote_ahead`と`diverged`は自動pull/rebaseで解消せず、publicationだけをfail closedとする。
 
 ## Local Configuration
 

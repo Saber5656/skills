@@ -19,7 +19,9 @@ Runtime context supplies:
 2. Verify the Publication Manifest, approved review digest, both Vault preflight
    states, artifact paths, SHA-256 values, and exact artifact plan.
 3. Do not create or revise a Task Change Manifest. Use only the approved
-   per-Vault manifests; stop if current state or a digest differs.
+   per-Vault manifests; stop if current state, local-only commit history, or a
+   digest differs. Preserve every `approved_existing_commits` object and its
+   existing commit boundary; never rewrite it into a new commit group.
 4. Run the supplied deterministic installer with `runtime_context_file`,
    `collection_result_file`, and `artifact_plan_file` to install only the exact
    declared targets.
@@ -27,7 +29,10 @@ Runtime context supplies:
    following approved `commit_groups`. Do not edit or commit the deferred
    evidence-finalization target unless it was already part of a pre-existing
    dirty path in an approved initial commit group.
-6. Do not fetch or push. The trusted runner validates the exact reported commit sequence and performs fixed non-force `main` pushes outside the agent.
+6. Do not fetch or push. The trusted runner validates the approved local-only
+   commits followed by the exact newly reported commit sequence, scans the full
+   remote-to-final range, and performs fixed non-force `main` pushes outside the
+   agent.
 7. For each Vault, hash the pre/post porcelain status exactly as supplied by the runtime contract and report `pre_local_head`, `local_head`, `pre_dirty_digest`, `post_dirty_digest`, and `clean`.
 8. Return `ready_to_push` only when both initial local commit phases are
    complete/not-required and both worktrees are clean. Set
