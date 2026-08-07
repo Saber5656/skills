@@ -115,12 +115,12 @@ def read_commit_patch(
     if parents:
         arguments = [
             "git", f"--git-dir={git_dir}", "diff", "--binary", "--full-index",
-            "--no-ext-diff", parents[0], commit,
+            "--no-ext-diff", "--no-textconv", parents[0], commit,
         ]
     else:
         arguments = [
             "git", f"--git-dir={git_dir}", "diff-tree", "--root", "-p",
-            "--binary", "--full-index", "--no-ext-diff", commit,
+            "--binary", "--full-index", "--no-ext-diff", "--no-textconv", commit,
         ]
     content = subprocess.run(
         arguments,

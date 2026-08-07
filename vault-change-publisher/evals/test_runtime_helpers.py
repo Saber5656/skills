@@ -573,7 +573,10 @@ def load_environment(*, checkout_root, environ, require_catalog):
 
         peer = self.root / "history-peer"
         subprocess.run(
-            ["git", "clone", "-q", str(self.origins["user"]), str(peer)],
+            [
+                "git", "clone", "-q", "--branch", "main",
+                str(self.origins["user"]), str(peer),
+            ],
             check=True,
         )
         subprocess.run(["git", "-C", str(peer), "config", "user.name", "Peer"], check=True)
@@ -632,6 +635,81 @@ def load_environment(*, checkout_root, environ, require_catalog):
         history.assert_not_called()
         self.assertEqual(state["history_relation"], "local_ahead")
         self.assertEqual(state["local_commits"], [])
+
+    def test_local_commit_patch_helpers_disable_repository_textconv(self) -> None:
+        """Do not execute repository-configured textconv while hashing reviewed patches."""
+        repo = self.user
+        marker = self.root / "textconv-executed"
+        helper = self.root / "textconv.sh"
+        helper.write_text(
+            f"#!/bin/sh\ntouch {marker}\ncat \"$1\"\n",
+            encoding="utf-8",
+        )
+        helper.chmod(0o755)
+        subprocess.run(["git", "-C", str(repo), "config", "user.name", "Fixture"], check=True)
+        subprocess.run(
+            ["git", "-C", str(repo), "config", "user.email", "fixture@example.invalid"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(repo), "config", "diff.fixture.textconv", str(helper)],
+            check=True,
+        )
+        (repo / ".gitattributes").write_text("*.txt diff=fixture\n", encoding="utf-8")
+        target = repo / "reviewed.txt"
+        target.write_text("before\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", ".gitattributes", "reviewed.txt"], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "base"], check=True)
+        parent = subprocess.check_output(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True
+        ).strip()
+        target.write_text("after\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "reviewed.txt"], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "change"], check=True)
+        commit = subprocess.check_output(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True
+        ).strip()
+
+        patch = CAPTURE_MODULE.commit_patch(str(repo), commit, [parent])
+        DIRTY_STAGER_MODULE.read_commit_patch(
+            str(repo / ".git"), commit, [parent], hashlib.sha256(patch).hexdigest()
+        )
+        self.assertEqual(
+            PUSH_MODULE.commit_patch_sha256(str(repo), commit, [parent]),
+            hashlib.sha256(patch).hexdigest(),
+        )
+        self.assertFalse(marker.exists())
+
+    def test_empty_existing_commit_message_is_captured_and_schema_valid(self) -> None:
+        """Represent valid local-only commits whose Git message is empty."""
+        repo = self.user
+        subprocess.run(["git", "-C", str(repo), "config", "user.name", "Fixture"], check=True)
+        subprocess.run(
+            ["git", "-C", str(repo), "config", "user.email", "fixture@example.invalid"],
+            check=True,
+        )
+        (repo / "base.md").write_text("base\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "base.md"], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "base"], check=True)
+        base = subprocess.check_output(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True
+        ).strip()
+        subprocess.run(
+            [
+                "git", "-C", str(repo), "commit", "-q", "--allow-empty",
+                "--allow-empty-message", "-m", "",
+            ],
+            check=True,
+        )
+        head = subprocess.check_output(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True
+        ).strip()
+        commits = CAPTURE_MODULE.local_commit_metadata(str(repo), base, head)
+        self.assertEqual(commits[0]["message"], "")
+        schema = json.loads(
+            (SKILL_ROOT / "references" / "publication-review-result.schema.json").read_text()
+        )
+        self.assertNotIn("minLength", schema["$defs"]["existingCommit"]["properties"]["message"])
 
     def test_local_committer_uses_explicit_git_paths_and_no_network_overrides(self) -> None:
         """Keep local mutation independent of a Vault process cwd or ambient Git config."""
@@ -2667,6 +2745,37 @@ output.write_text(json.dumps(result))
             ),
             encoding="utf-8",
         )
+
+        subprocess.run(
+            ["git", "-C", str(self.user), "branch", "--unset-upstream"],
+            check=True,
+        )
+        missing_upstream = subprocess.run(
+            [str(runtime / "run-daily-it-news-vulnerability-check.sh")],
+            check=False,
+            env={**os.environ, "PATH": os.environ["PATH"]},
+        )
+        self.assertEqual(missing_upstream.returncode, 75)
+        missing_upstream_logs = list((runtime / "logs").rglob("invocations.log"))
+        self.assertEqual(len(missing_upstream_logs), 1)
+        self.assertEqual(
+            missing_upstream_logs[0].read_text(encoding="utf-8").splitlines(),
+            ["collection"],
+        )
+        self.assertIn(
+            "phase=publication_preflight",
+            (runtime / "last-status.txt").read_text(encoding="utf-8"),
+        )
+        subprocess.run(
+            [
+                "git", "-C", str(self.user), "branch", "--set-upstream-to",
+                "origin/main", "main",
+            ],
+            check=True,
+        )
+        shutil.rmtree(runtime / "logs")
+        (runtime / "last-status.txt").unlink()
+
         ahead = self.root / "ahead-clone"
         subprocess.run(
             [

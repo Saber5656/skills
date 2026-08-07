@@ -69,7 +69,7 @@
           "items": {"type": "string", "pattern": "^[0-9a-f]{40}$"}
         },
         "tree": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
-        "message": {"type": "string", "minLength": 1},
+        "message": {"type": "string"},
         "changed_paths": {
           "type": "array",
           "uniqueItems": true,

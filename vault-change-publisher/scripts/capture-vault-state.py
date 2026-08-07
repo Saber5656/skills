@@ -57,12 +57,12 @@ def commit_patch(repo: str, commit: str, parents: list[str]) -> bytes:
     if parents:
         arguments = [
             "git", "-C", repo, "diff", "--binary", "--full-index",
-            "--no-ext-diff", parents[0], commit,
+            "--no-ext-diff", "--no-textconv", parents[0], commit,
         ]
     else:
         arguments = [
             "git", "-C", repo, "diff-tree", "--root", "-p", "--binary",
-            "--full-index", "--no-ext-diff", commit,
+            "--full-index", "--no-ext-diff", "--no-textconv", commit,
         ]
     return subprocess.run(
         arguments,
@@ -270,10 +270,17 @@ def capture(repo: str, include_local_history: bool = False) -> dict[str, object]
     history_snapshot = json.dumps(
         local_commits, ensure_ascii=False, sort_keys=True, separators=(",", ":")
     ).encode("utf-8")
+    branch = git(repo, "branch", "--show-current")
+    upstream = git(
+        repo,
+        "for-each-ref",
+        "--format=%(upstream:short)",
+        f"refs/heads/{branch}",
+    )
     return {
         "repo_root": str(Path(repo).resolve()),
-        "branch": git(repo, "branch", "--show-current"),
-        "upstream": git(repo, "rev-parse", "--abbrev-ref", "@{u}"),
+        "branch": branch,
+        "upstream": upstream or None,
         "local_head": local_head,
         "remote_head": remote_head,
         "history_relation": history_relation,

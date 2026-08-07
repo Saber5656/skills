@@ -178,11 +178,14 @@ def commit_paths(repo: str, commit: str) -> list[str]:
 def commit_patch_sha256(repo: str, commit: str, parents: list[str]) -> str:
     """Hash the deterministic first-parent patch used by publication review."""
     arguments = (
-        ["diff", "--binary", "--full-index", "--no-ext-diff", parents[0], commit]
+        [
+            "diff", "--binary", "--full-index", "--no-ext-diff",
+            "--no-textconv", parents[0], commit,
+        ]
         if parents
         else [
             "diff-tree", "--root", "-p", "--binary", "--full-index",
-            "--no-ext-diff", commit,
+            "--no-ext-diff", "--no-textconv", commit,
         ]
     )
     environment = {
