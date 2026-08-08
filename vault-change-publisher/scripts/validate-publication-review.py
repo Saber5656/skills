@@ -111,7 +111,10 @@ def validate_dirty_snapshots(
     if hashlib.sha256(manifest_bytes).hexdigest() != expected_manifest_digest:
         raise ReviewError("dirty snapshot manifest digest mismatch")
     manifest = json.loads(manifest_bytes.decode("utf-8"))
-    if manifest.get("version") != 1 or set(manifest.get("vaults", {})) != {
+    if manifest.get("version") != 2 or set(manifest.get("vaults", {})) != {
+        "agents_vault",
+        "user_vault",
+    } or set(manifest.get("local_commits", {})) != {
         "agents_vault",
         "user_vault",
     }:
@@ -140,6 +143,31 @@ def validate_dirty_snapshots(
             )
             if hashlib.sha256(snapshot_bytes).hexdigest() != actual.get("sha256"):
                 raise ReviewError("dirty snapshot content digest mismatch")
+        actual_commits = manifest["local_commits"][state_key]
+        expected_commits = pre[state_key].get("local_commits", [])
+        if len(actual_commits) != len(expected_commits):
+            raise ReviewError("local commit snapshot count mismatch")
+        for index, (actual, expected) in enumerate(
+            zip(actual_commits, expected_commits)
+        ):
+            actual_identity = {
+                key: actual.get(key)
+                for key in (
+                    "commit", "parents", "tree", "message", "changed_paths",
+                    "patch_sha256",
+                )
+            }
+            if actual_identity != expected:
+                raise ReviewError("local commit snapshot identity mismatch")
+            expected_relative = f"commit-snapshots/{label}/{index:04d}.patch"
+            if actual.get("snapshot") != expected_relative:
+                raise ReviewError("local commit snapshot path mismatch")
+            snapshot_bytes = read_regular_beneath(
+                manifest_path.parent, PurePosixPath(expected_relative)
+            )
+            digest = hashlib.sha256(snapshot_bytes).hexdigest()
+            if digest != actual.get("sha256") or digest != expected["patch_sha256"]:
+                raise ReviewError("local commit patch digest mismatch")
 
 
 def relative_target(root: str, target: str) -> str:
@@ -174,18 +202,34 @@ def validate_manifest(
         state["repo_root"] != repo_root
         or state["branch"] != "main"
         or state["upstream"] != "origin/main"
-        or state["local_head"] != state["remote_head"]
+        or state.get("history_relation") not in {"equal", "local_ahead"}
         or state["operation_in_progress"] is not False
     ):
         raise ReviewError("pre-publication Git state is not safe")
+    local_commits = state.get("local_commits", [])
+    if (
+        state["history_relation"] == "equal" and local_commits
+    ) or (
+        state["history_relation"] == "local_ahead" and not local_commits
+    ):
+        raise ReviewError("pre-publication local history metadata is inconsistent")
+    if manifest["approved_existing_commits"] != local_commits:
+        raise ReviewError("approved local-only commits do not match pre-state")
     artifact_target = relative_target(repo_root, artifact["target_path"])
     initial_paths = sorted(set(state["dirty_paths"]) | {artifact_target})
+    existing_paths = sorted(
+        {
+            path
+            for commit in local_commits
+            for path in commit["changed_paths"]
+        }
+    )
     if any(
         path == ".obsidian" or path.startswith(".obsidian/")
-        for path in initial_paths
+        for path in [*initial_paths, *existing_paths]
     ):
         raise ReviewError("publication scope contains a forbidden .obsidian path")
-    expected_owned = set(initial_paths)
+    expected_owned = set(initial_paths) | set(existing_paths)
     expected_evidence = None
     if evidence_target is not None:
         expected_evidence = relative_target(repo_root, evidence_target)
@@ -224,6 +268,7 @@ def validate_manifest(
         "secret_scan_tool": "gitleaks",
         "secret_scan_tool_version": gitleaks_version,
         "reviewed_snapshot_sha256": state["diff_snapshot_sha256"],
+        "reviewed_history_sha256": state["history_snapshot_sha256"],
     }:
         raise ReviewError("typed validation evidence mismatch")
     if manifest["commit_required"] is not True:

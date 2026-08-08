@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Materialize captured dirty Git blobs for the no-network publication review."""
+"""Materialize dirty blobs and local-only commit patches for publication review."""
 
 from __future__ import annotations
 
@@ -104,6 +104,38 @@ def read_blob(git_dir: str, worktree: str, relative: str, oid: str) -> bytes:
     return content
 
 
+def read_commit_patch(
+    git_dir: str, commit: str, parents: list[str], expected_sha256: str
+) -> bytes:
+    """Read one captured local-only commit as a deterministic first-parent patch."""
+    if OID_PATTERN.fullmatch(commit) is None or any(
+        OID_PATTERN.fullmatch(parent) is None for parent in parents
+    ):
+        raise DirtySnapshotError("local commit has an invalid Git object ID")
+    if parents:
+        arguments = [
+            "git", f"--git-dir={git_dir}", "diff", "--binary", "--full-index",
+            "--no-ext-diff", "--no-textconv", parents[0], commit,
+        ]
+    else:
+        arguments = [
+            "git", f"--git-dir={git_dir}", "diff-tree", "--root", "-p",
+            "--binary", "--full-index", "--no-ext-diff", "--no-textconv", commit,
+        ]
+    content = subprocess.run(
+        arguments,
+        check=True,
+        capture_output=True,
+        cwd="/",
+        env=clean_git_environment(),
+    ).stdout
+    if hashlib.sha256(content).hexdigest() != expected_sha256:
+        raise DirtySnapshotError("local commit patch differs from captured state")
+    if len(content) > MAX_BLOB_BYTES:
+        raise DirtySnapshotError("local commit patch exceeds per-file size limit")
+    return content
+
+
 def mkdir_exclusive(parent_descriptor: int, name: str) -> int:
     os.mkdir(name, 0o700, dir_fd=parent_descriptor)
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
@@ -137,7 +169,7 @@ def materialize(
     root_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
     destination_descriptor = os.open(destination, root_flags)
     total_bytes = 0
-    manifest: dict[str, object] = {"version": 1, "vaults": {}}
+    manifest: dict[str, object] = {"version": 2, "vaults": {}, "local_commits": {}}
     try:
         snapshots_descriptor = mkdir_exclusive(destination_descriptor, "dirty-snapshots")
         try:
@@ -197,6 +229,46 @@ def materialize(
                     os.close(vault_descriptor)
         finally:
             os.close(snapshots_descriptor)
+        commits_descriptor = mkdir_exclusive(destination_descriptor, "commit-snapshots")
+        try:
+            for label, state_key, git_key in (
+                ("agents", "agents_vault", "agents_git_dir"),
+                ("user", "user_vault", "user_git_dir"),
+            ):
+                vault_descriptor = mkdir_exclusive(commits_descriptor, label)
+                try:
+                    commits = pre_state[state_key].get("local_commits", [])
+                    if not isinstance(commits, list):
+                        raise DirtySnapshotError("local commits are not a list")
+                    output_commits: list[dict[str, object]] = []
+                    for index, commit in enumerate(commits):
+                        parents = commit.get("parents")
+                        expected_sha256 = commit.get("patch_sha256")
+                        if not isinstance(parents, list) or not isinstance(expected_sha256, str):
+                            raise DirtySnapshotError("local commit metadata is invalid")
+                        content = read_commit_patch(
+                            str(runtime[git_key]),
+                            str(commit.get("commit")),
+                            [str(parent) for parent in parents],
+                            expected_sha256,
+                        )
+                        total_bytes += len(content)
+                        if total_bytes > MAX_TOTAL_BYTES:
+                            raise DirtySnapshotError("review snapshots exceed total size limit")
+                        filename = f"{index:04d}.patch"
+                        write_exclusive(vault_descriptor, filename, content)
+                        output_commits.append(
+                            {
+                                **commit,
+                                "snapshot": f"commit-snapshots/{label}/{filename}",
+                                "sha256": hashlib.sha256(content).hexdigest(),
+                            }
+                        )
+                    manifest["local_commits"][state_key] = output_commits
+                finally:
+                    os.close(vault_descriptor)
+        finally:
+            os.close(commits_descriptor)
         encoded = (json.dumps(manifest, ensure_ascii=False, sort_keys=True) + "\n").encode()
         write_exclusive(destination_descriptor, "dirty-snapshots.json", encoded)
     finally:

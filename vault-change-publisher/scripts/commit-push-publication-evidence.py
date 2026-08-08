@@ -197,11 +197,11 @@ def partial_result(
     repo = runtime["agents_vault_root"]
     head = git(repo, "rev-parse", "HEAD").stdout.strip()
     clean, _ = dirty_status(repo)
-    commits = git(
+    finalization_commits = git(
         repo,
         "rev-list",
         "--reverse",
-        f"{pre['agents_vault']['local_head']}..{head}",
+        f"{initial['agents_vault']['local_head']}..{head}",
     ).stdout.splitlines()
     try:
         remote = remote_head(
@@ -212,8 +212,15 @@ def partial_result(
     agents = dict(initial["agents_vault"])
     agents.update(
         {
-            "commit_status": "complete" if commits else "not_started",
-            "commit_hashes": commits,
+            "commit_status": (
+                "complete"
+                if initial["agents_vault"]["commit_hashes"] or finalization_commits
+                else "not_started"
+            ),
+            "commit_hashes": [
+                *initial["agents_vault"]["commit_hashes"],
+                *finalization_commits,
+            ],
             "push_status": "complete" if remote == head else "failed",
             "local_head": head,
             "remote_head": remote,
@@ -227,8 +234,8 @@ def partial_result(
             "phase": "evidence_finalization",
             "agents_vault": agents,
             "evidence_finalization_commit": (
-                commits[-1]
-                if len(commits) > len(initial["agents_vault"]["commit_hashes"])
+                finalization_commits[-1]
+                if finalization_commits
                 else None
             ),
             "next_action": reason,

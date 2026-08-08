@@ -58,6 +58,26 @@
         }
       }
     },
+    "existingCommit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["commit", "parents", "tree", "message", "changed_paths", "patch_sha256"],
+      "properties": {
+        "commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "parents": {
+          "type": "array",
+          "items": {"type": "string", "pattern": "^[0-9a-f]{40}$"}
+        },
+        "tree": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "message": {"type": "string"},
+        "changed_paths": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1}
+        },
+        "patch_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
     "taskChangeManifest": {
       "type": "object",
       "additionalProperties": false,
@@ -67,6 +87,7 @@
         "owned_paths",
         "excluded_paths",
         "approved_diff_snapshot_sha256",
+        "approved_existing_commits",
         "approved_dirty_entries",
         "reviewed_artifacts",
         "validation_evidence",
@@ -90,6 +111,10 @@
           "items": {"type": "string", "minLength": 1}
         },
         "approved_diff_snapshot_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "approved_existing_commits": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/existingCommit"}
+        },
         "approved_dirty_entries": {
           "type": "array",
           "items": {
@@ -118,14 +143,16 @@
             "secret_scan",
             "secret_scan_tool",
             "secret_scan_tool_version",
-            "reviewed_snapshot_sha256"
+            "reviewed_snapshot_sha256",
+            "reviewed_history_sha256"
           ],
           "properties": {
             "file_guard": {"const": "passed"},
             "secret_scan": {"const": "passed"},
             "secret_scan_tool": {"const": "gitleaks"},
             "secret_scan_tool_version": {"type": "string", "minLength": 1},
-            "reviewed_snapshot_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+            "reviewed_snapshot_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "reviewed_history_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
           }
         },
         "review_or_validation_status": {"enum": ["quality_ok", "blocked"]},

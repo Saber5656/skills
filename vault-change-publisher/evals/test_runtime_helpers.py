@@ -73,6 +73,12 @@ EVIDENCE_SPEC = importlib.util.spec_from_file_location(
 assert EVIDENCE_SPEC and EVIDENCE_SPEC.loader
 EVIDENCE_MODULE = importlib.util.module_from_spec(EVIDENCE_SPEC)
 EVIDENCE_SPEC.loader.exec_module(EVIDENCE_MODULE)
+CAPTURE_SPEC = importlib.util.spec_from_file_location(
+    "capture_vault_state", SCRIPTS / "capture-vault-state.py"
+)
+assert CAPTURE_SPEC and CAPTURE_SPEC.loader
+CAPTURE_MODULE = importlib.util.module_from_spec(CAPTURE_SPEC)
+CAPTURE_SPEC.loader.exec_module(CAPTURE_MODULE)
 
 
 class RuntimeHelperTests(unittest.TestCase):
@@ -387,6 +393,7 @@ def load_environment(*, checkout_root, environ, require_catalog):
             json.dumps(
                 {
                     "agents_vault": {
+                        "local_commits": [],
                         "dirty_entries": [
                             {
                                 "path": "tasks/dirty.md",
@@ -395,7 +402,7 @@ def load_environment(*, checkout_root, environ, require_catalog):
                             }
                         ]
                     },
-                    "user_vault": {"dirty_entries": []},
+                    "user_vault": {"local_commits": [], "dirty_entries": []},
                 }
             ),
             encoding="utf-8",
@@ -459,6 +466,274 @@ def load_environment(*, checkout_root, environ, require_catalog):
                 ],
             )
             self.assertNotIn("-C", command)
+
+    def test_capture_and_review_snapshot_local_ahead_then_diverged(self) -> None:
+        """Allow reviewable local-ahead history but classify divergence separately."""
+        for repo in (self.agents, self.user):
+            subprocess.run(["git", "-C", str(repo), "config", "user.name", "Fixture"], check=True)
+            subprocess.run(
+                ["git", "-C", str(repo), "config", "user.email", "fixture@example.invalid"],
+                check=True,
+            )
+            (repo / "base.md").write_text("base\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(repo), "add", "base.md"], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "base"], check=True)
+            subprocess.run(["git", "-C", str(repo), "branch", "-M", "main"], check=True)
+            subprocess.run(["git", "-C", str(repo), "push", "-q", "-u", "origin", "main"], check=True)
+
+        base = subprocess.check_output(
+            ["git", "-C", str(self.user), "rev-parse", "HEAD"], text=True
+        ).strip()
+        (self.user / "local.md").write_text("local\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.user), "add", "local.md"], check=True)
+        subprocess.run(
+            ["git", "-C", str(self.user), "commit", "-q", "-m", "local only"],
+            check=True,
+        )
+        local_head = subprocess.check_output(
+            ["git", "-C", str(self.user), "rev-parse", "HEAD"], text=True
+        ).strip()
+        runtime = self.workdir / "history-runtime.json"
+        runtime.write_text(
+            json.dumps(
+                {
+                    "agents_vault_root": str(self.agents),
+                    "agents_git_dir": str(self.agents / ".git"),
+                    "user_vault_root": str(self.user),
+                    "user_git_dir": str(self.user / ".git"),
+                }
+            ),
+            encoding="utf-8",
+        )
+        pre = self.workdir / "history-pre.json"
+        with pre.open("w", encoding="utf-8") as output:
+            subprocess.run(
+                [
+                    str(SCRIPTS / "capture-vault-state.py"),
+                    "--include-local-history",
+                    str(runtime),
+                ],
+                check=True,
+                stdout=output,
+                text=True,
+            )
+        state = json.loads(pre.read_text())
+        user_state = state["user_vault"]
+        self.assertEqual(user_state["history_relation"], "local_ahead")
+        self.assertEqual(user_state["remote_head"], base)
+        self.assertEqual(user_state["local_head"], local_head)
+        self.assertEqual(
+            [item["commit"] for item in user_state["local_commits"]], [local_head]
+        )
+
+        review_input = self.workdir / "history-review-input"
+        review_input.mkdir()
+        self.assertEqual(
+            subprocess.run(
+                [
+                    str(SCRIPTS / "stage-dirty-review-inputs.py"),
+                    str(runtime),
+                    str(pre),
+                    str(review_input),
+                ],
+                check=False,
+            ).returncode,
+            0,
+        )
+        review_input.chmod(0o700)
+        manifest_path = review_input / "dirty-snapshots.json"
+        manifest = json.loads(manifest_path.read_text())
+        self.assertEqual(manifest["version"], 2)
+        self.assertEqual(
+            manifest["local_commits"]["user_vault"][0]["commit"], local_head
+        )
+        REVIEW_MODULE.validate_dirty_snapshots(
+            {
+                "dirty_snapshot_manifest_file": str(manifest_path),
+                "dirty_snapshot_manifest_sha256": hashlib.sha256(
+                    manifest_path.read_bytes()
+                ).hexdigest(),
+            },
+            state,
+        )
+        patch_path = review_input / "commit-snapshots" / "user" / "0000.patch"
+        patch_path.write_bytes(patch_path.read_bytes() + b"tampered")
+        with self.assertRaisesRegex(
+            REVIEW_MODULE.ReviewError, "local commit patch digest mismatch"
+        ):
+            REVIEW_MODULE.validate_dirty_snapshots(
+                {
+                    "dirty_snapshot_manifest_file": str(manifest_path),
+                    "dirty_snapshot_manifest_sha256": hashlib.sha256(
+                        manifest_path.read_bytes()
+                    ).hexdigest(),
+                },
+                state,
+            )
+
+        peer = self.root / "history-peer"
+        subprocess.run(  # noqa: S603 -- controlled Git fixture command
+            [  # noqa: S607 -- controlled Git fixture command
+                "git", "clone", "-q", "--branch", "main",
+                str(self.origins["user"]), str(peer),
+            ],
+            check=True,
+        )
+        subprocess.run(["git", "-C", str(peer), "config", "user.name", "Peer"], check=True)
+        subprocess.run(
+            ["git", "-C", str(peer), "config", "user.email", "peer@example.invalid"],
+            check=True,
+        )
+        (peer / "remote.md").write_text("remote\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(peer), "add", "remote.md"], check=True)
+        subprocess.run(
+            ["git", "-C", str(peer), "commit", "-q", "-m", "remote only"],
+            check=True,
+        )
+        subprocess.run(["git", "-C", str(peer), "push", "-q", "origin", "main"], check=True)
+        subprocess.run(
+            [
+                "git", "-C", str(self.user), "fetch", "origin",
+                "refs/heads/main:refs/remotes/origin/main",
+            ],
+            check=True,
+        )
+        with pre.open("w", encoding="utf-8") as output:
+            subprocess.run(
+                [str(SCRIPTS / "capture-vault-state.py"), str(runtime)],
+                check=True,
+                stdout=output,
+                text=True,
+            )
+        diverged = json.loads(pre.read_text())["user_vault"]
+        self.assertEqual(diverged["history_relation"], "diverged")
+        self.assertEqual(diverged["local_commits"], [])
+
+    def test_lightweight_capture_does_not_materialize_local_commit_patches(self) -> None:
+        """Keep expensive local-only history work behind publication preflight."""
+        for repo in (self.agents, self.user):
+            subprocess.run(["git", "-C", str(repo), "config", "user.name", "Fixture"], check=True)
+            subprocess.run(
+                ["git", "-C", str(repo), "config", "user.email", "fixture@example.invalid"],
+                check=True,
+            )
+            (repo / "base.md").write_text("base\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(repo), "add", "base.md"], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "base"], check=True)
+            subprocess.run(["git", "-C", str(repo), "branch", "-M", "main"], check=True)
+            subprocess.run(["git", "-C", str(repo), "push", "-q", "-u", "origin", "main"], check=True)
+        (self.user / "huge-history.bin").write_bytes(b"local history")
+        subprocess.run(["git", "-C", str(self.user), "add", "huge-history.bin"], check=True)
+        subprocess.run(["git", "-C", str(self.user), "commit", "-q", "-m", "local ahead"], check=True)
+
+        with mock.patch.object(
+            CAPTURE_MODULE,
+            "local_commit_metadata",
+            side_effect=AssertionError("history materialization ran before collection"),
+        ) as history:
+            state = CAPTURE_MODULE.capture(str(self.user))
+        history.assert_not_called()
+        self.assertEqual(state["history_relation"], "local_ahead")
+        self.assertEqual(state["local_commits"], [])
+
+    def test_local_commit_patch_helpers_disable_repository_textconv(self) -> None:
+        """Do not execute repository-configured textconv while hashing reviewed patches."""
+        repo = self.user
+        marker = self.root / "textconv-executed"
+        helper = self.root / "textconv.sh"
+        helper.write_text(
+            f"#!/bin/sh\ntouch {marker}\ncat \"$1\"\n",
+            encoding="utf-8",
+        )
+        helper.chmod(0o755)
+        subprocess.run(  # noqa: S603 -- controlled Git fixture command
+            ["git", "-C", str(repo), "config", "user.name", "Fixture"],  # noqa: S607
+            check=True,
+        )
+        subprocess.run(  # noqa: S603 -- controlled Git fixture command
+            ["git", "-C", str(repo), "config", "user.email", "fixture@example.invalid"],  # noqa: S607
+            check=True,
+        )
+        subprocess.run(  # noqa: S603 -- controlled Git fixture command
+            ["git", "-C", str(repo), "config", "diff.fixture.textconv", str(helper)],  # noqa: S607
+            check=True,
+        )
+        (repo / ".gitattributes").write_text("*.txt diff=fixture\n", encoding="utf-8")
+        target = repo / "reviewed.txt"
+        target.write_text("before\n", encoding="utf-8")
+        subprocess.run(  # noqa: S603 -- controlled Git fixture command
+            ["git", "-C", str(repo), "add", ".gitattributes", "reviewed.txt"],  # noqa: S607
+            check=True,
+        )
+        subprocess.run(  # noqa: S603 -- controlled Git fixture command
+            ["git", "-C", str(repo), "commit", "-q", "-m", "base"],  # noqa: S607
+            check=True,
+        )
+        parent = subprocess.check_output(  # noqa: S603 -- controlled Git fixture command
+            ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True  # noqa: S607
+        ).strip()
+        target.write_text("after\n", encoding="utf-8")
+        subprocess.run(  # noqa: S603 -- controlled Git fixture command
+            ["git", "-C", str(repo), "add", "reviewed.txt"],  # noqa: S607
+            check=True,
+        )
+        subprocess.run(  # noqa: S603 -- controlled Git fixture command
+            ["git", "-C", str(repo), "commit", "-q", "-m", "change"],  # noqa: S607
+            check=True,
+        )
+        commit = subprocess.check_output(  # noqa: S603 -- controlled Git fixture command
+            ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True  # noqa: S607
+        ).strip()
+
+        patch = CAPTURE_MODULE.commit_patch(str(repo), commit, [parent])
+        DIRTY_STAGER_MODULE.read_commit_patch(
+            str(repo / ".git"), commit, [parent], hashlib.sha256(patch).hexdigest()
+        )
+        self.assertEqual(
+            PUSH_MODULE.commit_patch_sha256(str(repo), commit, [parent]),
+            hashlib.sha256(patch).hexdigest(),
+        )
+        self.assertFalse(marker.exists())
+
+    def test_empty_existing_commit_message_is_captured_and_schema_valid(self) -> None:
+        """Represent valid local-only commits whose Git message is empty."""
+        repo = self.user
+        subprocess.run(  # noqa: S603 -- controlled Git fixture command
+            ["git", "-C", str(repo), "config", "user.name", "Fixture"],  # noqa: S607
+            check=True,
+        )
+        subprocess.run(  # noqa: S603 -- controlled Git fixture command
+            ["git", "-C", str(repo), "config", "user.email", "fixture@example.invalid"],  # noqa: S607
+            check=True,
+        )
+        (repo / "base.md").write_text("base\n", encoding="utf-8")
+        subprocess.run(  # noqa: S603 -- controlled Git fixture command
+            ["git", "-C", str(repo), "add", "base.md"],  # noqa: S607
+            check=True,
+        )
+        subprocess.run(  # noqa: S603 -- controlled Git fixture command
+            ["git", "-C", str(repo), "commit", "-q", "-m", "base"],  # noqa: S607
+            check=True,
+        )
+        base = subprocess.check_output(  # noqa: S603 -- controlled Git fixture command
+            ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True  # noqa: S607
+        ).strip()
+        subprocess.run(  # noqa: S603 -- controlled Git fixture command
+            [  # noqa: S607 -- controlled Git fixture command
+                "git", "-C", str(repo), "commit", "-q", "--allow-empty",
+                "--allow-empty-message", "-m", "",
+            ],
+            check=True,
+        )
+        head = subprocess.check_output(  # noqa: S603 -- controlled Git fixture command
+            ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True  # noqa: S607
+        ).strip()
+        commits = CAPTURE_MODULE.local_commit_metadata(str(repo), base, head)
+        self.assertEqual(commits[0]["message"], "")
+        schema = json.loads(
+            (SKILL_ROOT / "references" / "publication-review-result.schema.json").read_text()
+        )
+        self.assertNotIn("minLength", schema["$defs"]["existingCommit"]["properties"]["message"])
 
     def test_local_committer_uses_explicit_git_paths_and_no_network_overrides(self) -> None:
         """Keep local mutation independent of a Vault process cwd or ambient Git config."""
@@ -1885,6 +2160,7 @@ def load_environment(*, checkout_root, environ, require_catalog):
             "owned_paths": ["published.md"],
             "excluded_paths": [],
             "approved_diff_snapshot_sha256": hashlib.sha256(b"").hexdigest(),
+            "approved_existing_commits": [],
             "approved_dirty_entries": [],
             "reviewed_artifacts": [
                 {
@@ -1901,6 +2177,9 @@ def load_environment(*, checkout_root, environ, require_catalog):
                 "secret_scan_tool": "gitleaks",
                 "secret_scan_tool_version": "fixture-gitleaks 1.0",
                 "reviewed_snapshot_sha256": hashlib.sha256(b"").hexdigest(),
+                "reviewed_history_sha256": pre[
+                    "agents_vault" if root == self.agents else "user_vault"
+                ]["history_snapshot_sha256"],
             },
             "review_or_validation_status": "quality_ok",
             "commit_required": True,
@@ -1979,6 +2258,95 @@ def load_environment(*, checkout_root, environ, require_catalog):
         self.assertEqual(
             final["agents_vault"]["local_head"],
             final["agents_vault"]["remote_head"],
+        )
+
+    def test_pusher_scans_remote_to_final_and_rejects_remote_race(self) -> None:
+        """Fix both secret-scan coverage and the pre-push remote race gate."""
+        completed = subprocess.CompletedProcess([], 0, "", "")
+        with mock.patch.object(PUSH_MODULE.subprocess, "run", return_value=completed) as run:
+            PUSH_MODULE.scan_commits("/tools/gitleaks", "/vault", "a" * 40, "b" * 40)
+        self.assertIn(
+            f"{'a' * 40}..{'b' * 40}",
+            run.call_args.args[0],
+        )
+        pre = {
+            "agents_vault": {"remote_head": "a" * 40},
+            "user_vault": {"remote_head": "b" * 40},
+        }
+        PUSH_MODULE.require_unchanged_remote_heads("a" * 40, "b" * 40, pre)
+        with self.assertRaisesRegex(PUSH_MODULE.PushError, "remote main moved"):
+            PUSH_MODULE.require_unchanged_remote_heads("c" * 40, "b" * 40, pre)
+
+    def test_review_rejects_forbidden_path_in_local_only_history(self) -> None:
+        """Apply the .obsidian guard to commits that already exist locally."""
+        state = {
+            "repo_root": str(self.agents),
+            "branch": "main",
+            "upstream": "origin/main",
+            "history_relation": "local_ahead",
+            "operation_in_progress": False,
+            "local_commits": [
+                {
+                    "commit": "a" * 40,
+                    "parents": ["b" * 40],
+                    "tree": "c" * 40,
+                    "message": "unsafe",
+                    "changed_paths": [".obsidian/workspace.json"],
+                    "patch_sha256": "d" * 64,
+                }
+            ],
+            "dirty_paths": [],
+        }
+        with self.assertRaisesRegex(REVIEW_MODULE.ReviewError, "forbidden .obsidian"):
+            REVIEW_MODULE.validate_manifest(
+                {
+                    "repo_root": str(self.agents),
+                    "task_id": "TSK-AUTH",
+                    "approved_existing_commits": state["local_commits"],
+                },
+                state,
+                str(self.agents),
+                "TSK-AUTH",
+                {
+                    "role": "agents_security_advisory",
+                    "source_sha256": "e" * 64,
+                    "target_path": str(self.agents / "advisory.md"),
+                },
+                None,
+                "fixture-gitleaks 1.0",
+            )
+
+    def test_partial_evidence_keeps_initial_and_finalization_commits(self) -> None:
+        """Do not discard already-published local-ahead hashes on partial recovery."""
+        initial_hash = "1" * 40
+        finalization_hash = "2" * 40
+        initial = {
+            "agents_vault": {
+                "commit_hashes": [initial_hash],
+                "local_head": initial_hash,
+                "remote_head": initial_hash,
+            }
+        }
+        git_results = [
+            subprocess.CompletedProcess([], 0, finalization_hash + "\n", ""),
+            subprocess.CompletedProcess([], 0, finalization_hash + "\n", ""),
+        ]
+        with mock.patch.object(FINALIZER_MODULE, "git", side_effect=git_results), \
+             mock.patch.object(FINALIZER_MODULE, "dirty_status", return_value=(True, "")), \
+             mock.patch.object(FINALIZER_MODULE, "remote_head", return_value=initial_hash):
+            result = FINALIZER_MODULE.partial_result(
+                {
+                    "agents_vault_root": str(self.agents),
+                    "agents_remote_url": "fixture",
+                    "agents_git_dir": str(self.agents / ".git"),
+                },
+                {},
+                initial,
+                "fixture failure",
+            )
+        self.assertEqual(
+            result["agents_vault"]["commit_hashes"],
+            [initial_hash, finalization_hash],
         )
 
     def test_review_rejects_forbidden_obsidian_scope(self) -> None:
@@ -2134,12 +2502,13 @@ def load_environment(*, checkout_root, environ, require_catalog):
                 {"message": "approved group", "paths": ["a.md", "b.md"]}
             ],
             "reviewed_artifacts": [],
+            "approved_existing_commits": [],
             "approved_dirty_entries": [],
         }
         with self.assertRaises(PUSH_MODULE.PushError):
             PUSH_MODULE.validate_scope(
                 str(repo),
-                {"local_head": before},
+                {"remote_head": before, "local_head": before, "local_commits": []},
                 {"local_head": commits[-1], "commit_hashes": commits},
                 manifest,
             )
@@ -2163,12 +2532,17 @@ def load_environment(*, checkout_root, environ, require_catalog):
                     "source_sha256": hashlib.sha256(b"outside-target").hexdigest(),
                 }
             ],
+            "approved_existing_commits": [],
             "approved_dirty_entries": [],
         }
         with self.assertRaises(PUSH_MODULE.PushError):
             PUSH_MODULE.validate_scope(
                 str(repo),
-                {"local_head": second_before},
+                {
+                    "remote_head": second_before,
+                    "local_head": second_before,
+                    "local_commits": [],
+                },
                 {
                     "local_head": symlink_commit,
                     "commit_hashes": [symlink_commit],
@@ -2206,6 +2580,7 @@ def load_environment(*, checkout_root, environ, require_catalog):
                 {"message": "dirty", "paths": ["approved-dirty.md"]}
             ],
             "reviewed_artifacts": [],
+            "approved_existing_commits": [],
             "approved_dirty_entries": [
                 {
                     "path": "approved-dirty.md",
@@ -2217,7 +2592,11 @@ def load_environment(*, checkout_root, environ, require_catalog):
         with self.assertRaises(PUSH_MODULE.PushError):
             PUSH_MODULE.validate_scope(
                 str(repo),
-                {"local_head": third_before},
+                {
+                    "remote_head": third_before,
+                    "local_head": third_before,
+                    "local_commits": [],
+                },
                 {
                     "local_head": substituted_commit,
                     "commit_hashes": [substituted_commit],
@@ -2326,7 +2705,8 @@ elif stage=="review":
     assert hashlib.sha256(authorization.read_bytes()).hexdigest() == publication["authorization_task_sha256"]
     dirty_manifest=Path(publication["dirty_snapshot_manifest_file"])
     assert hashlib.sha256(dirty_manifest.read_bytes()).hexdigest() == publication["dirty_snapshot_manifest_sha256"]
-    assert json.loads(dirty_manifest.read_text())["version"] == 1
+    snapshot_manifest=json.loads(dirty_manifest.read_text())
+    assert snapshot_manifest["version"] == 2
     runtime_context=publication["runtime"]
     pre=publication["pre_collection_state"]
     plan=context["artifact_plan"]
@@ -2342,8 +2722,9 @@ elif stage=="review":
             evidence=None
         target_rel=rel(root,target)
         initial=sorted(set(state["dirty_paths"]+[target_rel]))
-        owned=sorted(set(initial+([evidence] if evidence else [])))
-        return {"repo_root":root,"task_id":publication["authorization_task_id"],"owned_paths":owned,"excluded_paths":[],"approved_diff_snapshot_sha256":state["diff_snapshot_sha256"],"approved_dirty_entries":state["dirty_entries"],"reviewed_artifacts":[{"role":item["role"],"source_sha256":item["sha256"],"target_path":target_rel}],"validation_evidence":{"file_guard":"passed","secret_scan":"passed","secret_scan_tool":"gitleaks","secret_scan_tool_version":runtime_context["gitleaks_version"],"reviewed_snapshot_sha256":state["diff_snapshot_sha256"]},"review_or_validation_status":"quality_ok","commit_required":True,"unrelated_dirty_paths":[],"commit_groups":[{"message":"fixture publication","paths":initial}],"evidence_finalization":({"target_path":evidence,"template":"daily_publication_v1"} if evidence else None)}
+        existing_paths=[path for commit in state["local_commits"] for path in commit["changed_paths"]]
+        owned=sorted(set(initial+existing_paths+([evidence] if evidence else [])))
+        return {"repo_root":root,"task_id":publication["authorization_task_id"],"owned_paths":owned,"excluded_paths":[],"approved_diff_snapshot_sha256":state["diff_snapshot_sha256"],"approved_existing_commits":state["local_commits"],"approved_dirty_entries":state["dirty_entries"],"reviewed_artifacts":[{"role":item["role"],"source_sha256":item["sha256"],"target_path":target_rel}],"validation_evidence":{"file_guard":"passed","secret_scan":"passed","secret_scan_tool":"gitleaks","secret_scan_tool_version":runtime_context["gitleaks_version"],"reviewed_snapshot_sha256":state["diff_snapshot_sha256"],"reviewed_history_sha256":state["history_snapshot_sha256"]},"review_or_validation_status":"quality_ok","commit_required":True,"unrelated_dirty_paths":[],"commit_groups":[{"message":"fixture publication","paths":initial}],"evidence_finalization":({"target_path":evidence,"template":"daily_publication_v1"} if evidence else None)}
     result={"outcome":"approved","publication_context_sha256":context["publication_context_sha256"],"agents_vault":manifest("agents"),"user_vault":manifest("user"),"next_action":None}
 elif stage=="publication":
     publication=context["publication_context"]
@@ -2388,6 +2769,37 @@ output.write_text(json.dumps(result))
             ),
             encoding="utf-8",
         )
+
+        subprocess.run(  # noqa: S603 -- controlled Git fixture command
+            ["git", "-C", str(self.user), "branch", "--unset-upstream"],  # noqa: S607
+            check=True,
+        )
+        missing_upstream = subprocess.run(  # noqa: S603 -- controlled fixture executable
+            [str(runtime / "run-daily-it-news-vulnerability-check.sh")],
+            check=False,
+            env={**os.environ, "PATH": os.environ["PATH"]},
+        )
+        self.assertEqual(missing_upstream.returncode, 75)
+        missing_upstream_logs = list((runtime / "logs").rglob("invocations.log"))
+        self.assertEqual(len(missing_upstream_logs), 1)
+        self.assertEqual(
+            missing_upstream_logs[0].read_text(encoding="utf-8").splitlines(),
+            ["collection"],
+        )
+        self.assertIn(
+            "phase=publication_preflight",
+            (runtime / "last-status.txt").read_text(encoding="utf-8"),
+        )
+        subprocess.run(  # noqa: S603 -- controlled Git fixture command
+            [  # noqa: S607 -- controlled Git fixture command
+                "git", "-C", str(self.user), "branch", "--set-upstream-to",
+                "origin/main", "main",
+            ],
+            check=True,
+        )
+        shutil.rmtree(runtime / "logs")
+        (runtime / "last-status.txt").unlink()
+
         ahead = self.root / "ahead-clone"
         subprocess.run(
             [
@@ -2426,9 +2838,14 @@ output.write_text(json.dumps(result))
             env={**os.environ, "PATH": os.environ["PATH"]},
         )
         self.assertEqual(blocked.returncode, 75)
-        self.assertEqual(list((runtime / "logs").rglob("invocations.log")), [])
+        blocked_logs = list((runtime / "logs").rglob("invocations.log"))
+        self.assertEqual(len(blocked_logs), 1)
+        self.assertEqual(
+            blocked_logs[0].read_text(encoding="utf-8").splitlines(),
+            ["collection"],
+        )
         self.assertIn(
-            "phase=preflight",
+            "phase=publication_preflight",
             (runtime / "last-status.txt").read_text(encoding="utf-8"),
         )
         subprocess.run(
@@ -2462,6 +2879,18 @@ output.write_text(json.dumps(result))
         shutil.rmtree(runtime / "logs")
         (runtime / "last-status.txt").unlink()
 
+        (self.user / "local-ahead.md").write_text("local ahead\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "-C", str(self.user), "add", "local-ahead.md"], check=True
+        )
+        subprocess.run(
+            ["git", "-C", str(self.user), "commit", "-q", "-m", "local ahead"],
+            check=True,
+        )
+        local_ahead_commit = subprocess.check_output(
+            ["git", "-C", str(self.user), "rev-parse", "HEAD"], text=True
+        ).strip()
+
         result = subprocess.run(
             [str(runtime / "run-daily-it-news-vulnerability-check.sh")],
             check=False,
@@ -2477,6 +2906,16 @@ output.write_text(json.dumps(result))
         status_files = list(runtime.glob("last-status.txt"))
         self.assertEqual(len(status_files), 1)
         self.assertIn("semantic_status=success", status_files[0].read_text())
+        publication_results = list(runtime.glob("logs/**/publication-result.json"))
+        self.assertEqual(len(publication_results), 1)
+        publication_result = json.loads(publication_results[0].read_text())
+        self.assertIn(
+            local_ahead_commit, publication_result["user_vault"]["commit_hashes"]
+        )
+        self.assertEqual(
+            publication_result["user_vault"]["local_head"],
+            publication_result["user_vault"]["remote_head"],
+        )
 
         shutil.rmtree(runtime / "logs")
         (runtime / "last-status.txt").unlink()

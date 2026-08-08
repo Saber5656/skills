@@ -61,6 +61,16 @@ fi
 /usr/bin/grep -F -- 'CANONICAL_VALIDATOR="$WORKDIR/validate-canonical-result.py"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- 'STANDING_TASK_STAGER="$WORKDIR/stage-standing-task.py"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- 'DIRTY_REVIEW_STAGER="$WORKDIR/stage-dirty-review-inputs.py"' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- '(.history_relation | IN("equal", "local_ahead"))' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- 'remote-ahead, diverged' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- 'phase=publication_preflight' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- '"$STATE_CAPTURE" --include-local-history' "$RUNNER" >/dev/null
+collection_line="$(/usr/bin/grep -n -F -- 'COLLECTION_STATUS=$?' "$RUNNER" | /usr/bin/cut -d: -f1)"
+history_line="$(/usr/bin/grep -n -F -- '"$STATE_CAPTURE" --include-local-history' "$RUNNER" | /usr/bin/cut -d: -f1)"
+if [[ -z "$collection_line" || -z "$history_line" || "$history_line" -le "$collection_line" ]]; then
+  echo "local-only history materialization must happen after collection" >&2
+  exit 1
+fi
 /usr/bin/grep -F -- '--arg standing_task "$STANDING_TASK_SNAPSHOT"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- 'AUTHORIZATION_TASK_SNAPSHOT="$REVIEW_INPUT_ROOT/authorization-task.md"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- '"$RUNTIME_CONTEXT_FILE" "$REVIEW_INPUT_ROOT" authorization' "$RUNNER" >/dev/null
@@ -107,4 +117,4 @@ for forbidden in "/""Users/" "Library/Mobile"" Documents" "Yasu""'s Vault"; do
   fi
 done
 
-echo "runner isolation contract: 28/28 passed"
+echo "runner isolation contract: 30/30 passed"

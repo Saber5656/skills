@@ -51,12 +51,12 @@ Saihai primary checkoutの`directory-path.env`だけをsourceにし、空mapping
 | repository root | catalogで解決したVault root自身 |
 | branch / upstream | `main` / `origin/main` |
 | operation | merge/rebase/cherry-pick/revert中でない |
-| freshness | fetch後、local mainとorigin/mainが完全一致 |
+| history safety | fetch後、`origin/main`がlocal `main`のancestor（equalまたはlocal-ahead）。remote-ahead/divergedは不可 |
 | collection isolation | current head/dirty pathsが`pre_collection_state`と一致 |
 | artifact | regular non-symlink file、staging配下、hash一致 |
 | remote evidence | credentialを除去したremote名・host・repository |
 
-片方でも失敗したら、どちらもartifact配置・commit・pushしない。checkout、pull、merge、rebase、reset、stashで回避しない。
+Vault履歴の状態は日次収集を止めない。収集とVault不変性の検証を完了してからpublication preflightを行う。local-aheadの場合はreview inputへ各commitのhash、parents、tree、message、changed paths、first-parent patchを封印し、publication reviewとpinned gitleaks scanへ含める。remote-ahead、diverged、Git operation中、または封印済みhistoryとの不一致はpublicationだけを停止する。停止をcheckout、pull、merge、rebase、reset、stashで回避しない。
 
 ## Artifact Install
 
@@ -79,6 +79,7 @@ local publication commitとAgents evidence finalization commitは、ambient Git 
 | `owned_paths` | pre-existing dirty paths、配置済みartifact、許可済みevidence hunkだけ |
 | `excluded_paths` | scope外path |
 | `approved_diff_snapshot` | path/hunkとSHA-256 |
+| `approved_existing_commits` | `origin/main..local main`の既存commit metadataとpatch digest。順序・境界を維持 |
 | `approved_dirty_entries` | pre-existing dirty pathごとのexpected Git blob OID、mode、deletion |
 | `reviewed_artifacts` | artifact hash、role、planned target |
 | `validation_evidence` | file guard、pinned gitleaks version/result、reviewed snapshot digest |
@@ -92,11 +93,12 @@ local publication commitとAgents evidence finalization commitは、ambient Git 
 
 ## Push Phase
 
-両initial commit phaseが`complete`または`not_required`で、task-owned pathがcleanの場合だけrunnerの固定push helperへ`ready_to_push`を渡す。
+両initial commit phaseが`complete`または`not_required`で、task-owned pathがcleanの場合だけrunnerの固定push helperへ`ready_to_push`を渡す。pre-existing local commitsは新しいcommit groupへ作り直さず、その履歴を保持したまま、dirty差分とartifactの新規commit群を後続させる。
 
-- helperは報告されたcommit列をordered commit groupsと1対1で照合し、各commit message/path set、cumulative changed paths、pre-existing dirty pathのfinal blob OID/mode/deletion、artifact blob SHA-256/modeが承認済みManifestと完全一致することを検証する。
+- helperはpre-existing local commit列を`approved_existing_commits`と照合し、新規commit列をordered commit groupsと1対1で照合する。各commit message/path set、cumulative changed paths、pre-existing dirty pathのfinal blob OID/mode/deletion、artifact blob SHA-256/modeが承認済みManifestと完全一致することを検証する。
 - local commit前後で`.git/config`とhooksのdigestが不変であることを確認し、ambient Git configを無効化し、hooksを実行せず、catalog解決時にpinしたcredential-free remote URLと`<validated-object-id>:refs/heads/main`だけを使う。
-- pinned gitleaksでcandidate commit rangeを再scanしてからplain non-force pushする。
+- pinned gitleaksでremote HEADから最終local HEADまで（pre-existing local commitsを含む）を再scanしてからplain non-force pushする。
+- push直前のremote HEADがpre-collectionで固定したremote HEADから動いていた場合はpushせず停止する。
 - local publication agentにはnetworkを与えず、任意remoteや任意refspecを操作させない。
 - 両commit成功後に両pushが失敗した場合も、local stateが進んだため`partial_publication`とする。
 - 片側だけのcommit/push、またはevidence finalization失敗も`partial_publication`とする。
