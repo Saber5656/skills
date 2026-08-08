@@ -34,6 +34,16 @@ class CollectionError(RuntimeError):
     """Represent a source collection error that should fail closed."""
 
 
+class RobotsDisallowed(CollectionError):
+    """Carry sealed robots.txt evidence for one disallowed direct URL."""
+
+    def __init__(self, requested_url: str, robots_url: str, robots_sha256: str) -> None:
+        super().__init__("robots_disallowed")
+        self.requested_url = requested_url
+        self.robots_url = robots_url
+        self.robots_sha256 = robots_sha256
+
+
 def load_catalog(path: Path) -> list[dict[str, Any]]:
     """Load and strictly validate the tracked source catalog."""
     payload = json.loads(path.read_text(encoding="utf-8"))
@@ -109,8 +119,8 @@ class SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
         return self.http_error_302(req, fp, code, msg, headers)
 
 
-def robots_allowed(url: str, hosts: set[str]) -> bool:
-    """Honor a reachable robots.txt; an unavailable policy is not invented."""
+def robots_policy(url: str, hosts: set[str]) -> dict[str, object]:
+    """Return a reachable robots.txt decision and its exact evidence digest."""
     parsed = urllib.parse.urlsplit(url)
     robots_url = urllib.parse.urlunsplit(
         (parsed.scheme, parsed.netloc, "/robots.txt", "", "")
@@ -120,20 +130,32 @@ def robots_allowed(url: str, hosts: set[str]) -> bool:
     opener = urllib.request.build_opener(SafeRedirectHandler(hosts))
     try:
         with opener.open(request, timeout=8) as response:
-            data = response.read(512 * 1024).decode("utf-8", errors="replace")
+            content = response.read(512 * 1024 + 1)
     except (OSError, urllib.error.URLError, urllib.error.HTTPError, socket.timeout):
-        return True
+        return {"allowed": True, "robots_url": robots_url, "robots_sha256": None}
+    if len(content) > 512 * 1024:
+        raise CollectionError("robots.txt exceeds size limit")
+    data = content.decode("utf-8", errors="replace")
     parser = urllib.robotparser.RobotFileParser()
     parser.set_url(robots_url)
     parser.parse(data.splitlines())
-    return parser.can_fetch(USER_AGENT, url)
+    return {
+        "allowed": parser.can_fetch(USER_AGENT, url),
+        "robots_url": robots_url,
+        "robots_sha256": hashlib.sha256(content).hexdigest(),
+    }
 
 
 def read_bounded(response) -> bytes:  # type: ignore[no-untyped-def]
     """Read a response with a hard size cap and optional gzip decoding."""
     declared = response.headers.get("Content-Length")
-    if declared and int(declared) > MAX_BYTES:
-        raise CollectionError("response exceeds size limit")
+    if declared:
+        try:
+            declared_size = int(declared)
+        except (TypeError, ValueError):
+            declared_size = None
+        if declared_size is not None and declared_size > MAX_BYTES:
+            raise CollectionError("response exceeds size limit")
     content = response.read(MAX_BYTES + 1)
     if len(content) > MAX_BYTES:
         raise CollectionError("response exceeds size limit")
@@ -150,8 +172,11 @@ def read_bounded(response) -> bytes:  # type: ignore[no-untyped-def]
 def fetch_url(url: str, hosts: set[str]) -> dict[str, Any]:
     """Fetch one reviewed URL, accepting public XML/HTML regardless of MIME quirks."""
     validate_url(url, hosts)
-    if not robots_allowed(url, hosts):
-        raise CollectionError("robots_disallowed")
+    policy = robots_policy(url, hosts)
+    if not policy["allowed"]:
+        raise RobotsDisallowed(
+            url, str(policy["robots_url"]), str(policy["robots_sha256"])
+        )
     opener = urllib.request.build_opener(SafeRedirectHandler(hosts))
     request = urllib.request.Request(
         url,
@@ -195,7 +220,18 @@ def fetch_url(url: str, hosts: set[str]) -> dict[str, Any]:
                 validate_url(redirected, hosts)
                 request = urllib.request.Request(redirected, headers=dict(request.header_items()))
                 continue
-            if exc.code in (401, 402, 403, 407, 429):
+            if exc.code in (401, 402, 403, 407):
+                content = read_bounded(exc)
+                if detect_access_constraint(content):
+                    return {
+                        "content": content,
+                        "content_type": exc.headers.get_content_type().lower(),
+                        "final_url": validate_url(exc.geturl(), hosts),
+                        "http_status": exc.code,
+                        "attempt": attempt,
+                    }
+                break
+            if exc.code == 429:
                 break
         except (CollectionError, OSError, urllib.error.URLError, socket.timeout) as exc:
             last_error = str(exc)
@@ -236,6 +272,7 @@ def extract_xml(content: bytes) -> list[dict[str, Optional[str]]]:
             "url": None,
             "published": None,
             "summary": None,
+            "candidate_provenance": "feed_entry",
         }
         for child in list(item):
             name = local_name(child.tag)
@@ -267,6 +304,8 @@ class LinkExtractor(HTMLParser):
         self.article_depth = 0
         self.article_entry_start = 0
         self.article_published: Optional[str] = None
+        self.heading_depth = 0
+        self.current_article_headline = False
         self.in_time = False
         self.time_text: list[str] = []
 
@@ -282,12 +321,15 @@ class LinkExtractor(HTMLParser):
             self.in_time = True
             self.time_text = []
             self.article_published = clean_text(attributes.get("datetime"), 200)
+        if lowered in {"h1", "h2", "h3", "h4", "h5", "h6"} and self.article_depth:
+            self.heading_depth += 1
         if lowered != "a" or len(self.entries) >= 400:
             return
         href = attributes.get("href")
         if href:
             self.current_href = urllib.parse.urljoin(self.base_url, href)
             self.current_text = []
+            self.current_article_headline = self.article_depth > 0 and self.heading_depth > 0
 
     def handle_data(self, data: str) -> None:
         if self.current_href:
@@ -303,9 +345,21 @@ class LinkExtractor(HTMLParser):
             self.time_text = []
         if lowered == "article" and self.article_depth:
             self.article_depth -= 1
-            if self.article_depth == 0 and self.article_published:
-                for entry in self.entries[self.article_entry_start:]:
-                    entry["published"] = entry["published"] or self.article_published
+            if self.article_depth == 0:
+                article_entries = self.entries[self.article_entry_start:]
+                candidate = next(
+                    (
+                        entry for entry in article_entries
+                        if entry.get("candidate_provenance") == "article_headline"
+                    ),
+                    article_entries[0] if len(article_entries) == 1 else None,
+                )
+                for entry in article_entries:
+                    entry["candidate_provenance"] = "article" if entry is candidate else None
+                    if entry is candidate:
+                        entry["published"] = entry["published"] or self.article_published
+        if lowered in {"h1", "h2", "h3", "h4", "h5", "h6"} and self.heading_depth:
+            self.heading_depth -= 1
         if lowered != "a" or not self.current_href:
             return
         parsed = urllib.parse.urlsplit(self.current_href)
@@ -317,11 +371,20 @@ class LinkExtractor(HTMLParser):
             and title
         ):
             self.entries.append(
-                {"title": title, "url": self.current_href, "published": None, "summary": None}
+                {
+                    "title": title,
+                    "url": self.current_href,
+                    "published": None,
+                    "summary": None,
+                    "candidate_provenance": (
+                        "article_headline" if self.current_article_headline else None
+                    ),
+                }
             )
             self.seen.add(self.current_href)
         self.current_href = None
         self.current_text = []
+        self.current_article_headline = False
 
 
 def extract_json_ld(content: bytes, base_url: str) -> list[dict[str, Optional[str]]]:
@@ -345,12 +408,20 @@ def extract_json_ld(content: bytes, base_url: str) -> list[dict[str, Optional[st
         if isinstance(raw_url, dict):
             raw_url = raw_url.get("@id") or raw_url.get("url")
         published = clean_text(value.get("datePublished") or value.get("dateModified"), 200)
-        if title and isinstance(raw_url, str) and published:
+        raw_type = value.get("@type")
+        types = raw_type if isinstance(raw_type, list) else [raw_type]
+        article_like = any(
+            isinstance(item, str)
+            and (item.lower().endswith("article") or item.lower().endswith("posting"))
+            for item in types
+        )
+        if title and isinstance(raw_url, str) and (published or article_like):
             entries.append({
                 "title": title,
                 "url": urllib.parse.urljoin(base_url, raw_url),
                 "published": published,
                 "summary": clean_text(value.get("description"), 800),
+                "candidate_provenance": "json_ld" if article_like else None,
             })
         for nested in value.values():
             if isinstance(nested, (dict, list)):
@@ -368,7 +439,19 @@ def canonical_url(value: str) -> str:
     """Normalize an HTTP URL for same-article evidence comparison."""
     parsed = urllib.parse.urlsplit(value)
     path = parsed.path.rstrip("/") or "/"
-    return urllib.parse.urlunsplit((parsed.scheme.lower(), parsed.netloc.lower(), path, "", ""))
+    host = (parsed.hostname or "").lower()
+    host = f"[{host}]" if ":" in host else host
+    try:
+        port = parsed.port
+    except ValueError:
+        port = None
+    default_port = (parsed.scheme.lower() == "https" and port == 443) or (
+        parsed.scheme.lower() == "http" and port == 80
+    )
+    netloc = host if port is None or default_port else f"{host}:{port}"
+    return urllib.parse.urlunsplit(
+        (parsed.scheme.lower(), netloc, path, parsed.query, "")
+    )
 
 
 def extract_primary_publication_date(content: bytes, final_url: str) -> Optional[str]:
@@ -401,9 +484,23 @@ def extract_content(content: bytes, content_type: str, final_url: str) -> dict[s
             pass
     parser = LinkExtractor(final_url)
     parser.feed(content.decode("utf-8", errors="replace"))
-    combined = extract_json_ld(content, final_url)
-    seen = {entry["url"] for entry in combined}
-    combined.extend(entry for entry in parser.entries if entry["url"] not in seen)
+    combined: list[dict[str, Optional[str]]] = []
+    by_url: dict[str, dict[str, Optional[str]]] = {}
+    for entry in [*extract_json_ld(content, final_url), *parser.entries]:
+        url = entry.get("url")
+        if not isinstance(url, str):
+            combined.append(entry)
+            continue
+        key = canonical_url(url)
+        existing = by_url.get(key)
+        if existing is None:
+            by_url[key] = entry
+            combined.append(entry)
+            continue
+        existing["published"] = existing.get("published") or entry.get("published")
+        existing["candidate_provenance"] = (
+            existing.get("candidate_provenance") or entry.get("candidate_provenance")
+        )
     combined = combined[:400]
     return {
         "format": "html_links",
@@ -451,13 +548,19 @@ def collect_source(
             )
             constraint = detect_access_constraint(fetched["content"])
             if constraint and extract["entry_count"] < 10:
-                attempts.append({"method": method, "url": url, "status": "access_constraint"})
-                constraints.append({
+                constraint_record = {
                     "method": method, "requested_url": url,
                     "final_url": fetched["final_url"], "constraint": constraint,
                     "http_status": fetched["http_status"],
+                }
+                attempts.append({
+                    "method": method, "url": url, "status": "access_constraint",
+                    **constraint_record,
                 })
+                constraints.append(constraint_record)
                 continue
+            if extract["entry_count"] == 0:
+                raise CollectionError("empty_extract")
             filename = safe_filename(index, source["name"], method)
             destination = output_root / filename
             content = fetched.pop("content")
@@ -485,11 +588,26 @@ def collect_source(
                 "extracted_entry_count": extract["entry_count"],
                 "attempts": attempts,
             }
+        except RobotsDisallowed as exc:
+            constraint_record = {
+                "method": method,
+                "requested_url": exc.requested_url,
+                "final_url": exc.requested_url,
+                "constraint": "robots",
+                "http_status": None,
+                "robots_url": exc.robots_url,
+                "robots_sha256": exc.robots_sha256,
+            }
+            attempts.append({
+                "method": method, "url": url, "status": "access_constraint",
+                "reason": str(exc), **constraint_record,
+            })
+            constraints.append(constraint_record)
         except (CollectionError, OSError, ValueError) as exc:
             attempts.append(
                 {"method": method, "url": url, "status": "failed", "reason": str(exc)}
             )
-    if constraints:
+    if attempts and all(item.get("status") == "access_constraint" for item in attempts):
         resolved = constraints[-1]
         return {
             "name": source["name"], "tier": source["tier"],
@@ -621,6 +739,21 @@ def verify_resolutions(
             raise CollectionError("fallback URL is access constrained")
         else:
             status = "verified_fallback"
+            if extract["entry_count"] == 0:
+                raise CollectionError("verified fallback extract is empty")
+        candidates = (
+            extract["entries"]
+            if extract["format"] == "feed"
+            else [
+                entry for entry in extract["entries"]
+                if entry.get("candidate_provenance") in {"article", "json_ld"}
+            ]
+        )
+        published_dates = [entry.get("published") for entry in candidates]
+        if status == "verified_fallback" and (
+            not published_dates or any(not value for value in published_dates)
+        ):
+            raise CollectionError("verified fallback lacks complete publication-date evidence")
         verified.append({
             "name": name,
             "status": status,
@@ -629,8 +762,17 @@ def verify_resolutions(
             "final_url": fetched["final_url"],
             "http_status": fetched["http_status"],
             "constraint": constraint,
-            "published_dates": [
-                entry["published"] for entry in extract["entries"] if entry.get("published")
+            "extracted_entry_count": extract["entry_count"],
+            "candidate_entry_count": len(candidates),
+            "date_evidence_count": sum(bool(value) for value in published_dates),
+            "published_dates": published_dates,
+            "candidate_evidence": [
+                {
+                    "url": entry.get("url"),
+                    "provenance": entry.get("candidate_provenance"),
+                    "published": entry.get("published"),
+                }
+                for entry in candidates
             ],
         })
         seen.add(name)
@@ -644,6 +786,8 @@ def verify_resolutions(
             raise CollectionError("publication-date evidence is outside catalog scope")
         hosts = source_hosts(by_name[name])
         fetched = fetch_url(validate_url(url, hosts), hosts)
+        if canonical_url(url) != canonical_url(fetched["final_url"]):
+            raise CollectionError("publication-date evidence redirected to another article")
         extract = extract_content(fetched["content"], fetched["content_type"], fetched["final_url"])
         published_date = extract_primary_publication_date(
             fetched["content"], fetched["final_url"]

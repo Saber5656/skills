@@ -12,7 +12,9 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import date
 from pathlib import Path
+from typing import Optional
 from unittest import mock
 
 SKILL_ROOT = Path(__file__).parents[1]
@@ -75,6 +77,12 @@ EVIDENCE_SPEC = importlib.util.spec_from_file_location(
 assert EVIDENCE_SPEC and EVIDENCE_SPEC.loader
 EVIDENCE_MODULE = importlib.util.module_from_spec(EVIDENCE_SPEC)
 EVIDENCE_SPEC.loader.exec_module(EVIDENCE_MODULE)
+COLLECTION_VALIDATOR_SPEC = importlib.util.spec_from_file_location(
+    "validate_collection_result", SCRIPTS / "validate-collection-result.py"
+)
+assert COLLECTION_VALIDATOR_SPEC and COLLECTION_VALIDATOR_SPEC.loader
+COLLECTION_VALIDATOR_MODULE = importlib.util.module_from_spec(COLLECTION_VALIDATOR_SPEC)
+COLLECTION_VALIDATOR_SPEC.loader.exec_module(COLLECTION_VALIDATOR_MODULE)
 
 
 def source_coverage_markdown() -> str:
@@ -114,20 +122,49 @@ def write_source_manifest(root: Path) -> Path:
         if index == len(catalog["sources"]) - 1:
             sources.append({
                 "name": source["name"], "tier": source["tier"],
-                "status": "needs_search_fallback", "attempts": [
-                    {"method": method, "url": url, "status": "failed", "reason": "robots_disallowed"}
+                "status": "access_constraint",
+                "method": method,
+                "requested_url": url,
+                "final_url": url,
+                "constraint": "robots",
+                "http_status": None,
+                "robots_url": f"https://{url.split('/')[2]}/robots.txt",
+                "robots_sha256": "a" * 64,
+                "attempts": [
+                    {
+                        "method": attempt_method,
+                        "url": attempt_url,
+                        "status": "access_constraint",
+                        "reason": "robots_disallowed",
+                        "requested_url": attempt_url,
+                        "final_url": attempt_url,
+                        "constraint": "robots",
+                        "http_status": None,
+                        "robots_url": f"https://{attempt_url.split('/')[2]}/robots.txt",
+                        "robots_sha256": "a" * 64,
+                    }
+                    for attempt_method, attempt_url in (
+                        ("rss", source["feed_url"]),
+                        ("public_page", source["page_url"]),
+                    )
+                    if attempt_url
                 ],
             })
         else:
+            extract_file = f"source-{index}.extract.json"
+            published = "2026-07-31T00:00:00Z" if index == 0 else "2026-07-01T00:00:00Z"
+            (source_root / extract_file).write_text(
+                json.dumps({
+                    "format": "feed" if method == "rss" else "html_links",
+                    "entries": [{"url": f"{url}?fixture={index}", "published": published}],
+                }),
+                encoding="utf-8",
+            )
             evidence = {
                 "name": source["name"], "tier": source["tier"], "status": "fetched",
                 "method": method, "final_url": url, "attempts": [],
+                "extract_file": extract_file, "extracted_entry_count": 1,
             }
-            if index == 0:
-                evidence["extract_file"] = "first.extract.json"
-                (source_root / "first.extract.json").write_text(json.dumps({
-                    "entries": [{"published": "2026-07-31T00:00:00Z"}]
-                }), encoding="utf-8")
             sources.append(evidence)
     path = source_root / "source-manifest.json"
     path.write_text(json.dumps({
@@ -142,6 +179,79 @@ def write_verified_resolutions(root: Path) -> Path:
     path = root / "verified-source-resolutions.json"
     path.write_text(json.dumps({"version": 1, "resolutions": [], "date_evidence": []}), encoding="utf-8")
     return path
+
+
+def write_minimal_coverage_fixture(
+    root: Path,
+    *,
+    extract_entries: list[dict[str, object]],
+    evidence_updates: Optional[dict[str, object]] = None,
+    resolutions: Optional[list[dict[str, object]]] = None,
+    date_evidence: Optional[list[dict[str, object]]] = None,
+    status: str = "取得済み",
+    method: str = "RSS",
+    count: int = 1,
+    confirmed_url: Optional[str] = None,
+    reason: str = "fixture",
+) -> tuple[str, Path, Path, Path]:
+    """Create one-source sealed coverage evidence for focused validator tests."""
+    catalog = root / "catalog.json"
+    manifest = root / "source-manifest.json"
+    verified = root / "verified.json"
+    extract = root / "source.extract.json"
+    source_url = "https://example.test/feed"
+    catalog.write_text(
+        json.dumps({
+            "version": 1,
+            "sources": [{
+                "name": "Fixture News",
+                "tier": 1,
+                "feed_url": source_url,
+                "page_url": "https://example.test/news",
+            }],
+        }),
+        encoding="utf-8",
+    )
+    extract.write_text(
+        json.dumps({
+            "format": "feed" if method == "RSS" else "html_links",
+            "entries": extract_entries,
+        }),
+        encoding="utf-8",
+    )
+    evidence: dict[str, object] = {
+        "name": "Fixture News",
+        "tier": 1,
+        "status": "fetched",
+        "method": "rss",
+        "final_url": source_url,
+        "extract_file": extract.name,
+        "extracted_entry_count": len(extract_entries),
+        "attempts": [],
+    }
+    evidence.update(evidence_updates or {})
+    manifest.write_text(
+        json.dumps({
+            "catalog_sha256": hashlib.sha256(catalog.read_bytes()).hexdigest(),
+            "sources": [evidence],
+        }),
+        encoding="utf-8",
+    )
+    verified.write_text(
+        json.dumps({
+            "version": 1,
+            "resolutions": resolutions or [],
+            "date_evidence": date_evidence or [],
+        }),
+        encoding="utf-8",
+    )
+    summary = (
+        "## 確認済みサイト一覧\n\n"
+        "| サイト | Tier | 状態 | 取得方法 | 確認URL | 期間内件数 | 理由 |\n"
+        "|---|---:|---|---|---|---:|---|\n"
+        f"| Fixture News | 1 | {status} | {method} | {confirmed_url or source_url} | {count} | {reason} |\n"
+    )
+    return summary, catalog, manifest, verified
 
 
 class RuntimeHelperTests(unittest.TestCase):
@@ -1488,6 +1598,295 @@ def load_environment(*, checkout_root, environ, require_catalog):
         result_path.write_text(json.dumps(payload), encoding="utf-8")
         self.assertEqual(subprocess.run(command, check=False).returncode, 75)
 
+    def test_collection_validator_preserves_query_article_identity(self) -> None:
+        """Count distinct query-addressed articles instead of collapsing their evidence."""
+        root = self.workdir / "query-coverage"
+        root.mkdir()
+        summary, catalog, manifest, verified = write_minimal_coverage_fixture(
+            root,
+            extract_entries=[
+                {"url": "https://example.test/news?id=1", "published": "2026-07-31"},
+                {"url": "https://example.test/news?id=2", "published": "2026-07-31"},
+            ],
+            count=2,
+        )
+        COLLECTION_VALIDATOR_MODULE.validate_source_coverage(
+            summary, catalog, manifest, verified, date(2026, 7, 31)
+        )
+
+    def test_collection_validator_binds_supplemental_date_to_extract_url(self) -> None:
+        """Reject same-host dates for articles absent from the sealed extract."""
+        root = self.workdir / "unbound-date"
+        root.mkdir()
+        summary, catalog, manifest, verified = write_minimal_coverage_fixture(
+            root,
+            extract_entries=[
+                {"url": "https://example.test/news?id=1", "published": None}
+            ],
+            date_evidence=[{
+                "name": "Fixture News",
+                "requested_url": "https://example.test/news?id=2",
+                "final_url": "https://example.test/news?id=2",
+                "published_date": "2026-07-31",
+            }],
+        )
+        with self.assertRaisesRegex(
+            COLLECTION_VALIDATOR_MODULE.ValidationError,
+            "not bound to an undated extract entry",
+        ):
+            COLLECTION_VALIDATOR_MODULE.validate_source_coverage(
+                summary, catalog, manifest, verified, date(2026, 7, 31)
+            )
+
+    def test_collection_validator_rejects_supplemental_date_redirect(self) -> None:
+        """Require verified date evidence to finish on the sealed article URL."""
+        root = self.workdir / "redirected-date"
+        root.mkdir()
+        summary, catalog, manifest, verified = write_minimal_coverage_fixture(
+            root,
+            extract_entries=[
+                {"url": "https://example.test/news?id=1", "published": None}
+            ],
+            date_evidence=[{
+                "name": "Fixture News",
+                "requested_url": "https://example.test/news?id=1",
+                "final_url": "https://example.test/news?id=2",
+                "published_date": "2026-07-31",
+            }],
+        )
+        with self.assertRaisesRegex(
+            COLLECTION_VALIDATOR_MODULE.ValidationError, "redirected"
+        ):
+            COLLECTION_VALIDATOR_MODULE.validate_source_coverage(
+                summary, catalog, manifest, verified, date(2026, 7, 31)
+            )
+
+    def test_collection_validator_ignores_undated_navigation_entries(self) -> None:
+        """Count sealed dated articles without treating undated navigation as articles."""
+        root = self.workdir / "mixed-html-dates"
+        root.mkdir()
+        summary, catalog, manifest, verified = write_minimal_coverage_fixture(
+            root,
+            extract_entries=[
+                {"url": "https://example.test/article", "published": "2026-07-31"},
+                {"url": "https://example.test/about", "published": None},
+            ],
+            evidence_updates={
+                "method": "public_page",
+                "final_url": "https://example.test/news",
+            },
+            method="公開ページ",
+            confirmed_url="https://example.test/news",
+            count=1,
+        )
+        COLLECTION_VALIDATOR_MODULE.validate_source_coverage(
+            summary, catalog, manifest, verified, date(2026, 7, 31)
+        )
+
+    def test_collection_validator_requires_dates_for_every_feed_entry(self) -> None:
+        """Do not treat undated RSS entries as HTML navigation links."""
+        root = self.workdir / "undated-feed-entry"
+        root.mkdir()
+        summary, catalog, manifest, verified = write_minimal_coverage_fixture(
+            root,
+            extract_entries=[
+                {"url": "https://example.test/article", "published": "2026-07-31"},
+                {"url": "https://example.test/undated", "published": None},
+            ],
+            count=1,
+        )
+        with self.assertRaisesRegex(
+            COLLECTION_VALIDATOR_MODULE.ValidationError,
+            "feed source lacks publication-date evidence",
+        ):
+            COLLECTION_VALIDATOR_MODULE.validate_source_coverage(
+                summary, catalog, manifest, verified, date(2026, 7, 31)
+            )
+
+    def test_sealed_extract_requires_a_filename(self) -> None:
+        """Raise the validator's typed error instead of an unpacking ValueError."""
+        with self.assertRaisesRegex(
+            COLLECTION_VALIDATOR_MODULE.ValidationError,
+            "source extract filename is invalid",
+        ):
+            COLLECTION_VALIDATOR_MODULE.sealed_extract_entries(
+                self.workdir / "source-manifest.json", {}
+            )
+
+    def test_collection_validator_requires_gate_attempt_transport_evidence(self) -> None:
+        """Reject non-robots constraints without final URL and HTTP status evidence."""
+        root = self.workdir / "incomplete-gate-attempt"
+        root.mkdir()
+        feed_url = "https://example.test/feed"
+        page_url = "https://example.test/news"
+        attempts = [
+            {
+                "method": attempt_method,
+                "url": attempt_url,
+                "requested_url": attempt_url,
+                "status": "access_constraint",
+                "constraint": "login",
+            }
+            for attempt_method, attempt_url in (
+                ("rss", feed_url),
+                ("public_page", page_url),
+            )
+        ]
+        summary, catalog, manifest, verified = write_minimal_coverage_fixture(
+            root,
+            extract_entries=[],
+            evidence_updates={
+                "status": "access_constraint",
+                "method": "public_page",
+                "final_url": page_url,
+                "constraint": "login",
+                "attempts": attempts,
+            },
+            status="アクセス制約",
+            method="公開ページ",
+            count=0,
+            confirmed_url=page_url,
+            reason="login required",
+        )
+        with self.assertRaisesRegex(
+            COLLECTION_VALIDATOR_MODULE.ValidationError,
+            "sealed access-constraint evidence",
+        ):
+            COLLECTION_VALIDATOR_MODULE.validate_source_coverage(
+                summary, catalog, manifest, verified, date(2026, 7, 31)
+            )
+
+    def test_collection_validator_accepts_reviewed_www_gate_redirect(self) -> None:
+        """Use the same reviewed www/non-www aliases as the collector."""
+        root = self.workdir / "www-gate-redirect"
+        root.mkdir()
+        feed_url = "https://example.test/feed"
+        page_url = "https://example.test/news"
+        attempts = [
+            {
+                "method": attempt_method,
+                "url": attempt_url,
+                "requested_url": attempt_url,
+                "final_url": attempt_url.replace("example.test", "www.example.test"),
+                "http_status": 403,
+                "status": "access_constraint",
+                "constraint": "login",
+            }
+            for attempt_method, attempt_url in (
+                ("rss", feed_url),
+                ("public_page", page_url),
+            )
+        ]
+        summary, catalog, manifest, verified = write_minimal_coverage_fixture(
+            root,
+            extract_entries=[],
+            evidence_updates={
+                "status": "access_constraint",
+                "method": "public_page",
+                "final_url": page_url.replace("example.test", "www.example.test"),
+                "constraint": "login",
+                "attempts": attempts,
+            },
+            status="アクセス制約",
+            method="公開ページ",
+            count=0,
+            confirmed_url=page_url.replace("example.test", "www.example.test"),
+            reason="login required",
+        )
+        COLLECTION_VALIDATOR_MODULE.validate_source_coverage(
+            summary, catalog, manifest, verified, date(2026, 7, 31)
+        )
+
+    def test_collection_validator_rejects_empty_fetched_extract(self) -> None:
+        """Do not infer no recent articles from an empty parser result."""
+        root = self.workdir / "empty-extract"
+        root.mkdir()
+        summary, catalog, manifest, verified = write_minimal_coverage_fixture(
+            root,
+            extract_entries=[],
+            status="対象期間記事なし",
+            count=0,
+        )
+        with self.assertRaisesRegex(
+            COLLECTION_VALIDATOR_MODULE.ValidationError,
+            "empty or inconsistent extract",
+        ):
+            COLLECTION_VALIDATOR_MODULE.validate_source_coverage(
+                summary, catalog, manifest, verified, date(2026, 7, 31)
+            )
+
+    def test_collection_validator_requires_complete_fallback_dates(self) -> None:
+        """Reject fallback counts when any extracted entry has no parseable date."""
+        root = self.workdir / "fallback-dates"
+        root.mkdir()
+        summary, catalog, manifest, verified = write_minimal_coverage_fixture(
+            root,
+            extract_entries=[],
+            evidence_updates={
+                "status": "needs_search_fallback",
+                "method": None,
+                "final_url": None,
+                "extract_file": None,
+                "extracted_entry_count": 0,
+                "attempts": [{"method": "rss", "status": "failed", "reason": "fixture"}],
+            },
+            resolutions=[{
+                "name": "Fixture News",
+                "status": "verified_fallback",
+                "method": "site_search",
+                "requested_url": "https://example.test/feed",
+                "final_url": "https://example.test/feed",
+                "extracted_entry_count": 1,
+                "candidate_entry_count": 1,
+                "date_evidence_count": 1,
+                "published_dates": [None],
+                "candidate_evidence": [{
+                    "url": "https://example.test/article",
+                    "provenance": "feed_entry",
+                    "published": None,
+                }],
+            }],
+            status="対象期間記事なし",
+            method="サイト限定検索",
+            count=0,
+        )
+        with self.assertRaisesRegex(
+            COLLECTION_VALIDATOR_MODULE.ValidationError,
+            "complete publication-date evidence",
+        ):
+            COLLECTION_VALIDATOR_MODULE.validate_source_coverage(
+                summary, catalog, manifest, verified, date(2026, 7, 31)
+            )
+
+    def test_collection_validator_rejects_mixed_robots_attempts_without_fallback(self) -> None:
+        """One robots denial must not hide a generic failure on another endpoint."""
+        root = self.workdir / "mixed-robots"
+        root.mkdir()
+        summary, catalog, manifest, verified = write_minimal_coverage_fixture(
+            root,
+            extract_entries=[],
+            evidence_updates={
+                "status": "needs_search_fallback",
+                "method": None,
+                "final_url": None,
+                "extract_file": None,
+                "extracted_entry_count": 0,
+                "attempts": [
+                    {"method": "rss", "status": "access_constraint", "reason": "robots_disallowed"},
+                    {"method": "public_page", "status": "failed", "reason": "transient"},
+                ],
+            },
+            status="アクセス制約",
+            count=0,
+        )
+        with self.assertRaisesRegex(
+            COLLECTION_VALIDATOR_MODULE.ValidationError,
+            "verified fallback resolution",
+        ):
+            COLLECTION_VALIDATOR_MODULE.validate_source_coverage(
+                summary, catalog, manifest, verified, date(2026, 7, 31)
+            )
+
     def test_collection_validator_rejects_unsafe_advisory_references(self) -> None:
         """Reject private paths, inconsistent hashes/names, and duplicate fields."""
         staging = self.workdir / "staging"
@@ -2420,10 +2819,12 @@ if sys.argv[1] == "--verify-resolutions":
 catalog_path=Path(sys.argv[1]); output=Path(sys.argv[2]); output.mkdir()
 catalog=json.loads(catalog_path.read_text())
 sources=[]
-for source in catalog["sources"]:
+for index,source in enumerate(catalog["sources"]):
     url=source["feed_url"] or source["page_url"]
     method="rss" if source["feed_url"] else "public_page"
-    sources.append({"name":source["name"],"tier":source["tier"],"status":"fetched","method":method,"final_url":url,"attempts":[]})
+    extract_file=f"source-{index}.extract.json"
+    (output/extract_file).write_text(json.dumps({"format":"feed" if method=="rss" else "html_links","entries":[{"url":f"{url}?fixture={index}","published":"2020-01-01"}]}))
+    sources.append({"name":source["name"],"tier":source["tier"],"status":"fetched","method":method,"final_url":url,"extract_file":extract_file,"extracted_entry_count":1,"attempts":[]})
 manifest={"catalog_sha256":hashlib.sha256(catalog_path.read_bytes()).hexdigest(),"sources":sources}
 (output/"source-manifest.json").write_text(json.dumps(manifest))
 print(json.dumps(manifest))

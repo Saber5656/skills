@@ -27,6 +27,7 @@ CONSTRAINT_REASON = {
     "login": re.compile(r"login|log-in|sign-in|ログイン", re.IGNORECASE),
     "paywall": re.compile(r"paywall|subscription|subscribe|購読|有料|会員限定", re.IGNORECASE),
     "captcha": re.compile(r"captcha|キャプチャ", re.IGNORECASE),
+    "robots": re.compile(r"robots|ロボット", re.IGNORECASE),
 }
 
 class ValidationError(RuntimeError):
@@ -220,16 +221,61 @@ def canonical_url(value: str) -> str:
     """Normalize an article URL for evidence deduplication."""
     parsed = urllib.parse.urlsplit(value)
     path = parsed.path.rstrip("/") or "/"
-    return urllib.parse.urlunsplit((parsed.scheme.lower(), parsed.netloc.lower(), path, "", ""))
+    host = (parsed.hostname or "").lower()
+    host = f"[{host}]" if ":" in host else host
+    try:
+        port = parsed.port
+    except ValueError:
+        port = None
+    default_port = (parsed.scheme.lower() == "https" and port == 443) or (
+        parsed.scheme.lower() == "http" and port == 80
+    )
+    netloc = host if port is None or default_port else f"{host}:{port}"
+    return urllib.parse.urlunsplit(
+        (parsed.scheme.lower(), netloc, path, parsed.query, "")
+    )
 
 
-def sealed_extract_dated_entries(
-    manifest_path: Path, source_evidence: dict[str, object], run_date: date
-) -> dict[str, date]:
-    """Load canonical article URLs and dates from one sealed compact extract."""
+def source_hosts(source: dict[str, object]) -> set[str]:
+    """Mirror the collector's reviewed www/non-www host aliases."""
+    hosts: set[str] = set()
+    for value in (source.get("feed_url"), source.get("page_url")):
+        if not isinstance(value, str) or not value:
+            continue
+        host = urllib.parse.urlsplit(value).hostname
+        if not host:
+            continue
+        hosts.add(host)
+        hosts.add(host[4:] if host.startswith("www.") else f"www.{host}")
+    return hosts
+
+
+def is_allowed_source_url(value: object, hosts: set[str]) -> bool:
+    """Apply the collector's transport restrictions to sealed final URLs."""
+    if not isinstance(value, str):
+        return False
+    parsed = urllib.parse.urlsplit(value)
+    try:
+        port = parsed.port
+    except ValueError:
+        return False
+    return (
+        parsed.scheme == "https"
+        and parsed.hostname in hosts
+        and parsed.username is None
+        and parsed.password is None
+        and port in (None, 443)
+        and not parsed.fragment
+    )
+
+
+def sealed_extract_entries(
+    manifest_path: Path, source_evidence: dict[str, object]
+) -> tuple[str, dict[str, Optional[date]]]:
+    """Load every canonical article entry and optional date from a sealed extract."""
     filename = source_evidence.get("extract_file")
     if not isinstance(filename, str):
-        return {}
+        raise ValidationError("source extract filename is invalid")
     if Path(filename).name != filename:
         raise ValidationError("source extract filename is invalid")
     path = manifest_path.parent / filename
@@ -237,19 +283,23 @@ def sealed_extract_dated_entries(
     if not stat.S_ISREG(metadata.st_mode) or metadata.st_size <= 0 or metadata.st_size > MAX_ARTIFACT_BYTES:
         raise ValidationError("source extract is not a bounded regular file")
     payload = json.loads(path.read_text(encoding="utf-8"))
+    extract_format = payload.get("format")
+    if extract_format not in {"feed", "html_links"}:
+        raise ValidationError("source extract format is invalid")
     entries = payload.get("entries")
     if not isinstance(entries, list):
         raise ValidationError("source extract entries are invalid")
-    dated: dict[str, date] = {}
+    sealed: dict[str, Optional[date]] = {}
     for index, item in enumerate(entries):
         if not isinstance(item, dict):
-            continue
+            raise ValidationError("source extract entry is invalid")
         published = parse_publication_date(item.get("published"))
         url = item.get("url")
-        if published:
-            key = canonical_url(url) if isinstance(url, str) else f"undirected:{index}"
-            dated[key] = published
-    return dated
+        key = canonical_url(url) if isinstance(url, str) else f"undirected:{index}"
+        if key in sealed:
+            raise ValidationError("source extract contains a duplicate article URL")
+        sealed[key] = published
+    return str(extract_format), sealed
 
 
 def validate_source_coverage(
@@ -312,29 +362,47 @@ def validate_source_coverage(
                 raise ValidationError("summary source row does not match fetch evidence")
             if status == "アクセス制約":
                 raise ValidationError("fetched source cannot be an access constraint")
-            dated_entries = sealed_extract_dated_entries(
-                manifest_path, source_evidence, run_date
+            extract_format, sealed_entries = sealed_extract_entries(
+                manifest_path, source_evidence
             )
+            extracted_count = source_evidence.get("extracted_entry_count")
+            if (
+                not isinstance(extracted_count, int)
+                or extracted_count <= 0
+                or extracted_count != len(sealed_entries)
+            ):
+                raise ValidationError("fetched source has an empty or inconsistent extract")
             for item in supplemental_dates.get(name, []):
+                requested_url = item.get("requested_url")
                 final_url = item.get("final_url")
                 published = parse_publication_date(item.get("published_date"))
-                if not isinstance(final_url, str) or not published:
+                if (
+                    not isinstance(requested_url, str)
+                    or not isinstance(final_url, str)
+                    or not published
+                ):
                     raise ValidationError("verified publication-date entry is invalid")
-                key = canonical_url(final_url)
-                if key in dated_entries:
-                    raise ValidationError("publication-date evidence duplicates an article URL")
-                dated_entries[key] = published
+                key = canonical_url(requested_url)
+                if key != canonical_url(final_url):
+                    raise ValidationError(
+                        "publication-date evidence redirected to another article"
+                    )
+                if key not in sealed_entries or sealed_entries[key] is not None:
+                    raise ValidationError(
+                        "publication-date evidence is not bound to an undated extract entry"
+                    )
+                sealed_entries[key] = published
+            dated_entries = [value for value in sealed_entries.values() if value is not None]
+            if not dated_entries:
+                raise ValidationError("source lacks publication-date evidence")
+            if extract_format == "feed" and len(dated_entries) != len(sealed_entries):
+                raise ValidationError("feed source lacks publication-date evidence")
             start = run_date - timedelta(days=6)
             evidence_count = sum(
-                start <= value <= run_date for value in dated_entries.values()
+                start <= value <= run_date
+                for value in dated_entries
             )
-            if (
-                isinstance(source_evidence.get("extract_file"), str)
-                and source_evidence.get("extracted_entry_count", 0)
-                and not dated_entries
-            ):
-                raise ValidationError("source lacks publication-date evidence")
-            if dated_entries and item_count != evidence_count:
+            if item_count != evidence_count:
                 raise ValidationError("summary source item count does not match dated extract evidence")
         elif source_evidence.get("status") == "access_constraint":
             expected_method = {"rss": "RSS", "public_page": "公開ページ"}.get(
@@ -349,6 +417,79 @@ def validate_source_coverage(
                 or not CONSTRAINT_REASON[str(constraint)].search(reason)
             ):
                 raise ValidationError("summary access constraint does not match fetch evidence")
+            attempts = source_evidence.get("attempts")
+            expected_attempts = [
+                (attempt_method, attempt_url)
+                for attempt_method, attempt_url in (
+                    ("rss", source.get("feed_url")),
+                    ("public_page", source.get("page_url")),
+                )
+                if isinstance(attempt_url, str) and attempt_url
+            ]
+            if (
+                not isinstance(attempts, list)
+                or len(attempts) != len(expected_attempts)
+            ):
+                raise ValidationError("source access constraint does not cover every direct endpoint")
+            for attempt, (attempt_method, attempt_url) in zip(attempts, expected_attempts):
+                if (
+                    not isinstance(attempt, dict)
+                    or attempt.get("method") != attempt_method
+                    or attempt.get("url") != attempt_url
+                    or attempt.get("requested_url") != attempt_url
+                    or attempt.get("status") != "access_constraint"
+                    or attempt.get("constraint") not in CONSTRAINT_REASON
+                ):
+                    raise ValidationError(
+                        "source access constraint does not cover every direct endpoint"
+                    )
+                attempt_constraint = attempt.get("constraint")
+                if attempt_constraint == "robots":
+                    if (
+                        attempt.get("final_url") != attempt_url
+                        or attempt.get("http_status") is not None
+                    ):
+                        raise ValidationError(
+                            "direct endpoint lacks sealed robots.txt evidence"
+                        )
+                    attempt_robots_url = attempt.get("robots_url")
+                    attempt_robots_sha256 = attempt.get("robots_sha256")
+                    parsed_attempt_robots = urllib.parse.urlsplit(str(attempt_robots_url))
+                    parsed_attempt_source = urllib.parse.urlsplit(attempt_url)
+                    if (
+                        parsed_attempt_robots.scheme != "https"
+                        or parsed_attempt_robots.hostname != parsed_attempt_source.hostname
+                        or parsed_attempt_robots.path != "/robots.txt"
+                        or not isinstance(attempt_robots_sha256, str)
+                        or re.fullmatch(r"[0-9a-f]{64}", attempt_robots_sha256) is None
+                    ):
+                        raise ValidationError(
+                            "direct endpoint lacks sealed robots.txt evidence"
+                        )
+                else:
+                    attempt_final_url = attempt.get("final_url")
+                    attempt_http_status = attempt.get("http_status")
+                    if (
+                        not is_allowed_source_url(attempt_final_url, source_hosts(source))
+                        or not isinstance(attempt_http_status, int)
+                        or not 200 <= attempt_http_status <= 599
+                    ):
+                        raise ValidationError(
+                            "direct endpoint lacks sealed access-constraint evidence"
+                        )
+            if constraint == "robots":
+                robots_url = source_evidence.get("robots_url")
+                robots_sha256 = source_evidence.get("robots_sha256")
+                parsed_robots = urllib.parse.urlsplit(str(robots_url))
+                parsed_source = urllib.parse.urlsplit(str(confirmed_url))
+                if (
+                    parsed_robots.scheme != "https"
+                    or parsed_robots.hostname != parsed_source.hostname
+                    or parsed_robots.path != "/robots.txt"
+                    or not isinstance(robots_sha256, str)
+                    or re.fullmatch(r"[0-9a-f]{64}", robots_sha256) is None
+                ):
+                    raise ValidationError("robots constraint lacks sealed robots.txt evidence")
         elif source_evidence.get("status") == "needs_search_fallback":
             fallback = resolutions.get(name)
             if fallback:
@@ -376,15 +517,49 @@ def validate_source_coverage(
                 ):
                     raise ValidationError("summary source row does not match verified fallback")
                 published_dates = fallback.get("published_dates")
-                if not isinstance(published_dates, list):
+                candidate_evidence = fallback.get("candidate_evidence")
+                if not isinstance(published_dates, list) or not isinstance(candidate_evidence, list):
                     raise ValidationError("verified fallback lacks publication-date evidence")
                 parsed_dates = [parse_publication_date(value) for value in published_dates]
+                extracted_count = fallback.get("extracted_entry_count")
+                candidate_count = fallback.get("candidate_entry_count")
+                date_evidence_count = fallback.get("date_evidence_count")
+                if (
+                    not isinstance(extracted_count, int)
+                    or extracted_count <= 0
+                    or not isinstance(candidate_count, int)
+                    or candidate_count <= 0
+                    or candidate_count > extracted_count
+                    or not isinstance(date_evidence_count, int)
+                    or date_evidence_count <= 0
+                    or date_evidence_count != len(parsed_dates)
+                    or date_evidence_count != candidate_count
+                    or any(value is None for value in parsed_dates)
+                    or len(candidate_evidence) != candidate_count
+                ):
+                    raise ValidationError("verified fallback lacks complete publication-date evidence")
+                candidate_urls: set[str] = set()
+                for index, item in enumerate(candidate_evidence):
+                    candidate_url = item.get("url") if isinstance(item, dict) else None
+                    candidate_key = (
+                        canonical_url(candidate_url) if isinstance(candidate_url, str) else ""
+                    )
+                    if (
+                        not isinstance(item, dict)
+                        or not is_allowed_source_url(candidate_url, source_hosts(source))
+                        or candidate_key in candidate_urls
+                        or item.get("provenance") not in {"feed_entry", "article", "json_ld"}
+                        or parse_publication_date(item.get("published")) != parsed_dates[index]
+                    ):
+                        raise ValidationError(
+                            "verified fallback candidate evidence is invalid"
+                        )
+                    candidate_urls.add(candidate_key)
                 dated = [value for value in parsed_dates if value is not None]
-                if dated:
-                    start = run_date - timedelta(days=6)
-                    evidence_count = sum(start <= value <= run_date for value in dated)
-                    if item_count != evidence_count:
-                        raise ValidationError("fallback item count does not match date evidence")
+                start = run_date - timedelta(days=6)
+                evidence_count = sum(start <= value <= run_date for value in dated)
+                if item_count != evidence_count:
+                    raise ValidationError("fallback item count does not match date evidence")
                 if status == "対象期間記事なし" and item_count != 0:
                     raise ValidationError("no-recent-article status must have zero items")
                 if status == "取得済み" and item_count <= 0:
@@ -393,19 +568,7 @@ def validate_source_coverage(
             attempts = source_evidence.get("attempts")
             if not isinstance(attempts, list):
                 raise ValidationError("unresolved source lacks attempt evidence")
-            robots_attempts = [
-                attempt for attempt in attempts
-                if isinstance(attempt, dict) and attempt.get("reason") == "robots_disallowed"
-            ]
-            expected_methods = {"rss": "RSS", "public_page": "公開ページ"}
-            if not any(
-                confirmed_url == attempt.get("url")
-                and method == expected_methods.get(attempt.get("method"))
-                for attempt in robots_attempts
-            ):
-                raise ValidationError("unresolved source lacks matching robots evidence")
-            if status != "アクセス制約":
-                raise ValidationError("unresolved source is not a verified access constraint")
+            raise ValidationError("source requires a verified fallback resolution")
         else:
             raise ValidationError("source manifest status is invalid")
         if status == "アクセス制約":

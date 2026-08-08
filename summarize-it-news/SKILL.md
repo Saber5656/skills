@@ -28,7 +28,7 @@ python3 <source_fetcher> <source_catalog> <COLLECTION_OUTPUT_ROOT>/source-inputs
 
 sealed manifestの`fetched` sourceは`extract_file`のcompactな抽出結果を読む。raw `content_file`は監査証跡でありmodel contextへ投入しない。`needs_search_fallback` sourceは、公開ページ、過去7日を指定したsite-scoped Web検索、公式代替URLの順に確認する。ただし保存する監査行はdeterministic manifestのURL・方式・robots evidenceと一致させる。RSS/XMLのcontent-type、safe-open、parser、一時HTTPエラーだけで取得不可にしてはならない。
 
-HTML extractでは各entryの`published`と`date_evidence_count`を確認する。候補記事の日付が欠ける場合はsite-scoped検索と公式記事ページで公開日を補完し、日付根拠がない記事を過去7日内外へ推測分類しない。`期間内件数`と`対象期間記事なし`は確認できた公開日に基づく。
+HTML extractでは各entryの`published`と`candidate_provenance`を確認する。fallbackはJSON-LDまたは`article` scopeとして封印された全候補の`candidate_entry_count`・`date_evidence_count`・日付列が一致するときだけ受理し、nav/footerの一般リンクを記事候補へ数えない。候補記事の日付が欠ける場合はsite-scoped検索と公式記事ページで公開日を補完し、日付根拠がない記事を過去7日内外へ推測分類しない。`期間内件数`と`対象期間記事なし`は確認できた公開日に基づく。
 
 interactive manualでは`references/it-news-sources.json`を正本として同じ順序で確認する。helperを使える場合は使用し、使えない場合もRSS、公開ページ、site-scoped検索、公式代替URLをすべて試す。
 
@@ -199,7 +199,7 @@ frontmatter の後に以下の形式で要約を記述する:
 |---|---:|---|---|---|---:|---|
 | catalog上のexact name | 1または2 | 取得済み / 対象期間記事なし / アクセス制約 | RSS / 公開ページ / サイト限定検索 / 公式代替URL | bare https URL | 0以上 | 簡潔な監査理由 |
 
-catalogの全sourceをexact nameで1回ずつ記載する。`取得済み`は期間内件数1以上、`対象期間記事なし`は0とする。`アクセス制約`はログイン、購読、robots、CAPTCHAの確認根拠を理由欄へ記載する。未解決sourceや`取得不可`を残したままcompleteにしない。
+catalogの全sourceをexact nameで1回ずつ記載する。`取得済み`は期間内件数1以上、`対象期間記事なし`は0とする。`アクセス制約`はログイン、購読、robots、CAPTCHAの確認根拠を理由欄へ記載する。robotsはcollectorが同一hostの`/robots.txt`を取得し、対象direct endpointの拒否判定とrobots.txt SHA-256をsealed source manifestへ記録し、全direct endpointが検証済み制約だった場合だけ使用する。未解決sourceや`取得不可`を残したままcompleteにしない。
 ```
 
 ## 前提

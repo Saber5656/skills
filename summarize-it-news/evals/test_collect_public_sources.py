@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import importlib.util
 import gzip
+import io
 import json
 import os
 import tempfile
@@ -24,13 +25,21 @@ SPEC.loader.exec_module(MODULE)
 class FakeHeaders:
     """Provide the response header subset used by the collector."""
 
-    def __init__(self, content_type: str, content_encoding: str = "") -> None:
+    def __init__(
+        self,
+        content_type: str,
+        content_encoding: str = "",
+        content_length=None,  # type: ignore[no-untyped-def]
+    ) -> None:
         self.content_type = content_type
         self.content_encoding = content_encoding
+        self.content_length = content_length
 
     def get(self, name: str, default=None):  # type: ignore[no-untyped-def]
         if name == "Content-Encoding":
             return self.content_encoding
+        if name == "Content-Length":
+            return self.content_length
         return default
 
     def get_content_type(self) -> str:
@@ -97,7 +106,11 @@ class PublicSourceCollectorTests(unittest.TestCase):
         response = FakeResponse(b"<?xml version='1.0'?><rss/>", "application/rss+xml", url)
         opener = mock.Mock()
         opener.open.return_value = response
-        with mock.patch.object(MODULE, "robots_allowed", return_value=True), mock.patch.object(
+        with mock.patch.object(
+            MODULE,
+            "robots_policy",
+            return_value={"allowed": True, "robots_url": "https://example/robots.txt", "robots_sha256": None},
+        ), mock.patch.object(
             MODULE.urllib.request, "build_opener", return_value=opener
         ):
             result = MODULE.fetch_url(url, hosts)
@@ -114,7 +127,7 @@ class PublicSourceCollectorTests(unittest.TestCase):
             side_effect=[
                 MODULE.CollectionError("content-type fixture"),
                 {
-                    "content": b"<html>public page</html>",
+                    "content": b'<html><a href="/article">Public article</a></html>',
                     "content_type": "text/html",
                     "final_url": source["page_url"],
                     "http_status": 200,
@@ -164,6 +177,34 @@ class PublicSourceCollectorTests(unittest.TestCase):
         with self.assertRaises(MODULE.CollectionError):
             MODULE.read_bounded(response)
 
+    def test_ignores_malformed_content_length_and_reads_bounded_body(self) -> None:
+        """Do not let a malformed upstream header abort fallback verification."""
+        response = FakeResponse(b"bounded", "text/plain", "https://example.test")
+        response.headers = FakeHeaders("text/plain", content_length="not-a-number")
+        self.assertEqual(MODULE.read_bounded(response), b"bounded")
+
+    def test_reads_explicit_gate_body_from_http_error(self) -> None:
+        """Recognize bounded login markup returned with an HTTP gate status."""
+        source = MODULE.load_catalog(CATALOG)[0]
+        body = b'<form><input type="password"><button>Sign in</button></form>'
+        error = MODULE.urllib.error.HTTPError(
+            source["page_url"],
+            403,
+            "Forbidden",
+            FakeHeaders("text/html", content_length=str(len(body))),
+            io.BytesIO(body),
+        )
+        opener = mock.Mock()
+        opener.open.side_effect = error
+        with mock.patch.object(
+            MODULE,
+            "robots_policy",
+            return_value={"allowed": True, "robots_url": "https://example/robots.txt", "robots_sha256": None},
+        ), mock.patch.object(MODULE.urllib.request, "build_opener", return_value=opener):
+            fetched = MODULE.fetch_url(source["page_url"], MODULE.source_hosts(source))
+        self.assertEqual(fetched["http_status"], 403)
+        self.assertEqual(MODULE.detect_access_constraint(fetched["content"]), "login")
+
     def test_rejects_escape_before_creating_output(self) -> None:
         """Do not leave directories outside the caller-bound staging root."""
         with tempfile.TemporaryDirectory() as temporary:
@@ -191,13 +232,97 @@ class PublicSourceCollectorTests(unittest.TestCase):
                 "name": source["name"], "method": "site_search", "url": candidate
             }], "date_evidence": []}), encoding="utf-8")
             with mock.patch.dict(os.environ, {"COLLECTION_OUTPUT_ROOT": str(root)}), mock.patch.object(
-                MODULE, "fetch_url", return_value={"final_url": candidate, "http_status": 200, "content_type": "text/html", "content": b"public article"}
+                MODULE, "fetch_url", return_value={
+                    "final_url": candidate,
+                    "http_status": 200,
+                    "content_type": "text/html",
+                    "content": (
+                        b'<article><time datetime="2026-08-08"></time>'
+                        b'<h2><a href="/article">Public article</a></h2>'
+                        b'<a href="/author">Alice</a><a href="/tag">AI</a></article>'
+                        b'<nav><a href="/about">About</a></nav>'
+                    ),
+                }
             ) as fetch:
                 MODULE.verify_resolutions(CATALOG, manifest, request, output)
             fetch.assert_called_once()
             verified = json.loads(output.read_text(encoding="utf-8"))["resolutions"][0]
             self.assertEqual(verified["status"], "verified_fallback")
             self.assertEqual(verified["final_url"], candidate)
+            self.assertEqual(verified["extracted_entry_count"], 4)
+            self.assertEqual(verified["candidate_entry_count"], 1)
+            self.assertEqual(verified["date_evidence_count"], 1)
+            self.assertEqual(verified["published_dates"], ["2026-08-08"])
+            self.assertEqual(
+                verified["candidate_evidence"][0]["url"],
+                MODULE.urllib.parse.urljoin(candidate, "/article"),
+            )
+
+    def test_fallback_rejects_partially_dated_article_candidates(self) -> None:
+        """Require dates for every sealed article candidate while ignoring navigation."""
+        source = MODULE.load_catalog(CATALOG)[0]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manifest = root / "manifest.json"
+            request = root / "request.json"
+            output = root / "verified.json"
+            candidate = source["page_url"]
+            manifest.write_text(json.dumps({"sources": [{
+                "name": source["name"], "status": "needs_search_fallback"
+            }]}), encoding="utf-8")
+            request.write_text(json.dumps({"version": 1, "resolutions": [{
+                "name": source["name"], "method": "site_search", "url": candidate
+            }], "date_evidence": []}), encoding="utf-8")
+            content = (
+                b'<article><time datetime="2026-08-08"></time>'
+                b'<h2><a href="/article">Public article</a></h2></article>'
+                b'<article><h2><a href="/article-2">Undated article</a></h2></article>'
+                b'<nav><a href="/about">About</a></nav>'
+            )
+            with mock.patch.dict(
+                os.environ, {"COLLECTION_OUTPUT_ROOT": str(root)}
+            ), mock.patch.object(MODULE, "fetch_url", return_value={
+                "final_url": candidate,
+                "http_status": 200,
+                "content_type": "text/html",
+                "content": content,
+            }):
+                with self.assertRaisesRegex(MODULE.CollectionError, "complete"):
+                    MODULE.verify_resolutions(CATALOG, manifest, request, output)
+
+    def test_json_ld_seals_undated_article_and_merges_same_url_date(self) -> None:
+        """Keep undated article-like JSON-LD and merge matching card evidence."""
+        base = "https://example.test/"
+        undated = b'''<script type="application/ld+json">{"@type":"NewsArticle","headline":"A","url":"/a"}</script>'''
+        extracted = MODULE.extract_content(undated, "text/html", base)
+        self.assertEqual(extracted["entries"][0]["candidate_provenance"], "json_ld")
+        self.assertIsNone(extracted["entries"][0]["published"])
+
+        merged = b'''<script type="application/ld+json">{"@type":"NewsArticle","headline":"A","url":"https://example.test:443/a/"}</script><article><time datetime="2026-08-08"></time><h2><a href="/a">A</a></h2></article>'''
+        extracted = MODULE.extract_content(merged, "text/html", base)
+        self.assertEqual(len(extracted["entries"]), 1)
+        self.assertEqual(extracted["entries"][0]["published"], "2026-08-08")
+
+        distinct_queries = b'''<script type="application/ld+json">[{"@type":"NewsArticle","headline":"A1","url":"/a?id=1","datePublished":"2026-08-08"},{"@type":"NewsArticle","headline":"A2","url":"/a?id=2","datePublished":"2026-08-08"}]</script>'''
+        extracted = MODULE.extract_content(distinct_queries, "text/html", base)
+        self.assertEqual(len(extracted["entries"]), 2)
+
+    def test_article_without_headline_is_candidate_only_when_unambiguous(self) -> None:
+        """Do not guess that an author/tag link is the article permalink."""
+        base = "https://example.test/"
+        ambiguous = (
+            b'<article><time datetime="2026-08-08"></time>'
+            b'<a href="/author">Alice</a><a href="/story">Story</a></article>'
+        )
+        extracted = MODULE.extract_content(ambiguous, "text/html", base)
+        self.assertFalse(any(entry.get("candidate_provenance") for entry in extracted["entries"]))
+
+        single = (
+            b'<article><time datetime="2026-08-08"></time>'
+            b'<a href="/story">Story</a></article>'
+        )
+        extracted = MODULE.extract_content(single, "text/html", base)
+        self.assertEqual(extracted["entries"][0]["candidate_provenance"], "article")
 
     def test_detects_explicit_login_gate_but_not_generic_forbidden_text(self) -> None:
         """Resolve login exceptions from gate markup, not a bare status/error word."""
@@ -219,6 +344,88 @@ class PublicSourceCollectorTests(unittest.TestCase):
             result = MODULE.collect_source(1, source, MODULE.source_hosts(source), Path(temporary))
         self.assertEqual(result["status"], "fetched")
         self.assertEqual(result["method"], "public_page")
+
+    def test_mixed_constraint_and_failure_requires_fallback(self) -> None:
+        """Do not close a publisher when another direct endpoint failed generically."""
+        source = MODULE.load_catalog(CATALOG)[0]
+        gate = b'<form><input type="password"><button>Sign in</button></form>'
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.object(
+            MODULE,
+            "fetch_url",
+            side_effect=[
+                {"content": gate, "content_type": "text/html", "final_url": source["feed_url"], "http_status": 403},
+                MODULE.CollectionError("transient failure"),
+            ],
+        ):
+            result = MODULE.collect_source(
+                1, source, MODULE.source_hosts(source), Path(temporary)
+            )
+        self.assertEqual(result["status"], "needs_search_fallback")
+
+    def test_verified_robots_constraint_requires_all_direct_endpoints(self) -> None:
+        """Seal robots evidence only when every direct endpoint is disallowed."""
+        source = MODULE.load_catalog(CATALOG)[0]
+        digest = "a" * 64
+        errors = [
+            MODULE.RobotsDisallowed(source["feed_url"], "https://techcrunch.com/robots.txt", digest),
+            MODULE.RobotsDisallowed(source["page_url"], "https://techcrunch.com/robots.txt", digest),
+        ]
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.object(
+            MODULE, "fetch_url", side_effect=errors
+        ):
+            result = MODULE.collect_source(
+                1, source, MODULE.source_hosts(source), Path(temporary)
+            )
+        self.assertEqual(result["status"], "access_constraint")
+        self.assertEqual(result["constraint"], "robots")
+        self.assertEqual(result["robots_sha256"], digest)
+        self.assertTrue(all(item["constraint"] == "robots" for item in result["attempts"]))
+        self.assertTrue(all(item["robots_sha256"] == digest for item in result["attempts"]))
+
+    def test_date_evidence_rejects_redirect_to_another_article(self) -> None:
+        """Do not assign a redirect target's date to the requested sealed article."""
+        source = MODULE.load_catalog(CATALOG)[0]
+        requested = source["page_url"] + "article-a"
+        redirected = source["page_url"] + "article-b"
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manifest = root / "manifest.json"
+            request = root / "request.json"
+            output = root / "verified.json"
+            manifest.write_text(json.dumps({"sources": []}), encoding="utf-8")
+            request.write_text(json.dumps({
+                "version": 1,
+                "resolutions": [],
+                "date_evidence": [{"name": source["name"], "url": requested}],
+            }), encoding="utf-8")
+            with mock.patch.dict(
+                os.environ, {"COLLECTION_OUTPUT_ROOT": str(root)}
+            ), mock.patch.object(MODULE, "fetch_url", return_value={
+                "final_url": redirected,
+                "http_status": 200,
+                "content_type": "text/html",
+                "content": b'<meta property="article:published_time" content="2026-08-08">',
+            }):
+                with self.assertRaisesRegex(MODULE.CollectionError, "redirected"):
+                    MODULE.verify_resolutions(CATALOG, manifest, request, output)
+
+    def test_empty_direct_extract_requires_fallback(self) -> None:
+        """Treat unparseable direct pages as unresolved instead of article-free."""
+        source = MODULE.load_catalog(CATALOG)[0]
+        empty = {
+            "content": b"<html></html>",
+            "content_type": "text/html",
+            "final_url": source["page_url"],
+            "http_status": 200,
+        }
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.object(
+            MODULE, "fetch_url", side_effect=[empty, empty]
+        ):
+            result = MODULE.collect_source(
+                1, source, MODULE.source_hosts(source), Path(temporary)
+            )
+        self.assertEqual(result["status"], "needs_search_fallback")
+        self.assertTrue(all(item["reason"] == "empty_extract" for item in result["attempts"]))
 
     def test_resolution_request_rejects_symlink(self) -> None:
         """Do not follow a model-created symlink in the trusted verification phase."""
