@@ -572,8 +572,8 @@ def load_environment(*, checkout_root, environ, require_catalog):
             )
 
         peer = self.root / "history-peer"
-        subprocess.run(
-            [
+        subprocess.run(  # noqa: S603 -- controlled Git fixture command
+            [  # noqa: S607 -- controlled Git fixture command
                 "git", "clone", "-q", "--branch", "main",
                 str(self.origins["user"]), str(peer),
             ],
@@ -646,28 +646,43 @@ def load_environment(*, checkout_root, environ, require_catalog):
             encoding="utf-8",
         )
         helper.chmod(0o755)
-        subprocess.run(["git", "-C", str(repo), "config", "user.name", "Fixture"], check=True)
-        subprocess.run(
-            ["git", "-C", str(repo), "config", "user.email", "fixture@example.invalid"],
+        subprocess.run(  # noqa: S603 -- controlled Git fixture command
+            ["git", "-C", str(repo), "config", "user.name", "Fixture"],  # noqa: S607
             check=True,
         )
-        subprocess.run(
-            ["git", "-C", str(repo), "config", "diff.fixture.textconv", str(helper)],
+        subprocess.run(  # noqa: S603 -- controlled Git fixture command
+            ["git", "-C", str(repo), "config", "user.email", "fixture@example.invalid"],  # noqa: S607
+            check=True,
+        )
+        subprocess.run(  # noqa: S603 -- controlled Git fixture command
+            ["git", "-C", str(repo), "config", "diff.fixture.textconv", str(helper)],  # noqa: S607
             check=True,
         )
         (repo / ".gitattributes").write_text("*.txt diff=fixture\n", encoding="utf-8")
         target = repo / "reviewed.txt"
         target.write_text("before\n", encoding="utf-8")
-        subprocess.run(["git", "-C", str(repo), "add", ".gitattributes", "reviewed.txt"], check=True)
-        subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "base"], check=True)
-        parent = subprocess.check_output(
-            ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True
+        subprocess.run(  # noqa: S603 -- controlled Git fixture command
+            ["git", "-C", str(repo), "add", ".gitattributes", "reviewed.txt"],  # noqa: S607
+            check=True,
+        )
+        subprocess.run(  # noqa: S603 -- controlled Git fixture command
+            ["git", "-C", str(repo), "commit", "-q", "-m", "base"],  # noqa: S607
+            check=True,
+        )
+        parent = subprocess.check_output(  # noqa: S603 -- controlled Git fixture command
+            ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True  # noqa: S607
         ).strip()
         target.write_text("after\n", encoding="utf-8")
-        subprocess.run(["git", "-C", str(repo), "add", "reviewed.txt"], check=True)
-        subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "change"], check=True)
-        commit = subprocess.check_output(
-            ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True
+        subprocess.run(  # noqa: S603 -- controlled Git fixture command
+            ["git", "-C", str(repo), "add", "reviewed.txt"],  # noqa: S607
+            check=True,
+        )
+        subprocess.run(  # noqa: S603 -- controlled Git fixture command
+            ["git", "-C", str(repo), "commit", "-q", "-m", "change"],  # noqa: S607
+            check=True,
+        )
+        commit = subprocess.check_output(  # noqa: S603 -- controlled Git fixture command
+            ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True  # noqa: S607
         ).strip()
 
         patch = CAPTURE_MODULE.commit_patch(str(repo), commit, [parent])
@@ -683,26 +698,35 @@ def load_environment(*, checkout_root, environ, require_catalog):
     def test_empty_existing_commit_message_is_captured_and_schema_valid(self) -> None:
         """Represent valid local-only commits whose Git message is empty."""
         repo = self.user
-        subprocess.run(["git", "-C", str(repo), "config", "user.name", "Fixture"], check=True)
-        subprocess.run(
-            ["git", "-C", str(repo), "config", "user.email", "fixture@example.invalid"],
+        subprocess.run(  # noqa: S603 -- controlled Git fixture command
+            ["git", "-C", str(repo), "config", "user.name", "Fixture"],  # noqa: S607
+            check=True,
+        )
+        subprocess.run(  # noqa: S603 -- controlled Git fixture command
+            ["git", "-C", str(repo), "config", "user.email", "fixture@example.invalid"],  # noqa: S607
             check=True,
         )
         (repo / "base.md").write_text("base\n", encoding="utf-8")
-        subprocess.run(["git", "-C", str(repo), "add", "base.md"], check=True)
-        subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "base"], check=True)
-        base = subprocess.check_output(
-            ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True
+        subprocess.run(  # noqa: S603 -- controlled Git fixture command
+            ["git", "-C", str(repo), "add", "base.md"],  # noqa: S607
+            check=True,
+        )
+        subprocess.run(  # noqa: S603 -- controlled Git fixture command
+            ["git", "-C", str(repo), "commit", "-q", "-m", "base"],  # noqa: S607
+            check=True,
+        )
+        base = subprocess.check_output(  # noqa: S603 -- controlled Git fixture command
+            ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True  # noqa: S607
         ).strip()
-        subprocess.run(
-            [
+        subprocess.run(  # noqa: S603 -- controlled Git fixture command
+            [  # noqa: S607 -- controlled Git fixture command
                 "git", "-C", str(repo), "commit", "-q", "--allow-empty",
                 "--allow-empty-message", "-m", "",
             ],
             check=True,
         )
-        head = subprocess.check_output(
-            ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True
+        head = subprocess.check_output(  # noqa: S603 -- controlled Git fixture command
+            ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True  # noqa: S607
         ).strip()
         commits = CAPTURE_MODULE.local_commit_metadata(str(repo), base, head)
         self.assertEqual(commits[0]["message"], "")
@@ -2746,11 +2770,11 @@ output.write_text(json.dumps(result))
             encoding="utf-8",
         )
 
-        subprocess.run(
-            ["git", "-C", str(self.user), "branch", "--unset-upstream"],
+        subprocess.run(  # noqa: S603 -- controlled Git fixture command
+            ["git", "-C", str(self.user), "branch", "--unset-upstream"],  # noqa: S607
             check=True,
         )
-        missing_upstream = subprocess.run(
+        missing_upstream = subprocess.run(  # noqa: S603 -- controlled fixture executable
             [str(runtime / "run-daily-it-news-vulnerability-check.sh")],
             check=False,
             env={**os.environ, "PATH": os.environ["PATH"]},
@@ -2766,8 +2790,8 @@ output.write_text(json.dumps(result))
             "phase=publication_preflight",
             (runtime / "last-status.txt").read_text(encoding="utf-8"),
         )
-        subprocess.run(
-            [
+        subprocess.run(  # noqa: S603 -- controlled Git fixture command
+            [  # noqa: S607 -- controlled Git fixture command
                 "git", "-C", str(self.user), "branch", "--set-upstream-to",
                 "origin/main", "main",
             ],
