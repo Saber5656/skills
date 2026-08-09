@@ -10,6 +10,8 @@ RUNNER="$SCRIPT_DIR/../assets/run-daily-it-news-vulnerability-check.sh"
 /usr/bin/grep -F -- 'commit-reviewed-publication.py' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- 'daily-it-news.evidence-review.prompt.md' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- '--add-dir "$STAGING_ROOT"' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- 'COLLECTION_FETCHER="$WORKDIR/collect-public-sources.py"' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- 'SOURCE_CATALOG="$WORKDIR/it-news-sources.json"' "$RUNNER" >/dev/null
 
 COLLECTION_BLOCK="$(sed -n '/CODEX_BIN.*--search/,/COLLECTION_STATUS=/p' "$RUNNER")"
 REVIEW_BLOCK="$(sed -n '/^"\$CODEX_BIN" -a never exec/,/REVIEW_STATUS=/p' "$RUNNER" | sed -n '1,/REVIEW_STATUS=/p')"
@@ -22,6 +24,14 @@ if print -r -- "$COLLECTION_BLOCK" | /usr/bin/grep -E 'AGENTS_GIT_DIR|USER_GIT_D
 fi
 if ! print -r -- "$COLLECTION_BLOCK" | /usr/bin/grep -F -- '-C "$STAGING_ROOT"' >/dev/null; then
   echo "collection cwd must be the run staging root" >&2
+  exit 1
+fi
+if ! print -r -- "$COLLECTION_BLOCK" | /usr/bin/grep -F -- '-m gpt-5.6-luna' >/dev/null; then
+  echo "collection must pin the requested GPT-5.6 Luna model" >&2
+  exit 1
+fi
+if ! print -r -- "$COLLECTION_BLOCK" | /usr/bin/grep -F -- 'model_reasoning_effort="medium"' >/dev/null; then
+  echo "collection must pin Luna reasoning effort" >&2
   exit 1
 fi
 if print -r -- "$COLLECTION_BLOCK" | /usr/bin/grep -F -- '-C "$WORKDIR"' >/dev/null; then
@@ -62,6 +72,13 @@ fi
 /usr/bin/grep -F -- 'STANDING_TASK_STAGER="$WORKDIR/stage-standing-task.py"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- 'DIRTY_REVIEW_STAGER="$WORKDIR/stage-dirty-review-inputs.py"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- '--arg standing_task "$STANDING_TASK_SNAPSHOT"' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- '--arg source_catalog "$SOURCE_CATALOG"' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- 'COLLECTION_OUTPUT_ROOT="$RUN_ROOT"' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- '"$COLLECTION_FETCHER" "$SOURCE_CATALOG" "$SOURCE_INPUT_ROOT"' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- '--arg source_manifest "$SOURCE_MANIFEST"' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- 'chmod -R a-w "$SOURCE_INPUT_ROOT"' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- '"$COLLECTION_FETCHER" --verify-resolutions' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- '"$SOURCE_MANIFEST" "$RESOLUTION_REQUEST" "$VERIFIED_RESOLUTIONS"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- 'AUTHORIZATION_TASK_SNAPSHOT="$REVIEW_INPUT_ROOT/authorization-task.md"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- '"$RUNTIME_CONTEXT_FILE" "$REVIEW_INPUT_ROOT" authorization' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- '--arg authorization_task "$AUTHORIZATION_TASK_SNAPSHOT"' "$RUNNER" >/dev/null

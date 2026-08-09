@@ -4,12 +4,14 @@ description: ITニュースサイトを横断して最新トピックを収集�
 user-invocable: true
 category: News-Data
 created: 2026-02-11
-updated: 2026-07-31
+updated: 2026-08-05
 status: active
 purpose: ITニュースの自動収集・要約・分析
 allowed-tools: WebFetch, WebSearch, Write, Bash, Read, Glob
 argument-hint: "[追加の関心トピック]"
-model: sonnet
+model: gpt-5.6-luna
+model_reasoning_effort: medium
+model_rationale: 公開フィードを多数反復取得する明確で高ボリュームな収集処理にLunaを固定する
 ---
 
 あなたはITニュースのリサーチアナリストです。以下のサイト群から過去7日間の主要トピックを収集・分析し、日本語Markdownで報告してください。
@@ -18,7 +20,19 @@ model: sonnet
 
 ### Step 1 — RSS/Webから全件収集（情報最大化）
 
-各サイトについて、まず RSS フィード URL を WebFetch で取得する。RSS が取得不可の場合はフォールバック URL（Webページ）から取得する。
+scheduled automationではcallerが実行・sealed済みの`source_manifest`と`source_catalog`を使う。manual実行でhelperを直接使う場合だけ、最初に次を実行する。
+
+```text
+python3 <source_fetcher> <source_catalog> <COLLECTION_OUTPUT_ROOT>/source-inputs
+```
+
+sealed manifestの`fetched` sourceは`extract_file`のcompactな抽出結果を読む。raw `content_file`は監査証跡でありmodel contextへ投入しない。`needs_search_fallback` sourceは、公開ページ、過去7日を指定したsite-scoped Web検索、公式代替URLの順に確認する。ただし保存する監査行はdeterministic manifestのURL・方式・robots evidenceと一致させる。RSS/XMLのcontent-type、safe-open、parser、一時HTTPエラーだけで取得不可にしてはならない。
+
+HTML extractでは各entryの`published`と`candidate_provenance`を確認する。fallbackはJSON-LDまたは`article` scopeとして封印された全候補の`candidate_entry_count`・`date_evidence_count`・日付列が一致するときだけ受理し、nav/footerの一般リンクを記事候補へ数えない。候補記事の日付が欠ける場合はsite-scoped検索と公式記事ページで公開日を補完し、日付根拠がない記事を過去7日内外へ推測分類しない。`期間内件数`と`対象期間記事なし`は確認できた公開日に基づく。
+
+interactive manualでは`references/it-news-sources.json`を正本として同じ順序で確認する。helperを使える場合は使用し、使えない場合もRSS、公開ページ、site-scoped検索、公式代替URLをすべて試す。
+
+ログイン、cookie/session流用、paywall、robots、CAPTCHAを回避しない。`アクセス制約`として扱えるのは、これらの制約を実際に確認した場合だけとする。genericな401/403やtool failureは検索fallbackへ進む。
 
 過去7日以内のトピックを**すべて**列挙する。この段階では取捨選択・統合・要約を一切行わない。
 各トピックについて以下を内部的に記録:
@@ -43,6 +57,8 @@ Step 1の全トピックを俯瞰した上で以下を実行:
 | `interactive_manual` | caller-supplied `SUMMARY_OUTPUT_ROOT` | ユーザーが指定した保存root。Git commit/pushはしない |
 
 modeまたは対応するabsolute output rootがない場合は保存せず失敗を返す。`scheduled_automation`でVault rootまたはVault配下が渡された場合もfail closedとする。
+
+`scheduled_automation`はcaller-supplied `source_catalog`とsealed `source_manifest`も必須とする。全catalog sourceが`取得済み`、`対象期間記事なし`、または確認済みの`アクセス制約`に解決できない場合、要約を保存せず`summary_status: failed`を返す。
 
 要約結果を選択したoutput root以下へ保存する:
 
@@ -72,7 +88,7 @@ collection_completed_at: <ISO 8601 JST>
 
 ## 対象サイトとRSSフィード
 
-各サイトについて RSS URL を優先して WebFetch で取得する。RSS が失敗した場合のみフォールバック URL を使用する。
+この一覧のmachine-readable正本は`references/it-news-sources.json`。各サイトについてRSS、公開ページ、site-scoped検索、公式代替URLの順で解決する。
 
 ### Tier 1（必須確認）
 
@@ -116,7 +132,7 @@ collection_completed_at: <ISO 8601 JST>
 2. 出典は「媒体名・URL・公開日（ISO 8601, JST）」を記載。不明は「不明」。可能ならイベント発生日と記事公開日を区別。
 3. 数値・規模・金額は単位つきで具体的に。推測・あいまい表現は禁止。
 4. 事実と解釈を分離。解釈・主観は「総括」にのみ記載。
-5. 取得不能/有料壁の記事はスキップ理由を一言記載。
+5. ログイン、購読、robots、CAPTCHAで取得できない記事は回避せず、確認した制約を記載する。content-typeやtool failureだけを取得不能理由にしない。
 6. 固有名詞は原綴り併記。日本語は簡潔に。
 
 ## 出力フォーマット
@@ -126,7 +142,7 @@ collection_completed_at: <ISO 8601 JST>
 ```yaml
 ---
 created: YYYY-MM-DD
-agent: claude-code
+agent: codex
 type: it-news-summary
 tags:
   - it-news-summary
@@ -178,7 +194,12 @@ frontmatter の後に以下の形式で要約を記述する:
 - キーワード — 理由（1行、根拠となる出典を媒体名で明記）
 
 ## 確認済みサイト一覧
-（実際にアクセス・確認したサイトとURLのリスト。アクセスできなかったサイトがあればその旨記載）
+
+| サイト | Tier | 状態 | 取得方法 | 確認URL | 期間内件数 | 理由 |
+|---|---:|---|---|---|---:|---|
+| catalog上のexact name | 1または2 | 取得済み / 対象期間記事なし / アクセス制約 | RSS / 公開ページ / サイト限定検索 / 公式代替URL | bare https URL | 0以上 | 簡潔な監査理由 |
+
+catalogの全sourceをexact nameで1回ずつ記載する。`取得済み`は期間内件数1以上、`対象期間記事なし`は0とする。`アクセス制約`はログイン、購読、robots、CAPTCHAの確認根拠を理由欄へ記載する。robotsはcollectorが同一hostの`/robots.txt`を取得し、対象direct endpointの拒否判定とrobots.txt SHA-256をsealed source manifestへ記録し、全direct endpointが検証済み制約だった場合だけ使用する。未解決sourceや`取得不可`を残したままcompleteにしない。
 ```
 
 ## 前提
