@@ -60,6 +60,9 @@ def git(
     }
     environment["GIT_CONFIG_NOSYSTEM"] = "1"
     environment["GIT_CONFIG_GLOBAL"] = os.devnull
+    environment["GIT_NO_LAZY_FETCH"] = "1"
+    environment["GIT_NO_REPLACE_OBJECTS"] = "1"
+    environment["GIT_OPTIONAL_LOCKS"] = "0"
     repository_arguments = (
         [f"--git-dir={git_dir}", f"--work-tree={repo}"]
         if git_dir is not None
@@ -172,6 +175,68 @@ def commit_paths(repo: str, commit: str) -> list[str]:
     return sorted(value for value in output.split("\0") if value)
 
 
+def commit_patch_sha256(repo: str, commit: str, parents: list[str]) -> str:
+    """Hash the deterministic first-parent patch used by publication review."""
+    arguments = (
+        [
+            "diff", "--binary", "--full-index", "--no-ext-diff",
+            "--no-textconv", parents[0], commit,
+        ]
+        if parents
+        else [
+            "diff-tree", "--root", "-p", "--binary", "--full-index",
+            "--no-ext-diff", "--no-textconv", commit,
+        ]
+    )
+    environment = {
+        key: value for key, value in os.environ.items() if not key.startswith("GIT_")
+    }
+    environment["GIT_CONFIG_NOSYSTEM"] = "1"
+    environment["GIT_CONFIG_GLOBAL"] = os.devnull
+    environment["GIT_NO_LAZY_FETCH"] = "1"
+    environment["GIT_NO_REPLACE_OBJECTS"] = "1"
+    environment["GIT_OPTIONAL_LOCKS"] = "0"
+    content = subprocess.run(
+        ["git", "-C", repo, "-c", f"core.hooksPath={os.devnull}", *arguments],
+        check=True,
+        capture_output=True,
+        env=environment,
+    ).stdout
+    return hashlib.sha256(content).hexdigest()
+
+
+def existing_commit_metadata(
+    repo: str, pre_state: dict[str, object]
+) -> list[dict[str, object]]:
+    """Reconstruct the local-only history captured before collection."""
+    commits = git(
+        repo,
+        "rev-list",
+        "--reverse",
+        "--topo-order",
+        f"{pre_state['remote_head']}..{pre_state['local_head']}",
+    ).stdout.splitlines()
+    result: list[dict[str, object]] = []
+    for commit in commits:
+        parents = git(repo, "show", "-s", "--format=%P", commit).stdout.split()
+        message = git(repo, "show", "-s", "--format=%B", commit).stdout.rstrip("\n")
+        if parents:
+            changed = changed_paths(repo, parents[0], commit)
+        else:
+            changed = commit_paths(repo, commit)
+        result.append(
+            {
+                "commit": commit,
+                "parents": parents,
+                "tree": git(repo, "show", "-s", "--format=%T", commit).stdout.strip(),
+                "message": message,
+                "changed_paths": changed,
+                "patch_sha256": commit_patch_sha256(repo, commit, parents),
+            }
+        )
+    return result
+
+
 def blob_sha256(repo: str, head: str, relative: str) -> str:
     """Hash one committed blob without checking out or following a symlink."""
     result = subprocess.run(
@@ -243,6 +308,18 @@ def validate_scope(
     manifest: dict[str, object],
 ) -> None:
     """Bind actual commits and artifact blobs to an approved review manifest."""
+    existing_commits = existing_commit_metadata(repo, pre_state)
+    if (
+        existing_commits != pre_state.get("local_commits", [])
+        or existing_commits != manifest["approved_existing_commits"]
+    ):
+        raise PushError("local-only history differs from approved existing commits")
+    if any(
+        path == ".obsidian" or path.startswith(".obsidian/")
+        for commit in existing_commits
+        for path in commit["changed_paths"]
+    ):
+        raise PushError("local-only history contains a forbidden .obsidian path")
     approved_groups = manifest["commit_groups"]
     approved_paths = sorted(
         path for group in approved_groups for path in group["paths"]
@@ -403,15 +480,33 @@ def push_one(
     return ("complete", after)
 
 
+def require_unchanged_remote_heads(
+    agents_head: str, user_head: str, pre: dict[str, object]
+) -> None:
+    """Reject a remote race after the reviewed pre-publication snapshot."""
+    if (
+        agents_head != pre["agents_vault"]["remote_head"]
+        or user_head != pre["user_vault"]["remote_head"]
+    ):
+        raise PushError("remote main moved after pre-collection fetch")
+
+
 def final_vault(
     reported: dict[str, object],
     push_status: str,
     remote: str,
+    pre_state: dict[str, object] | None = None,
 ) -> dict[str, object]:
     """Convert one local commit result into the final publication shape."""
+    commit_hashes = list(reported["commit_hashes"])
+    if pre_state is not None:
+        commit_hashes = [
+            str(commit["commit"])
+            for commit in pre_state.get("local_commits", [])
+        ] + commit_hashes
     return {
-        "commit_status": reported["commit_status"],
-        "commit_hashes": reported["commit_hashes"],
+        "commit_status": "complete" if commit_hashes else reported["commit_status"],
+        "commit_hashes": commit_hashes,
         "push_status": push_status,
         "local_head": reported["local_head"],
         "remote_head": remote,
@@ -537,13 +632,13 @@ def main(argv: list[str]) -> int:
         scan_commits(
             runtime["gitleaks_bin"],
             runtime["agents_vault_root"],
-            pre["agents_vault"]["local_head"],
+            pre["agents_vault"]["remote_head"],
             agents_head,
         )
         scan_commits(
             runtime["gitleaks_bin"],
             runtime["user_vault_root"],
-            pre["user_vault"]["local_head"],
+            pre["user_vault"]["remote_head"],
             user_head,
         )
         if committed.get("daily_pipeline_status") != "complete":
@@ -558,11 +653,12 @@ def main(argv: list[str]) -> int:
             runtime["user_remote_url"],
             runtime["user_git_dir"],
         )
+        require_unchanged_remote_heads(agents_before, user_before, pre)
         agents_push, agents_remote = push_one(
             runtime["agents_vault_root"],
             runtime["agents_remote_url"],
             agents_head,
-            committed["agents_vault"]["commit_status"] == "complete",
+            agents_before != agents_head,
             agents_before,
             runtime["agents_git_dir"],
         )
@@ -570,7 +666,7 @@ def main(argv: list[str]) -> int:
             runtime["user_vault_root"],
             runtime["user_remote_url"],
             user_head,
-            committed["user_vault"]["commit_status"] == "complete",
+            user_before != user_head,
             user_before,
             runtime["user_git_dir"],
         )
@@ -588,10 +684,12 @@ def main(argv: list[str]) -> int:
             "advisory_path": committed["advisory_path"],
             "notification_result": committed["notification_result"],
             "agents_vault": final_vault(
-                committed["agents_vault"], agents_push, agents_remote
+                committed["agents_vault"], agents_push, agents_remote,
+                pre["agents_vault"],
             ),
             "user_vault": final_vault(
-                committed["user_vault"], user_push, user_remote
+                committed["user_vault"], user_push, user_remote,
+                pre["user_vault"],
             ),
             "evidence_finalization_commit": committed[
                 "evidence_finalization_commit"

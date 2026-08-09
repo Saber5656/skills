@@ -148,7 +148,7 @@ def current_state(repo: str, git_dir: str, pre: dict[str, object]) -> dict[str, 
 def capture_exact(capture: str, runtime_file: str, expected: dict[str, object]) -> None:
     """Require the current two-Vault state to equal the immutable pre-state."""
     completed = subprocess.run(
-        [capture, runtime_file],
+        [capture, "--include-local-history", runtime_file],
         cwd="/",
         check=True,
         capture_output=True,
@@ -162,7 +162,7 @@ def capture_exact(capture: str, runtime_file: str, expected: dict[str, object]) 
 def capture_state(capture: str, runtime_file: str) -> dict[str, object]:
     """Capture the complete current state for both Vaults."""
     completed = subprocess.run(
-        [capture, runtime_file],
+        [capture, "--include-local-history", runtime_file],
         cwd="/",
         check=True,
         capture_output=True,
