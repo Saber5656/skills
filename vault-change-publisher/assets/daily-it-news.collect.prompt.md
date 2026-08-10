@@ -24,11 +24,29 @@ Runtime context supplies:
    tool rejects its MIME type.
    For HTML extracts, inspect `published` and `date_evidence_count`. When a
    candidate article lacks a publication date, use a site-scoped search and open
-   the official article URL to establish its date. Do not count an article inside
-   or outside the seven-day window without publication-date evidence.
+   the official article URL to establish its date. The collection window is an
+   inclusive JST calendar-date window: derive `run_date` in JST from the supplied
+   run context, include publication dates from `run_date - 6 days` through
+   `run_date`, and exclude `run_date - 7 days`. Normalize RFC 2822 and ISO 8601
+   timestamps to JST before comparing their calendar date. Do not count an
+   article inside or outside this window without publication-date evidence.
+   An HTML candidate set with zero publication-date evidence is unresolved; it
+   must use the search/official fallback in step 5 and must not be reported as
+   `対象期間記事なし` from the undated direct-page candidates.
 5. Resolve every catalog entry. For `needs_search_fallback`, try the public page,
-   a site-scoped Web search for the last seven days, and an official alternate
+   a site-scoped Web search for the JST calendar window defined in step 4, and an official alternate
    URL. Do not stop at a content-type, safe-open, transient HTTP, or parser error.
+   When the direct HTML page failed because it had no publication-date evidence,
+   a fallback resolution URL must be a specific official article page whose own
+   publication date is visible, or an official feed/page where every sealed
+   `article`/JSON-LD candidate has a publication date. Do not submit a home,
+   category, archive, or listing URL that repeats the undated direct-page failure.
+   If no verifiable dated official URL can be found, return blocked. The summary
+   row's `期間内件数` must equal the dated candidates from that verified fallback.
+   Add entries to `source-resolutions.json.resolutions` only for source names whose
+   sealed manifest status is exactly `needs_search_fallback`. Never add a
+   redundant resolution for a source already sealed as `fetched` or
+   `access_constraint`; represent those sources only in the summary audit row.
    Do not log in, reuse cookies, bypass paywalls/robots/CAPTCHA, or weaken access
    controls.
 6. The summary's `確認済みサイト一覧` must contain exactly one Markdown table
@@ -36,7 +54,18 @@ Runtime context supplies:
    `サイト | Tier | 状態 | 取得方法 | 確認URL | 期間内件数 | 理由`.
    `確認URL`はMarkdown linkではなくbare HTTPS URLを記載する。
    `状態` is `取得済み`, `対象期間記事なし`, or `アクセス制約` only.
-   `期間内件数` must be derived from dated entries; `対象期間記事なし` requires
+   `取得方法` must be exactly one allowed value, never a combined label. Map the
+   sealed evidence method as follows: `rss` -> `RSS`, `public_page` ->
+   `公開ページ`, verified `site_search` -> `サイト限定検索`, and verified
+   `official_alternate` -> `公式代替URL`. For a direct `access_constraint`, use
+   the manifest's single final `method`; do not write `RSS / 公開ページ` even
+   when both direct attempts recorded the same constraint.
+   The direct constraint row must copy `final_url`, use count `0`, and name the
+   exact sealed constraint in `理由`: `robots` must say `robots`, `login` must say
+   `login` or `ログイン`, `paywall` must say `paywall`/`購読`/`有料`, and `captcha`
+   must say `captcha`. Never describe a sealed `robots` constraint as `購読`.
+   `期間内件数` must exactly equal the sealed dated entries in the inclusive JST
+   window defined in step 4; `対象期間記事なし` requires
    evidence that the dated candidates checked do not fall in the window.
    A public source is not complete until an RSS/page/search/official-alternate
    result is verified by the fetcher's source manifest. `アクセス制約` is only for confirmed login, subscription,
@@ -48,6 +77,8 @@ Runtime context supplies:
    shape: `{"version":1,"resolutions":[{"name":"catalog name","method":"site_search|official_alternate","url":"bare HTTPS URL"}],"date_evidence":[{"name":"catalog name","url":"official article URL"}]}`.
    For a login/paywall/CAPTCHA page discovered only during fallback, use
    `{"name":"catalog name","method":"access_constraint","url":"bare HTTPS URL","constraint":"login|paywall|captcha"}` instead. Use `公開ページ` in its audit row and include the matching constraint term in `理由`.
+   A direct manifest `access_constraint` (including robots) is not a fallback
+   resolution and must not be copied into this array.
    Put every official article URL used to supplement a missing HTML `published`
    value in `date_evidence`; do not repeat entries already carrying a date in the
    sealed extract. Always write this file, using empty arrays when no fallback URL
@@ -59,7 +90,14 @@ Runtime context supplies:
 8. Run `personal-vulnerability-advisor/scripts/format-summary-reference.py` with that summary path and copy its stdout verbatim into the advisory's `入力ニュース` field.
 9. Save both summary and advisory below the run-specific staging root.
 10. Calculate SHA-256 for both staged files.
-11. Return only JSON matching the collection schema.
+11. Return only JSON matching the collection schema. When both staged artifacts
+    were created by this run, validated, hashed, and every catalog source was
+    resolved, return `daily_pipeline_status: "complete"`,
+    `vault_artifacts_complete: true`, and `next_action: null`. The trusted
+    publisher handoff is the runner's subsequent responsibility and is not a
+    reason to mark collection incomplete. A blocked result must instead use
+    `daily_pipeline_status: "blocked"`, `vault_artifacts_complete: false`, and a
+    non-empty `next_action` describing the unresolved collection action.
 
 The collection-result JSON must retain the validated absolute staged paths. Artifact Markdown must not contain the collection output root, a machine-specific home path, or any absolute staging path. The advisory identifies its input only by the same-run summary basename and SHA-256 emitted by `format-summary-reference.py`.
 

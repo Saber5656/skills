@@ -20,6 +20,7 @@ import urllib.parse
 import urllib.request
 import urllib.robotparser
 import xml.etree.ElementTree as ET
+from datetime import date
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Optional
@@ -304,6 +305,7 @@ class LinkExtractor(HTMLParser):
         self.article_depth = 0
         self.article_entry_start = 0
         self.article_published: Optional[str] = None
+        self.article_text: list[str] = []
         self.heading_depth = 0
         self.current_article_headline = False
         self.in_time = False
@@ -316,6 +318,7 @@ class LinkExtractor(HTMLParser):
             if self.article_depth == 0:
                 self.article_entry_start = len(self.entries)
                 self.article_published = None
+                self.article_text = []
             self.article_depth += 1
         if lowered == "time" and self.article_depth:
             self.in_time = True
@@ -336,6 +339,8 @@ class LinkExtractor(HTMLParser):
             self.current_text.append(data)
         if self.in_time:
             self.time_text.append(data)
+        if self.article_depth:
+            self.article_text.append(data)
 
     def handle_endtag(self, tag: str) -> None:
         lowered = tag.lower()
@@ -346,6 +351,17 @@ class LinkExtractor(HTMLParser):
         if lowered == "article" and self.article_depth:
             self.article_depth -= 1
             if self.article_depth == 0:
+                if not self.article_published:
+                    visible_date = re.search(
+                        r"\b(20\d{2})[./-](\d{1,2})[./-](\d{1,2})\b",
+                        " ".join(self.article_text),
+                    )
+                    if visible_date:
+                        year, month, day = map(int, visible_date.groups())
+                        try:
+                            self.article_published = date(year, month, day).isoformat()
+                        except ValueError:
+                            self.article_published = None
                 article_entries = self.entries[self.article_entry_start:]
                 candidate = next(
                     (
@@ -358,6 +374,7 @@ class LinkExtractor(HTMLParser):
                     entry["candidate_provenance"] = "article" if entry is candidate else None
                     if entry is candidate:
                         entry["published"] = entry["published"] or self.article_published
+                self.article_text = []
         if lowered in {"h1", "h2", "h3", "h4", "h5", "h6"} and self.heading_depth:
             self.heading_depth -= 1
         if lowered != "a" or not self.current_href:
@@ -435,6 +452,73 @@ def extract_json_ld(content: bytes, base_url: str) -> list[dict[str, Optional[st
     return entries[:200]
 
 
+def extract_embedded_article_metadata(
+    content: bytes, base_url: str
+) -> list[dict[str, Optional[str]]]:
+    """Extract dated article records from bounded publisher list markup/data."""
+    text = content.decode("utf-8", errors="replace")
+    entries: list[dict[str, Optional[str]]] = []
+
+    def append(title: str, url: str, published: str) -> None:
+        absolute = urllib.parse.urljoin(base_url, html.unescape(url))
+        parsed = urllib.parse.urlsplit(absolute)
+        base_host = urllib.parse.urlsplit(base_url).hostname
+        cleaned_title = clean_text(title, 300)
+        if (
+            parsed.scheme == "https"
+            and parsed.hostname == base_host
+            and cleaned_title
+            and len(entries) < 200
+        ):
+            entries.append({
+                "title": cleaned_title,
+                "url": absolute,
+                "published": published,
+                "summary": None,
+                "candidate_provenance": "article",
+            })
+
+    for match in re.finditer(
+        r'<p[^>]+class=["\'][^"\']*\btitle\b[^"\']*["\'][^>]*>\s*'
+        r'<a[^>]+href=["\']([^"\']+)["\'][^>]*>(.*?)</a>.*?'
+        r'<p[^>]+class=["\'][^"\']*\bdate\b[^"\']*["\'][^>]*>\s*\(?'
+        r'(20\d{2})/(\d{1,2})/(\d{1,2})',
+        text,
+        re.IGNORECASE | re.DOTALL,
+    ):
+        year, month, day = map(int, match.groups()[2:])
+        try:
+            published = date(year, month, day).isoformat()
+        except ValueError:
+            continue
+        append(match.group(2), match.group(1), published)
+
+    for match in re.finditer(
+        r"\{'url':'([^']+)','title':'([^']*)'.{0,5000}?'date':'"
+        r"(20\d{2})/(\d{1,2})/(\d{1,2})'",
+        text,
+        re.DOTALL,
+    ):
+        year, month, day = map(int, match.groups()[2:])
+        try:
+            published = date(year, month, day).isoformat()
+        except ValueError:
+            continue
+        append(match.group(2) or match.group(1), match.group(1), published)
+
+    for match in re.finditer(
+        r'datePublished\\?"\s*:\s*\\?"([^"\\]+)\\?".*?'
+        r'articleMetadata.*?title\\?"\s*:\s*\\?"([^"\\]+)\\?".*?'
+        r'issueId\\?"\s*:\s*\\?"([^"\\]+)\\?".*?'
+        r'issueVolume\\?"\s*:\s*(\d+).*?issueNumber\\?"\s*:\s*(\d+)',
+        text,
+        re.DOTALL,
+    ):
+        published, title, issue_id, volume, number = match.groups()
+        append(title, f"/newsletters/{issue_id}/{volume}/{number}", published)
+    return entries[:200]
+
+
 def canonical_url(value: str) -> str:
     """Normalize an HTTP URL for same-article evidence comparison."""
     parsed = urllib.parse.urlsplit(value)
@@ -486,7 +570,11 @@ def extract_content(content: bytes, content_type: str, final_url: str) -> dict[s
     parser.feed(content.decode("utf-8", errors="replace"))
     combined: list[dict[str, Optional[str]]] = []
     by_url: dict[str, dict[str, Optional[str]]] = {}
-    for entry in [*extract_json_ld(content, final_url), *parser.entries]:
+    for entry in [
+        *extract_json_ld(content, final_url),
+        *extract_embedded_article_metadata(content, final_url),
+        *parser.entries,
+    ]:
         url = entry.get("url")
         if not isinstance(url, str):
             combined.append(entry)
@@ -561,6 +649,11 @@ def collect_source(
                 continue
             if extract["entry_count"] == 0:
                 raise CollectionError("empty_extract")
+            if (
+                extract["format"] == "html_links"
+                and extract.get("date_evidence_count", 0) == 0
+            ):
+                raise CollectionError("html_extract_lacks_publication_date_evidence")
             filename = safe_filename(index, source["name"], method)
             destination = output_root / filename
             content = fetched.pop("content")
@@ -741,14 +834,24 @@ def verify_resolutions(
             status = "verified_fallback"
             if extract["entry_count"] == 0:
                 raise CollectionError("verified fallback extract is empty")
-        candidates = (
-            extract["entries"]
-            if extract["format"] == "feed"
-            else [
-                entry for entry in extract["entries"]
-                if entry.get("candidate_provenance") in {"article", "json_ld"}
-            ]
+        primary_published = extract_primary_publication_date(
+            fetched["content"], fetched["final_url"]
         )
+        if extract["format"] == "html_links" and primary_published:
+            candidates = [{
+                "url": fetched["final_url"],
+                "candidate_provenance": "json_ld",
+                "published": primary_published,
+            }]
+        else:
+            candidates = (
+                extract["entries"]
+                if extract["format"] == "feed"
+                else [
+                    entry for entry in extract["entries"]
+                    if entry.get("candidate_provenance") in {"article", "json_ld"}
+                ]
+            )
         published_dates = [entry.get("published") for entry in candidates]
         if status == "verified_fallback" and (
             not published_dates or any(not value for value in published_dates)

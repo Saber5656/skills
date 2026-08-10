@@ -70,8 +70,17 @@
       "expectations": [
         "uses published metadata from article cards or JSON-LD when available",
         "searches the source site and opens official article URLs for missing dates",
-        "does not count an undated article inside or outside the seven-day window"
+        "does not count an undated article inside or outside the seven-day window",
+        "does not resubmit an undated home, category, archive, or listing page as a verified fallback"
       ]
+    },
+    {
+      "id": 7,
+      "name": "inclusive_jst_calendar_window",
+      "prompt": "run_dateは2026-08-10 JSTです。2026-08-03T23:59:59+09:00、Mon, 03 Aug 2026 15:00:00 GMT、2026-08-10T23:59:59+09:00、2026-08-10T15:00:00Zの記事を期間内件数へ分類してください。",
+      "expected_output": "timestampをJSTへ正規化し、2026-08-04 00:00 JSTと2026-08-10 23:59:59 JSTの2件だけを期間内として数える。",
+      "files": [],
+      "expectations": ["normalizes RFC 2822 and ISO 8601 timestamps to JST", "includes run_date-6 and run_date", "excludes run_date-7 and run_date+1", "reports a count of 2"]
     }
   ]
 }

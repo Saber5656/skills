@@ -127,7 +127,7 @@ class PublicSourceCollectorTests(unittest.TestCase):
             side_effect=[
                 MODULE.CollectionError("content-type fixture"),
                 {
-                    "content": b'<html><a href="/article">Public article</a></html>',
+                    "content": b'<html><article><a href="/article">Public article</a><time datetime="2026-08-10">Today</time></article></html>',
                     "content_type": "text/html",
                     "final_url": source["page_url"],
                     "http_status": 200,
@@ -141,6 +141,32 @@ class PublicSourceCollectorTests(unittest.TestCase):
         self.assertEqual(result["status"], "fetched")
         self.assertEqual(result["method"], "public_page")
         self.assertEqual([item["status"] for item in result["attempts"]], ["failed", "fetched"])
+
+    def test_undated_html_requires_search_fallback(self) -> None:
+        """Do not seal an HTML candidate set that cannot support a date audit."""
+        source = MODULE.load_catalog(CATALOG)[0]
+        undated = b'<html><article><a href="/article">Public article</a></article></html>'
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.object(
+            MODULE,
+            "fetch_url",
+            side_effect=[
+                MODULE.CollectionError("feed unavailable"),
+                {
+                    "content": undated,
+                    "content_type": "text/html",
+                    "final_url": source["page_url"],
+                    "http_status": 200,
+                },
+            ],
+        ):
+            result = MODULE.collect_source(
+                1, source, MODULE.source_hosts(source), Path(temporary)
+            )
+        self.assertEqual(result["status"], "needs_search_fallback")
+        self.assertEqual(
+            result["attempts"][-1]["reason"],
+            "html_extract_lacks_publication_date_evidence",
+        )
 
     def test_unresolved_direct_attempts_require_search_fallback(self) -> None:
         """Never present two direct failures as successful coverage."""
@@ -169,6 +195,48 @@ class PublicSourceCollectorTests(unittest.TestCase):
         self.assertEqual(by_url["https://example.test/card"]["published"], "2026-08-05")
         self.assertEqual(by_url["https://example.test/json"]["published"], "2026-08-04")
         self.assertEqual(extracted["date_evidence_count"], 2)
+
+    def test_html_extract_binds_visible_card_date_to_article(self) -> None:
+        """Normalize a visible YYYY/M/D date inside one article card."""
+        content = (
+            b'<article><h2><a href="/card">Card story</a></h2>'
+            b'<span class="date">2026/8/4</span></article>'
+        )
+        extracted = MODULE.extract_content(
+            content, "text/html", "https://example.test/news"
+        )
+        self.assertEqual(extracted["entries"][0]["published"], "2026-08-04")
+        self.assertEqual(extracted["date_evidence_count"], 1)
+
+    def test_extracts_dated_publisher_list_metadata(self) -> None:
+        """Bind supported public list metadata to its official article URL."""
+        fixtures = [
+            (
+                b'<p class="title"><a href="/docs/1.html">Forest story</a></p>'
+                b'<p class="date">(2026/8/7)</p>',
+                "https://forest.watch.impress.co.jp/category/genai/",
+                "https://forest.watch.impress.co.jp/docs/1.html",
+            ),
+            (
+                b"{'url':'/ait/articles/2608/07/news008.html','title':'AIT story',"
+                b"'subtitle':'x','date':'2026/08/07',}",
+                "https://atmarkit.itmedia.co.jp/",
+                "https://atmarkit.itmedia.co.jp/ait/articles/2608/07/news008.html",
+            ),
+            (
+                b'{\\"datePublished\\":\\"2026-08-07T16:00:00.000Z\\",'
+                b'\\"articleMetadata\\":{\\"title\\":\\"Cyber story\\"},'
+                b'\\"issueId\\":\\"daily-briefing\\",\\"issueVolume\\":15,'
+                b'\\"issueNumber\\":150}',
+                "https://thecyberwire.com/newsletters/daily-briefing",
+                "https://thecyberwire.com/newsletters/daily-briefing/15/150",
+            ),
+        ]
+        for content, base, expected_url in fixtures:
+            with self.subTest(base=base):
+                entries = MODULE.extract_embedded_article_metadata(content, base)
+                self.assertEqual(entries[0]["url"], expected_url)
+                self.assertTrue(entries[0]["published"].startswith("2026-08-07"))
 
     def test_rejects_gzip_expansion_over_limit(self) -> None:
         """Bound decompressed bytes as well as compressed transport bytes."""
@@ -290,6 +358,39 @@ class PublicSourceCollectorTests(unittest.TestCase):
                 with self.assertRaisesRegex(MODULE.CollectionError, "complete"):
                     MODULE.verify_resolutions(CATALOG, manifest, request, output)
 
+    def test_specific_article_fallback_seals_only_its_primary_date(self) -> None:
+        """Ignore undated related cards when the requested page is itself an article."""
+        source = MODULE.load_catalog(CATALOG)[0]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manifest = root / "manifest.json"
+            request = root / "request.json"
+            output = root / "verified.json"
+            candidate = MODULE.urllib.parse.urljoin(source["page_url"], "/article")
+            manifest.write_text(json.dumps({"sources": [{
+                "name": source["name"], "status": "needs_search_fallback"
+            }]}), encoding="utf-8")
+            request.write_text(json.dumps({"version": 1, "resolutions": [{
+                "name": source["name"], "method": "site_search", "url": candidate
+            }], "date_evidence": []}), encoding="utf-8")
+            content = (
+                b'<meta property="article:published_time" content="2026-08-08">'
+                b'<article><h2><a href="/related">Undated related story</a></h2></article>'
+            )
+            with mock.patch.dict(
+                os.environ, {"COLLECTION_OUTPUT_ROOT": str(root)}
+            ), mock.patch.object(MODULE, "fetch_url", return_value={
+                "final_url": candidate,
+                "http_status": 200,
+                "content_type": "text/html",
+                "content": content,
+            }):
+                MODULE.verify_resolutions(CATALOG, manifest, request, output)
+            verified = json.loads(output.read_text())["resolutions"][0]
+            self.assertEqual(verified["candidate_entry_count"], 1)
+            self.assertEqual(verified["candidate_evidence"][0]["url"], candidate)
+            self.assertEqual(verified["published_dates"], ["2026-08-08"])
+
     def test_json_ld_seals_undated_article_and_merges_same_url_date(self) -> None:
         """Keep undated article-like JSON-LD and merge matching card evidence."""
         base = "https://example.test/"
@@ -334,7 +435,7 @@ class PublicSourceCollectorTests(unittest.TestCase):
         """Do not classify a whole publisher from a constrained feed endpoint."""
         source = MODULE.load_catalog(CATALOG)[0]
         gate = b'<form><input type="password"><button>Sign in</button></form>'
-        page = b'<html><a href="/article">Public article</a></html>'
+        page = b'<html><article><a href="/article">Public article</a><time datetime="2026-08-10">Today</time></article></html>'
         with tempfile.TemporaryDirectory() as temporary, mock.patch.object(
             MODULE, "fetch_url", side_effect=[
                 {"content": gate, "content_type": "text/html", "final_url": source["feed_url"], "http_status": 200},
