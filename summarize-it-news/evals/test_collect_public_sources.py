@@ -14,12 +14,22 @@ from pathlib import Path
 from unittest import mock
 
 SKILL_ROOT = Path(__file__).parents[1]
+REPO_ROOT = SKILL_ROOT.parent
 CATALOG = SKILL_ROOT / "references" / "it-news-sources.json"
 SCRIPT = SKILL_ROOT / "scripts" / "collect-public-sources.py"
 SPEC = importlib.util.spec_from_file_location("collect_public_sources", SCRIPT)
 assert SPEC and SPEC.loader
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
+VALIDATOR_SCRIPT = (
+    REPO_ROOT / "vault-change-publisher/scripts/validate-collection-result.py"
+)
+VALIDATOR_SPEC = importlib.util.spec_from_file_location(
+    "validate_collection_result_for_collector", VALIDATOR_SCRIPT
+)
+assert VALIDATOR_SPEC and VALIDATOR_SPEC.loader
+VALIDATOR = importlib.util.module_from_spec(VALIDATOR_SPEC)
+VALIDATOR_SPEC.loader.exec_module(VALIDATOR)
 
 
 class FakeHeaders:
@@ -135,11 +145,16 @@ class PublicSourceCollectorTests(unittest.TestCase):
                 },
             ],
         ):
-            result = MODULE.collect_source(1, source, hosts, Path(temporary))
+            result = MODULE.collect_source(
+                1, source, hosts, Path(temporary), MODULE.date(2026, 8, 10)
+            )
             extract = json.loads((Path(temporary) / result["extract_file"]).read_text())
             self.assertEqual(extract["format"], "html_links")
         self.assertEqual(result["status"], "fetched")
         self.assertEqual(result["method"], "public_page")
+        self.assertEqual(result["jst_window_start"], "2026-08-04")
+        self.assertEqual(result["jst_window_end"], "2026-08-10")
+        self.assertEqual(result["jst_window_item_count"], 1)
         self.assertEqual([item["status"] for item in result["attempts"]], ["failed", "fetched"])
 
     def test_undated_html_requires_search_fallback(self) -> None:
@@ -208,6 +223,56 @@ class PublicSourceCollectorTests(unittest.TestCase):
         self.assertEqual(extracted["entries"][0]["published"], "2026-08-04")
         self.assertEqual(extracted["date_evidence_count"], 1)
 
+    def test_html_extract_rejects_arbitrary_visible_and_malformed_dates(self) -> None:
+        """Do not promote body dates or malformed metadata to publication evidence."""
+        content = b'''<article><h2><a href="/card">Support ends 2026-08-04</a></h2></article><script type="application/ld+json">{"@type":"NewsArticle","headline":"Broken","url":"/broken","datePublished":"not-a-date"}</script>'''
+        extracted = MODULE.extract_content(
+            content, "text/html", "https://example.test/news"
+        )
+        candidates = [
+            entry for entry in extracted["entries"]
+            if entry.get("candidate_provenance") in {"article", "json_ld"}
+        ]
+        self.assertEqual(len(candidates), 2)
+        self.assertTrue(all(entry["published"] is None for entry in candidates))
+        self.assertEqual(extracted["date_evidence_count"], 0)
+
+    def test_non_article_json_ld_does_not_supply_date_evidence(self) -> None:
+        """Ignore dated WebPage metadata when sealing article candidates."""
+        content = b'''<script type="application/ld+json">{"@type":"WebPage","name":"Archive","url":"/news","datePublished":"2026-08-04","dateModified":"2026-08-05"}</script>'''
+        extracted = MODULE.extract_content(
+            content, "text/html", "https://example.test/news"
+        )
+        self.assertEqual(extracted["candidate_entry_count"], 0)
+        self.assertEqual(extracted["date_evidence_count"], 0)
+
+    def test_collector_and_validator_share_jst_timestamp_semantics(self) -> None:
+        """Keep RFC, offset, Z, and naive timestamps identical at window edges."""
+        fixtures = {
+            "Mon, 03 Aug 2026 15:00:00 GMT": MODULE.date(2026, 8, 4),
+            "2026-08-03T15:00:00Z": MODULE.date(2026, 8, 4),
+            "2026-08-03T23:59:59+09:00": MODULE.date(2026, 8, 3),
+            "2026-08-03T16:00:00": MODULE.date(2026, 8, 4),
+            "2026-08-10T14:59:59Z": MODULE.date(2026, 8, 10),
+            "2026-08-10T15:00:00Z": MODULE.date(2026, 8, 11),
+        }
+        for value, expected in fixtures.items():
+            with self.subTest(value=value):
+                self.assertEqual(MODULE.publication_date_in_jst(value), expected)
+                self.assertEqual(VALIDATOR.parse_publication_date(value), expected)
+        extract = {
+            "format": "feed",
+            "entries": [
+                {"published": "2026-08-03T14:59:59Z"},
+                {"published": "2026-08-03T15:00:00Z"},
+                {"published": "2026-08-10T14:59:59Z"},
+                {"published": "2026-08-10T15:00:00Z"},
+            ],
+        }
+        self.assertEqual(
+            MODULE.jst_window_item_count(extract, MODULE.date(2026, 8, 10)), 2
+        )
+
     def test_extracts_dated_publisher_list_metadata(self) -> None:
         """Bind supported public list metadata to its official article URL."""
         fixtures = [
@@ -237,6 +302,19 @@ class PublicSourceCollectorTests(unittest.TestCase):
                 entries = MODULE.extract_embedded_article_metadata(content, base)
                 self.assertEqual(entries[0]["url"], expected_url)
                 self.assertTrue(entries[0]["published"].startswith("2026-08-07"))
+
+    def test_embedded_list_date_cannot_cross_into_the_next_record(self) -> None:
+        """Keep an undated title from consuming a later record's date."""
+        content = (
+            b'<p class="title"><a href="/first">First</a></p>'
+            b'<p class="summary">No publication date</p>'
+            b'<p class="title"><a href="/second">Second</a></p>'
+            b'<p class="date">(2026/8/7)</p>'
+        )
+        entries = MODULE.extract_embedded_article_metadata(
+            content, "https://example.test/news"
+        )
+        self.assertEqual([entry["url"] for entry in entries], ["https://example.test/second"])
 
     def test_rejects_gzip_expansion_over_limit(self) -> None:
         """Bound decompressed bytes as well as compressed transport bytes."""
@@ -391,6 +469,18 @@ class PublicSourceCollectorTests(unittest.TestCase):
             self.assertEqual(verified["candidate_evidence"][0]["url"], candidate)
             self.assertEqual(verified["published_dates"], ["2026-08-08"])
 
+    def test_generic_page_date_does_not_collapse_listing_candidates(self) -> None:
+        """Do not treat generic category metadata as the listing's publication date."""
+        content = (
+            b'<meta name="date" content="2026-08-08">'
+            b'<article><h2><a href="/undated">Undated story</a></h2></article>'
+        )
+        self.assertIsNone(
+            MODULE.extract_primary_publication_date(
+                content, "https://example.test/news"
+            )
+        )
+
     def test_json_ld_seals_undated_article_and_merges_same_url_date(self) -> None:
         """Keep undated article-like JSON-LD and merge matching card evidence."""
         base = "https://example.test/"
@@ -445,6 +535,33 @@ class PublicSourceCollectorTests(unittest.TestCase):
             result = MODULE.collect_source(1, source, MODULE.source_hosts(source), Path(temporary))
         self.assertEqual(result["status"], "fetched")
         self.assertEqual(result["method"], "public_page")
+
+    def test_direct_html_requires_dates_for_every_article_candidate(self) -> None:
+        """Send partially dated listings to fallback instead of sealing a subset."""
+        source = MODULE.load_catalog(CATALOG)[0]
+        page = (
+            b'<article><h2><a href="/dated">Dated</a></h2>'
+            b'<time datetime="2026-08-10"></time></article>'
+            b'<article><h2><a href="/undated">Undated</a></h2></article>'
+        )
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.object(
+            MODULE,
+            "fetch_url",
+            side_effect=[
+                MODULE.CollectionError("feed unavailable"),
+                {
+                    "content": page,
+                    "content_type": "text/html",
+                    "final_url": source["page_url"],
+                    "http_status": 200,
+                },
+            ],
+        ):
+            result = MODULE.collect_source(
+                1, source, MODULE.source_hosts(source), Path(temporary)
+            )
+        self.assertEqual(result["status"], "needs_search_fallback")
+        self.assertIn("lacks_publication", result["attempts"][-1]["reason"])
 
     def test_mixed_constraint_and_failure_requires_fallback(self) -> None:
         """Do not close a publisher when another direct endpoint failed generically."""
@@ -549,7 +666,7 @@ class PublicSourceCollectorTests(unittest.TestCase):
         article = source["page_url"]
         html = (
             '<script type="application/ld+json">'
-            f'{{"headline":"Story","url":"{article}","datePublished":"2026-08-05"}}'
+            f'{{"@type":"NewsArticle","headline":"Story","url":"{article}","datePublished":"2026-08-05"}}'
             '</script>'
         ).encode()
         with tempfile.TemporaryDirectory() as temporary:

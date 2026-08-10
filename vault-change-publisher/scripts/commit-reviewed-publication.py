@@ -12,7 +12,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path, PurePosixPath
-from typing import Callable
+from typing import Callable, Optional
 
 
 CLEAN_DIGEST = hashlib.sha256(b"").hexdigest()
@@ -625,6 +625,8 @@ def commit_groups(
                 repo,
                 git_dir,
                 "-c",
+                # Reviewed Markdown bytes are immutable and may intentionally end
+                # with approved blank lines as well as Markdown hard breaks.
                 "core.whitespace=-blank-at-eol,-blank-at-eof",
                 "diff",
                 "--cached",
@@ -689,6 +691,9 @@ def result_after_failure(
     collection: dict[str, object],
     plan: dict[str, object],
     reason: str,
+    publication_context_sha256: Optional[str] = None,
+    capture: Optional[str] = None,
+    runtime_file: Optional[str] = None,
 ) -> dict[str, object]:
     """Report actual local progress without hiding partially applied mutation."""
     results: dict[str, dict[str, object]] = {}
@@ -719,7 +724,13 @@ def result_after_failure(
             state["post_dirty_digest"] != state["pre_dirty_digest"]
         )
         results[key] = state
-    return {
+    resumable_state = None
+    if capture and runtime_file:
+        try:
+            resumable_state = capture_state(capture, runtime_file)
+        except (OSError, ValueError, json.JSONDecodeError, subprocess.SubprocessError):
+            resumable_state = None
+    result = {
         "outcome": "partial_publication" if changed else "blocked",
         "phase": "local_commit",
         "daily_pipeline_status": collection.get("daily_pipeline_status", "blocked"),
@@ -731,6 +742,10 @@ def result_after_failure(
         "evidence_finalization_commit": None,
         "next_action": reason,
     }
+    if changed:
+        result["publication_context_sha256"] = publication_context_sha256
+        result["resumable_state"] = resumable_state
+    return result
 
 
 def main(argv: list[str]) -> int:
@@ -747,6 +762,8 @@ def main(argv: list[str]) -> int:
     pre: dict[str, object] = {}
     collection: dict[str, object] = {}
     plan: dict[str, object] = {}
+    context_digest: Optional[str] = None
+    bound_runtime: Optional[Path] = None
     try:
         runtime = json.loads(Path(argv[1]).read_text(encoding="utf-8"))
         pre = json.loads(Path(argv[2]).read_text(encoding="utf-8"))
@@ -754,6 +771,7 @@ def main(argv: list[str]) -> int:
         plan = json.loads(Path(argv[4]).read_text(encoding="utf-8"))
         context_path = Path(argv[5])
         context_bytes = stable_regular_bytes(context_path)
+        context_digest = hashlib.sha256(context_bytes).hexdigest()
         context = json.loads(context_bytes)
         runtime, pre, collection, plan = reviewed_inputs(
             context, runtime, pre, collection, plan
@@ -775,7 +793,7 @@ def main(argv: list[str]) -> int:
         review = json.loads(review_bytes)
         if review.get("outcome") != "approved" or review.get(
             "publication_context_sha256"
-        ) != hashlib.sha256(context_bytes).hexdigest():
+        ) != context_digest:
             raise CommitError("publication review is not approved and context-bound")
         previous = None
         if output.exists():
@@ -783,6 +801,8 @@ def main(argv: list[str]) -> int:
             if (
                 candidate.get("outcome") == "partial_publication"
                 and candidate.get("phase") == "local_commit"
+                and candidate.get("publication_context_sha256") == context_digest
+                and isinstance(candidate.get("resumable_state"), dict)
                 and candidate.get("agents_vault", {}).get("commit_status")
                 in {"complete", "failed"}
                 and candidate.get("user_vault", {}).get("commit_status")
@@ -814,6 +834,9 @@ def main(argv: list[str]) -> int:
                 "summary_target": plan["summary_target"],
                 "advisory_target": plan["advisory_target"],
             }
+            current_resume_state = capture_state(argv[8], str(bound_runtime))
+            if current_resume_state != previous["resumable_state"]:
+                raise CommitError("Vaults no longer match the resumable result")
         require_bound_bytes(bound_runtime, bound_runtime_bytes)
         require_bound_bytes(bound_collection, bound_collection_bytes)
         require_bound_bytes(bound_plan, bound_plan_bytes)
@@ -872,19 +895,22 @@ def main(argv: list[str]) -> int:
                 ),
             )
         else:
-            agents = dict(previous["agents_vault"])
+            claimed = previous["agents_vault"]
             actual_agents = current_state(
                 str(runtime["agents_vault_root"]),
                 str(runtime["agents_git_dir"]),
                 pre["agents_vault"],
             )
             if any(
-                actual_agents[field] != agents.get(field)
+                actual_agents[field] != claimed.get(field)
                 for field in ("commit_hashes", "local_head", "clean")
             ) or not actual_agents["clean"]:
                 raise CommitError("Agents Vault no longer matches the resumable result")
+            agents = dict(actual_agents)
             agents["commit_status"] = "complete"
         after_agents = capture_state(argv[8], str(bound_runtime))
+        if previous is not None and after_agents != current_resume_state:
+            raise CommitError("Vaults changed while resuming publication")
         if (
             after_agents["agents_vault"]["dirty_paths"]
             or after_agents["agents_vault"]["local_head"] != agents["local_head"]
@@ -934,7 +960,14 @@ def main(argv: list[str]) -> int:
         subprocess.SubprocessError,
     ) as exc:
         result = result_after_failure(
-            runtime, pre, collection, plan, f"Local publication failed closed: {exc}"
+            runtime,
+            pre,
+            collection,
+            plan,
+            f"Local publication failed closed: {exc}",
+            context_digest,
+            argv[8] if bound_runtime is not None else None,
+            str(bound_runtime) if bound_runtime is not None else None,
         )
         output.write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
         print(str(exc), file=sys.stderr)

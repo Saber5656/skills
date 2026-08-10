@@ -64,11 +64,18 @@ fi
 /usr/bin/grep -F -- 'git_diff_digest.py' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- 'fail_run 75 artifact_plan' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- '/bin/cp "$INITIAL_PUSH_RESULT" "$PUBLICATION_RESULT"' "$RUNNER" >/dev/null
-if sed -n '/^else$/,/^fi$/p' "$RUNNER" | /usr/bin/grep -F -- '"$EVIDENCE_PLAN"' >/dev/null; then
+EVIDENCE_PREPARATION_BLOCK="$(sed -n '/^if \[\[ "\$EVIDENCE_PREPARE_STATUS" -eq 0 \]\]; then$/,/^fi$/p' "$RUNNER")"
+EVIDENCE_FALLBACK_BLOCK="$(print -r -- "$EVIDENCE_PREPARATION_BLOCK" | sed -n '/^[[:space:]]*else[[:space:]]*$/,$p')"
+if [[ -z "$EVIDENCE_FALLBACK_BLOCK" ]]; then
+  echo "evidence preparation fallback block not found" >&2
+  exit 1
+fi
+if print -r -- "$EVIDENCE_FALLBACK_BLOCK" | /usr/bin/grep -F -- '"$EVIDENCE_PLAN"' >/dev/null; then
   echo "failed evidence preparation must not invoke finalizer with a missing plan" >&2
   exit 1
 fi
 /usr/bin/grep -F -- 'COLLECTION_OUTPUT_ROOT="$STAGING_ROOT"' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- '"$COLLECTION_FETCHER" "$SOURCE_CATALOG" "$SOURCE_INPUT_ROOT" "$STARTED_AT"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- 'local exit_code="$1"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- 'FIXED_FETCHER="$WORKDIR/fetch-vault-main.py"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- '"$FIXED_FETCHER" "$RUNTIME_CONTEXT_FILE"' "$RUNNER" >/dev/null

@@ -20,10 +20,12 @@ import urllib.parse
 import urllib.request
 import urllib.robotparser
 import xml.etree.ElementTree as ET
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Optional
+from zoneinfo import ZoneInfo
 
 MAX_BYTES = 8 * 1024 * 1024
 TIMEOUT_SECONDS = 20
@@ -256,6 +258,66 @@ def clean_text(value: Optional[str], limit: int = 800) -> Optional[str]:
     return normalized[:limit] or None
 
 
+def validated_publication_date(value: Optional[str]) -> Optional[str]:
+    """Return bounded date evidence only when it is a parseable timestamp."""
+    cleaned = clean_text(value, 200)
+    if not cleaned:
+        return None
+    try:
+        datetime.fromisoformat(cleaned.replace("Z", "+00:00"))
+        return cleaned
+    except ValueError:
+        pass
+    try:
+        parsedate_to_datetime(cleaned)
+        return cleaned
+    except (TypeError, ValueError, OverflowError):
+        pass
+    match = re.fullmatch(r"(20\d{2})[./-](\d{1,2})[./-](\d{1,2})", cleaned)
+    if match:
+        try:
+            return date(*(int(part) for part in match.groups())).isoformat()
+        except ValueError:
+            pass
+    return None
+
+
+def publication_date_in_jst(value: Optional[str]) -> Optional[date]:
+    """Normalize validated RSS/HTML evidence to its JST calendar date."""
+    validated = validated_publication_date(value)
+    if not validated:
+        return None
+    try:
+        parsed = datetime.fromisoformat(validated.replace("Z", "+00:00"))
+    except ValueError:
+        try:
+            parsed = parsedate_to_datetime(validated)
+        except (TypeError, ValueError, OverflowError):
+            return None
+    jst = ZoneInfo("Asia/Tokyo")
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(jst).date()
+
+
+def jst_window_item_count(extract: dict[str, Any], run_date: date) -> int:
+    """Count sealed article candidates in the inclusive seven-day JST window."""
+    entries = extract.get("entries", [])
+    if extract.get("format") == "html_links":
+        entries = [
+            entry for entry in entries
+            if entry.get("candidate_provenance") in {"article", "json_ld"}
+        ]
+    start = run_date - timedelta(days=6)
+    return sum(
+        start <= published <= run_date
+        for published in (
+            publication_date_in_jst(entry.get("published")) for entry in entries
+        )
+        if published is not None
+    )
+
+
 def local_name(tag: str) -> str:
     """Drop an XML namespace from one element tag."""
     return tag.rsplit("}", 1)[-1].lower()
@@ -282,7 +344,7 @@ def extract_xml(content: bytes) -> list[dict[str, Optional[str]]]:
             elif name == "link" and not fields["url"]:
                 fields["url"] = child.attrib.get("href") or clean_text(child.text, 1000)
             elif name in {"pubdate", "published", "updated", "date"} and not fields["published"]:
-                fields["published"] = clean_text(child.text, 200)
+                fields["published"] = validated_publication_date(child.text)
             elif name in {"description", "summary", "content"} and not fields["summary"]:
                 fields["summary"] = clean_text("".join(child.itertext()), 800)
         if fields["title"] or fields["url"]:
@@ -310,6 +372,8 @@ class LinkExtractor(HTMLParser):
         self.current_article_headline = False
         self.in_time = False
         self.time_text: list[str] = []
+        self.date_element_depth = 0
+        self.date_element_text: list[str] = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, Optional[str]]]) -> None:
         lowered = tag.lower()
@@ -324,6 +388,14 @@ class LinkExtractor(HTMLParser):
             self.in_time = True
             self.time_text = []
             self.article_published = clean_text(attributes.get("datetime"), 200)
+        if self.date_element_depth:
+            self.date_element_depth += 1
+        class_tokens = set((attributes.get("class") or "").lower().split())
+        if not self.date_element_depth and self.article_depth and class_tokens.intersection(
+            {"date", "published", "publication-date", "pubdate"}
+        ):
+            self.date_element_depth = 1
+            self.date_element_text = []
         if lowered in {"h1", "h2", "h3", "h4", "h5", "h6"} and self.article_depth:
             self.heading_depth += 1
         if lowered != "a" or len(self.entries) >= 400:
@@ -339,29 +411,30 @@ class LinkExtractor(HTMLParser):
             self.current_text.append(data)
         if self.in_time:
             self.time_text.append(data)
-        if self.article_depth:
-            self.article_text.append(data)
+        if self.date_element_depth:
+            self.date_element_text.append(data)
 
     def handle_endtag(self, tag: str) -> None:
         lowered = tag.lower()
         if lowered == "time" and self.in_time:
-            self.article_published = self.article_published or clean_text(" ".join(self.time_text), 200)
+            self.article_published = self.article_published or validated_publication_date(
+                " ".join(self.time_text)
+            )
             self.in_time = False
             self.time_text = []
+        if self.date_element_depth:
+            self.date_element_depth -= 1
+            if self.date_element_depth == 0:
+                self.article_published = self.article_published or validated_publication_date(
+                    " ".join(self.date_element_text)
+                )
+                self.date_element_text = []
         if lowered == "article" and self.article_depth:
             self.article_depth -= 1
             if self.article_depth == 0:
-                if not self.article_published:
-                    visible_date = re.search(
-                        r"\b(20\d{2})[./-](\d{1,2})[./-](\d{1,2})\b",
-                        " ".join(self.article_text),
-                    )
-                    if visible_date:
-                        year, month, day = map(int, visible_date.groups())
-                        try:
-                            self.article_published = date(year, month, day).isoformat()
-                        except ValueError:
-                            self.article_published = None
+                self.article_published = validated_publication_date(
+                    self.article_published
+                )
                 article_entries = self.entries[self.article_entry_start:]
                 candidate = next(
                     (
@@ -424,7 +497,7 @@ def extract_json_ld(content: bytes, base_url: str) -> list[dict[str, Optional[st
         raw_url = value.get("url") or value.get("mainEntityOfPage")
         if isinstance(raw_url, dict):
             raw_url = raw_url.get("@id") or raw_url.get("url")
-        published = clean_text(value.get("datePublished") or value.get("dateModified"), 200)
+        published = validated_publication_date(value.get("datePublished"))
         raw_type = value.get("@type")
         types = raw_type if isinstance(raw_type, list) else [raw_type]
         article_like = any(
@@ -432,7 +505,7 @@ def extract_json_ld(content: bytes, base_url: str) -> list[dict[str, Optional[st
             and (item.lower().endswith("article") or item.lower().endswith("posting"))
             for item in types
         )
-        if title and isinstance(raw_url, str) and (published or article_like):
+        if title and isinstance(raw_url, str) and article_like:
             entries.append({
                 "title": title,
                 "url": urllib.parse.urljoin(base_url, raw_url),
@@ -464,10 +537,12 @@ def extract_embedded_article_metadata(
         parsed = urllib.parse.urlsplit(absolute)
         base_host = urllib.parse.urlsplit(base_url).hostname
         cleaned_title = clean_text(title, 300)
+        published = validated_publication_date(published)
         if (
             parsed.scheme == "https"
             and parsed.hostname == base_host
             and cleaned_title
+            and published
             and len(entries) < 200
         ):
             entries.append({
@@ -478,20 +553,37 @@ def extract_embedded_article_metadata(
                 "candidate_provenance": "article",
             })
 
-    for match in re.finditer(
-        r'<p[^>]+class=["\'][^"\']*\btitle\b[^"\']*["\'][^>]*>\s*'
-        r'<a[^>]+href=["\']([^"\']+)["\'][^>]*>(.*?)</a>.*?'
-        r'<p[^>]+class=["\'][^"\']*\bdate\b[^"\']*["\'][^>]*>\s*\(?'
-        r'(20\d{2})/(\d{1,2})/(\d{1,2})',
-        text,
+    title_pattern = re.compile(
+        r'<p[^>]+class=["\'][^"\']*\btitle\b[^"\']*["\'][^>]*>.*?</p>',
         re.IGNORECASE | re.DOTALL,
-    ):
-        year, month, day = map(int, match.groups()[2:])
+    )
+    title_matches = list(title_pattern.finditer(text))
+    for index, title_match in enumerate(title_matches):
+        record_end = (
+            title_matches[index + 1].start()
+            if index + 1 < len(title_matches)
+            else len(text)
+        )
+        record = text[title_match.start():record_end]
+        link = re.search(
+            r'<a[^>]+href=["\']([^"\']+)["\'][^>]*>(.*?)</a>',
+            title_match.group(0),
+            re.IGNORECASE | re.DOTALL,
+        )
+        date_match = re.search(
+            r'<p[^>]+class=["\'][^"\']*\bdate\b[^"\']*["\'][^>]*>\s*\(?'
+            r'(20\d{2})/(\d{1,2})/(\d{1,2})',
+            record,
+            re.IGNORECASE | re.DOTALL,
+        )
+        if not link or not date_match:
+            continue
+        year, month, day = map(int, date_match.groups())
         try:
             published = date(year, month, day).isoformat()
         except ValueError:
             continue
-        append(match.group(2), match.group(1), published)
+        append(link.group(2), link.group(1), published)
 
     for match in re.finditer(
         r"\{'url':'([^']+)','title':'([^']*)'.{0,5000}?'date':'"
@@ -543,18 +635,18 @@ def extract_primary_publication_date(content: bytes, final_url: str) -> Optional
     target = canonical_url(final_url)
     for entry in extract_json_ld(content, final_url):
         if entry.get("url") and canonical_url(str(entry["url"])) == target:
-            return entry.get("published")
+            return validated_publication_date(entry.get("published"))
     text = content.decode("utf-8", errors="replace")
     meta = re.search(
-        r"<meta[^>]+(?:property|name)=[\"'](?:article:published_time|datePublished|date)[\"'][^>]+content=[\"']([^\"']+)",
+        r"<meta[^>]+(?:property|name)=[\"'](?:article:published_time|datePublished)[\"'][^>]+content=[\"']([^\"']+)",
         text, re.IGNORECASE,
     )
     if not meta:
         meta = re.search(
-            r"<meta[^>]+content=[\"']([^\"']+)[\"'][^>]+(?:property|name)=[\"'](?:article:published_time|datePublished|date)[\"']",
+            r"<meta[^>]+content=[\"']([^\"']+)[\"'][^>]+(?:property|name)=[\"'](?:article:published_time|datePublished)[\"']",
             text, re.IGNORECASE,
         )
-    return clean_text(meta.group(1), 200) if meta else None
+    return validated_publication_date(meta.group(1)) if meta else None
 
 
 def extract_content(content: bytes, content_type: str, final_url: str) -> dict[str, Any]:
@@ -585,15 +677,25 @@ def extract_content(content: bytes, content_type: str, final_url: str) -> dict[s
             by_url[key] = entry
             combined.append(entry)
             continue
-        existing["published"] = existing.get("published") or entry.get("published")
+        existing["published"] = validated_publication_date(
+            existing.get("published") or entry.get("published")
+        )
         existing["candidate_provenance"] = (
             existing.get("candidate_provenance") or entry.get("candidate_provenance")
         )
     combined = combined[:400]
+    candidates = [
+        entry for entry in combined
+        if entry.get("candidate_provenance") in {"article", "json_ld"}
+    ]
     return {
         "format": "html_links",
         "entry_count": len(combined),
-        "date_evidence_count": sum(bool(entry["published"]) for entry in combined),
+        "candidate_entry_count": len(candidates),
+        "date_evidence_count": sum(
+            bool(validated_publication_date(entry.get("published")))
+            for entry in candidates
+        ),
         "entries": combined,
     }
 
@@ -621,6 +723,7 @@ def collect_source(
     source: dict[str, Any],
     hosts: set[str],
     output_root: Path,
+    run_date: Optional[date] = None,
 ) -> dict[str, Any]:
     """Try feed first, then the public page, retaining an audit of both."""
     attempts: list[dict[str, Any]] = []
@@ -651,7 +754,11 @@ def collect_source(
                 raise CollectionError("empty_extract")
             if (
                 extract["format"] == "html_links"
-                and extract.get("date_evidence_count", 0) == 0
+                and (
+                    extract.get("candidate_entry_count", 0) == 0
+                    or extract.get("date_evidence_count", 0)
+                    != extract.get("candidate_entry_count", 0)
+                )
             ):
                 raise CollectionError("html_extract_lacks_publication_date_evidence")
             filename = safe_filename(index, source["name"], method)
@@ -665,7 +772,7 @@ def collect_source(
                 json.dumps(extract, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
             )
             attempts.append({"method": method, "url": url, "status": "fetched"})
-            return {
+            result = {
                 "name": source["name"],
                 "tier": source["tier"],
                 "status": "fetched",
@@ -681,6 +788,13 @@ def collect_source(
                 "extracted_entry_count": extract["entry_count"],
                 "attempts": attempts,
             }
+            if run_date is not None:
+                result.update({
+                    "jst_window_start": (run_date - timedelta(days=6)).isoformat(),
+                    "jst_window_end": run_date.isoformat(),
+                    "jst_window_item_count": jst_window_item_count(extract, run_date),
+                })
+            return result
         except RobotsDisallowed as exc:
             constraint_record = {
                 "method": method,
@@ -852,7 +966,9 @@ def verify_resolutions(
                     if entry.get("candidate_provenance") in {"article", "json_ld"}
                 ]
             )
-        published_dates = [entry.get("published") for entry in candidates]
+        published_dates = [
+            validated_publication_date(entry.get("published")) for entry in candidates
+        ]
         if status == "verified_fallback" and (
             not published_dates or any(not value for value in published_dates)
         ):
@@ -919,8 +1035,11 @@ def main(argv: list[str]) -> int:
         if len(argv) == 6 and argv[1] == "--verify-resolutions":
             verify_resolutions(Path(argv[2]), Path(argv[3]), Path(argv[4]), Path(argv[5]))
             return 0
-        if len(argv) != 3:
-            print("usage: collect_public_sources.py CATALOG OUTPUT_ROOT", file=sys.stderr)
+        if len(argv) != 4:
+            print(
+                "usage: collect_public_sources.py CATALOG OUTPUT_ROOT STARTED_AT",
+                file=sys.stderr,
+            )
             return 64
         catalog_path = Path(argv[1])
         sources = load_catalog(catalog_path)
@@ -930,11 +1049,19 @@ def main(argv: list[str]) -> int:
             if source["feed_url"]:
                 validate_url(source["feed_url"], hosts)
         output_root = resolve_output_root(argv[2])
+        run_date = publication_date_in_jst(argv[3])
+        if run_date is None:
+            raise CollectionError("started-at timestamp is invalid")
         results: list[Optional[dict[str, Any]]] = [None] * len(sources)
         with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
             futures = {
                 executor.submit(
-                    collect_source, i, source, source_hosts(source), output_root
+                    collect_source,
+                    i,
+                    source,
+                    source_hosts(source),
+                    output_root,
+                    run_date,
                 ): i
                 for i, source in enumerate(sources, start=1)
             }

@@ -402,8 +402,20 @@ def validate_source_coverage(
                 start <= value <= run_date
                 for value in dated_entries
             )
+            manifest_count = source_evidence.get("jst_window_item_count")
+            if (
+                type(manifest_count) is not int
+                or manifest_count != evidence_count
+                or source_evidence.get("jst_window_start") != start.isoformat()
+                or source_evidence.get("jst_window_end") != run_date.isoformat()
+            ):
+                raise ValidationError(
+                    f"source manifest JST window count is invalid for {name}"
+                )
             if item_count != evidence_count:
-                raise ValidationError("summary source item count does not match dated extract evidence")
+                raise ValidationError(
+                    f"summary source item count does not match dated extract evidence for {name}"
+                )
         elif source_evidence.get("status") == "access_constraint":
             expected_method = {"rss": "RSS", "public_page": "公開ページ"}.get(
                 source_evidence.get("method")

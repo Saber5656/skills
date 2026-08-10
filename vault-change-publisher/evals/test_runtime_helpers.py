@@ -12,7 +12,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Optional
 from unittest import mock
@@ -170,6 +170,9 @@ def write_source_manifest(root: Path) -> Path:
                 "name": source["name"], "tier": source["tier"], "status": "fetched",
                 "method": method, "final_url": url, "attempts": [],
                 "extract_file": extract_file, "extracted_entry_count": 1,
+                "jst_window_start": "2026-07-25",
+                "jst_window_end": "2026-07-31",
+                "jst_window_item_count": 1 if index == 0 else 0,
             }
             sources.append(evidence)
     path = source_root / "source-manifest.json"
@@ -199,6 +202,7 @@ def write_minimal_coverage_fixture(
     count: int = 1,
     confirmed_url: Optional[str] = None,
     reason: str = "fixture",
+    run_date: date = date(2026, 7, 31),
 ) -> tuple[str, Path, Path, Path]:
     """Create one-source sealed coverage evidence for focused validator tests."""
     catalog = root / "catalog.json"
@@ -234,6 +238,16 @@ def write_minimal_coverage_fixture(
         "extract_file": extract.name,
         "extracted_entry_count": len(extract_entries),
         "attempts": [],
+        "jst_window_start": (run_date - timedelta(days=6)).isoformat(),
+        "jst_window_end": run_date.isoformat(),
+        "jst_window_item_count": sum(
+            run_date - timedelta(days=6) <= published <= run_date
+            for published in (
+                COLLECTION_VALIDATOR_MODULE.parse_publication_date(item.get("published"))
+                for item in extract_entries
+            )
+            if published is not None
+        ),
     }
     evidence.update(evidence_updates or {})
     manifest.write_text(
@@ -1562,6 +1576,7 @@ def load_environment(*, checkout_root, environ, require_catalog):
         partial_result = {
             "outcome": "partial_publication",
             "phase": "local_commit",
+            "publication_context_sha256": review["publication_context_sha256"],
             "agents_vault": {
                 "commit_status": "failed",
                 "commit_hashes": [agents_after],
@@ -1582,7 +1597,6 @@ def load_environment(*, checkout_root, environ, require_catalog):
             },
             "evidence_finalization_commit": None,
         }
-        output.write_text(json.dumps(partial_result), encoding="utf-8")
         actual_agents = {
             "commit_status": "complete",
             "commit_hashes": [agents_after],
@@ -1603,8 +1617,14 @@ def load_environment(*, checkout_root, environ, require_catalog):
         }
         captured = {
             "agents_vault": {"dirty_paths": [], "local_head": agents_after},
-            "user_vault": {},
+            "user_vault": {
+                "dirty_paths": ["summary.md"],
+                "local_head": user_before,
+                "dirty_digest": "f" * 64,
+            },
         }
+        partial_result["resumable_state"] = captured
+        output.write_text(json.dumps(partial_result), encoding="utf-8")
 
         with mock.patch.object(
             COMMITTER_MODULE, "validate_final_worktree"
@@ -1632,8 +1652,84 @@ def load_environment(*, checkout_root, environ, require_catalog):
         result = json.loads(output.read_text())
         self.assertEqual(result["outcome"], "ready_to_push")
         self.assertEqual(result["agents_vault"]["commit_status"], "complete")
+        self.assertEqual(result["agents_vault"]["commit_hashes"], [agents_after])
         self.assertEqual(result["user_vault"], user_result)
         resumed_commit.assert_called_once()
+
+        complete_partial = json.loads(json.dumps(partial_result))
+        complete_partial["agents_vault"]["commit_status"] = "complete"
+        output.write_text(json.dumps(complete_partial), encoding="utf-8")
+        with mock.patch.object(
+            COMMITTER_MODULE, "validate_final_worktree"
+        ), mock.patch.object(
+            COMMITTER_MODULE, "current_state", return_value=actual_agents
+        ), mock.patch.object(
+            COMMITTER_MODULE, "capture_state", return_value=captured
+        ), mock.patch.object(
+            COMMITTER_MODULE, "commit_groups", return_value=user_result
+        ) as complete_resume_commit:
+            complete_status = COMMITTER_MODULE.main(
+                [
+                    "commit-reviewed-publication.py",
+                    *(str(path) for path in input_paths),
+                    str(context_path),
+                    str(review_path),
+                    "/unused-installer",
+                    "/unused-capture",
+                    hashlib.sha256(review_path.read_bytes()).hexdigest(),
+                    str(output),
+                ]
+            )
+        self.assertEqual(complete_status, 0)
+        complete_result = json.loads(output.read_text())
+        self.assertEqual(
+            complete_result["agents_vault"]["commit_hashes"], [agents_after]
+        )
+        complete_resume_commit.assert_called_once()
+
+        output.write_text(json.dumps(partial_result), encoding="utf-8")
+        drifted_capture = json.loads(json.dumps(captured))
+        drifted_capture["user_vault"]["dirty_digest"] = "9" * 64
+        with mock.patch.object(
+            COMMITTER_MODULE, "capture_state", return_value=drifted_capture
+        ), mock.patch.object(
+            COMMITTER_MODULE, "commit_groups"
+        ) as user_drift_commit:
+            user_drift = COMMITTER_MODULE.main(
+                [
+                    "commit-reviewed-publication.py",
+                    *(str(path) for path in input_paths),
+                    str(context_path),
+                    str(review_path),
+                    "/unused-installer",
+                    "/unused-capture",
+                    hashlib.sha256(review_path.read_bytes()).hexdigest(),
+                    str(output),
+                ]
+            )
+        self.assertEqual(user_drift, 75)
+        self.assertIn("Vaults no longer match", json.loads(output.read_text())["next_action"])
+        user_drift_commit.assert_not_called()
+
+        wrong_context = json.loads(json.dumps(partial_result))
+        wrong_context["publication_context_sha256"] = "0" * 64
+        output.write_text(json.dumps(wrong_context), encoding="utf-8")
+        with mock.patch.object(COMMITTER_MODULE, "commit_groups") as context_commit:
+            wrong_context_status = COMMITTER_MODULE.main(
+                [
+                    "commit-reviewed-publication.py",
+                    *(str(path) for path in input_paths),
+                    str(context_path),
+                    str(review_path),
+                    "/unused-installer",
+                    "/unused-capture",
+                    hashlib.sha256(review_path.read_bytes()).hexdigest(),
+                    str(output),
+                ]
+            )
+        self.assertEqual(wrong_context_status, 75)
+        self.assertIn("not a resumable", json.loads(output.read_text())["next_action"])
+        context_commit.assert_not_called()
 
         output.write_text(json.dumps(partial_result), encoding="utf-8")
         drifted_agents = dict(actual_agents, local_head="9" * 40)
@@ -1641,6 +1737,8 @@ def load_environment(*, checkout_root, environ, require_catalog):
             COMMITTER_MODULE, "validate_final_worktree"
         ), mock.patch.object(
             COMMITTER_MODULE, "current_state", return_value=drifted_agents
+        ), mock.patch.object(
+            COMMITTER_MODULE, "capture_state", return_value=captured
         ), mock.patch.object(
             COMMITTER_MODULE, "commit_groups"
         ) as rejected_commit:
@@ -2278,6 +2376,7 @@ def load_environment(*, checkout_root, environ, require_catalog):
             root,
             extract_entries=entries,
             count=2,
+            run_date=date(2026, 8, 10),
         )
         COLLECTION_VALIDATOR_MODULE.validate_source_coverage(
             summary, catalog, manifest, verified, date(2026, 8, 10)
@@ -2290,6 +2389,63 @@ def load_environment(*, checkout_root, environ, require_catalog):
         ):
             COLLECTION_VALIDATOR_MODULE.validate_source_coverage(
                 wrong_summary, catalog, manifest, verified, date(2026, 8, 10)
+            )
+
+    def test_collection_validator_rederives_manifest_window_count(self) -> None:
+        """Accept the trusted count hint only when sealed dates reproduce it."""
+        root = self.workdir / "manifest-window-count"
+        root.mkdir()
+        summary, catalog, manifest, verified = write_minimal_coverage_fixture(
+            root,
+            extract_entries=[
+                {"url": "https://example.test/in", "published": "2026-08-10"},
+                {"url": "https://example.test/out", "published": "2026-08-03"},
+            ],
+            evidence_updates={
+                "jst_window_start": "2026-08-04",
+                "jst_window_end": "2026-08-10",
+                "jst_window_item_count": 1,
+            },
+            count=1,
+            run_date=date(2026, 8, 10),
+        )
+        COLLECTION_VALIDATOR_MODULE.validate_source_coverage(
+            summary, catalog, manifest, verified, date(2026, 8, 10)
+        )
+        payload = json.loads(manifest.read_text())
+        payload["sources"][0]["jst_window_item_count"] = 0
+        manifest.write_text(json.dumps(payload), encoding="utf-8")
+        with self.assertRaisesRegex(
+            COLLECTION_VALIDATOR_MODULE.ValidationError,
+            "manifest JST window count is invalid",
+        ):
+            COLLECTION_VALIDATOR_MODULE.validate_source_coverage(
+                summary, catalog, manifest, verified, date(2026, 8, 10)
+            )
+        for invalid in (None, True):
+            payload = json.loads(manifest.read_text())
+            if invalid is None:
+                payload["sources"][0].pop("jst_window_item_count", None)
+            else:
+                payload["sources"][0]["jst_window_item_count"] = invalid
+            manifest.write_text(json.dumps(payload), encoding="utf-8")
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(
+                COLLECTION_VALIDATOR_MODULE.ValidationError,
+                "manifest JST window count is invalid",
+            ):
+                COLLECTION_VALIDATOR_MODULE.validate_source_coverage(
+                    summary, catalog, manifest, verified, date(2026, 8, 10)
+                )
+        payload = json.loads(manifest.read_text())
+        payload["sources"][0]["jst_window_item_count"] = 1
+        payload["sources"][0].pop("jst_window_start", None)
+        manifest.write_text(json.dumps(payload), encoding="utf-8")
+        with self.assertRaisesRegex(
+            COLLECTION_VALIDATOR_MODULE.ValidationError,
+            "manifest JST window count is invalid",
+        ):
+            COLLECTION_VALIDATOR_MODULE.validate_source_coverage(
+                summary, catalog, manifest, verified, date(2026, 8, 10)
             )
 
     def test_collection_validator_binds_supplemental_date_to_extract_url(self) -> None:
@@ -3593,6 +3749,7 @@ def load_environment(*, checkout_root, environ, require_catalog):
         (runtime / "collect-public-sources.py").write_text(
             """#!/usr/bin/env python3
 import hashlib, json, os, sys
+from datetime import date,timedelta
 from pathlib import Path
 if sys.argv[1] == "--verify-resolutions":
     request=json.loads(Path(sys.argv[4]).read_text())
@@ -3600,13 +3757,14 @@ if sys.argv[1] == "--verify-resolutions":
     raise SystemExit(0)
 catalog_path=Path(sys.argv[1]); output=Path(sys.argv[2]); output.mkdir()
 catalog=json.loads(catalog_path.read_text())
+run_date=date.fromisoformat(sys.argv[3][:10]); window_start=run_date-timedelta(days=6)
 sources=[]
 for index,source in enumerate(catalog["sources"]):
     url=source["feed_url"] or source["page_url"]
     method="rss" if source["feed_url"] else "public_page"
     extract_file=f"source-{index}.extract.json"
     (output/extract_file).write_text(json.dumps({"format":"feed" if method=="rss" else "html_links","entries":[{"url":f"{url}?fixture={index}","published":"2020-01-01"}]}))
-    sources.append({"name":source["name"],"tier":source["tier"],"status":"fetched","method":method,"final_url":url,"extract_file":extract_file,"extracted_entry_count":1,"attempts":[]})
+    sources.append({"name":source["name"],"tier":source["tier"],"status":"fetched","method":method,"final_url":url,"extract_file":extract_file,"extracted_entry_count":1,"jst_window_start":window_start.isoformat(),"jst_window_end":run_date.isoformat(),"jst_window_item_count":0,"attempts":[]})
 manifest={"catalog_sha256":hashlib.sha256(catalog_path.read_bytes()).hexdigest(),"sources":sources}
 (output/"source-manifest.json").write_text(json.dumps(manifest))
 print(json.dumps(manifest))

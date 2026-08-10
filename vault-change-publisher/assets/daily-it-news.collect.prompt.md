@@ -67,6 +67,10 @@ Runtime context supplies:
    `期間内件数` must exactly equal the sealed dated entries in the inclusive JST
    window defined in step 4; `対象期間記事なし` requires
    evidence that the dated candidates checked do not fall in the window.
+   For every direct manifest entry whose status is `fetched`, copy the trusted
+   `jst_window_item_count` exactly into `期間内件数`; do not independently recount
+   or override it. The trusted validator rederives this value from the sealed
+   extract before accepting the row.
    A public source is not complete until an RSS/page/search/official-alternate
    result is verified by the fetcher's source manifest. `アクセス制約` is only for confirmed login, subscription,
    robots, or CAPTCHA restrictions; generic 401/403 or tool failure still needs

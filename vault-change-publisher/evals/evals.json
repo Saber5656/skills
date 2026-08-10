@@ -136,6 +136,30 @@
       "expected_output": "2026-08-04から2026-08-10までだけを数え、daily_pipeline_status=complete、vault_artifacts_complete=true、next_action=nullを返す。publisher handoffを未完了理由にしない。",
       "files": [],
       "expectations": ["uses the inclusive JST run_date-6 through run_date window", "excludes run_date-7", "maps a fully validated collection to complete, true, and null", "leaves trusted publication to the runner"]
+    },
+    {
+      "id": 22,
+      "name": "context_bound_partial_resume",
+      "prompt": "Agents Vault commit後にUser Vault commit前で停止したpartial publicationを再開してください。",
+      "expected_output": "同じpublication contextかつ記録済み両Vault完全状態と一致する場合だけUser Vault commitへ進む。",
+      "files": [],
+      "expectations": ["binds a partial result to the current publication context digest", "revalidates the complete two-Vault state before mutation", "builds the resumed Agents result from current Git state", "rejects User Vault drift before creating another commit"]
+    },
+    {
+      "id": 23,
+      "name": "evidence_fallback_test_scope",
+      "prompt": "runner templateでevidence preparation失敗時にfinalizerがmissing planを使わないことを検証してください。",
+      "expected_output": "EVIDENCE_PREPARE_STATUS branchだけを抽出し、fallback blockの存在とEVIDENCE_PLAN非参照を検証する。",
+      "files": [],
+      "expectations": ["anchors the assertion to the evidence-preparation branch", "accepts an indented else boundary", "does not inspect unrelated top-level branches"]
+    },
+    {
+      "id": 24,
+      "name": "rederive_trusted_jst_window_count",
+      "prompt": "collection summaryはmanifestのjst_window_item_countを監査行へコピーしました。publication前に検証してください。",
+      "expected_output": "manifestのwindow境界と件数をsealed extractから再計算し、summary、manifest、再計算値の3者が一致する場合だけ通過する。",
+      "files": [],
+      "expectations": ["rejects a manifest count that differs from sealed dates", "rejects mismatched JST window boundaries", "rejects a summary row that differs from the recomputed count", "does not trust model output as the count authority"]
     }
   ]
 }

@@ -13,6 +13,10 @@ ROOT = Path(__file__).parents[2]
 class CollectionPromptPrivacyTests(unittest.TestCase):
     """Ensure prompt and PVA instructions agree on artifact privacy."""
 
+    @staticmethod
+    def _flat(content: str) -> str:
+        return " ".join(content.split())
+
     def test_collection_prompt_requires_formatter_and_forbids_staging_path(self) -> None:
         prompt = (
             ROOT / "vault-change-publisher/assets/daily-it-news.collect.prompt.md"
@@ -73,21 +77,34 @@ class CollectionPromptPrivacyTests(unittest.TestCase):
         self.assertIn("specific official article page", prompt)
         self.assertIn("具体的な公式記事ページ", skill)
 
+    def test_direct_counts_are_copied_from_trusted_manifest(self) -> None:
+        """Keep routine audit counts deterministic instead of model-recounted."""
+        prompt = (
+            ROOT / "vault-change-publisher/assets/daily-it-news.collect.prompt.md"
+        ).read_text(encoding="utf-8")
+        skill = (ROOT / "summarize-it-news/SKILL.md").read_text(encoding="utf-8")
+        for content in (prompt, skill):
+            self.assertIn("jst_window_item_count", content)
+        self.assertIn("copy the trusted", prompt)
+        self.assertIn("再集計・上書きしない", skill)
+
     def test_approved_publication_has_no_excluded_path_placeholders(self) -> None:
         prompt = (
             ROOT / "vault-change-publisher/assets/daily-it-news.review.prompt.md"
         ).read_text(encoding="utf-8")
+        flat = self._flat(prompt)
         self.assertIn("both `excluded_paths` and", prompt)
         self.assertIn("must be empty arrays", prompt)
         self.assertIn("`.obsidian/`", prompt)
-        self.assertIn("return\n   `blocked`", prompt)
+        self.assertIn("return `blocked`", flat)
 
     def test_resolution_request_is_limited_to_unresolved_sources(self) -> None:
         prompt = (
             ROOT / "vault-change-publisher/assets/daily-it-news.collect.prompt.md"
         ).read_text(encoding="utf-8")
+        flat = self._flat(prompt)
         self.assertIn("status is exactly `needs_search_fallback`", prompt)
-        self.assertIn("Never add a\n   redundant resolution", prompt)
+        self.assertIn("Never add a redundant resolution", flat)
         self.assertIn("direct manifest `access_constraint`", prompt)
 
     def test_audit_method_is_one_exact_manifest_mapping(self) -> None:

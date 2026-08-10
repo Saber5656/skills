@@ -111,7 +111,7 @@ collection_completed_at: <ISO 8601 JST>
 | サイト | RSS URL | フォールバック |
 |--------|---------|---------------|
 | MIT News AI | なし | https://news.mit.edu/topic/artificial-intelligence2 |
-| Ben's Bites | なし | https://www.bensbites.com/ |
+| Ben's Bites | https://www.bensbites.com/feed | https://www.bensbites.com/ |
 | KrebsOnSecurity | https://krebsonsecurity.com/feed/ | https://krebsonsecurity.com/ |
 | The CyberWire | https://thecyberwire.com/feeds/rss.xml | https://thecyberwire.com/newsletters/daily-briefing |
 | The New Stack | なし（403） | https://thenewstack.io/ |
@@ -128,7 +128,7 @@ collection_completed_at: <ISO 8601 JST>
 
 ## 収集ルール
 
-1. 対象期間はJST暦日の`run_date - 6 days`から`run_date`まで（両端を含む）。RFC 2822 / ISO 8601 timestampはJSTへ正規化してから暦日を比較し、`run_date - 7 days`は除外する。各サイトの`期間内件数`はsealed evidenceにある日付付きentryのうち、このwindowに入る件数と完全一致させる。
+1. 対象期間はJST暦日の`run_date - 6 days`から`run_date`まで（両端を含む）。RFC 2822 / ISO 8601 timestampはJSTへ正規化してから暦日を比較し、`run_date - 7 days`は除外する。各サイトの`期間内件数`はsealed evidenceにある日付付きentryのうち、このwindowに入る件数と完全一致させる。direct manifestの`fetched` sourceはtrusted collectorが算出した`jst_window_item_count`をそのまま監査行へコピーし、model側で再集計・上書きしない。この値はtrusted validatorがsealed extractから再計算して照合する。
 2. 出典は「媒体名・URL・公開日（ISO 8601, JST）」を記載。不明は「不明」。可能ならイベント発生日と記事公開日を区別。
 3. 数値・規模・金額は単位つきで具体的に。推測・あいまい表現は禁止。
 4. 事実と解釈を分離。解釈・主観は「総括」にのみ記載。
