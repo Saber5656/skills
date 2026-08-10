@@ -160,6 +160,14 @@
       "expected_output": "manifestのwindow境界と件数をsealed extractから再計算し、summary、manifest、再計算値の3者が一致する場合だけ通過する。",
       "files": [],
       "expectations": ["rejects a manifest count that differs from sealed dates", "rejects mismatched JST window boundaries", "rejects a summary row that differs from the recomputed count", "does not trust model output as the count authority"]
+    },
+    {
+      "id": 25,
+      "name": "partial_result_resume_field_consistency",
+      "prompt": "publication context digest算出前にlocal progressを検出したfailure resultと、resumable_stateが欠落した既存partial resultを安全に扱ってください。",
+      "expected_output": "前者はschema-validなnon-resumable partial evidenceとして保持し、後者はcommit前にresume拒否する。resume binding fieldsは常に両方存在するか両方存在しない。",
+      "files": [],
+      "expectations": ["preserves partial publication evidence when context binding is unavailable", "emits publication context digest and resumable state only as a pair", "rejects a partial result missing resumable_state before commit_groups", "does not misclassify progressed local state as blocked"]
     }
   ]
 }

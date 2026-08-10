@@ -1731,6 +1731,26 @@ def load_environment(*, checkout_root, environ, require_catalog):
         self.assertIn("not a resumable", json.loads(output.read_text())["next_action"])
         context_commit.assert_not_called()
 
+        missing_state = json.loads(json.dumps(partial_result))
+        missing_state.pop("resumable_state")
+        output.write_text(json.dumps(missing_state), encoding="utf-8")
+        with mock.patch.object(COMMITTER_MODULE, "commit_groups") as state_commit:
+            missing_state_status = COMMITTER_MODULE.main(
+                [
+                    "commit-reviewed-publication.py",
+                    *(str(path) for path in input_paths),
+                    str(context_path),
+                    str(review_path),
+                    "/unused-installer",
+                    "/unused-capture",
+                    hashlib.sha256(review_path.read_bytes()).hexdigest(),
+                    str(output),
+                ]
+            )
+        self.assertEqual(missing_state_status, 75)
+        self.assertIn("not a resumable", json.loads(output.read_text())["next_action"])
+        state_commit.assert_not_called()
+
         output.write_text(json.dumps(partial_result), encoding="utf-8")
         drifted_agents = dict(actual_agents, local_head="9" * 40)
         with mock.patch.object(
@@ -1820,6 +1840,58 @@ def load_environment(*, checkout_root, environ, require_catalog):
         self.assertEqual(result.returncode, 75)
         self.assertEqual(json.loads(output.read_text())["outcome"], "blocked")
         self.assertNotIn("Traceback", result.stderr)
+
+    def test_partial_failure_without_context_is_valid_but_not_resumable(self) -> None:
+        """Preserve early local progress without fabricating resume bindings."""
+        before = {
+            "agents_vault": {"local_head": "a" * 40, "dirty_digest": "d" * 64},
+            "user_vault": {"local_head": "b" * 40, "dirty_digest": "e" * 64},
+        }
+        progressed = {
+            "commit_status": "failed",
+            "commit_hashes": ["c" * 40],
+            "pre_local_head": "a" * 40,
+            "local_head": "c" * 40,
+            "pre_dirty_digest": "d" * 64,
+            "post_dirty_digest": hashlib.sha256(b"").hexdigest(),
+            "clean": True,
+        }
+        unchanged = {
+            "commit_status": "not_started",
+            "commit_hashes": [],
+            "pre_local_head": "b" * 40,
+            "local_head": "b" * 40,
+            "pre_dirty_digest": "e" * 64,
+            "post_dirty_digest": "e" * 64,
+            "clean": False,
+        }
+        with mock.patch.object(
+            COMMITTER_MODULE, "current_state", side_effect=[progressed, unchanged]
+        ):
+            partial = COMMITTER_MODULE.result_after_failure(
+                {
+                    "agents_vault_root": "/agents",
+                    "agents_git_dir": "/agents/.git",
+                    "user_vault_root": "/user",
+                    "user_git_dir": "/user/.git",
+                },
+                before,
+                {"daily_pipeline_status": "complete"},
+                {"summary_target": "/user/summary.md", "advisory_target": "/agents/advisory.md"},
+                "early failure",
+            )
+        self.assertEqual(partial["outcome"], "partial_publication")
+        self.assertNotIn("publication_context_sha256", partial)
+        self.assertNotIn("resumable_state", partial)
+        schema = json.loads(
+            (SKILL_ROOT / "references" / "publication-commit-result.schema.json").read_text()
+        )
+        CANONICAL_MODULE.validate(partial, schema, schema)
+        incomplete_binding = dict(
+            partial, publication_context_sha256="f" * 64
+        )
+        with self.assertRaises(CANONICAL_MODULE.CanonicalValidationError):
+            CANONICAL_MODULE.validate(incomplete_binding, schema, schema)
 
     def test_local_committer_rejects_staged_only_before_head_changes(self) -> None:
         """Fail before commit when reviewed index bytes differ from the worktree."""

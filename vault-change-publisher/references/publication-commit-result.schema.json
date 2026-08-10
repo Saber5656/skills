@@ -30,6 +30,14 @@
   },
   "allOf": [
     {
+      "if": {"required": ["publication_context_sha256"]},
+      "then": {"required": ["resumable_state"]}
+    },
+    {
+      "if": {"required": ["resumable_state"]},
+      "then": {"required": ["publication_context_sha256"]}
+    },
+    {
       "if": {"properties": {"outcome": {"const": "ready_to_push"}}},
       "then": {
         "properties": {
@@ -57,7 +65,6 @@
     {
       "if": {"properties": {"outcome": {"const": "partial_publication"}}},
       "then": {
-        "required": ["publication_context_sha256", "resumable_state"],
         "properties": {
           "next_action": {"type": "string", "minLength": 1}
         },

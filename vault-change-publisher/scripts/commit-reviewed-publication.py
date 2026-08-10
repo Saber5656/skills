@@ -742,7 +742,7 @@ def result_after_failure(
         "evidence_finalization_commit": None,
         "next_action": reason,
     }
-    if changed:
+    if changed and publication_context_sha256 is not None:
         result["publication_context_sha256"] = publication_context_sha256
         result["resumable_state"] = resumable_state
     return result
