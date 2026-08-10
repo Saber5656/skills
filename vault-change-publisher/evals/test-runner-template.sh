@@ -63,6 +63,11 @@ fi
 /usr/bin/grep -F -- '"$EVIDENCE_FINALIZER"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- 'git_diff_digest.py' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- 'fail_run 75 artifact_plan' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- '/bin/cp "$INITIAL_PUSH_RESULT" "$PUBLICATION_RESULT"' "$RUNNER" >/dev/null
+if sed -n '/^else$/,/^fi$/p' "$RUNNER" | /usr/bin/grep -F -- '"$EVIDENCE_PLAN"' >/dev/null; then
+  echo "failed evidence preparation must not invoke finalizer with a missing plan" >&2
+  exit 1
+fi
 /usr/bin/grep -F -- 'COLLECTION_OUTPUT_ROOT="$STAGING_ROOT"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- 'local exit_code="$1"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- 'FIXED_FETCHER="$WORKDIR/fetch-vault-main.py"' "$RUNNER" >/dev/null

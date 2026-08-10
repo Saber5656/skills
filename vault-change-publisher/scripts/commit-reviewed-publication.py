@@ -254,6 +254,10 @@ def write_bound_json(directory: Path, name: str, value: object) -> tuple[Path, b
         value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
     ).encode("utf-8")
     path = directory / name
+    if path.exists():
+        if stable_regular_bytes(path) != content:
+            raise CommitError("existing bound publication input differs from context")
+        return path, content
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
@@ -620,6 +624,8 @@ def commit_groups(
             git(
                 repo,
                 git_dir,
+                "-c",
+                "core.whitespace=-blank-at-eol,-blank-at-eof",
                 "diff",
                 "--cached",
                 "--check",
@@ -771,22 +777,43 @@ def main(argv: list[str]) -> int:
             "publication_context_sha256"
         ) != hashlib.sha256(context_bytes).hexdigest():
             raise CommitError("publication review is not approved and context-bound")
-        capture_exact(argv[8], str(bound_runtime), pre)
-        installed = json.loads(
-            subprocess.run(
-                [
-                    argv[7],
-                    str(bound_runtime),
-                    str(bound_collection),
-                    str(bound_plan),
-                ],
-                cwd="/",
-                check=True,
-                capture_output=True,
-                text=True,
-                env=clean_environment(),
-            ).stdout
-        )
+        previous = None
+        if output.exists():
+            candidate = json.loads(stable_regular_bytes(output))
+            if (
+                candidate.get("outcome") == "partial_publication"
+                and candidate.get("phase") == "local_commit"
+                and candidate.get("agents_vault", {}).get("commit_status")
+                in {"complete", "failed"}
+                and candidate.get("user_vault", {}).get("commit_status")
+                == "not_started"
+                and candidate.get("evidence_finalization_commit") is None
+            ):
+                previous = candidate
+            else:
+                raise CommitError("existing commit result is not a resumable partial publication")
+        if previous is None:
+            capture_exact(argv[8], str(bound_runtime), pre)
+            installed = json.loads(
+                subprocess.run(
+                    [
+                        argv[7],
+                        str(bound_runtime),
+                        str(bound_collection),
+                        str(bound_plan),
+                    ],
+                    cwd="/",
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    env=clean_environment(),
+                ).stdout
+            )
+        else:
+            installed = {
+                "summary_target": plan["summary_target"],
+                "advisory_target": plan["advisory_target"],
+            }
         require_bound_bytes(bound_runtime, bound_runtime_bytes)
         require_bound_bytes(bound_collection, bound_collection_bytes)
         require_bound_bytes(bound_plan, bound_plan_bytes)
@@ -801,11 +828,15 @@ def main(argv: list[str]) -> int:
         user_artifact = str(
             Path(plan["summary_target"]).relative_to(runtime["user_vault_root"])
         )
-        installed_state = capture_installed_scope(
-            argv[8],
-            str(bound_runtime),
-            pre,
-            {"agents_vault": agents_artifact, "user_vault": user_artifact},
+        installed_state = (
+            capture_installed_scope(
+                argv[8],
+                str(bound_runtime),
+                pre,
+                {"agents_vault": agents_artifact, "user_vault": user_artifact},
+            )
+            if previous is None
+            else None
         )
         validate_final_worktree(
             str(runtime["agents_vault_root"]),
@@ -821,24 +852,38 @@ def main(argv: list[str]) -> int:
             user_artifact,
             str(collection["summary_sha256"]),
         )
-        agents = commit_groups(
-            str(runtime["agents_vault_root"]),
-            str(runtime["agents_git_dir"]),
-            str(runtime["gitleaks_bin"]),
-            pre["agents_vault"],
-            review["agents_vault"],
-            str(
-                Path(plan["advisory_target"]).relative_to(
-                    runtime["agents_vault_root"]
-                )
-            ),
-            str(collection["advisory_sha256"]),
-            output.parent,
-            publisher_identity,
-            before_update=lambda: capture_exact(
-                argv[8], str(bound_runtime), installed_state
-            ),
-        )
+        if previous is None:
+            agents = commit_groups(
+                str(runtime["agents_vault_root"]),
+                str(runtime["agents_git_dir"]),
+                str(runtime["gitleaks_bin"]),
+                pre["agents_vault"],
+                review["agents_vault"],
+                str(
+                    Path(plan["advisory_target"]).relative_to(
+                        runtime["agents_vault_root"]
+                    )
+                ),
+                str(collection["advisory_sha256"]),
+                output.parent,
+                publisher_identity,
+                before_update=lambda: capture_exact(
+                    argv[8], str(bound_runtime), installed_state
+                ),
+            )
+        else:
+            agents = dict(previous["agents_vault"])
+            actual_agents = current_state(
+                str(runtime["agents_vault_root"]),
+                str(runtime["agents_git_dir"]),
+                pre["agents_vault"],
+            )
+            if any(
+                actual_agents[field] != agents.get(field)
+                for field in ("commit_hashes", "local_head", "clean")
+            ) or not actual_agents["clean"]:
+                raise CommitError("Agents Vault no longer matches the resumable result")
+            agents["commit_status"] = "complete"
         after_agents = capture_state(argv[8], str(bound_runtime))
         if (
             after_agents["agents_vault"]["dirty_paths"]
