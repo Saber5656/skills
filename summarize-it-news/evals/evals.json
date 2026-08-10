@@ -105,6 +105,14 @@
       "expected_output": "trusted collectorのjst_window_item_countをそのまま期間内件数へコピーし、validatorによるsealed date再計算と一致させる。",
       "files": [],
       "expectations": ["derives the count deterministically from parseable sealed dates", "normalizes timestamps to JST before the calendar comparison", "copies the trusted direct-source count without model recounting", "keeps validator recomputation as the acceptance authority"]
+    },
+    {
+      "id": 11,
+      "name": "html_void_element_date_state",
+      "prompt": "記事カードの日付要素にbrやimgがあり、別カードには閉じ忘れのnested tagがあります。後続記事も含めて公開日を抽出してください。",
+      "expected_output": "HTML void elementを深さへ加算せず、article終了時に日付capture stateをresetして、1カードのmalformed markupが後続カードを壊さない。",
+      "files": [],
+      "expectations": ["does not increment date capture depth for HTML void elements", "resets date capture state when the enclosing article closes", "continues extracting validated dates from later article cards"]
     }
   ]
 }

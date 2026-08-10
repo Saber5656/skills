@@ -223,6 +223,26 @@ class PublicSourceCollectorTests(unittest.TestCase):
         self.assertEqual(extracted["entries"][0]["published"], "2026-08-04")
         self.assertEqual(extracted["date_evidence_count"], 1)
 
+    def test_html_date_capture_ignores_void_depth_and_resets_between_articles(self) -> None:
+        """Do not let void or malformed nested tags poison later card dates."""
+        content = (
+            b'<article><h2><a href="/one">One</a></h2>'
+            b'<span class="date"><br/>2026/8/4</span></article>'
+            b'<article><h2><a href="/broken">Broken</a></h2>'
+            b'<span class="date"><em>malformed</article>'
+            b'<article><h2><a href="/two">Two</a></h2>'
+            b'<span class="date"><img src="x"/>2026/8/5</span></article>'
+            b'<article><h2><a href="/three">Three</a></h2>'
+            b'<span class="date"><br>2026/8/6</span></article>'
+        )
+        extracted = MODULE.extract_content(
+            content, "text/html", "https://example.test/news"
+        )
+        by_url = {entry["url"]: entry for entry in extracted["entries"]}
+        self.assertEqual(by_url["https://example.test/one"]["published"], "2026-08-04")
+        self.assertEqual(by_url["https://example.test/two"]["published"], "2026-08-05")
+        self.assertEqual(by_url["https://example.test/three"]["published"], "2026-08-06")
+
     def test_html_extract_rejects_arbitrary_visible_and_malformed_dates(self) -> None:
         """Do not promote body dates or malformed metadata to publication evidence."""
         content = b'''<article><h2><a href="/card">Support ends 2026-08-04</a></h2></article><script type="application/ld+json">{"@type":"NewsArticle","headline":"Broken","url":"/broken","datePublished":"not-a-date"}</script>'''

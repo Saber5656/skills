@@ -354,6 +354,12 @@ def extract_xml(content: bytes) -> list[dict[str, Optional[str]]]:
     return entries
 
 
+HTML_VOID_ELEMENTS = frozenset({
+    "area", "base", "br", "col", "embed", "hr", "img", "input",
+    "link", "meta", "param", "source", "track", "wbr",
+})
+
+
 class LinkExtractor(HTMLParser):
     """Collect bounded public links and visible anchor text from HTML."""
 
@@ -388,11 +394,16 @@ class LinkExtractor(HTMLParser):
             self.in_time = True
             self.time_text = []
             self.article_published = clean_text(attributes.get("datetime"), 200)
-        if self.date_element_depth:
+        if self.date_element_depth and lowered not in HTML_VOID_ELEMENTS:
             self.date_element_depth += 1
         class_tokens = set((attributes.get("class") or "").lower().split())
-        if not self.date_element_depth and self.article_depth and class_tokens.intersection(
-            {"date", "published", "publication-date", "pubdate"}
+        if (
+            lowered not in HTML_VOID_ELEMENTS
+            and not self.date_element_depth
+            and self.article_depth
+            and class_tokens.intersection(
+                {"date", "published", "publication-date", "pubdate"}
+            )
         ):
             self.date_element_depth = 1
             self.date_element_text = []
@@ -414,6 +425,15 @@ class LinkExtractor(HTMLParser):
         if self.date_element_depth:
             self.date_element_text.append(data)
 
+    def handle_startendtag(
+        self, tag: str, attrs: list[tuple[str, Optional[str]]]
+    ) -> None:
+        """Do not synthesize a depth-closing event for HTML void elements."""
+        if tag.lower() in HTML_VOID_ELEMENTS:
+            self.handle_starttag(tag, attrs)
+            return
+        super().handle_startendtag(tag, attrs)
+
     def handle_endtag(self, tag: str) -> None:
         lowered = tag.lower()
         if lowered == "time" and self.in_time:
@@ -422,7 +442,7 @@ class LinkExtractor(HTMLParser):
             )
             self.in_time = False
             self.time_text = []
-        if self.date_element_depth:
+        if self.date_element_depth and lowered not in HTML_VOID_ELEMENTS:
             self.date_element_depth -= 1
             if self.date_element_depth == 0:
                 self.article_published = self.article_published or validated_publication_date(
@@ -447,6 +467,10 @@ class LinkExtractor(HTMLParser):
                     entry["candidate_provenance"] = "article" if entry is candidate else None
                     if entry is candidate:
                         entry["published"] = entry["published"] or self.article_published
+                self.in_time = False
+                self.time_text = []
+                self.date_element_depth = 0
+                self.date_element_text = []
                 self.article_text = []
         if lowered in {"h1", "h2", "h3", "h4", "h5", "h6"} and self.heading_depth:
             self.heading_depth -= 1
