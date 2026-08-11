@@ -13,7 +13,7 @@
     {"name": "Publickey", "tier": 1, "feed_url": "https://www.publickey1.jp/atom.xml", "page_url": "https://www.publickey1.jp/"},
     {"name": "Zenn", "tier": 1, "feed_url": "https://zenn.dev/feed", "page_url": "https://zenn.dev/"},
     {"name": "MIT News AI", "tier": 2, "feed_url": null, "page_url": "https://news.mit.edu/topic/artificial-intelligence2"},
-    {"name": "Ben's Bites", "tier": 2, "feed_url": null, "page_url": "https://www.bensbites.com/"},
+    {"name": "Ben's Bites", "tier": 2, "feed_url": "https://www.bensbites.com/feed", "page_url": "https://www.bensbites.com/"},
     {"name": "KrebsOnSecurity", "tier": 2, "feed_url": "https://krebsonsecurity.com/feed/", "page_url": "https://krebsonsecurity.com/"},
     {"name": "The CyberWire", "tier": 2, "feed_url": "https://thecyberwire.com/feeds/rss.xml", "page_url": "https://thecyberwire.com/newsletters/daily-briefing"},
     {"name": "The New Stack", "tier": 2, "feed_url": null, "page_url": "https://thenewstack.io/"},

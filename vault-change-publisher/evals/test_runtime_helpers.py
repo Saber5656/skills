@@ -12,7 +12,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Optional
 from unittest import mock
@@ -170,6 +170,9 @@ def write_source_manifest(root: Path) -> Path:
                 "name": source["name"], "tier": source["tier"], "status": "fetched",
                 "method": method, "final_url": url, "attempts": [],
                 "extract_file": extract_file, "extracted_entry_count": 1,
+                "jst_window_start": "2026-07-25",
+                "jst_window_end": "2026-07-31",
+                "jst_window_item_count": 1 if index == 0 else 0,
             }
             sources.append(evidence)
     path = source_root / "source-manifest.json"
@@ -199,6 +202,7 @@ def write_minimal_coverage_fixture(
     count: int = 1,
     confirmed_url: Optional[str] = None,
     reason: str = "fixture",
+    run_date: date = date(2026, 7, 31),
 ) -> tuple[str, Path, Path, Path]:
     """Create one-source sealed coverage evidence for focused validator tests."""
     catalog = root / "catalog.json"
@@ -234,6 +238,16 @@ def write_minimal_coverage_fixture(
         "extract_file": extract.name,
         "extracted_entry_count": len(extract_entries),
         "attempts": [],
+        "jst_window_start": (run_date - timedelta(days=6)).isoformat(),
+        "jst_window_end": run_date.isoformat(),
+        "jst_window_item_count": sum(
+            run_date - timedelta(days=6) <= published <= run_date
+            for published in (
+                COLLECTION_VALIDATOR_MODULE.parse_publication_date(item.get("published"))
+                for item in extract_entries
+            )
+            if published is not None
+        ),
     }
     evidence.update(evidence_updates or {})
     manifest.write_text(
@@ -1300,6 +1314,473 @@ def load_environment(*, checkout_root, environ, require_catalog):
                     added_index,
                 )
 
+    def test_local_committer_preserves_reviewed_markdown_whitespace(self) -> None:
+        """Reviewed Vault content is committed byte-for-byte, including hard breaks."""
+        repo = self.agents
+        git_dir = str(repo / ".git")
+        base = repo / "base.md"
+        base.write_text("base\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "base.md"], check=True)
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo),
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "-q",
+                "-m",
+                "base",
+            ],
+            check=True,
+        )
+        before = subprocess.check_output(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True
+        ).strip()
+        reviewed = repo / "reviewed.md"
+        reviewed.write_text("reviewed line  \n", encoding="utf-8")
+        reviewed_oid = COMMITTER_MODULE.write_blob(
+            str(repo), git_dir, reviewed.read_bytes()
+        )
+        artifact = repo / "artifact.md"
+        artifact.write_text("artifact\n", encoding="utf-8")
+        manifest = {
+            "approved_dirty_entries": [
+                {
+                    "path": "reviewed.md",
+                    "git_blob_oid": reviewed_oid,
+                    "mode": "100644",
+                }
+            ],
+            "commit_groups": [
+                {"message": "approved content", "paths": ["reviewed.md"]},
+                {"message": "publish artifact", "paths": ["artifact.md"]},
+            ],
+        }
+
+        final_state = {
+            "commit_status": "complete",
+            "commit_hashes": ["1" * 40, "2" * 40],
+            "pre_local_head": before,
+            "local_head": "2" * 40,
+            "pre_dirty_digest": hashlib.sha256(b"").hexdigest(),
+            "post_dirty_digest": hashlib.sha256(b"").hexdigest(),
+            "clean": True,
+        }
+        with mock.patch.object(
+            COMMITTER_MODULE, "current_state", return_value=final_state
+        ):
+            result = COMMITTER_MODULE.commit_groups(
+                str(repo),
+                git_dir,
+                str(self.fake_gitleaks),
+                {
+                    "local_head": before,
+                    "dirty_digest": hashlib.sha256(b"").hexdigest(),
+                },
+                manifest,
+                "artifact.md",
+                hashlib.sha256(b"artifact\n").hexdigest(),
+                self.workdir,
+            )
+
+        self.assertEqual(result["commit_status"], "complete")
+        self.assertTrue(result["clean"])
+        self.assertEqual(reviewed.read_bytes(), b"reviewed line  \n")
+
+    def test_fixed_pusher_validates_unquoted_unicode_paths(self) -> None:
+        """Tree validation handles spaces and non-ASCII paths without Git quoting."""
+        repo = self.agents
+        relative = "日本語 フォルダ/要約.md"
+        target = repo / relative
+        target.parent.mkdir(parents=True)
+        target.write_text("reviewed\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", relative], check=True)
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo),
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "-q",
+                "-m",
+                "unicode path",
+            ],
+            check=True,
+        )
+        head = subprocess.check_output(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True
+        ).strip()
+        oid = subprocess.check_output(
+            ["git", "-C", str(repo), "rev-parse", f"{head}:{relative}"], text=True
+        ).strip()
+
+        PUSH_MODULE.validate_dirty_entry(
+            str(repo),
+            head,
+            {"path": relative, "mode": "100644", "git_blob_oid": oid},
+        )
+        PUSH_MODULE.validate_blob_mode(str(repo), head, relative)
+
+    def test_local_committer_rejects_reviewed_conflict_markers(self) -> None:
+        """Whitespace exceptions must not disable Git's conflict-marker guard."""
+        repo = self.agents
+        git_dir = str(repo / ".git")
+        base = repo / "base.md"
+        base.write_text("base\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "base.md"], check=True)
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo),
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "-q",
+                "-m",
+                "base",
+            ],
+            check=True,
+        )
+        before = subprocess.check_output(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True
+        ).strip()
+        reviewed = repo / "reviewed.md"
+        reviewed.write_text("<<<<<<< ours\nvalue\n=======\nother\n>>>>>>> theirs\n")
+        reviewed_oid = COMMITTER_MODULE.write_blob(
+            str(repo), git_dir, reviewed.read_bytes()
+        )
+        artifact = repo / "artifact.md"
+        artifact.write_text("artifact\n", encoding="utf-8")
+        manifest = {
+            "approved_dirty_entries": [
+                {
+                    "path": "reviewed.md",
+                    "git_blob_oid": reviewed_oid,
+                    "mode": "100644",
+                }
+            ],
+            "commit_groups": [
+                {
+                    "message": "approved content",
+                    "paths": ["reviewed.md", "artifact.md"],
+                }
+            ],
+        }
+
+        with self.assertRaises(subprocess.CalledProcessError):
+            COMMITTER_MODULE.commit_groups(
+                str(repo),
+                git_dir,
+                str(self.fake_gitleaks),
+                {
+                    "local_head": before,
+                    "dirty_digest": hashlib.sha256(b"").hexdigest(),
+                },
+                manifest,
+                "artifact.md",
+                hashlib.sha256(b"artifact\n").hexdigest(),
+                self.workdir,
+            )
+        self.assertEqual(
+            subprocess.check_output(
+                ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True
+            ).strip(),
+            before,
+        )
+
+    def test_local_committer_main_resumes_after_agents_commit(self) -> None:
+        """A sealed partial result resumes the uncommitted User Vault only."""
+        resume_root = self.workdir / "resume-main"
+        resume_root.mkdir()
+        agents_root = resume_root / "agents"
+        user_root = resume_root / "user"
+        agents_root.mkdir()
+        user_root.mkdir()
+        advisory = agents_root / "advisory.md"
+        summary = user_root / "summary.md"
+        advisory.write_text("advisory\n", encoding="utf-8")
+        summary.write_text("summary\n", encoding="utf-8")
+        runtime = {
+            "agents_vault_root": str(agents_root),
+            "agents_git_dir": str(agents_root / ".git"),
+            "user_vault_root": str(user_root),
+            "user_git_dir": str(user_root / ".git"),
+            "gitleaks_bin": str(self.fake_gitleaks),
+            "publisher_git_name": "Fixture",
+            "publisher_git_email": "fixture@example.invalid",
+        }
+        agents_before = "a" * 40
+        agents_after = "b" * 40
+        user_before = "c" * 40
+        clean_digest = hashlib.sha256(b"").hexdigest()
+        pre = {
+            "agents_vault": {
+                "local_head": agents_before,
+                "dirty_digest": "d" * 64,
+            },
+            "user_vault": {
+                "local_head": user_before,
+                "dirty_digest": "e" * 64,
+            },
+        }
+        collection = {
+            "daily_pipeline_status": "complete",
+            "summary_sha256": hashlib.sha256(summary.read_bytes()).hexdigest(),
+            "advisory_sha256": hashlib.sha256(advisory.read_bytes()).hexdigest(),
+            "notification_result": "none",
+        }
+        plan = {
+            "summary_target": str(summary),
+            "advisory_target": str(advisory),
+        }
+        context = {
+            "runtime": runtime,
+            "pre_collection_state": pre,
+            "verified_collection": collection,
+            "artifact_plan": plan,
+        }
+        review = {
+            "outcome": "approved",
+            "agents_vault": {},
+            "user_vault": {},
+        }
+        context_path = resume_root / "context.json"
+        context_path.write_text(json.dumps(context), encoding="utf-8")
+        review["publication_context_sha256"] = hashlib.sha256(
+            context_path.read_bytes()
+        ).hexdigest()
+        review_path = resume_root / "review.json"
+        review_path.write_text(json.dumps(review), encoding="utf-8")
+        input_paths = []
+        for name, value in (
+            ("runtime.json", runtime),
+            ("pre.json", pre),
+            ("collection.json", collection),
+            ("plan.json", plan),
+        ):
+            path = resume_root / name
+            path.write_text(json.dumps(value), encoding="utf-8")
+            input_paths.append(path)
+        output = resume_root / "commit-result.json"
+        partial_result = {
+            "outcome": "partial_publication",
+            "phase": "local_commit",
+            "publication_context_sha256": review["publication_context_sha256"],
+            "agents_vault": {
+                "commit_status": "failed",
+                "commit_hashes": [agents_after],
+                "pre_local_head": agents_before,
+                "local_head": agents_after,
+                "pre_dirty_digest": "d" * 64,
+                "post_dirty_digest": clean_digest,
+                "clean": True,
+            },
+            "user_vault": {
+                "commit_status": "not_started",
+                "commit_hashes": [],
+                "pre_local_head": user_before,
+                "local_head": user_before,
+                "pre_dirty_digest": "e" * 64,
+                "post_dirty_digest": "f" * 64,
+                "clean": False,
+            },
+            "evidence_finalization_commit": None,
+        }
+        actual_agents = {
+            "commit_status": "complete",
+            "commit_hashes": [agents_after],
+            "pre_local_head": agents_before,
+            "local_head": agents_after,
+            "pre_dirty_digest": "d" * 64,
+            "post_dirty_digest": clean_digest,
+            "clean": True,
+        }
+        user_result = {
+            "commit_status": "complete",
+            "commit_hashes": ["1" * 40],
+            "pre_local_head": user_before,
+            "local_head": "1" * 40,
+            "pre_dirty_digest": "e" * 64,
+            "post_dirty_digest": clean_digest,
+            "clean": True,
+        }
+        captured = {
+            "agents_vault": {"dirty_paths": [], "local_head": agents_after},
+            "user_vault": {
+                "dirty_paths": ["summary.md"],
+                "local_head": user_before,
+                "dirty_digest": "f" * 64,
+            },
+        }
+        partial_result["resumable_state"] = captured
+        output.write_text(json.dumps(partial_result), encoding="utf-8")
+
+        with mock.patch.object(
+            COMMITTER_MODULE, "validate_final_worktree"
+        ), mock.patch.object(
+            COMMITTER_MODULE, "current_state", return_value=actual_agents
+        ), mock.patch.object(
+            COMMITTER_MODULE, "capture_state", return_value=captured
+        ), mock.patch.object(
+            COMMITTER_MODULE, "commit_groups", return_value=user_result
+        ) as resumed_commit:
+            status = COMMITTER_MODULE.main(
+                [
+                    "commit-reviewed-publication.py",
+                    *(str(path) for path in input_paths),
+                    str(context_path),
+                    str(review_path),
+                    "/unused-installer",
+                    "/unused-capture",
+                    hashlib.sha256(review_path.read_bytes()).hexdigest(),
+                    str(output),
+                ]
+            )
+
+        self.assertEqual(status, 0)
+        result = json.loads(output.read_text())
+        self.assertEqual(result["outcome"], "ready_to_push")
+        self.assertEqual(result["agents_vault"]["commit_status"], "complete")
+        self.assertEqual(result["agents_vault"]["commit_hashes"], [agents_after])
+        self.assertEqual(result["user_vault"], user_result)
+        resumed_commit.assert_called_once()
+
+        complete_partial = json.loads(json.dumps(partial_result))
+        complete_partial["agents_vault"]["commit_status"] = "complete"
+        output.write_text(json.dumps(complete_partial), encoding="utf-8")
+        with mock.patch.object(
+            COMMITTER_MODULE, "validate_final_worktree"
+        ), mock.patch.object(
+            COMMITTER_MODULE, "current_state", return_value=actual_agents
+        ), mock.patch.object(
+            COMMITTER_MODULE, "capture_state", return_value=captured
+        ), mock.patch.object(
+            COMMITTER_MODULE, "commit_groups", return_value=user_result
+        ) as complete_resume_commit:
+            complete_status = COMMITTER_MODULE.main(
+                [
+                    "commit-reviewed-publication.py",
+                    *(str(path) for path in input_paths),
+                    str(context_path),
+                    str(review_path),
+                    "/unused-installer",
+                    "/unused-capture",
+                    hashlib.sha256(review_path.read_bytes()).hexdigest(),
+                    str(output),
+                ]
+            )
+        self.assertEqual(complete_status, 0)
+        complete_result = json.loads(output.read_text())
+        self.assertEqual(
+            complete_result["agents_vault"]["commit_hashes"], [agents_after]
+        )
+        complete_resume_commit.assert_called_once()
+
+        output.write_text(json.dumps(partial_result), encoding="utf-8")
+        drifted_capture = json.loads(json.dumps(captured))
+        drifted_capture["user_vault"]["dirty_digest"] = "9" * 64
+        with mock.patch.object(
+            COMMITTER_MODULE, "capture_state", return_value=drifted_capture
+        ), mock.patch.object(
+            COMMITTER_MODULE, "commit_groups"
+        ) as user_drift_commit:
+            user_drift = COMMITTER_MODULE.main(
+                [
+                    "commit-reviewed-publication.py",
+                    *(str(path) for path in input_paths),
+                    str(context_path),
+                    str(review_path),
+                    "/unused-installer",
+                    "/unused-capture",
+                    hashlib.sha256(review_path.read_bytes()).hexdigest(),
+                    str(output),
+                ]
+            )
+        self.assertEqual(user_drift, 75)
+        self.assertIn("Vaults no longer match", json.loads(output.read_text())["next_action"])
+        user_drift_commit.assert_not_called()
+
+        wrong_context = json.loads(json.dumps(partial_result))
+        wrong_context["publication_context_sha256"] = "0" * 64
+        output.write_text(json.dumps(wrong_context), encoding="utf-8")
+        with mock.patch.object(COMMITTER_MODULE, "commit_groups") as context_commit:
+            wrong_context_status = COMMITTER_MODULE.main(
+                [
+                    "commit-reviewed-publication.py",
+                    *(str(path) for path in input_paths),
+                    str(context_path),
+                    str(review_path),
+                    "/unused-installer",
+                    "/unused-capture",
+                    hashlib.sha256(review_path.read_bytes()).hexdigest(),
+                    str(output),
+                ]
+            )
+        self.assertEqual(wrong_context_status, 75)
+        self.assertIn("not a resumable", json.loads(output.read_text())["next_action"])
+        context_commit.assert_not_called()
+
+        missing_state = json.loads(json.dumps(partial_result))
+        missing_state.pop("resumable_state")
+        output.write_text(json.dumps(missing_state), encoding="utf-8")
+        with mock.patch.object(COMMITTER_MODULE, "commit_groups") as state_commit:
+            missing_state_status = COMMITTER_MODULE.main(
+                [
+                    "commit-reviewed-publication.py",
+                    *(str(path) for path in input_paths),
+                    str(context_path),
+                    str(review_path),
+                    "/unused-installer",
+                    "/unused-capture",
+                    hashlib.sha256(review_path.read_bytes()).hexdigest(),
+                    str(output),
+                ]
+            )
+        self.assertEqual(missing_state_status, 75)
+        self.assertIn("not a resumable", json.loads(output.read_text())["next_action"])
+        state_commit.assert_not_called()
+
+        output.write_text(json.dumps(partial_result), encoding="utf-8")
+        drifted_agents = dict(actual_agents, local_head="9" * 40)
+        with mock.patch.object(
+            COMMITTER_MODULE, "validate_final_worktree"
+        ), mock.patch.object(
+            COMMITTER_MODULE, "current_state", return_value=drifted_agents
+        ), mock.patch.object(
+            COMMITTER_MODULE, "capture_state", return_value=captured
+        ), mock.patch.object(
+            COMMITTER_MODULE, "commit_groups"
+        ) as rejected_commit:
+            rejected = COMMITTER_MODULE.main(
+                [
+                    "commit-reviewed-publication.py",
+                    *(str(path) for path in input_paths),
+                    str(context_path),
+                    str(review_path),
+                    "/unused-installer",
+                    "/unused-capture",
+                    hashlib.sha256(review_path.read_bytes()).hexdigest(),
+                    str(output),
+                ]
+            )
+        self.assertEqual(rejected, 75)
+        self.assertIn(
+            "Agents Vault no longer matches",
+            json.loads(output.read_text())["next_action"],
+        )
+        rejected_commit.assert_not_called()
+
     def test_local_committer_malformed_input_emits_blocked_result(self) -> None:
         """Convert malformed early input into status 75 and structured JSON."""
         invalid = self.workdir / "invalid-committer-runtime.json"
@@ -1359,6 +1840,58 @@ def load_environment(*, checkout_root, environ, require_catalog):
         self.assertEqual(result.returncode, 75)
         self.assertEqual(json.loads(output.read_text())["outcome"], "blocked")
         self.assertNotIn("Traceback", result.stderr)
+
+    def test_partial_failure_without_context_is_valid_but_not_resumable(self) -> None:
+        """Preserve early local progress without fabricating resume bindings."""
+        before = {
+            "agents_vault": {"local_head": "a" * 40, "dirty_digest": "d" * 64},
+            "user_vault": {"local_head": "b" * 40, "dirty_digest": "e" * 64},
+        }
+        progressed = {
+            "commit_status": "failed",
+            "commit_hashes": ["c" * 40],
+            "pre_local_head": "a" * 40,
+            "local_head": "c" * 40,
+            "pre_dirty_digest": "d" * 64,
+            "post_dirty_digest": hashlib.sha256(b"").hexdigest(),
+            "clean": True,
+        }
+        unchanged = {
+            "commit_status": "not_started",
+            "commit_hashes": [],
+            "pre_local_head": "b" * 40,
+            "local_head": "b" * 40,
+            "pre_dirty_digest": "e" * 64,
+            "post_dirty_digest": "e" * 64,
+            "clean": False,
+        }
+        with mock.patch.object(
+            COMMITTER_MODULE, "current_state", side_effect=[progressed, unchanged]
+        ):
+            partial = COMMITTER_MODULE.result_after_failure(
+                {
+                    "agents_vault_root": "/agents",
+                    "agents_git_dir": "/agents/.git",
+                    "user_vault_root": "/user",
+                    "user_git_dir": "/user/.git",
+                },
+                before,
+                {"daily_pipeline_status": "complete"},
+                {"summary_target": "/user/summary.md", "advisory_target": "/agents/advisory.md"},
+                "early failure",
+            )
+        self.assertEqual(partial["outcome"], "partial_publication")
+        self.assertNotIn("publication_context_sha256", partial)
+        self.assertNotIn("resumable_state", partial)
+        schema = json.loads(
+            (SKILL_ROOT / "references" / "publication-commit-result.schema.json").read_text()
+        )
+        CANONICAL_MODULE.validate(partial, schema, schema)
+        incomplete_binding = dict(
+            partial, publication_context_sha256="f" * 64
+        )
+        with self.assertRaises(CANONICAL_MODULE.CanonicalValidationError):
+            CANONICAL_MODULE.validate(incomplete_binding, schema, schema)
 
     def test_local_committer_rejects_staged_only_before_head_changes(self) -> None:
         """Fail before commit when reviewed index bytes differ from the worktree."""
@@ -1888,6 +2421,104 @@ def load_environment(*, checkout_root, environ, require_catalog):
         COLLECTION_VALIDATOR_MODULE.validate_source_coverage(
             summary, catalog, manifest, verified, date(2026, 7, 31)
         )
+
+    def test_collection_validator_uses_inclusive_seven_jst_calendar_dates(self) -> None:
+        """Include run_date-6 through run_date after timezone normalization."""
+        root = self.workdir / "jst-calendar-window"
+        root.mkdir()
+        entries = [
+            {
+                "url": "https://example.test/too-old",
+                "published": "2026-08-03T23:59:59+09:00",
+            },
+            {
+                "url": "https://example.test/first-second",
+                "published": "Mon, 03 Aug 2026 15:00:00 GMT",
+            },
+            {
+                "url": "https://example.test/last-second",
+                "published": "2026-08-10T23:59:59+09:00",
+            },
+            {
+                "url": "https://example.test/too-new",
+                "published": "2026-08-10T15:00:00Z",
+            },
+        ]
+        summary, catalog, manifest, verified = write_minimal_coverage_fixture(
+            root,
+            extract_entries=entries,
+            count=2,
+            run_date=date(2026, 8, 10),
+        )
+        COLLECTION_VALIDATOR_MODULE.validate_source_coverage(
+            summary, catalog, manifest, verified, date(2026, 8, 10)
+        )
+
+        wrong_summary = summary.replace("| 2 | fixture |", "| 3 | fixture |")
+        with self.assertRaisesRegex(
+            COLLECTION_VALIDATOR_MODULE.ValidationError,
+            "item count does not match dated extract evidence",
+        ):
+            COLLECTION_VALIDATOR_MODULE.validate_source_coverage(
+                wrong_summary, catalog, manifest, verified, date(2026, 8, 10)
+            )
+
+    def test_collection_validator_rederives_manifest_window_count(self) -> None:
+        """Accept the trusted count hint only when sealed dates reproduce it."""
+        root = self.workdir / "manifest-window-count"
+        root.mkdir()
+        summary, catalog, manifest, verified = write_minimal_coverage_fixture(
+            root,
+            extract_entries=[
+                {"url": "https://example.test/in", "published": "2026-08-10"},
+                {"url": "https://example.test/out", "published": "2026-08-03"},
+            ],
+            evidence_updates={
+                "jst_window_start": "2026-08-04",
+                "jst_window_end": "2026-08-10",
+                "jst_window_item_count": 1,
+            },
+            count=1,
+            run_date=date(2026, 8, 10),
+        )
+        COLLECTION_VALIDATOR_MODULE.validate_source_coverage(
+            summary, catalog, manifest, verified, date(2026, 8, 10)
+        )
+        payload = json.loads(manifest.read_text())
+        payload["sources"][0]["jst_window_item_count"] = 0
+        manifest.write_text(json.dumps(payload), encoding="utf-8")
+        with self.assertRaisesRegex(
+            COLLECTION_VALIDATOR_MODULE.ValidationError,
+            "manifest JST window count is invalid",
+        ):
+            COLLECTION_VALIDATOR_MODULE.validate_source_coverage(
+                summary, catalog, manifest, verified, date(2026, 8, 10)
+            )
+        for invalid in (None, True):
+            payload = json.loads(manifest.read_text())
+            if invalid is None:
+                payload["sources"][0].pop("jst_window_item_count", None)
+            else:
+                payload["sources"][0]["jst_window_item_count"] = invalid
+            manifest.write_text(json.dumps(payload), encoding="utf-8")
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(
+                COLLECTION_VALIDATOR_MODULE.ValidationError,
+                "manifest JST window count is invalid",
+            ):
+                COLLECTION_VALIDATOR_MODULE.validate_source_coverage(
+                    summary, catalog, manifest, verified, date(2026, 8, 10)
+                )
+        payload = json.loads(manifest.read_text())
+        payload["sources"][0]["jst_window_item_count"] = 1
+        payload["sources"][0].pop("jst_window_start", None)
+        manifest.write_text(json.dumps(payload), encoding="utf-8")
+        with self.assertRaisesRegex(
+            COLLECTION_VALIDATOR_MODULE.ValidationError,
+            "manifest JST window count is invalid",
+        ):
+            COLLECTION_VALIDATOR_MODULE.validate_source_coverage(
+                summary, catalog, manifest, verified, date(2026, 8, 10)
+            )
 
     def test_collection_validator_binds_supplemental_date_to_extract_url(self) -> None:
         """Reject same-host dates for articles absent from the sealed extract."""
@@ -3190,6 +3821,7 @@ def load_environment(*, checkout_root, environ, require_catalog):
         (runtime / "collect-public-sources.py").write_text(
             """#!/usr/bin/env python3
 import hashlib, json, os, sys
+from datetime import date,timedelta
 from pathlib import Path
 if sys.argv[1] == "--verify-resolutions":
     request=json.loads(Path(sys.argv[4]).read_text())
@@ -3197,13 +3829,14 @@ if sys.argv[1] == "--verify-resolutions":
     raise SystemExit(0)
 catalog_path=Path(sys.argv[1]); output=Path(sys.argv[2]); output.mkdir()
 catalog=json.loads(catalog_path.read_text())
+run_date=date.fromisoformat(sys.argv[3][:10]); window_start=run_date-timedelta(days=6)
 sources=[]
 for index,source in enumerate(catalog["sources"]):
     url=source["feed_url"] or source["page_url"]
     method="rss" if source["feed_url"] else "public_page"
     extract_file=f"source-{index}.extract.json"
     (output/extract_file).write_text(json.dumps({"format":"feed" if method=="rss" else "html_links","entries":[{"url":f"{url}?fixture={index}","published":"2020-01-01"}]}))
-    sources.append({"name":source["name"],"tier":source["tier"],"status":"fetched","method":method,"final_url":url,"extract_file":extract_file,"extracted_entry_count":1,"attempts":[]})
+    sources.append({"name":source["name"],"tier":source["tier"],"status":"fetched","method":method,"final_url":url,"extract_file":extract_file,"extracted_entry_count":1,"jst_window_start":window_start.isoformat(),"jst_window_end":run_date.isoformat(),"jst_window_item_count":0,"attempts":[]})
 manifest={"catalog_sha256":hashlib.sha256(catalog_path.read_bytes()).hexdigest(),"sources":sources}
 (output/"source-manifest.json").write_text(json.dumps(manifest))
 print(json.dumps(manifest))

@@ -24,9 +24,19 @@
     "agents_vault": {"$ref": "#/$defs/vaultResult"},
     "user_vault": {"$ref": "#/$defs/vaultResult"},
     "evidence_finalization_commit": {"type": ["string", "null"]},
-    "next_action": {"type": ["string", "null"]}
+    "next_action": {"type": ["string", "null"]},
+    "publication_context_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "resumable_state": {"type": ["object", "null"]}
   },
   "allOf": [
+    {
+      "if": {"required": ["publication_context_sha256"]},
+      "then": {"required": ["resumable_state"]}
+    },
+    {
+      "if": {"required": ["resumable_state"]},
+      "then": {"required": ["publication_context_sha256"]}
+    },
     {
       "if": {"properties": {"outcome": {"const": "ready_to_push"}}},
       "then": {

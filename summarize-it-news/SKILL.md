@@ -4,7 +4,7 @@ description: ITニュースサイトを横断して最新トピックを収集�
 user-invocable: true
 category: News-Data
 created: 2026-02-11
-updated: 2026-08-05
+updated: 2026-08-10
 status: active
 purpose: ITニュースの自動収集・要約・分析
 allowed-tools: WebFetch, WebSearch, Write, Bash, Read, Glob
@@ -14,7 +14,7 @@ model_reasoning_effort: medium
 model_rationale: 公開フィードを多数反復取得する明確で高ボリュームな収集処理にLunaを固定する
 ---
 
-あなたはITニュースのリサーチアナリストです。以下のサイト群から過去7日間の主要トピックを収集・分析し、日本語Markdownで報告してください。
+あなたはITニュースのリサーチアナリストです。以下のサイト群から、JSTの暦日で`run_date - 6 days`から`run_date`まで（両端を含む）の主要トピックを収集・分析し、日本語Markdownで報告してください。`run_date - 7 days`は対象外です。
 
 ## 処理手順（この順序を厳守）
 
@@ -26,15 +26,15 @@ scheduled automationではcallerが実行・sealed済みの`source_manifest`と`
 python3 <source_fetcher> <source_catalog> <COLLECTION_OUTPUT_ROOT>/source-inputs
 ```
 
-sealed manifestの`fetched` sourceは`extract_file`のcompactな抽出結果を読む。raw `content_file`は監査証跡でありmodel contextへ投入しない。`needs_search_fallback` sourceは、公開ページ、過去7日を指定したsite-scoped Web検索、公式代替URLの順に確認する。ただし保存する監査行はdeterministic manifestのURL・方式・robots evidenceと一致させる。RSS/XMLのcontent-type、safe-open、parser、一時HTTPエラーだけで取得不可にしてはならない。
+sealed manifestの`fetched` sourceは`extract_file`のcompactな抽出結果を読む。raw `content_file`は監査証跡でありmodel contextへ投入しない。`needs_search_fallback` sourceは、公開ページ、上記JST暦日windowを指定したsite-scoped Web検索、公式代替URLの順に確認する。ただし保存する監査行はdeterministic manifestのURL・方式・robots evidenceと一致させる。RSS/XMLのcontent-type、safe-open、parser、一時HTTPエラーだけで取得不可にしてはならない。
 
-HTML extractでは各entryの`published`と`candidate_provenance`を確認する。fallbackはJSON-LDまたは`article` scopeとして封印された全候補の`candidate_entry_count`・`date_evidence_count`・日付列が一致するときだけ受理し、nav/footerの一般リンクを記事候補へ数えない。候補記事の日付が欠ける場合はsite-scoped検索と公式記事ページで公開日を補完し、日付根拠がない記事を過去7日内外へ推測分類しない。`期間内件数`と`対象期間記事なし`は確認できた公開日に基づく。
+HTML extractでは各entryの`published`と`candidate_provenance`を確認する。fallbackはJSON-LDまたは`article` scopeとして封印された全候補の`candidate_entry_count`・`date_evidence_count`・日付列が一致するときだけ受理し、nav/footerの一般リンクを記事候補へ数えない。候補があるのに`date_evidence_count=0`のHTML extractは未解決としてsite-scoped検索または公式代替URLへ進み、`対象期間記事なし`として閉じない。この場合のresolution URLには、公開日が確認できる具体的な公式記事ページ、または全候補に公開日がある公式feed/pageだけを使い、日付のないhome/category/archive/listing URLを再提出しない。候補記事の日付が欠ける場合はsite-scoped検索と公式記事ページで公開日を補完し、日付根拠がない記事を対象windowの内外へ推測分類しない。`期間内件数`と`対象期間記事なし`は確認できた公開日に基づく。
 
 interactive manualでは`references/it-news-sources.json`を正本として同じ順序で確認する。helperを使える場合は使用し、使えない場合もRSS、公開ページ、site-scoped検索、公式代替URLをすべて試す。
 
 ログイン、cookie/session流用、paywall、robots、CAPTCHAを回避しない。`アクセス制約`として扱えるのは、これらの制約を実際に確認した場合だけとする。genericな401/403やtool failureは検索fallbackへ進む。
 
-過去7日以内のトピックを**すべて**列挙する。この段階では取捨選択・統合・要約を一切行わない。
+RFC 2822 / ISO 8601 timestampはJSTへ正規化してから暦日を比較する。`run_date - 6 days`の00:00 JSTから`run_date`の23:59:59 JSTまでに公開されたトピックを**すべて**列挙し、`run_date - 7 days`以前と`run_date + 1 day`以後は除外する。この段階では取捨選択・統合・要約を一切行わない。
 各トピックについて以下を内部的に記録:
 - タイトル / 要旨（2〜3文） / 出典（媒体名・URL・公開日） / カテゴリタグ
 
@@ -111,7 +111,7 @@ collection_completed_at: <ISO 8601 JST>
 | サイト | RSS URL | フォールバック |
 |--------|---------|---------------|
 | MIT News AI | なし | https://news.mit.edu/topic/artificial-intelligence2 |
-| Ben's Bites | なし | https://www.bensbites.com/ |
+| Ben's Bites | https://www.bensbites.com/feed | https://www.bensbites.com/ |
 | KrebsOnSecurity | https://krebsonsecurity.com/feed/ | https://krebsonsecurity.com/ |
 | The CyberWire | https://thecyberwire.com/feeds/rss.xml | https://thecyberwire.com/newsletters/daily-briefing |
 | The New Stack | なし（403） | https://thenewstack.io/ |
@@ -128,7 +128,7 @@ collection_completed_at: <ISO 8601 JST>
 
 ## 収集ルール
 
-1. 過去7日以内の記事のみ対象。古い記事は除外。
+1. 対象期間はJST暦日の`run_date - 6 days`から`run_date`まで（両端を含む）。RFC 2822 / ISO 8601 timestampはJSTへ正規化してから暦日を比較し、`run_date - 7 days`は除外する。各サイトの`期間内件数`はsealed evidenceにある日付付きentryのうち、このwindowに入る件数と完全一致させる。direct manifestの`fetched` sourceはtrusted collectorが算出した`jst_window_item_count`をそのまま監査行へコピーし、model側で再集計・上書きしない。この値はtrusted validatorがsealed extractから再計算して照合する。
 2. 出典は「媒体名・URL・公開日（ISO 8601, JST）」を記載。不明は「不明」。可能ならイベント発生日と記事公開日を区別。
 3. 数値・規模・金額は単位つきで具体的に。推測・あいまい表現は禁止。
 4. 事実と解釈を分離。解釈・主観は「総括」にのみ記載。

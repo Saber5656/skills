@@ -33,6 +33,11 @@ artifact installation, staging, commit, or push.
    unrelated dirty path. Copy every runner-captured `dirty_entries` path, Git
    blob OID, and mode exactly into `approved_dirty_entries`; block symlink,
    gitlink, unsupported mode, or a content mismatch.
+   For an `approved` manifest, both `excluded_paths` and
+   `unrelated_dirty_paths` must be empty arrays. Do not add policy-only path
+   prefixes such as `.obsidian/` when no captured dirty entry is excluded. If an
+   actual captured dirty path must be excluded or treated as unrelated, return
+   `blocked` instead of `approved`.
 6. Run deterministic file guards and the supplied pinned gitleaks binary without
    network. Review every staged local-commit patch. Record the exact supplied
    gitleaks version and bind the review to both the dirty snapshot digest and the

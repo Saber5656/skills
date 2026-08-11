@@ -266,7 +266,10 @@ def blob_sha256(repo: str, head: str, relative: str) -> str:
 
 def validate_blob_mode(repo: str, head: str, relative: str) -> None:
     """Require a normal non-executable Git blob for an installed Markdown artifact."""
-    line = git(repo, "ls-tree", head, "--", relative).stdout.strip()
+    output = git(repo, "ls-tree", "-z", head, "--", relative).stdout
+    if not output.endswith("\0") or output.count("\0") != 1:
+        raise PushError("committed artifact tree entry is missing or ambiguous")
+    line = output[:-1]
     metadata, separator, listed_path = line.partition("\t")
     fields = metadata.split()
     if (
@@ -283,7 +286,10 @@ def validate_dirty_entry(
     repo: str, head: str, entry: dict[str, object]
 ) -> None:
     """Bind an approved pre-existing dirty path to its reviewed Git blob and mode."""
-    line = git(repo, "ls-tree", head, "--", str(entry["path"])).stdout.strip()
+    output = git(repo, "ls-tree", "-z", head, "--", str(entry["path"])).stdout
+    if output and (not output.endswith("\0") or output.count("\0") != 1):
+        raise PushError("committed dirty path tree entry is ambiguous")
+    line = output[:-1] if output else ""
     if entry["git_blob_oid"] is None:
         if line:
             raise PushError("approved deletion still exists in the committed tree")

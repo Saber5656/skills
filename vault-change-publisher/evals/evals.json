@@ -128,6 +128,46 @@
       "expected_output": "Use gpt-5.6-luna, run the reviewed public-source fetcher, resolve every source through direct or search fallback, and block an incomplete audit before publication.",
       "files": [],
       "expectations": ["pins gpt-5.6-luna only for the network collection phase", "keeps publication reviews on the existing stronger boundary", "requires one resolved coverage row per source catalog entry", "does not bypass login, paywall, robots, or CAPTCHA"]
+    },
+    {
+      "id": 21,
+      "name": "collection_complete_state_and_jst_window_contract",
+      "prompt": "run_dateは2026-08-10 JSTです。2026-08-03から2026-08-10までの日付付き記事があり、今回runのsummaryとadvisoryは作成・検証・hash計算済みです。collection resultを返してください。",
+      "expected_output": "2026-08-04から2026-08-10までだけを数え、daily_pipeline_status=complete、vault_artifacts_complete=true、next_action=nullを返す。publisher handoffを未完了理由にしない。",
+      "files": [],
+      "expectations": ["uses the inclusive JST run_date-6 through run_date window", "excludes run_date-7", "maps a fully validated collection to complete, true, and null", "leaves trusted publication to the runner"]
+    },
+    {
+      "id": 22,
+      "name": "context_bound_partial_resume",
+      "prompt": "Agents Vault commit後にUser Vault commit前で停止したpartial publicationを再開してください。",
+      "expected_output": "同じpublication contextかつ記録済み両Vault完全状態と一致する場合だけUser Vault commitへ進む。",
+      "files": [],
+      "expectations": ["binds a partial result to the current publication context digest", "revalidates the complete two-Vault state before mutation", "builds the resumed Agents result from current Git state", "rejects User Vault drift before creating another commit"]
+    },
+    {
+      "id": 23,
+      "name": "evidence_fallback_test_scope",
+      "prompt": "runner templateでevidence preparation失敗時にfinalizerがmissing planを使わないことを検証してください。",
+      "expected_output": "EVIDENCE_PREPARE_STATUS branchだけを抽出し、fallback blockの存在とEVIDENCE_PLAN非参照を検証する。",
+      "files": [],
+      "expectations": ["anchors the assertion to the evidence-preparation branch", "accepts an indented else boundary", "does not inspect unrelated top-level branches"]
+    },
+    {
+      "id": 24,
+      "name": "rederive_trusted_jst_window_count",
+      "prompt": "collection summaryはmanifestのjst_window_item_countを監査行へコピーしました。publication前に検証してください。",
+      "expected_output": "manifestのwindow境界と件数をsealed extractから再計算し、summary、manifest、再計算値の3者が一致する場合だけ通過する。",
+      "files": [],
+      "expectations": ["rejects a manifest count that differs from sealed dates", "rejects mismatched JST window boundaries", "rejects a summary row that differs from the recomputed count", "does not trust model output as the count authority"]
+    },
+    {
+      "id": 25,
+      "name": "partial_result_resume_field_consistency",
+      "prompt": "publication context digest算出前にlocal progressを検出したfailure resultと、resumable_stateが欠落した既存partial resultを安全に扱ってください。",
+      "expected_output": "前者はschema-validなnon-resumable partial evidenceとして保持し、後者はcommit前にresume拒否する。resume binding fieldsは常に両方存在するか両方存在しない。",
+      "files": [],
+      "expectations": ["preserves partial publication evidence when context binding is unavailable", "emits publication context digest and resumable state only as a pair", "rejects a partial result missing resumable_state before commit_groups", "does not misclassify progressed local state as blocked"]
     }
   ]
 }

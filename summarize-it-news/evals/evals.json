@@ -70,8 +70,49 @@
       "expectations": [
         "uses published metadata from article cards or JSON-LD when available",
         "searches the source site and opens official article URLs for missing dates",
-        "does not count an undated article inside or outside the seven-day window"
+        "does not count an undated article inside or outside the seven-day window",
+        "does not resubmit an undated home, category, archive, or listing page as a verified fallback"
       ]
+    },
+    {
+      "id": 7,
+      "name": "inclusive_jst_calendar_window",
+      "prompt": "run_dateは2026-08-10 JSTです。2026-08-03T23:59:59+09:00、Mon, 03 Aug 2026 15:00:00 GMT、2026-08-10T23:59:59+09:00、2026-08-10T15:00:00Zの記事を期間内件数へ分類してください。",
+      "expected_output": "timestampをJSTへ正規化し、2026-08-04 00:00 JSTと2026-08-10 23:59:59 JSTの2件だけを期間内として数える。",
+      "files": [],
+      "expectations": ["normalizes RFC 2822 and ISO 8601 timestamps to JST", "includes run_date-6 and run_date", "excludes run_date-7 and run_date+1", "reports a count of 2"]
+    },
+    {
+      "id": 8,
+      "name": "article_publication_evidence_authenticity",
+      "prompt": "一覧HTMLに本文中の日付、malformed datePublished、dateModified付きWebPage、未日付の記事カードがあります。公開日証拠を封印してください。",
+      "expected_output": "記事型の候補と解析可能なdatePublishedまたは記事用publication metadataだけを採用し、全候補の日付が揃わなければfallbackへ進む。",
+      "files": [],
+      "expectations": ["rejects malformed publication timestamps", "does not use dateModified or non-article JSON-LD as publication evidence", "does not infer publication dates from arbitrary visible article text", "requires validated dates for every sealed HTML article candidate"]
+    },
+    {
+      "id": 9,
+      "name": "publisher_record_date_isolation",
+      "prompt": "publisher固有の一覧markupで最初の記事に日付がなく、次の記事だけに日付があります。",
+      "expected_output": "次の記事の日付を最初の記事へ横断して割り当てず、各publisher record内だけでURLと日付を結び付ける。",
+      "files": [],
+      "expectations": ["keeps embedded publication dates inside one publisher record", "does not consume the later dated article as evidence for an earlier undated article"]
+    },
+    {
+      "id": 10,
+      "name": "trusted_jst_window_count",
+      "prompt": "sealed extractが多数あり、モデルが期間内件数を誤再集計する可能性があります。direct fetched sourceの監査行を作成してください。",
+      "expected_output": "trusted collectorのjst_window_item_countをそのまま期間内件数へコピーし、validatorによるsealed date再計算と一致させる。",
+      "files": [],
+      "expectations": ["derives the count deterministically from parseable sealed dates", "normalizes timestamps to JST before the calendar comparison", "copies the trusted direct-source count without model recounting", "keeps validator recomputation as the acceptance authority"]
+    },
+    {
+      "id": 11,
+      "name": "html_void_element_date_state",
+      "prompt": "記事カードの日付要素にbrやimgがあり、別カードには閉じ忘れのnested tagがあります。後続記事も含めて公開日を抽出してください。",
+      "expected_output": "HTML void elementを深さへ加算せず、article終了時に日付capture stateをresetして、1カードのmalformed markupが後続カードを壊さない。",
+      "files": [],
+      "expectations": ["does not increment date capture depth for HTML void elements", "resets date capture state when the enclosing article closes", "continues extracting validated dates from later article cards"]
     }
   ]
 }
