@@ -164,14 +164,41 @@ def planned_target(
     raise InstallError("artifact collision limit exceeded")
 
 
+def target_from_bound_plan(
+    value: object,
+    vault_root: Path,
+    relative_directory: PurePosixPath,
+    filename: str,
+) -> Path:
+    """Validate a runner-generated target without probing a blocked Vault."""
+    if not isinstance(value, str):
+        raise InstallError("artifact plan target is not a string")
+    target = Path(value)
+    expected_parent = vault_root.joinpath(*relative_directory.parts)
+    stem, suffix = os.path.splitext(filename)
+    candidate_stem, candidate_suffix = os.path.splitext(target.name)
+    suffix_number = candidate_stem.removeprefix(f"{stem}-")
+    if (
+        not target.is_absolute()
+        or target.parent != expected_parent
+        or candidate_suffix != suffix
+        or (
+            target.name != filename
+            and (not suffix_number.isdigit() or int(suffix_number) < 2)
+        )
+    ):
+        raise InstallError("artifact plan target is invalid")
+    return target
+
+
 def main(argv: list[str]) -> int:
     """Install summary and advisory artifacts and emit their final paths."""
     plan_only = len(argv) == 4 and argv[1] == "--plan"
-    install_from_plan = len(argv) == 4 and argv[1] != "--plan"
+    install_from_plan = len(argv) == 5 and argv[1] != "--plan"
     if not plan_only and not install_from_plan:
         print(
             "usage: install-verified-artifacts.py --plan CONTEXT COLLECTION | "
-            "install-verified-artifacts.py CONTEXT COLLECTION PLAN",
+            "install-verified-artifacts.py CONTEXT COLLECTION PLAN ROLE",
             file=sys.stderr,
         )
         return 64
@@ -191,35 +218,65 @@ def main(argv: list[str]) -> int:
             year, month, day
         )
         advisory_relative = safe_relative(context["advisory_archive_relative"])
-        summary_target = planned_target(
-            Path(context["user_vault_root"]), summary_relative, summary_source.name
-        )
-        advisory_target = planned_target(
-            Path(context["agents_vault_root"]), advisory_relative, advisory_source.name
-        )
-        if not plan_only:
+        user_root = Path(context["user_vault_root"])
+        agents_root = Path(context["agents_vault_root"])
+        if plan_only:
+            summary_target = planned_target(
+                user_root, summary_relative, summary_source.name
+            )
+            advisory_target = planned_target(
+                agents_root, advisory_relative, advisory_source.name
+            )
+        else:
+            selected = {value for value in argv[4].split(",") if value}
+            if len(selected) != 1 or not selected <= {
+                "user_it_news_summary",
+                "agents_security_advisory",
+            }:
+                raise InstallError("exactly one artifact role must be selected")
             plan = json.loads(Path(argv[3]).read_text(encoding="utf-8"))
-            if (
-                plan.get("summary_target") != str(summary_target)
-                or plan.get("advisory_target") != str(advisory_target)
-            ):
-                raise InstallError("artifact plan no longer matches current Vault state")
-            summary_target = install(
-                summary_source,
-                collection["summary_sha256"],
-                Path(context["user_vault_root"]),
+            summary_target = target_from_bound_plan(
+                plan.get("summary_target"),
+                user_root,
                 summary_relative,
                 summary_source.name,
-                summary_target,
             )
-            advisory_target = install(
-                advisory_source,
-                collection["advisory_sha256"],
-                Path(context["agents_vault_root"]),
+            advisory_target = target_from_bound_plan(
+                plan.get("advisory_target"),
+                agents_root,
                 advisory_relative,
                 advisory_source.name,
-                advisory_target,
             )
+            if "user_it_news_summary" in selected:
+                if planned_target(
+                    user_root, summary_relative, summary_source.name
+                ) != summary_target:
+                    raise InstallError(
+                        "selected summary target no longer matches the artifact plan"
+                    )
+                summary_target = install(
+                    summary_source,
+                    collection["summary_sha256"],
+                    user_root,
+                    summary_relative,
+                    summary_source.name,
+                    summary_target,
+                )
+            if "agents_security_advisory" in selected:
+                if planned_target(
+                    agents_root, advisory_relative, advisory_source.name
+                ) != advisory_target:
+                    raise InstallError(
+                        "selected advisory target no longer matches the artifact plan"
+                    )
+                advisory_target = install(
+                    advisory_source,
+                    collection["advisory_sha256"],
+                    agents_root,
+                    advisory_relative,
+                    advisory_source.name,
+                    advisory_target,
+                )
         result = {
             "summary_target": str(summary_target),
             "advisory_target": str(advisory_target),

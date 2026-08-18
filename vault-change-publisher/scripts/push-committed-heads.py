@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import os
 import stat
@@ -11,9 +12,14 @@ import subprocess
 import sys
 from pathlib import Path
 
+from isolated_git_transport import TransportError, run_transport
+
 
 class PushError(RuntimeError):
     """Represent invalid local publication state or a rejected push."""
+
+
+SCAN_TIMEOUT_SECONDS = 120
 
 
 def read_regular_nofollow(path: Path) -> bytes:
@@ -63,13 +69,25 @@ def git(
     environment["GIT_NO_LAZY_FETCH"] = "1"
     environment["GIT_NO_REPLACE_OBJECTS"] = "1"
     environment["GIT_OPTIONAL_LOCKS"] = "0"
+    environment["GIT_CONFIG_COUNT"] = "1"
+    environment["GIT_CONFIG_KEY_0"] = "core.fsmonitor"
+    environment["GIT_CONFIG_VALUE_0"] = "false"
     repository_arguments = (
         [f"--git-dir={git_dir}", f"--work-tree={repo}"]
         if git_dir is not None
         else ["-C", repo]
     )
+    if arguments and arguments[0] in {"ls-remote", "push", "fetch"}:
+        if git_dir is None:
+            raise PushError("network Git operation requires an explicit Git directory")
+        return run_transport(git_dir, *arguments, check=check, text=True)
     return subprocess.run(
-        ["git", *repository_arguments, "-c", f"core.hooksPath={os.devnull}", *arguments],
+        [
+            "git", *repository_arguments,
+            "-c", f"core.hooksPath={os.devnull}",
+            "-c", "core.fsmonitor=false",
+            *arguments,
+        ],
         check=check,
         capture_output=True,
         text=True,
@@ -110,6 +128,11 @@ def git_control_digest(repo: str) -> str:
     git_dir = Path(
         git(repo, "rev-parse", "--absolute-git-dir").stdout.strip()
     )
+    common_dir = Path(
+        git(
+            repo, "rev-parse", "--path-format=absolute", "--git-common-dir"
+        ).stdout.strip()
+    )
     control = hashlib.sha256()
     git_marker = Path(repo) / ".git"
     control.update(b"worktree-git-entry\0")
@@ -123,16 +146,30 @@ def git_control_digest(repo: str) -> str:
         control.update(git_marker.read_bytes())
     else:
         control.update(b"directory\0")
-    control.update(b"config\0")
-    control.update((git_dir / "config").read_bytes())
-    hooks = git_dir / "hooks"
+    seen_control_paths: set[Path] = set()
+    for config_path in (common_dir / "config", git_dir / "config.worktree"):
+        if config_path in seen_control_paths or not os.path.lexists(config_path):
+            continue
+        seen_control_paths.add(config_path)
+        control.update(b"config\0")
+        control.update(str(config_path).encode("utf-8"))
+        control.update(b"\0")
+        control.update(f"{config_path.lstat().st_mode:o}".encode("ascii"))
+        control.update(b"\0")
+        if config_path.is_symlink():
+            control.update(b"symlink\0")
+            control.update(os.fsencode(os.readlink(config_path)))
+        else:
+            control.update(config_path.read_bytes())
+        control.update(b"\0")
+    hooks = common_dir / "hooks"
     if hooks.exists():
         for root, directories, files in os.walk(hooks, followlinks=False):
             directories.sort()
             files.sort()
             for filename in files:
                 path = Path(root) / filename
-                control.update(str(path.relative_to(git_dir)).encode("utf-8"))
+                control.update(str(path.relative_to(common_dir)).encode("utf-8"))
                 control.update(b"\0")
                 control.update(f"{path.lstat().st_mode:o}".encode("ascii"))
                 control.update(b"\0")
@@ -197,7 +234,12 @@ def commit_patch_sha256(repo: str, commit: str, parents: list[str]) -> str:
     environment["GIT_NO_REPLACE_OBJECTS"] = "1"
     environment["GIT_OPTIONAL_LOCKS"] = "0"
     content = subprocess.run(
-        ["git", "-C", repo, "-c", f"core.hooksPath={os.devnull}", *arguments],
+        [
+            "git", "-C", repo,
+            "-c", f"core.hooksPath={os.devnull}",
+            "-c", "core.fsmonitor=false",
+            *arguments,
+        ],
         check=True,
         capture_output=True,
         env=environment,
@@ -246,6 +288,8 @@ def blob_sha256(repo: str, head: str, relative: str) -> str:
             repo,
             "-c",
             f"core.hooksPath={os.devnull}",
+            "-c",
+            "core.fsmonitor=false",
             "show",
             f"{head}:{relative}",
         ],
@@ -259,6 +303,12 @@ def blob_sha256(repo: str, head: str, relative: str) -> str:
             },
             "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_NO_LAZY_FETCH": "1",
+            "GIT_NO_REPLACE_OBJECTS": "1",
+            "GIT_OPTIONAL_LOCKS": "0",
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "core.fsmonitor",
+            "GIT_CONFIG_VALUE_0": "false",
         },
     )
     return hashlib.sha256(result.stdout).hexdigest()
@@ -315,8 +365,12 @@ def validate_scope(
 ) -> None:
     """Bind actual commits and artifact blobs to an approved review manifest."""
     existing_commits = existing_commit_metadata(repo, pre_state)
+    captured_identity = [
+        {key: value for key, value in commit.items() if key != "patch_sha256"}
+        for commit in existing_commits
+    ]
     if (
-        existing_commits != pre_state.get("local_commits", [])
+        captured_identity != pre_state.get("local_commits", [])
         or existing_commits != manifest["approved_existing_commits"]
     ):
         raise PushError("local-only history differs from approved existing commits")
@@ -380,24 +434,35 @@ def scan_commits(gitleaks_bin: str, repo: str, old: str, new: str) -> None:
     }
     environment["GIT_CONFIG_NOSYSTEM"] = "1"
     environment["GIT_CONFIG_GLOBAL"] = os.devnull
-    result = subprocess.run(
-        [
-            gitleaks_bin,
-            "--no-banner",
-            "--redact",
-            "--ignore-gitleaks-allow",
-            "--gitleaks-ignore-path",
-            os.devnull,
-            "git",
-            "--log-opts",
-            f"{old}..{new}",
-            repo,
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-        env=environment,
-    )
+    environment["GIT_NO_LAZY_FETCH"] = "1"
+    environment["GIT_NO_REPLACE_OBJECTS"] = "1"
+    environment["GIT_OPTIONAL_LOCKS"] = "0"
+    environment["GIT_CONFIG_COUNT"] = "1"
+    environment["GIT_CONFIG_KEY_0"] = "core.fsmonitor"
+    environment["GIT_CONFIG_VALUE_0"] = "false"
+    try:
+        result = subprocess.run(
+            [
+                gitleaks_bin,
+                "--no-banner",
+                "--redact",
+                "--ignore-gitleaks-allow",
+                "--gitleaks-ignore-path",
+                os.devnull,
+                "git",
+                "--log-opts",
+                f"{old}..{new}",
+                repo,
+            ],
+            cwd="/",
+            check=False,
+            capture_output=True,
+            text=True,
+            env=environment,
+            timeout=SCAN_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise PushError("gitleaks history scan exceeded its deadline") from exc
     if result.returncode != 0:
         raise PushError("gitleaks rejected the candidate commit range")
 
@@ -406,11 +471,28 @@ def validate_local(
     repo: str,
     pre_state: dict[str, object],
     reported: dict[str, object],
+    current_state: dict[str, object] | None = None,
+    artifact_path: str | None = None,
 ) -> str:
-    """Bind a reported commit sequence to the actual clean main checkout."""
+    """Bind a reported commit sequence to its mode-specific checkout state."""
     branch = git(repo, "branch", "--show-current").stdout.strip()
-    upstream = git(repo, "rev-parse", "--abbrev-ref", "@{u}").stdout.strip()
     local_head = git(repo, "rev-parse", "HEAD").stdout.strip()
+    mode = reported.get("publication_mode")
+    if mode == "blocked":
+        actual_dirty = dirty_digest(repo)
+        if (
+            local_head != pre_state["local_head"]
+            or reported.get("local_head") != local_head
+            or reported.get("pre_local_head") != pre_state["local_head"]
+            or reported.get("commit_hashes")
+            or actual_dirty != pre_state["dirty_digest"]
+            or reported.get("post_dirty_digest") != actual_dirty
+            or current_state is None
+            or current_state.get("git_control_sha256") != pre_state.get("git_control_sha256")
+        ):
+            raise PushError("blocked Vault changed before push")
+        return local_head
+    upstream = git(repo, "rev-parse", "--abbrev-ref", "@{u}").stdout.strip()
     if branch != "main" or upstream != "origin/main":
         raise PushError("publication checkout is not main tracking origin/main")
     if local_head != reported["local_head"]:
@@ -420,8 +502,8 @@ def validate_local(
     if reported["pre_dirty_digest"] != pre_state["dirty_digest"]:
         raise PushError("reported pre-publication dirty digest does not match")
     actual_dirty = dirty_digest(repo)
-    if actual_dirty != reported["post_dirty_digest"] or actual_dirty != hashlib.sha256(b"").hexdigest():
-        raise PushError("publication checkout is not clean")
+    if actual_dirty != reported["post_dirty_digest"]:
+        raise PushError("reported residual status differs from the checkout")
     commits = git(
         repo,
         "rev-list",
@@ -435,7 +517,124 @@ def validate_local(
         raise PushError("complete commit status has no commits")
     if status == "not_required" and commits:
         raise PushError("not_required commit status changed history")
+    if mode == "sweep":
+        if actual_dirty != hashlib.sha256(b"").hexdigest() or not reported["clean"]:
+            raise PushError("sweep publication checkout is not clean")
+    elif mode == "own_only":
+        if current_state is None or artifact_path is None:
+            raise PushError("own_only residual state was not captured")
+        for field in (
+            "dirty_lines", "dirty_paths", "dirty_entries", "dirty_metadata",
+            "staged_paths", "dirty_worktree_sha256", "dirty_digest",
+            "diff_snapshot_sha256", "git_control_sha256", "branch", "upstream",
+            "operation_in_progress", "remote_head",
+        ):
+            if current_state.get(field) != pre_state.get(field):
+                raise PushError(f"own_only residual changed before push: {field}")
+        before_index = [
+            entry for entry in pre_state["index_entries"]
+            if entry["path"] != artifact_path
+        ]
+        after_index = [
+            entry for entry in current_state["index_entries"]
+            if entry["path"] != artifact_path
+        ]
+        if after_index != before_index:
+            raise PushError("own_only changed a non-owned index entry")
+    else:
+        raise PushError("reported publication mode is invalid")
     return local_head
+
+
+def capture_complete(runtime_file: str) -> dict[str, object]:
+    """Reuse the canonical state helper immediately before fixed pushes."""
+    helper = Path(__file__).with_name("capture-vault-state.py")
+    result = subprocess.run(
+        [str(helper), "--include-local-history", runtime_file],
+        check=True,
+        capture_output=True,
+        text=True,
+        env={
+            **{key: value for key, value in os.environ.items() if not key.startswith("GIT_")},
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_NO_LAZY_FETCH": "1",
+            "GIT_NO_REPLACE_OBJECTS": "1",
+            "GIT_OPTIONAL_LOCKS": "0",
+        },
+    )
+    return json.loads(result.stdout)
+
+
+def capture_one(repo: str) -> dict[str, object]:
+    """Capture one Vault so a failure in its peer cannot suppress publication."""
+    helper = Path(__file__).with_name("capture-vault-state.py")
+    spec = importlib.util.spec_from_file_location("publication_capture_one", helper)
+    if spec is None or spec.loader is None:
+        raise PushError("could not load canonical Vault state helper")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.capture(repo, include_local_history=True)
+
+
+def validate_and_push_one(
+    runtime: dict[str, object],
+    pre_state: dict[str, object],
+    reported: dict[str, object],
+    manifest: dict[str, object],
+    artifact_path: str,
+    prefix: str,
+) -> tuple[str, str, str | None]:
+    """Validate and fixed-push one Vault without consulting its peer Vault."""
+    repo = str(runtime[f"{prefix}_vault_root"])
+    git_dir = str(runtime[f"{prefix}_git_dir"])
+    expected_remote = str(pre_state["remote_head"])
+    observed_remote = expected_remote
+    mode = reported.get("publication_mode")
+    try:
+        if mode != manifest.get("publication_mode"):
+            raise PushError("commit result mode differs from the approved review")
+        state = capture_one(repo)
+        local_head = validate_local(
+            repo, pre_state, reported, state, artifact_path
+        )
+        if git_control_digest(repo) != pre_state["git_control_sha256"]:
+            raise PushError("Git config or hooks changed during local publication")
+        if mode != "blocked":
+            validate_scope(repo, pre_state, reported, manifest)
+            scan_commits(
+                str(runtime["gitleaks_bin"]), repo,
+                str(pre_state["remote_head"]), local_head,
+            )
+        push_status, observed_remote = push_one_independently(
+            repo,
+            str(runtime[f"{prefix}_remote_url"]),
+            local_head,
+            expected_remote,
+            str(mode),
+            git_dir,
+        )
+        return push_status, observed_remote, None
+    except (
+        KeyError,
+        OSError,
+        TypeError,
+        ValueError,
+        subprocess.SubprocessError,
+        TransportError,
+        PushError,
+    ) as exc:
+        try:
+            observed_remote = remote_head(
+                repo, str(runtime[f"{prefix}_remote_url"]), git_dir
+            )
+        except (OSError, subprocess.SubprocessError, TransportError, PushError):
+            pass
+        return (
+            "not_started" if mode == "blocked" else "failed",
+            observed_remote,
+            str(exc),
+        )
 
 
 def remote_head(repo: str, remote_url: str, git_dir: str | None = None) -> str:
@@ -467,34 +666,72 @@ def push_one(
         return ("not_required", before)
     if not required:
         raise PushError("not_required publication unexpectedly needs a push")
-    result = git(
-        repo,
-        "push",
-        remote_url,
-        f"{local_head}:refs/heads/main",
-        check=False,
-        git_dir=git_dir,
-    )
-    if result.returncode != 0:
-        return ("failed", before)
+    observed = before
+    for _ in range(3):
+        try:
+            observed = remote_head(repo, remote_url, git_dir)
+        except (PushError, subprocess.SubprocessError, TransportError):
+            continue
+        if observed == local_head:
+            return ("complete", observed)
+        if observed != before:
+            return ("failed", observed)
+        result = git(
+            repo,
+            "push",
+            remote_url,
+            f"{local_head}:refs/heads/main",
+            check=False,
+            git_dir=git_dir,
+        )
+        if result.returncode == 0:
+            try:
+                observed = remote_head(repo, remote_url, git_dir)
+            except (PushError, subprocess.SubprocessError, TransportError):
+                continue
+            if observed == local_head:
+                return ("complete", observed)
+    return ("failed", observed)
+
+
+def push_one_independently(
+    repo: str,
+    remote_url: str,
+    local_head: str,
+    expected_remote: str,
+    publication_mode: str,
+    git_dir: str | None = None,
+) -> tuple[str, str]:
+    """Attempt one Vault without allowing its race to suppress the other Vault."""
     try:
-        after = remote_head(repo, remote_url, git_dir)
-    except (PushError, subprocess.SubprocessError):
-        return ("failed", before)
-    if after != local_head:
-        return ("failed", after)
-    return ("complete", after)
-
-
-def require_unchanged_remote_heads(
-    agents_head: str, user_head: str, pre: dict[str, object]
-) -> None:
-    """Reject a remote race after the reviewed pre-publication snapshot."""
-    if (
-        agents_head != pre["agents_vault"]["remote_head"]
-        or user_head != pre["user_vault"]["remote_head"]
-    ):
-        raise PushError("remote main moved after pre-collection fetch")
+        observed = remote_head(repo, remote_url, git_dir)
+    except (OSError, subprocess.SubprocessError, TransportError, PushError):
+        return (
+            "not_started" if publication_mode == "blocked" else "failed",
+            expected_remote,
+        )
+    if publication_mode == "blocked":
+        return ("not_started", observed)
+    if publication_mode not in {"sweep", "own_only"}:
+        return ("failed", observed)
+    if observed == local_head:
+        return (
+            "not_required" if expected_remote == local_head else "complete",
+            observed,
+        )
+    if observed != expected_remote:
+        return ("failed", observed)
+    try:
+        return push_one(
+            repo,
+            remote_url,
+            local_head,
+            observed != local_head,
+            observed,
+            git_dir,
+        )
+    except (OSError, subprocess.SubprocessError, TransportError, PushError):
+        return ("failed", observed)
 
 
 def final_vault(
@@ -517,6 +754,8 @@ def final_vault(
         "local_head": reported["local_head"],
         "remote_head": remote,
         "clean": reported["clean"],
+        "publication_mode": reported["publication_mode"],
+        "deferred_cleanup": list(reported.get("deferred_cleanup", [])),
     }
 
 
@@ -534,153 +773,91 @@ def main(argv: list[str]) -> int:
     pre: dict[str, object] = {}
     committed: dict[str, object] = {}
     try:
-        runtime = json.loads(Path(argv[1]).read_text(encoding="utf-8"))
-        pre = json.loads(Path(argv[2]).read_text(encoding="utf-8"))
+        runtime = json.loads(read_regular_nofollow(Path(argv[1])))
+        pre = json.loads(read_regular_nofollow(Path(argv[2])))
         context_path = Path(argv[6])
-        context = json.loads(context_path.read_text(encoding="utf-8"))
+        context_bytes = read_regular_nofollow(context_path)
+        context = json.loads(context_bytes)
         review_bytes = read_regular_nofollow(Path(argv[7]))
         if hashlib.sha256(review_bytes).hexdigest() != argv[9]:
             raise PushError("publication review changed after validation")
         review = json.loads(review_bytes)
-        plan = json.loads(Path(argv[8]).read_text(encoding="utf-8"))
+        plan = json.loads(read_regular_nofollow(Path(argv[8])))
         if review.get("publication_context_sha256") != hashlib.sha256(
-            context_path.read_bytes()
+            context_bytes
         ).hexdigest():
             raise PushError("approved review is not bound to publication context")
-        process_status = int(argv[5])
+        if (
+            runtime != context.get("runtime")
+            or pre != context.get("pre_collection_state")
+            or plan != context.get("artifact_plan")
+        ):
+            raise PushError("fixed push inputs differ from reviewed context")
+        if int(argv[5]) != 0:
+            raise PushError("local publication did not pass canonical validation")
         try:
             committed = json.loads(Path(argv[3]).read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             committed = {}
-        actual_agents = current_local(runtime["agents_vault_root"], pre["agents_vault"])
-        actual_user = current_local(runtime["user_vault_root"], pre["user_vault"])
-        if process_status != 0 or committed.get("outcome") != "ready_to_push":
-            unchanged = all(
-                actual["local_head"] == before["local_head"]
-                and actual["post_dirty_digest"] == before["dirty_digest"]
-                for actual, before in (
-                    (actual_agents, pre["agents_vault"]),
-                    (actual_user, pre["user_vault"]),
-                )
-            )
-            requested_outcome = committed.get("outcome")
-            if requested_outcome == "blocked" and not unchanged:
-                requested_outcome = "partial_publication"
-            outcome = "blocked" if unchanged else "partial_publication"
-            if requested_outcome == "partial_publication":
-                outcome = "partial_publication"
-            agents_remote = remote_head(
-                runtime["agents_vault_root"],
-                runtime["agents_remote_url"],
-                runtime["agents_git_dir"],
-            )
-            user_remote = remote_head(
-                runtime["user_vault_root"],
-                runtime["user_remote_url"],
-                runtime["user_git_dir"],
-            )
-            result = {
-                "outcome": outcome,
-                "phase": "local_commit",
-                "daily_pipeline_status": committed.get(
-                    "daily_pipeline_status", "blocked"
-                ),
-                "summary_path": committed.get("summary_path"),
-                "advisory_path": committed.get("advisory_path"),
-                "notification_result": committed.get("notification_result"),
-                "agents_vault": final_vault(
-                    actual_agents, "not_started", agents_remote
-                ),
-                "user_vault": final_vault(actual_user, "not_started", user_remote),
-                "evidence_finalization_commit": None,
-                "next_action": committed.get("next_action")
-                or "Inspect the local publication failure; do not force or rewrite history.",
-            }
-            output_path.write_text(
-                json.dumps(result, ensure_ascii=False), encoding="utf-8"
-            )
-            return 75
-        agents_head = validate_local(
-            runtime["agents_vault_root"],
-            pre["agents_vault"],
-            committed["agents_vault"],
-        )
-        user_head = validate_local(
-            runtime["user_vault_root"],
-            pre["user_vault"],
-            committed["user_vault"],
-        )
-        if git_control_digest(runtime["agents_vault_root"]) != pre["agents_vault"][
-            "git_control_sha256"
-        ] or git_control_digest(runtime["user_vault_root"]) != pre["user_vault"][
-            "git_control_sha256"
-        ]:
-            raise PushError("Git config or hooks changed during local publication")
-        validate_scope(
-            runtime["agents_vault_root"],
-            pre["agents_vault"],
-            committed["agents_vault"],
-            review["agents_vault"],
-        )
-        validate_scope(
-            runtime["user_vault_root"],
-            pre["user_vault"],
-            committed["user_vault"],
-            review["user_vault"],
-        )
+        if committed.get("outcome") not in {"ready_to_push", "partial_publication"}:
+            raise PushError("local publication produced no independently pushable result")
+        if committed.get("publication_mode") != {
+            "agents_vault": committed["agents_vault"].get("publication_mode"),
+            "user_vault": committed["user_vault"].get("publication_mode"),
+        }:
+            raise PushError("top-level and per-Vault publication modes disagree")
+        if committed.get("deferred_cleanup") != {
+            "agents_vault": committed["agents_vault"].get("deferred_cleanup"),
+            "user_vault": committed["user_vault"].get("deferred_cleanup"),
+        }:
+            raise PushError("top-level and per-Vault deferred cleanup disagree")
+        agents_artifact = review["agents_vault"]["reviewed_artifacts"][0][
+            "target_path"
+        ]
+        user_artifact = review["user_vault"]["reviewed_artifacts"][0][
+            "target_path"
+        ]
         if committed.get("evidence_finalization_commit") is not None:
             raise PushError("evidence must be finalized after the first fixed pushes")
-        if (
-            committed.get("summary_path") != plan["summary_target"]
-            or committed.get("advisory_path") != plan["advisory_target"]
-        ):
-            raise PushError("reported artifact paths differ from the approved plan")
-        scan_commits(
-            runtime["gitleaks_bin"],
-            runtime["agents_vault_root"],
-            pre["agents_vault"]["remote_head"],
-            agents_head,
-        )
-        scan_commits(
-            runtime["gitleaks_bin"],
-            runtime["user_vault_root"],
-            pre["user_vault"]["remote_head"],
-            user_head,
-        )
         if committed.get("daily_pipeline_status") != "complete":
             raise PushError("ready publication does not mark the pipeline complete")
-        agents_before = remote_head(
-            runtime["agents_vault_root"],
-            runtime["agents_remote_url"],
-            runtime["agents_git_dir"],
-        )
-        user_before = remote_head(
-            runtime["user_vault_root"],
-            runtime["user_remote_url"],
-            runtime["user_git_dir"],
-        )
-        require_unchanged_remote_heads(agents_before, user_before, pre)
-        agents_push, agents_remote = push_one(
-            runtime["agents_vault_root"],
-            runtime["agents_remote_url"],
-            agents_head,
-            agents_before != agents_head,
-            agents_before,
-            runtime["agents_git_dir"],
-        )
-        user_push, user_remote = push_one(
-            runtime["user_vault_root"],
-            runtime["user_remote_url"],
-            user_head,
-            user_before != user_head,
-            user_before,
-            runtime["user_git_dir"],
-        )
+        actual_agents = dict(committed["agents_vault"])
+        actual_user = dict(committed["user_vault"])
+        if (
+            actual_agents["publication_mode"] != "blocked"
+            and committed.get("advisory_path") != plan["advisory_target"]
+        ):
+            agents_push, agents_remote, agents_error = (
+                "failed", str(pre["agents_vault"]["remote_head"]),
+                "reported advisory path differs from the approved plan",
+            )
+        else:
+            agents_push, agents_remote, agents_error = validate_and_push_one(
+                runtime, pre["agents_vault"], actual_agents,
+                review["agents_vault"], agents_artifact, "agents",
+            )
+        if (
+            actual_user["publication_mode"] != "blocked"
+            and committed.get("summary_path") != plan["summary_target"]
+        ):
+            user_push, user_remote, user_error = (
+                "failed", str(pre["user_vault"]["remote_head"]),
+                "reported summary path differs from the approved plan",
+            )
+        else:
+            user_push, user_remote, user_error = validate_and_push_one(
+                runtime, pre["user_vault"], actual_user,
+                review["user_vault"], user_artifact, "user",
+            )
         success = (
-            agents_push in {"complete", "not_required"}
+            agents_error is None
+            and user_error is None
+            and actual_agents["publication_mode"] != "blocked"
+            and actual_user["publication_mode"] != "blocked"
+            and agents_push in {"complete", "not_required"}
             and user_push in {"complete", "not_required"}
-            and agents_remote == agents_head
-            and user_remote == user_head
+            and agents_remote == actual_agents["local_head"]
+            and user_remote == actual_user["local_head"]
         )
         result = {
             "outcome": "partial_publication",
@@ -690,20 +867,28 @@ def main(argv: list[str]) -> int:
             "advisory_path": committed["advisory_path"],
             "notification_result": committed["notification_result"],
             "agents_vault": final_vault(
-                committed["agents_vault"], agents_push, agents_remote,
+                actual_agents, agents_push, agents_remote,
                 pre["agents_vault"],
             ),
             "user_vault": final_vault(
-                committed["user_vault"], user_push, user_remote,
+                actual_user, user_push, user_remote,
                 pre["user_vault"],
             ),
+            "publication_mode": committed["publication_mode"],
+            "deferred_cleanup": committed["deferred_cleanup"],
             "evidence_finalization_commit": committed[
                 "evidence_finalization_commit"
             ],
             "next_action": (
                 "Finalize and review actual push evidence, then push the Agents evidence commit."
                 if success
-                else "Repair the failed plain main push without force or history rewrite."
+                else "; ".join(
+                    value for value in (
+                        f"Agents Vault: {agents_error}" if agents_error else "",
+                        f"User Vault: {user_error}" if user_error else "",
+                        committed.get("next_action") or "",
+                    ) if value
+                ) or "Repair the failed plain main push without force or history rewrite."
             ),
         }
     except (
@@ -713,6 +898,7 @@ def main(argv: list[str]) -> int:
         ValueError,
         json.JSONDecodeError,
         subprocess.SubprocessError,
+        TransportError,
         PushError,
     ) as exc:
         print(f"fixed push blocked:{exc}", file=sys.stderr)
@@ -724,6 +910,15 @@ def main(argv: list[str]) -> int:
                 actual_user = current_local(
                     str(runtime["user_vault_root"]), pre["user_vault"]
                 )
+                for key, actual in (
+                    ("agents_vault", actual_agents), ("user_vault", actual_user)
+                ):
+                    actual["publication_mode"] = committed.get(key, {}).get(
+                        "publication_mode", "blocked"
+                    )
+                    actual["deferred_cleanup"] = committed.get(key, {}).get(
+                        "deferred_cleanup", []
+                    )
                 agents_remote = remote_head(
                     str(runtime["agents_vault_root"]),
                     str(runtime["agents_remote_url"]),
@@ -777,6 +972,12 @@ def main(argv: list[str]) -> int:
                         ),
                         user_remote,
                     ),
+                    "publication_mode": committed.get("publication_mode", {
+                        "agents_vault": "blocked", "user_vault": "blocked"
+                    }),
+                    "deferred_cleanup": committed.get("deferred_cleanup", {
+                        "agents_vault": [], "user_vault": []
+                    }),
                     "evidence_finalization_commit": None,
                     "next_action": (
                         f"Repair fixed-push validation without force: {exc}"

@@ -52,6 +52,8 @@ Runtime context supplies:
 6. The summary's `確認済みサイト一覧` must contain exactly one Markdown table
    row per catalog entry with these columns:
    `サイト | Tier | 状態 | 取得方法 | 確認URL | 期間内件数 | 理由`.
+   Copy `Tier` as the catalog's exact integer (`1` or `2`). Do not write a
+   display label such as `Tier 1` or `Tier 2`.
    `確認URL`はMarkdown linkではなくbare HTTPS URLを記載する。
    `状態` is `取得済み`, `対象期間記事なし`, or `アクセス制約` only.
    `取得方法` must be exactly one allowed value, never a combined label. Map the
@@ -71,11 +73,16 @@ Runtime context supplies:
    `jst_window_item_count` exactly into `期間内件数`; do not independently recount
    or override it. The trusted validator rederives this value from the sealed
    extract before accepting the row.
-   A public source is not complete until an RSS/page/search/official-alternate
-   result is verified by the fetcher's source manifest. `アクセス制約` is only for confirmed login, subscription,
+   A direct `fetched` or `access_constraint` source is complete only when its
+   audit row matches the sealed source manifest. A `needs_search_fallback` source
+   is provisionally complete for this response when its official candidate is
+   recorded in `source-resolutions.json`; the runner verifies it after the
+   response. `アクセス制約` is only for confirmed login, subscription,
    robots, or CAPTCHA restrictions; generic 401/403 or tool failure still needs
-   search fallback. A source-coverage row must match the manifest's final URL and
-   acquisition method; a robots restriction must match a recorded failed attempt.
+   search fallback. A direct-source coverage row must match the manifest's final
+   URL and acquisition method. A fallback coverage row must match the submitted
+   resolution candidate and is accepted only if the runner's post-response
+   verification agrees. A robots restriction must match a recorded failed attempt.
    For every successful site-search or official-alternate fallback, write one
    entry to `<collection_output_root>/source-resolutions.json` using exactly this
    shape: `{"version":1,"resolutions":[{"name":"catalog name","method":"site_search|official_alternate","url":"bare HTTPS URL"}],"date_evidence":[{"name":"catalog name","url":"official article URL"}]}`.
@@ -86,8 +93,15 @@ Runtime context supplies:
    Put every official article URL used to supplement a missing HTML `published`
    value in `date_evidence`; do not repeat entries already carrying a date in the
    sealed extract. Always write this file, using empty arrays when no fallback URL
-   or supplemental date is needed. The trusted runner independently fetches these URLs before accepting
-   the corresponding audit rows.
+   or supplemental date is needed. The runner-created
+   `verified-source-resolutions.json` does not exist and is not readable during
+   this collection response. Once you have found a dated official URL, recorded
+   it in `source-resolutions.json`, and used the corresponding evidence in the
+   audit row, treat that source as provisionally resolved for your output. Do not
+   return blocked only because post-response runner verification has not happened
+   yet. After this response, the trusted runner independently fetches every
+   submitted URL and fails closed before publication if the candidate or date
+   evidence cannot be verified.
    If any catalog source remains unresolved, return the daily
    pipeline as blocked instead of creating a misleading complete summary.
 7. Validate the same-run staged summary.
@@ -96,7 +110,8 @@ Runtime context supplies:
 10. Calculate SHA-256 for both staged files.
 11. Return only JSON matching the collection schema. When both staged artifacts
     were created by this run, validated, hashed, and every catalog source was
-    resolved, return `daily_pipeline_status: "complete"`,
+    resolved (including provisionally resolved fallback entries submitted for
+    post-response runner verification), return `daily_pipeline_status: "complete"`,
     `vault_artifacts_complete: true`, and `next_action: null`. The trusted
     publisher handoff is the runner's subsequent responsibility and is not a
     reason to mark collection incomplete. A blocked result must instead use

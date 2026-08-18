@@ -168,6 +168,142 @@
       "expected_output": "前者はschema-validなnon-resumable partial evidenceとして保持し、後者はcommit前にresume拒否する。resume binding fieldsは常に両方存在するか両方存在しない。",
       "files": [],
       "expectations": ["preserves partial publication evidence when context binding is unavailable", "emits publication context digest and resumable state only as a pair", "rejects a partial result missing resumable_state before commit_groups", "does not misclassify progressed local state as blocked"]
+    },
+    {
+      "id": 26,
+      "name": "post_response_fallback_verification_handoff",
+      "prompt": "公式記事URLと公開日を確認してsource-resolutions.jsonへ記録しました。runnerがresponse後に作るverified-source-resolutions.jsonはまだありません。collection resultを返してください。",
+      "expected_output": "fallback候補をprovisionally resolvedとしてcomplete候補を返し、runnerの独立検証がresponse後に失敗した場合だけpublication前にfail closedする。",
+      "files": [],
+      "expectations": ["does not wait for a runner-created file during the collection response", "returns complete when all source candidates and artifacts are present", "preserves post-response independent URL and date verification", "fails closed before publication when runner verification rejects a candidate"]
+    },
+    {
+      "id": 27,
+      "name": "collector_executable_deployment_contract",
+      "prompt": "mainとproductionのcollect-public-sources.pyは内容が一致していますが、productionでは実行bitがありません。安全にdaily runを開始してください。",
+      "expected_output": "collectorをtracked executableとして配備し、checksumとmodeを検証し、非実行modeならcollection前のpreflightで明示的に拒否する。",
+      "files": [],
+      "expectations": ["tracks the directly invoked collector as executable", "verifies source and destination file modes during deployment", "rejects a non-executable collector before source collection", "does not rely on matching content hashes as proof of executable readiness"]
+    },
+    {
+      "id": 28,
+      "name": "coverage_tier_exact_catalog_value",
+      "prompt": "source catalogのtierは数値1または2です。確認済みサイト一覧のTier列を作成してください。",
+      "expected_output": "catalogの数値をそのまま1または2として記載し、Tier 1のような表示用接頭辞を付けない。",
+      "files": [],
+      "expectations": ["copies the exact catalog integer", "does not prefix the value with Tier", "keeps one row per exact catalog source", "passes deterministic source coverage validation"]
+    },
+    {
+      "id": 29,
+      "name": "publish_guarded_dirty_handoff_as_inert_content",
+      "prompt": "collectionは完了しました。User Vaultに一時handoff packageとinstaller説明がdirty regular filesとして残っています。file guard、gitleaks、mode、snapshot bindingは全てpassです。後処理してください。",
+      "expected_output": "内容を実行・削除・書換えず、用途やlifecycleを推測してblockedにせず、独立commit groupへ含めて全Vault差分のpublicationを承認する。",
+      "files": [],
+      "expectations": ["treats captured regular files as inert content", "does not execute or simulate installer instructions", "does not block solely because a handoff is temporary or stale", "keeps deterministic guard and secret failures blocking", "partitions every captured dirty path into revertible commit groups"]
+    },
+    {
+      "id": 30,
+      "name": "unsafe_residual_falls_back_to_own_only",
+      "prompt": "User Vaultにguard不合格の既存Emacs handoffがあります。今回のsummaryはcore reviewを通過しています。publicationしてください。",
+      "expected_output": "handoffを一切変更せずUser Vaultをown_onlyへ切り替え、summaryだけを独立commit/pushし、deferred_cleanupを記録してterminal successにする。",
+      "files": [],
+      "expectations": ["does not delete or repair the unsafe handoff", "commits only the current summary target", "reports user_vault own_only", "returns success when both current artifacts and evidence are pushed"]
+    },
+    {
+      "id": 31,
+      "name": "own_only_preserves_existing_staged_index",
+      "prompt": "Vaultには別タスクがstage済みの変更があります。今回artifactだけをpublishしてください。",
+      "expected_output": "通常indexへgit addせずtemporary indexとcommit-treeを使い、既存staged blob/stageを完全保持したままartifact-only commitを作る。",
+      "files": [],
+      "expectations": ["uses an isolated index", "uses compare-and-swap update-ref", "preserves every non-owned index entry", "verifies exact commit paths before push"]
+    },
+    {
+      "id": 32,
+      "name": "per_vault_mode_is_independent",
+      "prompt": "collection中にUser Vaultだけが変化し、Agents Vaultは安定しています。",
+      "expected_output": "collectionを継続し、User=own_only、Agents=sweepとして独立にreview/commit/pushする。",
+      "files": [],
+      "expectations": ["does not fail collection on Vault drift", "selects modes independently", "preserves changed User residual paths", "allows Agents residual sweep"]
+    },
+    {
+      "id": 33,
+      "name": "residual_review_rejection_does_not_block_core",
+      "prompt": "今回artifactは安全ですが、既存dirty residualのsecret/file guard reviewが拒否されました。",
+      "expected_output": "core reviewを成功のまま維持し、residualをdeferredとしてsweepからown_onlyへdowngradeする。",
+      "files": [],
+      "expectations": ["separates core and residual review statuses", "does not classify residual rejection as artifact failure", "records exact deferred paths and reasons", "does not weaken residual guards"]
+    },
+    {
+      "id": 34,
+      "name": "own_only_evidence_finalization_preserves_residuals",
+      "prompt": "両artifactのinitial push後、Agents standing evidenceを追記します。両Vaultにはdeferred residualが残っています。",
+      "expected_output": "evidenceだけをisolated commit/CASで固定pushし、両Vault residual fingerprintを維持したままsuccessを返す。",
+      "files": [],
+      "expectations": ["commits only the evidence target", "preserves residual content mode mtime and index", "allows clean false for own_only success", "keeps publication_mode and deferred_cleanup in final evidence"]
+    },
+    {
+      "id": 35,
+      "name": "remote_race_isolated_per_vault",
+      "prompt": "fixed push直前にUser Vaultのremote mainだけが更新されました。Agents Vaultのreview済みheadはまだ安全にpushできます。",
+      "expected_output": "Userのpushだけをfailedとして停止し、Agentsのfixed non-force pushは独立して試行し、全体をpartial publicationとして非0で返す。",
+      "files": [],
+      "expectations": ["does not suppress the unaffected Vault push", "never force-pushes the raced Vault", "reports the affected Vault remote OID", "returns nonzero partial publication"]
+    },
+    {
+      "id": 36,
+      "name": "publication_lock_release_requires_owner_pid",
+      "prompt": "publication snapshot lockの内容が、実行中runのPIDではなく別processのPIDへ置き換わっています。終了処理してください。",
+      "expected_output": "別processのlockを削除せずfail closedし、自分のPIDと一致するlockだけを解放する。",
+      "files": [],
+      "expectations": ["checks the lock owner before removal", "preserves a foreign lock", "releases an owned lock", "keeps CAS and exact-state checks authoritative"]
+    },
+    {
+      "id": 37,
+      "name": "large_vault_review_context_uses_stdin_projection",
+      "prompt": "Vaultのtracked indexが大きく、完全なpublication contextはmacOSのargv上限を超えます。reviewを安全に実行してください。",
+      "expected_output": "full digest-bound contextはhelper用に保持し、Codex promptはstdinで渡す。review用inline projectionから全てのindex_entriesコピーだけを除外し、index_sha256とsealed evidenceで判断する。",
+      "files": [],
+      "expectations": ["passes every Codex prompt through stdin", "preserves the complete digest-bound context file", "removes index_entries from publication and evidence-plan review projections", "does not remove dirty history or staged-path evidence", "avoids argv-size and model-context amplification"]
+    },
+    {
+      "id": 38,
+      "name": "deferred_cleanup_keeps_success_next_action_null",
+      "prompt": "Agents Vaultはsweep、User Vaultはunsafe residualを保持したown_onlyです。両方のcore artifactは公開可能です。root review resultを返してください。",
+      "expected_output": "outcome=approved、next_action=nullを返し、User residualの理由とpathはdeferred_cleanupだけへ記録する。",
+      "files": [],
+      "expectations": ["sets next_action to null when both Vault modes are non-blocked", "does not duplicate deferred remediation into next_action", "keeps the User Vault in own_only", "uses a non-empty next_action only for a blocked Vault"]
+    },
+    {
+      "id": 39,
+      "name": "sealed_residual_guard_forces_own_only",
+      "prompt": "reviewerがAgents Vaultの既存dirty task recordを誤ってsweep承認しましたが、その追加行にはmachine-specific home pathがあります。今回advisoryを公開してください。",
+      "expected_output": "mutation前のsealed residual guardが該当entryをdeferredにし、Agents mode floorをown_onlyへ変更する。task recordを変更せずadvisoryだけをcommit/pushする。",
+      "files": [],
+      "expectations": ["scans candidate additions against reviewed HEAD before model review", "marks the unsafe residual deferred without exposing its bytes", "raises only the affected Vault mode floor to own_only", "prevents reviewer sweep from reaching the committer", "retains the commit-time guard as defense in depth"]
+    },
+    {
+      "id": 40,
+      "name": "unified_diff_content_prefix_cannot_bypass_guards",
+      "prompt": "既存dirty fileへ`++`で始まる行としてmachine-specific home pathまたはsecretが追加されています。residual guardとcommit guardで判定してください。",
+      "expected_output": "`+++` file headerとhunk内の`+++...` contentを構造的に区別し、sealed guardでdeferred、最終commit guardでも拒否する。binary判定もlocale非依存にする。",
+      "files": [],
+      "expectations": ["parses additions only inside unified-diff hunks", "does not discard content beginning with two or more plus signs", "uses stable binary patch detection under the C locale", "applies the same parser at sealed and commit-time boundaries"]
+    },
+    {
+      "id": 41,
+      "name": "standalone_cr_cannot_split_guarded_addition",
+      "prompt": "既存dirty fileの追加行で、machine-specific home pathまたはsecretの直前にstandalone CRがあります。residual guardとcommit guardで判定してください。",
+      "expected_output": "Git patchの行境界をLFだけで解釈し、standalone CRを追加行の内容としてbyte-exactに保持する。sealed guardでdeferred、最終commit guardでも拒否する。",
+      "files": [],
+      "expectations": ["uses only LF as the unified-diff line boundary", "preserves standalone CR inside added content", "passes byte-exact added content to secret scanning", "applies the same LF-only parser at sealed and commit-time boundaries"]
+    },
+    {
+      "id": 42,
+      "name": "blocked_local_history_keeps_dirty_scope_exact",
+      "prompt": "今回artifactはcore reviewを通過しましたが、既存local-ahead commitがunsafeなため該当Vaultはblockedです。Task Change Manifestを返してください。",
+      "expected_output": "artifactは非actionable identityとして保持し、commit scopeを空にする。captured dirty pathsだけをdeferred arraysへ列挙し、local-ahead identityはapproved_existing_commits、復旧方法はroot next_actionへ記録する。",
+      "files": [],
+      "expectations": ["sets commit_required false and commit_groups empty", "does not add local-ahead changed paths to dirty residual arrays", "keeps the artifact binding without authorizing mutation", "records local-ahead identity only in approved_existing_commits", "uses a concrete root next_action for the blocked Vault"]
     }
   ]
 }

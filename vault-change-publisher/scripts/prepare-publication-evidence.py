@@ -13,7 +13,7 @@ import subprocess
 import sys
 from pathlib import Path, PurePosixPath
 
-from git_diff_digest import git_diff_digest
+from evidence_hunk import canonical_patch, insert_evidence_block
 
 
 class EvidenceError(RuntimeError):
@@ -38,9 +38,13 @@ def read_regular_nofollow(path: Path) -> bytes:
         before = os.fstat(descriptor)
         if not stat.S_ISREG(before.st_mode):
             raise EvidenceError("input is not a regular file")
-        content = b""
+        if before.st_size > MAX_TASK_BYTES:
+            raise EvidenceError("input exceeds the allowed size")
+        content = bytearray()
         while chunk := os.read(descriptor, 1024 * 1024):
-            content += chunk
+            content.extend(chunk)
+            if len(content) > MAX_TASK_BYTES:
+                raise EvidenceError("input grew beyond the allowed size")
         after = os.fstat(descriptor)
         if (
             before.st_dev,
@@ -56,7 +60,7 @@ def read_regular_nofollow(path: Path) -> bytes:
             after.st_ctime_ns,
         ):
             raise EvidenceError("input changed while being read")
-        return content
+        return bytes(content)
     finally:
         os.close(descriptor)
 
@@ -72,10 +76,139 @@ def relative_path(root: str, absolute: str) -> str:
     return str(relative)
 
 
+def capture_complete(runtime_file: str) -> dict[str, object]:
+    """Capture the exact two-Vault baseline before evidence mutation."""
+    helper = Path(__file__).with_name("capture-vault-state.py")
+    completed = subprocess.run(
+        [str(helper), "--include-local-history", runtime_file],
+        check=True,
+        capture_output=True,
+        text=True,
+        env={
+            **{key: value for key, value in os.environ.items() if not key.startswith("GIT_")},
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_NO_LAZY_FETCH": "1",
+            "GIT_NO_REPLACE_OBJECTS": "1",
+            "GIT_OPTIONAL_LOCKS": "0",
+        },
+    )
+    return json.loads(completed.stdout)
+
+
 EVIDENCE_HEADING = "### Vault Publication Evidence"
 SECTION_BOUNDARY = re.compile(r"^ {0,3}#{1,3}(?:[ \t]+|$)")
 FENCE_START = re.compile(r"^ {0,3}(`{3,}|~{3,})")
 MAX_TASK_BYTES = 10 * 1024 * 1024
+
+
+def clean_git_environment() -> dict[str, str]:
+    """Disable ambient Git controls and command-capable fsmonitor config."""
+    environment = {
+        key: value for key, value in os.environ.items() if not key.startswith("GIT_")
+    }
+    environment.update(
+        {
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_NO_LAZY_FETCH": "1",
+            "GIT_NO_REPLACE_OBJECTS": "1",
+            "GIT_OPTIONAL_LOCKS": "0",
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "core.fsmonitor",
+            "GIT_CONFIG_VALUE_0": "false",
+        }
+    )
+    return environment
+
+
+def git_bytes(repo: str, git_dir: str, *arguments: str) -> bytes:
+    """Read bounded local Git object data without filters or replacement refs."""
+    process = subprocess.Popen(
+        [
+            "git", f"--git-dir={git_dir}", f"--work-tree={repo}",
+            "-c", f"core.hooksPath={os.devnull}",
+            "-c", "core.fsmonitor=false",
+            *arguments,
+        ],
+        cwd="/",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        env=clean_git_environment(),
+    )
+    assert process.stdout is not None
+    content = bytearray()
+    try:
+        while chunk := process.stdout.read(
+            min(65536, MAX_TASK_BYTES + 1 - len(content))
+        ):
+            content.extend(chunk)
+            if len(content) > MAX_TASK_BYTES:
+                process.kill()
+                process.wait()
+                raise EvidenceError("evidence Git object exceeds the allowed size")
+        return_code = process.wait()
+    finally:
+        process.stdout.close()
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+    if return_code != 0:
+        raise EvidenceError("evidence Git object is unavailable")
+    return bytes(content)
+
+
+def target_entries(
+    runtime: dict[str, object], baseline: dict[str, object], target: str
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Return exact regular HEAD/index entries for the standing task."""
+    repo = str(runtime["agents_vault_root"])
+    git_dir = str(runtime["agents_git_dir"])
+    raw = git_bytes(repo, git_dir, "ls-tree", "-z", "HEAD", "--", target)
+    metadata, separator, path = raw.rstrip(b"\0").partition(b"\t")
+    fields = metadata.split()
+    if separator != b"\t" or len(fields) != 3 or path.decode("utf-8") != target:
+        raise EvidenceError("evidence target is missing from HEAD")
+    head = {
+        "mode": fields[0].decode("ascii"),
+        "type": fields[1].decode("ascii"),
+        "git_blob_oid": fields[2].decode("ascii"),
+    }
+    if head["mode"] != "100644" or head["type"] != "blob":
+        raise EvidenceError("evidence target HEAD entry is not a regular Markdown blob")
+    index_matches = [
+        entry
+        for entry in baseline["agents_vault"]["index_entries"]
+        if entry.get("path") == target
+    ]
+    if len(index_matches) != 1 or index_matches[0].get("stage") != 0:
+        raise EvidenceError("evidence target index entry is missing or unmerged")
+    index = {
+        "mode": str(index_matches[0]["mode"]),
+        "git_blob_oid": str(index_matches[0]["git_blob_oid"]),
+    }
+    if index["mode"] != "100644":
+        raise EvidenceError("evidence target index mode is unsupported")
+    return head, index
+
+
+def read_blob(repo: str, git_dir: str, oid: str) -> bytes:
+    """Read one exact bounded Git blob."""
+    object_type = git_bytes(repo, git_dir, "cat-file", "-t", oid).strip()
+    if object_type != b"blob":
+        raise EvidenceError("evidence source object is not a blob")
+    return git_bytes(repo, git_dir, "cat-file", "blob", oid)
+
+
+def write_private_exclusive(path: Path, content: bytes) -> None:
+    """Create one immutable run-owned review input."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags, 0o600)
+    try:
+        write_all(descriptor, content)
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def stable_identity(metadata: os.stat_result) -> tuple[int, int, int, int, int]:
@@ -284,13 +417,13 @@ def main(argv: list[str]) -> int:
         )
         return 64
     try:
-        runtime = json.loads(Path(argv[1]).read_text(encoding="utf-8"))
+        runtime = json.loads(read_regular_nofollow(Path(argv[1])))
         context_path = Path(argv[2])
         review_bytes = read_regular_nofollow(Path(argv[3]))
         if hashlib.sha256(review_bytes).hexdigest() != argv[7]:
             raise EvidenceError("approved review digest mismatch")
         review = json.loads(review_bytes.decode("utf-8"))
-        initial = json.loads(Path(argv[4]).read_text(encoding="utf-8"))
+        initial = json.loads(read_regular_nofollow(Path(argv[4])))
         if not all(
             initial[key]["push_status"] in {"complete", "not_required"}
             and initial[key]["local_head"] == initial[key]["remote_head"]
@@ -303,7 +436,10 @@ def main(argv: list[str]) -> int:
         target_relative = PurePosixPath(finalization["target_path"])
         if target_relative.is_absolute() or ".." in target_relative.parts:
             raise EvidenceError("invalid evidence target")
-        context_digest = approved_context_digest(review, context_path.read_bytes())
+        context_digest = approved_context_digest(
+            review, read_regular_nofollow(context_path)
+        )
+        evidence_baseline = capture_complete(argv[1])
         payload = {
             "run_id": argv[5],
             "publication_context_sha256": review["publication_context_sha256"],
@@ -323,6 +459,8 @@ def main(argv: list[str]) -> int:
             "advisory_repo_path": relative_path(
                 runtime["agents_vault_root"], initial["advisory_path"]
             ),
+            "publication_mode": initial["publication_mode"],
+            "deferred_cleanup": initial["deferred_cleanup"],
         }
         marker = f"vault-change-publisher:{argv[5]}"
         block = (
@@ -332,17 +470,56 @@ def main(argv: list[str]) -> int:
             f"{json.dumps(payload, ensure_ascii=False, sort_keys=True)}\n"
             "```\n\n"
         ).encode("utf-8")
-        insert_under_evidence_section_no_follow(
-            Path(runtime["agents_vault_root"]), target_relative, block
+        target = str(target_relative)
+        repo = str(runtime["agents_vault_root"])
+        git_dir = str(runtime["agents_git_dir"])
+        head_entry, index_entry = target_entries(
+            runtime, evidence_baseline, target
         )
+        head_before = read_blob(repo, git_dir, head_entry["git_blob_oid"])
+        index_before = read_blob(repo, git_dir, index_entry["git_blob_oid"])
+        worktree_before = read_regular_nofollow(Path(repo) / target)
+        marker_bytes = marker.encode("utf-8")
+        head_candidate = insert_evidence_block(head_before, block, marker_bytes)
+        index_candidate = insert_evidence_block(index_before, block, marker_bytes)
+        worktree_candidate = insert_evidence_block(
+            worktree_before, block, marker_bytes
+        )
+        if max(len(head_candidate), len(index_candidate), len(worktree_candidate)) > MAX_TASK_BYTES:
+            raise EvidenceError("evidence candidate exceeds the allowed size")
+        review_patch = canonical_patch(target, head_before, head_candidate)
+        output_root = Path(argv[8]).parent
+        head_candidate_path = output_root / "evidence-head-candidate.blob"
+        index_candidate_path = output_root / "evidence-index-candidate.blob"
+        worktree_candidate_path = output_root / "evidence-worktree-candidate.blob"
+        review_patch_path = output_root / "evidence-review.patch"
+        for path, content in (
+            (head_candidate_path, head_candidate),
+            (index_candidate_path, index_candidate),
+            (worktree_candidate_path, worktree_candidate),
+            (review_patch_path, review_patch),
+        ):
+            write_private_exclusive(path, content)
         plan = {
             "template": "daily_publication_v1",
-            "target_path": str(target_relative),
-            "evidence_diff_sha256": git_diff_digest(
-                runtime["agents_vault_root"], str(target_relative)
-            ),
+            "target_path": target,
+            "base_head": initial["agents_vault"]["local_head"],
+            "head_entry": head_entry,
+            "index_entry": index_entry,
+            "head_source_sha256": hashlib.sha256(head_before).hexdigest(),
+            "index_source_sha256": hashlib.sha256(index_before).hexdigest(),
+            "worktree_source_sha256": hashlib.sha256(worktree_before).hexdigest(),
+            "head_candidate_path": str(head_candidate_path),
+            "head_candidate_sha256": hashlib.sha256(head_candidate).hexdigest(),
+            "index_candidate_path": str(index_candidate_path),
+            "index_candidate_sha256": hashlib.sha256(index_candidate).hexdigest(),
+            "worktree_candidate_path": str(worktree_candidate_path),
+            "worktree_candidate_sha256": hashlib.sha256(worktree_candidate).hexdigest(),
+            "review_patch_path": str(review_patch_path),
+            "evidence_diff_sha256": hashlib.sha256(review_patch).hexdigest(),
             "publication_context_sha256": context_digest,
             "marker": marker,
+            "pre_evidence_state": evidence_baseline,
         }
         Path(argv[8]).write_text(
             json.dumps(plan, ensure_ascii=False), encoding="utf-8"

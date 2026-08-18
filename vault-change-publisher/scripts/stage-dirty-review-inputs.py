@@ -10,16 +10,52 @@ import re
 import stat
 import subprocess
 import sys
+import tempfile
 from pathlib import Path, PurePosixPath
+
+from git_diff_digest import unified_diff_added_content
 
 
 MAX_BLOB_BYTES = 8 * 1024 * 1024
 MAX_TOTAL_BYTES = 32 * 1024 * 1024
+MAX_GUARD_PATCH_BYTES = (2 * MAX_BLOB_BYTES) + (1024 * 1024)
+SCAN_TIMEOUT_SECONDS = 30
 OID_PATTERN = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 
 
 class DirtySnapshotError(RuntimeError):
     """Raised when captured dirty state cannot be materialized safely."""
+
+
+def run_bounded(arguments: list[str], limit: int) -> bytes:
+    """Read subprocess stdout up to an explicit bound without buffering beyond it."""
+    process = subprocess.Popen(
+        arguments,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        cwd="/",
+        env=clean_git_environment(),
+    )
+    assert process.stdout is not None
+    chunks: list[bytes] = []
+    total = 0
+    try:
+        while chunk := process.stdout.read(min(65536, limit + 1 - total)):
+            total += len(chunk)
+            if total > limit:
+                process.kill()
+                process.wait()
+                raise DirtySnapshotError("review input exceeds per-file size limit")
+            chunks.append(chunk)
+        return_code = process.wait()
+    finally:
+        process.stdout.close()
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+    if return_code != 0:
+        raise DirtySnapshotError("Git review input is unavailable")
+    return b"".join(chunks)
 
 
 def clean_git_environment() -> dict[str, str]:
@@ -31,6 +67,21 @@ def clean_git_environment() -> dict[str, str]:
     environment["GIT_NO_LAZY_FETCH"] = "1"
     environment["GIT_NO_REPLACE_OBJECTS"] = "1"
     environment["GIT_OPTIONAL_LOCKS"] = "0"
+    environment["GIT_LITERAL_PATHSPECS"] = "1"
+    environment["LC_ALL"] = "C"
+    environment["LANG"] = "C"
+    environment["GIT_CONFIG_COUNT"] = "1"
+    environment["GIT_CONFIG_KEY_0"] = "core.fsmonitor"
+    environment["GIT_CONFIG_VALUE_0"] = "false"
+    return environment
+
+
+def clean_scan_environment() -> dict[str, str]:
+    """Return a Git- and gitleaks-config-neutral scanner environment."""
+    environment = clean_git_environment()
+    for key in tuple(environment):
+        if key.startswith("GITLEAKS_"):
+            environment.pop(key)
     return environment
 
 
@@ -78,15 +129,25 @@ def read_regular_beneath(root: Path, relative: PurePosixPath) -> bytes:
 def read_blob(git_dir: str, worktree: str, relative: str, oid: str) -> bytes:
     if OID_PATTERN.fullmatch(oid) is None:
         raise DirtySnapshotError("dirty entry has an invalid Git object ID")
-    completed = subprocess.run(
-        ["git", f"--git-dir={git_dir}", "cat-file", "blob", oid],
+    size = subprocess.run(
+        ["git", f"--git-dir={git_dir}", "cat-file", "-s", oid],
         check=False,
         capture_output=True,
+        text=True,
         cwd="/",
         env=clean_git_environment(),
     )
-    if completed.returncode == 0:
-        content = completed.stdout
+    if size.returncode == 0:
+        try:
+            object_size = int(size.stdout.strip())
+        except ValueError as exc:
+            raise DirtySnapshotError("dirty blob size is invalid") from exc
+        if object_size > MAX_BLOB_BYTES:
+            raise DirtySnapshotError("dirty blob exceeds per-file size limit")
+        content = run_bounded(
+            ["git", f"--git-dir={git_dir}", "cat-file", "blob", oid],
+            MAX_BLOB_BYTES,
+        )
     else:
         content = read_regular_beneath(Path(worktree), PurePosixPath(relative))
     hashed = subprocess.run(
@@ -104,10 +165,146 @@ def read_blob(git_dir: str, worktree: str, relative: str, oid: str) -> bytes:
     return content
 
 
+def read_head_blob(git_dir: str, head: object, relative: str) -> bytes:
+    """Read the exact HEAD blob for one path without consulting the worktree."""
+    if not isinstance(head, str) or OID_PATTERN.fullmatch(head) is None:
+        raise DirtySnapshotError("review state HEAD is unavailable for residual guard")
+    listing = run_bounded(
+        ["git", f"--git-dir={git_dir}", "ls-tree", "-z", head, "--", relative],
+        64 * 1024,
+    )
+    if not listing:
+        return b""
+    records = [record for record in listing.split(b"\0") if record]
+    if len(records) != 1 or b"\t" not in records[0]:
+        raise DirtySnapshotError("HEAD residual identity is ambiguous")
+    metadata, listed_path = records[0].split(b"\t", 1)
+    fields = metadata.split()
+    if listed_path != os.fsencode(relative) or len(fields) != 3:
+        raise DirtySnapshotError("HEAD residual identity does not match captured path")
+    if fields[1] != b"blob":
+        return b""
+    oid = fields[2].decode("ascii")
+    size = subprocess.run(
+        ["git", f"--git-dir={git_dir}", "cat-file", "-s", oid],
+        check=False,
+        capture_output=True,
+        text=True,
+        cwd="/",
+        env=clean_git_environment(),
+    )
+    try:
+        object_size = int(size.stdout.strip()) if size.returncode == 0 else -1
+    except ValueError as exc:
+        raise DirtySnapshotError("HEAD residual size is invalid") from exc
+    if object_size < 0 or object_size > MAX_BLOB_BYTES:
+        raise DirtySnapshotError("HEAD residual exceeds deterministic guard bounds")
+    return run_bounded(
+        ["git", f"--git-dir={git_dir}", "cat-file", "blob", oid],
+        MAX_BLOB_BYTES,
+    )
+
+
+def diff_added_bytes(baseline: bytes, candidate: bytes) -> tuple[bytes, bool]:
+    """Return exact no-index added lines, or the full candidate for binary data."""
+    with tempfile.TemporaryDirectory(prefix="daily-news-residual-guard-") as temporary:
+        root = Path(temporary)
+        before = root / "before"
+        after = root / "after"
+        before.write_bytes(baseline)
+        after.write_bytes(candidate)
+        try:
+            completed = subprocess.run(
+                [
+                    "git", "diff", "--no-index", "--no-color", "--unified=0",
+                    "--binary", "--no-ext-diff", "--no-textconv", "--",
+                    str(before), str(after),
+                ],
+                cwd="/",
+                check=False,
+                capture_output=True,
+                env=clean_git_environment(),
+                timeout=SCAN_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise DirtySnapshotError("residual guard diff exceeded its deadline") from exc
+    if completed.returncode not in {0, 1}:
+        raise DirtySnapshotError("residual guard diff is unavailable")
+    if len(completed.stdout) > MAX_GUARD_PATCH_BYTES:
+        raise DirtySnapshotError("residual guard diff exceeds its size limit")
+    binary = any(
+        line == b"GIT binary patch" for line in completed.stdout.splitlines()
+    )
+    if binary:
+        return candidate, True
+    added = unified_diff_added_content(completed.stdout)
+    return added, False
+
+
+def gitleaks_rejects(gitleaks_bin: str, content: bytes) -> bool:
+    """Scan only candidate additions with the pinned scanner and no ambient config."""
+    if not content:
+        return False
+    try:
+        completed = subprocess.run(
+            [
+                gitleaks_bin,
+                "--no-banner",
+                "--redact",
+                "--ignore-gitleaks-allow",
+                "--gitleaks-ignore-path",
+                os.devnull,
+                "stdin",
+            ],
+            input=content,
+            cwd="/",
+            check=False,
+            capture_output=True,
+            env=clean_scan_environment(),
+            timeout=SCAN_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return True
+    return completed.returncode != 0
+
+
+def residual_guard_reason(
+    runtime: dict[str, object],
+    state: dict[str, object],
+    git_key: str,
+    relative: str,
+    content: bytes,
+) -> str | None:
+    """Return a deterministic defer reason for an unsafe residual candidate."""
+    if relative == ".obsidian" or relative.startswith(".obsidian/"):
+        return "dirty_entry_forbidden_obsidian_path"
+    head = state.get("local_head")
+    gitleaks_bin = runtime.get("gitleaks_bin")
+    # Legacy unit fixtures without production capture/scanner fields exercise
+    # materialization only. Production runtime always supplies both fields.
+    if not isinstance(head, str) or not isinstance(gitleaks_bin, str):
+        return None
+    try:
+        baseline = read_head_blob(str(runtime[git_key]), head, relative)
+        added, binary = diff_added_bytes(baseline, content)
+    except (DirtySnapshotError, OSError, subprocess.SubprocessError):
+        return "dirty_entry_residual_guard_unavailable"
+    home_bytes = os.fsencode(str(Path.home()))
+    guarded_content = content if binary else added
+    if home_bytes and home_bytes in guarded_content:
+        return "dirty_entry_added_machine_home_path"
+    if gitleaks_rejects(gitleaks_bin, guarded_content):
+        return "dirty_entry_secret_scan_rejected"
+    return None
+
+
 def read_commit_patch(
-    git_dir: str, commit: str, parents: list[str], expected_sha256: str
+    git_dir: str,
+    commit: str,
+    parents: list[str],
+    expected_sha256: str | None = None,
 ) -> bytes:
-    """Read one captured local-only commit as a deterministic first-parent patch."""
+    """Read one immutable local-only commit as a bounded first-parent patch."""
     if OID_PATTERN.fullmatch(commit) is None or any(
         OID_PATTERN.fullmatch(parent) is None for parent in parents
     ):
@@ -122,17 +319,12 @@ def read_commit_patch(
             "git", f"--git-dir={git_dir}", "diff-tree", "--root", "-p",
             "--binary", "--full-index", "--no-ext-diff", "--no-textconv", commit,
         ]
-    content = subprocess.run(
-        arguments,
-        check=True,
-        capture_output=True,
-        cwd="/",
-        env=clean_git_environment(),
-    ).stdout
-    if hashlib.sha256(content).hexdigest() != expected_sha256:
-        raise DirtySnapshotError("local commit patch differs from captured state")
-    if len(content) > MAX_BLOB_BYTES:
-        raise DirtySnapshotError("local commit patch exceeds per-file size limit")
+    content = run_bounded(arguments, MAX_BLOB_BYTES)
+    if (
+        expected_sha256 is not None
+        and hashlib.sha256(content).hexdigest() != expected_sha256
+    ):
+        raise DirtySnapshotError("local commit patch differs from expected digest")
     return content
 
 
@@ -168,8 +360,8 @@ def materialize(
 ) -> dict[str, object]:
     root_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
     destination_descriptor = os.open(destination, root_flags)
-    total_bytes = 0
-    manifest: dict[str, object] = {"version": 2, "vaults": {}, "local_commits": {}}
+    total_bytes = {"agents": 0, "user": 0}
+    manifest: dict[str, object] = {"version": 4, "vaults": {}, "local_commits": {}}
     try:
         snapshots_descriptor = mkdir_exclusive(destination_descriptor, "dirty-snapshots")
         try:
@@ -191,6 +383,23 @@ def materialize(
                         seen.add(relative)
                         mode = entry["mode"]
                         oid = entry["git_blob_oid"]
+                        if relative == ".obsidian" or relative.startswith(
+                            ".obsidian/"
+                        ):
+                            output_entries.append(
+                                {
+                                    "path": relative,
+                                    "git_blob_oid": oid,
+                                    "mode": mode,
+                                    "snapshot": None,
+                                    "sha256": None,
+                                    "materialization_status": "deferred",
+                                    "materialization_reason": (
+                                        "dirty_entry_forbidden_obsidian_path"
+                                    ),
+                                }
+                            )
+                            continue
                         if mode is None and oid is None:
                             output_entries.append(
                                 {
@@ -199,20 +408,53 @@ def materialize(
                                     "mode": None,
                                     "snapshot": None,
                                     "sha256": None,
+                                    "materialization_status": "not_required",
+                                    "materialization_reason": None,
                                 }
                             )
                             continue
+                        deferred_reason = None
                         if mode not in {"100644", "100755"} or not isinstance(oid, str):
-                            raise DirtySnapshotError("dirty entry mode is not publishable")
-                        content = read_blob(
-                            str(runtime[git_key]),
-                            str(runtime[f"{label}_vault_root"]),
-                            relative,
-                            oid,
-                        )
-                        total_bytes += len(content)
-                        if total_bytes > MAX_TOTAL_BYTES:
-                            raise DirtySnapshotError("dirty snapshots exceed total size limit")
+                            deferred_reason = "dirty_entry_mode_not_materializable"
+                            content = b""
+                        else:
+                            try:
+                                content = read_blob(
+                                    str(runtime[git_key]),
+                                    str(runtime[f"{label}_vault_root"]),
+                                    relative,
+                                    oid,
+                                )
+                            except (DirtySnapshotError, OSError, subprocess.SubprocessError):
+                                content = b""
+                                deferred_reason = "dirty_entry_snapshot_unavailable"
+                        if deferred_reason is None:
+                            deferred_reason = residual_guard_reason(
+                                runtime,
+                                pre_state[state_key],
+                                git_key,
+                                relative,
+                                content,
+                            )
+                        if (
+                            deferred_reason is None
+                            and total_bytes[label] + len(content) > MAX_TOTAL_BYTES
+                        ):
+                            deferred_reason = "review_snapshot_total_size_limit"
+                        if deferred_reason is not None:
+                            output_entries.append(
+                                {
+                                    "path": relative,
+                                    "git_blob_oid": oid,
+                                    "mode": mode,
+                                    "snapshot": None,
+                                    "sha256": None,
+                                    "materialization_status": "deferred",
+                                    "materialization_reason": deferred_reason,
+                                }
+                            )
+                            continue
+                        total_bytes[label] += len(content)
                         filename = f"{index:04d}.blob"
                         write_exclusive(vault_descriptor, filename, content)
                         output_entries.append(
@@ -222,6 +464,8 @@ def materialize(
                                 "mode": mode,
                                 "snapshot": f"dirty-snapshots/{label}/{filename}",
                                 "sha256": hashlib.sha256(content).hexdigest(),
+                                "materialization_status": "available",
+                                "materialization_reason": None,
                             }
                         )
                     manifest["vaults"][state_key] = output_entries
@@ -243,25 +487,42 @@ def materialize(
                     output_commits: list[dict[str, object]] = []
                     for index, commit in enumerate(commits):
                         parents = commit.get("parents")
-                        expected_sha256 = commit.get("patch_sha256")
-                        if not isinstance(parents, list) or not isinstance(expected_sha256, str):
+                        if not isinstance(parents, list):
                             raise DirtySnapshotError("local commit metadata is invalid")
-                        content = read_commit_patch(
-                            str(runtime[git_key]),
-                            str(commit.get("commit")),
-                            [str(parent) for parent in parents],
-                            expected_sha256,
-                        )
-                        total_bytes += len(content)
-                        if total_bytes > MAX_TOTAL_BYTES:
-                            raise DirtySnapshotError("review snapshots exceed total size limit")
+                        try:
+                            content = read_commit_patch(
+                                str(runtime[git_key]),
+                                str(commit.get("commit")),
+                                [str(parent) for parent in parents],
+                            )
+                            unavailable = (
+                                total_bytes[label] + len(content) > MAX_TOTAL_BYTES
+                            )
+                        except (DirtySnapshotError, OSError, subprocess.SubprocessError):
+                            content = b""
+                            unavailable = True
+                        if unavailable:
+                            output_commits.append(
+                                {
+                                    **commit,
+                                    "snapshot": None,
+                                    "sha256": None,
+                                    "materialization_status": "blocked",
+                                    "materialization_reason": "local_commit_snapshot_unavailable",
+                                }
+                            )
+                            continue
+                        total_bytes[label] += len(content)
                         filename = f"{index:04d}.patch"
                         write_exclusive(vault_descriptor, filename, content)
                         output_commits.append(
                             {
                                 **commit,
+                                "patch_sha256": hashlib.sha256(content).hexdigest(),
                                 "snapshot": f"commit-snapshots/{label}/{filename}",
                                 "sha256": hashlib.sha256(content).hexdigest(),
+                                "materialization_status": "available",
+                                "materialization_reason": None,
                             }
                         )
                     manifest["local_commits"][state_key] = output_commits

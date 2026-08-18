@@ -24,13 +24,16 @@ write_result() {
     --arg up "$user_push" \
     --arg remote "$remote" \
     --arg next "$next_action" '{
+      mode:(if $outcome == "blocked" then "blocked" else "sweep" end),
       outcome:$outcome,phase:"publication",daily_pipeline_status:"complete",
       summary_path:"/staging/summary.md",advisory_path:"/staging/advisory.md",
       notification_result:"none",
-      agents_vault:{commit_status:(if ($ac|length)>0 then "complete" else "not_started" end),commit_hashes:$ac,push_status:$ap,local_head:"head",remote_head:$remote,clean:true},
-      user_vault:{commit_status:(if ($uc|length)>0 then "complete" else "not_started" end),commit_hashes:$uc,push_status:$up,local_head:"head",remote_head:$remote,clean:true},
+      agents_vault:{commit_status:(if ($ac|length)>0 then "complete" else "not_started" end),commit_hashes:$ac,push_status:$ap,local_head:"head",remote_head:$remote,clean:true,publication_mode:(if $outcome == "blocked" then "blocked" else "sweep" end),deferred_cleanup:[]},
+      user_vault:{commit_status:(if ($uc|length)>0 then "complete" else "not_started" end),commit_hashes:$uc,push_status:$up,local_head:"head",remote_head:$remote,clean:true,publication_mode:(if $outcome == "blocked" then "blocked" else "sweep" end),deferred_cleanup:[]},
+      publication_mode:{agents_vault:(if $outcome == "blocked" then "blocked" else "sweep" end),user_vault:(if $outcome == "blocked" then "blocked" else "sweep" end)},
+      deferred_cleanup:{agents_vault:[],user_vault:[]},
       evidence_finalization_commit:null,next_action:$next
-    }' > "$FIXTURE_ROOT/result.json"
+    } | del(.mode)' > "$FIXTURE_ROOT/result.json"
 }
 
 assert_result() {
@@ -74,6 +77,16 @@ write_result success '["a"]' '["b"]' complete complete true ""
 mv "$FIXTURE_ROOT/success.json" "$FIXTURE_ROOT/result.json"
 assert_result $'success\t0'
 
+/usr/bin/jq '
+  .user_vault.publication_mode="own_only"
+  | .user_vault.clean=false
+  | .user_vault.deferred_cleanup=[{"path":".codex-handoff/unsafe.md","reason":"guard rejection"}]
+  | .publication_mode.user_vault="own_only"
+  | .deferred_cleanup.user_vault=.user_vault.deferred_cleanup
+' "$FIXTURE_ROOT/result.json" > "$FIXTURE_ROOT/own-only.json"
+mv "$FIXTURE_ROOT/own-only.json" "$FIXTURE_ROOT/result.json"
+assert_result $'success\t0'
+
 write_result success '[]' '["b"]' complete complete true ""
 /usr/bin/jq '.agents_vault.commit_status="complete" | .evidence_finalization_commit="final" | .next_action=null' "$FIXTURE_ROOT/result.json" > "$FIXTURE_ROOT/invalid.json"
 mv "$FIXTURE_ROOT/invalid.json" "$FIXTURE_ROOT/result.json"
@@ -83,4 +96,4 @@ printf '{"outcome":"partial_publication"}\n' > "$FIXTURE_ROOT/result.json"
 assert_result $'invalid_result\t65'
 assert_result $'process_error\t42' 42
 
-echo "runner semantic interpretation: 11/11 passed"
+echo "runner semantic interpretation: 12/12 passed"

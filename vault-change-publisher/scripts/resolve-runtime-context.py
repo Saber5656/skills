@@ -29,10 +29,31 @@ ALLOWED_KEYS = {
     "PUBLISHER_GIT_EMAIL",
 }
 REQUIRED_KEYS = ALLOWED_KEYS
+CONTROL_COMMAND_TIMEOUT_SECONDS = 3
 
 
 class ContextError(RuntimeError):
     """Represent invalid or unavailable runtime configuration."""
+
+
+def clean_git_environment() -> dict[str, str]:
+    """Disable ambient Git control planes for every resolved repository."""
+    environment = {
+        key: value for key, value in os.environ.items() if not key.startswith("GIT_")
+    }
+    environment.update(
+        {
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_NO_LAZY_FETCH": "1",
+            "GIT_NO_REPLACE_OBJECTS": "1",
+            "GIT_OPTIONAL_LOCKS": "0",
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "core.fsmonitor",
+            "GIT_CONFIG_VALUE_0": "false",
+        }
+    )
+    return environment
 
 
 def parse_local_config(path: Path) -> dict[str, str]:
@@ -93,18 +114,28 @@ def validated_git_identity(name: str, email: str) -> tuple[str, str]:
 def git_directory(repo_root: Path) -> str:
     """Return a direct or safely detached Git directory for one Vault."""
     top_level = subprocess.run(
-        ["git", "-C", str(repo_root), "rev-parse", "--show-toplevel"],
+        [
+            "git", "-C", str(repo_root), "-c", "core.fsmonitor=false",
+            "rev-parse", "--show-toplevel",
+        ],
         check=True,
         capture_output=True,
         text=True,
+        env=clean_git_environment(),
+        timeout=CONTROL_COMMAND_TIMEOUT_SECONDS,
     ).stdout.strip()
     if Path(top_level).resolve() != repo_root.resolve():
         raise ContextError("catalog Vault root is not the repository top level")
     result = subprocess.run(
-        ["git", "-C", str(repo_root), "rev-parse", "--absolute-git-dir"],
+        [
+            "git", "-C", str(repo_root), "-c", "core.fsmonitor=false",
+            "rev-parse", "--absolute-git-dir",
+        ],
         check=True,
         capture_output=True,
         text=True,
+        env=clean_git_environment(),
+        timeout=CONTROL_COMMAND_TIMEOUT_SECONDS,
     )
     git_dir = Path(result.stdout.strip())
     expected = repo_root / ".git"
@@ -134,13 +165,112 @@ def git_directory(repo_root: Path) -> str:
     return str(resolved_git_dir)
 
 
+def validate_git_control_config(repo_root: Path, git_dir: str) -> None:
+    """Reject includes and repository config capable of redirecting Git I/O."""
+    common_dir = Path(
+        subprocess.run(
+            [
+                "git", "-C", str(repo_root), "rev-parse",
+                "--path-format=absolute", "--git-common-dir",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=clean_git_environment(),
+            timeout=CONTROL_COMMAND_TIMEOUT_SECONDS,
+        ).stdout.strip()
+    )
+    primary_config = common_dir / "config"
+    optional_worktree_config = Path(git_dir) / "config.worktree"
+    if primary_config.is_symlink() or not primary_config.is_file():
+        raise ContextError("repository-local Git config must be a regular file")
+    if os.path.lexists(optional_worktree_config) and (
+        optional_worktree_config.is_symlink()
+        or not optional_worktree_config.is_file()
+    ):
+        raise ContextError("worktree Git config must be a regular file")
+    completed = subprocess.run(
+        [
+            # Do not dereference repository-controlled include paths merely to
+            # discover that includes are forbidden.  The directive itself is
+            # visible with --no-includes and is rejected below.
+            "git", "-C", str(repo_root), "config", "--local", "--no-includes",
+            "--show-origin", "--null", "--list",
+        ],
+        check=True,
+        capture_output=True,
+        env=clean_git_environment(),
+        timeout=CONTROL_COMMAND_TIMEOUT_SECONDS,
+    )
+    fields = completed.stdout.split(b"\0")
+    if fields and fields[-1] == b"":
+        fields.pop()
+    if len(fields) % 2:
+        raise ContextError("could not parse repository-local Git config")
+    allowed_origin_paths = {
+        primary_config.resolve(),
+        optional_worktree_config.resolve(),
+    }
+    dangerous_exact = {
+        "core.attributesfile",
+        "core.askpass",
+        "core.excludesfile",
+        "core.fsmonitor",
+        "core.gitproxy",
+        "core.hookspath",
+        "core.sshcommand",
+        "ssh.variant",
+    }
+    for index in range(0, len(fields), 2):
+        try:
+            origin = fields[index].decode("utf-8")
+            key_value = fields[index + 1].decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ContextError("repository-local Git config is not UTF-8") from exc
+        key, separator, _value = key_value.partition("\n")
+        normalized = key.lower()
+        if not origin.startswith("file:"):
+            raise ContextError("repository-local Git config origin is forbidden")
+        origin_path = Path(origin.removeprefix("file:"))
+        if not origin_path.is_absolute():
+            origin_path = repo_root / origin_path
+        if not separator or origin_path.resolve() not in allowed_origin_paths:
+            raise ContextError("repository-local Git config include is forbidden")
+        if (
+            normalized in dangerous_exact
+            or normalized.startswith("include.")
+            or normalized.startswith("includeif.")
+            or normalized.startswith("url.")
+            or normalized.startswith("credential.")
+            or normalized.startswith("filter.")
+            or normalized.startswith("http.")
+            or normalized.startswith("protocol.")
+            or (
+                normalized.startswith("diff.")
+                and normalized.rsplit(".", 1)[-1]
+                in {"command", "textconv", "cachetextconv"}
+            )
+            or (
+                normalized.startswith("remote.")
+                and normalized.rsplit(".", 1)[-1]
+                in {"proxy", "pushurl", "receivepack", "uploadpack"}
+            )
+        ):
+            raise ContextError(f"unsafe repository-local Git config:{key}")
+
+
 def remote_url(repo_root: Path) -> str:
     """Return a credential-free HTTPS or SSH origin URL."""
     result = subprocess.run(
-        ["git", "-C", str(repo_root), "config", "--get", "remote.origin.url"],
+        [
+            "git", "-C", str(repo_root), "config", "--local", "--no-includes",
+            "--get", "remote.origin.url",
+        ],
         check=True,
         capture_output=True,
         text=True,
+        env=clean_git_environment(),
+        timeout=CONTROL_COMMAND_TIMEOUT_SECONDS,
     )
     value = result.stdout.strip()
     candidate = Path(value)
@@ -220,6 +350,11 @@ def resolve_context(local_config: Path, workdir: Path) -> dict[str, str]:
         values["PUBLISHER_GIT_NAME"], values["PUBLISHER_GIT_EMAIL"]
     )
 
+    agents_git_dir = git_directory(agents_root)
+    user_git_dir = git_directory(user_root)
+    validate_git_control_config(agents_root, agents_git_dir)
+    validate_git_control_config(user_root, user_git_dir)
+
     context = {
         "workdir": str(workdir.resolve()),
         "saihai_root": str(saihai_root),
@@ -232,12 +367,13 @@ def resolve_context(local_config: Path, workdir: Path) -> dict[str, str]:
             check=True,
             capture_output=True,
             text=True,
+            timeout=CONTROL_COMMAND_TIMEOUT_SECONDS,
         ).stdout.strip(),
         "skills_root": str(skills_root),
         "agents_vault_root": str(agents_root),
         "user_vault_root": str(user_root),
-        "agents_git_dir": git_directory(agents_root),
-        "user_git_dir": git_directory(user_root),
+        "agents_git_dir": agents_git_dir,
+        "user_git_dir": user_git_dir,
         "agents_remote_url": remote_url(agents_root),
         "user_remote_url": remote_url(user_root),
         "it_news_archive_root": str(user_root.joinpath(*archive_relative.parts)),

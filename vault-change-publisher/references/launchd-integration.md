@@ -9,15 +9,17 @@ launchd 04:00
   -> fixed fetch + lightweight Vault isolation snapshot (no local commit patches)
   -> collection Codex process (Web/search, run staging write only)
   -> deterministic artifact validation
-  -> exact lightweight Vault recapture and comparison
-  -> allow equal/local-ahead Vault publication; block remote-ahead/diverged publication
+  -> deterministic collision-safe artifact target plan
+  -> short cooperative publication lock + bounded stable Vault recapture
+  -> per-Vault mode hint (sweep / own_only / blocked)
+  -> target/snapshot conflict on retry-safe boundary: unlock and bounded full replan/review
   -> materialize local-only commit metadata and patches for publication only
   -> post-collection authorization snapshot into isolated review input
   -> captured dirty Git blobs and local-only commit patches into isolated review input
-  -> publication review Codex process (read-only, no search/network)
-  -> deterministic local commit helper (reviewed blobs only, no network)
+  -> core artifact + residual sweep review Codex process (read-only, no search/network)
+  -> deterministic local commit helper (sweep or isolated-index own_only, no network)
   -> initial fixed runner pushes (manifest-bound object IDs -> refs/heads/main)
-  -> deterministic push evidence hunk
+  -> deterministic push evidence hunk + sealed HEAD/index/worktree candidates
   -> evidence review Codex process (read-only, no search/network)
   -> deterministic evidence commit + fixed Agents main push
 ```
@@ -41,6 +43,7 @@ launchd 04:00
 | `scripts/resolve-runtime-context.py` | same workdir |
 | `scripts/fetch-vault-main.py` | same workdir |
 | `scripts/capture-vault-state.py` | same workdir |
+| `scripts/determine-publication-modes.py` | same workdir |
 | `scripts/validate-collection-result.py` | same workdir |
 | `scripts/install-verified-artifacts.py` | same workdir |
 | `scripts/commit-reviewed-publication.py` | same workdir |
@@ -48,14 +51,16 @@ launchd 04:00
 | `scripts/push-committed-heads.py` | same workdir |
 | `scripts/prepare-publication-evidence.py` | same workdir |
 | `scripts/commit-push-publication-evidence.py` | same workdir |
+| `scripts/evidence_hunk.py` | same workdir |
 | `scripts/git_diff_digest.py` | same workdir |
+| `scripts/isolated_git_transport.py` | same workdir |
 | `scripts/prepare-codex-output-schema.py` | same workdir |
 | `scripts/validate-canonical-result.py` | same workdir |
 | `scripts/stage-standing-task.py` | same workdir |
 | `scripts/stage-dirty-review-inputs.py` | same workdir |
 | `scripts/interpret-automation-result.sh` | same workdir |
 
-Tracked sourceがmainへmergeされた後に配備し、各source/destinationのSHA-256一致を確認する。task worktreeをproduction runtime pathとして参照しない。
+Tracked sourceがmainへmergeされた後に配備し、各source/destinationのSHA-256とfile mode一致を確認する。task worktreeをproduction runtime pathとして参照しない。特にdirect executionされる`collect-public-sources.py`はtracked sourceとproduction runtimeの双方がexecutableであることをdeployment gateで検証する。
 
 正本のresult schemaはstate-dependent constraintを保持する。runnerは各run配下へCodex Structured Outputs対応subsetを生成してAPIへ渡し、生成結果は各phaseのdeterministic validatorで正本契約に照合する。互換schemaだけをpublication可否の判定に使わない。
 
@@ -63,21 +68,35 @@ collection Codex processへiCloud上のstanding taskを直接読ませない。r
 
 authorization taskはnetwork-enabled collection終了後に別のreview input directoryへ0600・exclusive createし、no-network publication phaseへsnapshot pathだけを渡す。collection processからauthorization evidenceを参照可能にしない。
 
-pre/post-collectionの軽量captureはlocal-only commit patchを生成しない。collection成功とVault不変性を確認した後だけ、pre-collection時点のdirty fileをcapture済みGit blob OIDからreview inputへ0600・exclusive createし、local-ahead commitのhash、parents、tree、message、changed paths、first-parent patch digestとpatchを同じisolated review inputへ0600・exclusive createする。publication reviewはVault上のdirty fileやlocal-only historyを直接読まず、manifestでidentityとSHA-256に結合されたsnapshotだけを検査する。
+Codexへ渡すpromptはCLI引数へ展開せずstdinから供給し、macOSのargument-size上限に依存しない。publication/evidence reviewへinlineするcontextは、deterministic helperが使用する完全なcontext fileのSHA-256を保持したまま、review判断に不要な全tracked pathの`index_entries`列だけを除いたbounded projectionとする。reviewは`index_sha256`、staged path、dirty/history metadata、sealed snapshotを使い、完全なindex列をLLM contextへ複製しない。
 
-fetch後のhistory relationは収集の可否には使わない。ニュース収集とVault不変性の検証を先に完了し、その後のpublication phaseでは`equal`または`local_ahead`だけを許可する。local-aheadは既存commit境界を維持したままreview・secret scan・fixed pushへ含める。`remote_ahead`と`diverged`は自動pull/rebaseで解消せず、publicationだけをfail closedとする。
+pre/post-collectionの軽量captureはlocal-only commit patchを生成しない。collection成功後、Vaultが変化していてもcollectionを失敗扱いにせず、HEAD、index、dirty content/mode/mtime、Git control-planeの差をVaultごとの`own_only`制約へ変換する。publication時点がbounded retryで安定した後だけ、dirty fileをcapture済みGit blob OIDからreview inputへ0600・exclusive createし、local-ahead commitのhash、parents、tree、message、changed paths、first-parent patch digestとpatchを同じisolated review inputへ0600・exclusive createする。sealed residual guardはdirty candidateとreview済みHEADのno-index差分だけを検査し、新規machine-home path、`.obsidian/`、pinned gitleaks不合格を`deferred`へ変換してVault単位のmode floorを`own_only`にする。guard不合格entryのbytesはreviewerへ渡さず、既存fileを変更しない。publication reviewはVault上のdirty fileやlocal-only historyを直接読まず、manifestでidentityとSHA-256に結合されたsnapshotだけを検査する。
+
+cooperative publication lockはstable snapshotとmode hintの固定にだけ使い、長時間のreview中は保持しない。解放前にlock fileのPIDが実行中runner自身と一致することを確認し、別processのlockへ置き換わっていた場合は削除しない。lock解放後の競合はexact snapshot、expected parent、CASでfail closedする。
+
+plan後のtarget競合またはcommit前のretry-safeなsnapshot driftを検出した場合は、artifactも既存差分も上書きせずlockを解放し、最新stateからtarget plan、mode hint、reviewをbounded replanする。片側だけ今回commitを作成済みでも未pushであり、peerがmutation前にretry-safe失敗した場合に限り、その今回commitをold OID付きCASで取り消し、共有indexとartifact inodeをexact backupへ復元して再計画する。既存commit、既存dirty/staged差分、push済みcommitはrollbackしない。
+
+fetch後のhistory relationは収集の可否には使わない。`equal`または安全な`local_ahead`はpublication可能で、既存commit境界を維持したままreview・secret scan・fixed pushへ含める。unsafe local-ahead、`remote_ahead`、`diverged`、active Git operationは自動pull/rebaseで解消せず、該当Vaultだけ`blocked`とする。安定したdirty residualがguard/reviewを通れば`sweep`、失敗すればその内容を触らず`own_only`へdowngradeする。
+
+`own_only`は共有indexへ`git add`しない。一時indexからartifact-only tree/commitを作成し、commit changed paths、expected parent、old OID付きCASを検証する。commit後はartifact entryだけを共有indexへ同期し、既存staged entry、dirty blob、mode、mtime、porcelainを再照合する。deferred residualが存在しても両Vaultの今回artifactとstanding evidenceがfixed push済みならterminal statusは0とする。
 
 ## Local Configuration
 
 personal absolute paths、Vault names、machine layout、publisher account identityはtracked fileへ書かない。`automation.local.env`にはSaihai primary checkout、relative destination、承認taskのSHA-256 pin、GitHubへ紐付くpublisher Git name/emailを置き、runnerは`directory_paths.load_environment(checkout_root=..., environ={}, require_catalog=True)`でcanonical rootsを解決する。resolverがprivate identityを検証してruntime contextへbindし、commit helperはmutation直前に再検証する。承認taskが変わった場合は自動追従せず、内容を人間が再確認してpinを更新する。
 
-File Provider配下のVaultでnetwork Git transportを起動するときは、transport subprocessのcurrent working directoryをVaultへ移さない。resolverが検証したGit directoryとworktree rootをそれぞれ`--git-dir` / `--work-tree`へ明示し、fetch、`ls-remote`、fixed pushを実行する。remote URL、object ID、`refs/heads/main`の固定契約とnon-force制約は変更しない。
+File Provider配下のVaultでnetwork Git transportを起動するときは、Vault repoのlocal config、hooks、attributes、fsmonitor、filter、ssh commandを実行経路へ入れない。一時bare Git control planeを作り、Vaultのobject directoryだけをalternateとして共有し、fixed remote URL、object ID、`refs/heads/main`だけでfetch、`ls-remote`、fixed pushを行う。transport subprocessはVaultをcwdにせず、wall-clock deadline超過時はprocess group全体を終了する。non-force制約は変更しない。
+
+push直前のremote OID照合とfixed pushはVaultごとに独立して行う。片方でremote race、network failure、または`blocked`を検出しても、もう片方の安全なpushは抑止しない。片側だけ公開できた場合は`partial_publication`と非0を返し、forceや履歴書換えは行わない。
+
+standing task evidenceは、既存のHEAD/index/worktreeを別々のsealed inputとして扱う。review前にVaultを変更せず、承認後はHEAD candidateだけをcommitし、元のstaged/unstaged差分をそれぞれindex/worktree candidateからexactに復元する。review拒否、digest不一致、CAS失敗ではstanding taskのcontent、mode、mtime、Git statusを変更しない。
 
 ## Deployment Gate
 
 1. source PRがreview・merge済み。
 2. runtime filesとplistをbackup。
-3. tracked filesをcopyしchecksum一致。
+3. tracked files（`determine-publication-modes.py`を含む）をmode-preservingでcopyし、checksumとfile modeが一致。direct executionされる全Python helperと`collect-public-sources.py`は両方でexecutable。
 4. ignored local configを人間が確認。
 5. `zsh -n`、Python tests、JSON parse、`plutil -lint`。
-6. TCC復旧後に実Vault E2Eを1回実施。
+6. unsafeな既存handoffをUser Vaultへ残し、content/mode/mtime/index statusを記録する。
+7. 実Web E2Eを実施し、`complete/true/null`、User=`own_only`、handoff不変、両fixed push、evidence finalization、exit 0を確認する。
+8. merge後に最新mainから再配備し、launchd one-shotでも同じ条件を確認する。

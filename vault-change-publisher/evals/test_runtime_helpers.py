@@ -83,12 +83,19 @@ CAPTURE_SPEC = importlib.util.spec_from_file_location(
 assert CAPTURE_SPEC and CAPTURE_SPEC.loader
 CAPTURE_MODULE = importlib.util.module_from_spec(CAPTURE_SPEC)
 CAPTURE_SPEC.loader.exec_module(CAPTURE_MODULE)
+MODE_SPEC = importlib.util.spec_from_file_location(
+    "determine_publication_modes", SCRIPTS / "determine-publication-modes.py"
+)
+assert MODE_SPEC and MODE_SPEC.loader
+MODE_MODULE = importlib.util.module_from_spec(MODE_SPEC)
+MODE_SPEC.loader.exec_module(MODE_MODULE)
 COLLECTION_VALIDATOR_SPEC = importlib.util.spec_from_file_location(
     "validate_collection_result", SCRIPTS / "validate-collection-result.py"
 )
 assert COLLECTION_VALIDATOR_SPEC and COLLECTION_VALIDATOR_SPEC.loader
 COLLECTION_VALIDATOR_MODULE = importlib.util.module_from_spec(COLLECTION_VALIDATOR_SPEC)
 COLLECTION_VALIDATOR_SPEC.loader.exec_module(COLLECTION_VALIDATOR_MODULE)
+import isolated_git_transport as TRANSPORT_MODULE
 
 
 def source_coverage_markdown() -> str:
@@ -371,9 +378,9 @@ def load_environment(*, checkout_root, environ, require_catalog):
         self.assertIn('"anyOf"', encoded)
         self.assertNotIn("approvedManifest", projected["$defs"])
         self.assertEqual(
-            projected["$defs"]["taskChangeManifest"]["properties"]
-            ["validation_evidence"]["properties"]["file_guard"]["type"],
-            "string",
+            projected["$defs"]["validationEvidence"]["properties"]
+            ["file_guard"]["enum"],
+            ["passed", "blocked"],
         )
         self.assertEqual(
             json.loads(source_path.read_text(encoding="utf-8")), source
@@ -433,6 +440,151 @@ def load_environment(*, checkout_root, environ, require_catalog):
         with self.assertRaises(CANONICAL_MODULE.CanonicalValidationError):
             CANONICAL_MODULE.validate(result, schema, schema)
 
+    def test_publication_review_root_next_action_tracks_blocked_mode(self) -> None:
+        """Deferred cleanup alone keeps an approved review terminally actionable."""
+        review = {
+            "outcome": "approved",
+            "agents_vault": {"publication_mode": "sweep"},
+            "user_vault": {"publication_mode": "own_only"},
+            "next_action": None,
+        }
+        schema = json.loads(
+            (SKILL_ROOT / "references" / "publication-review-result.schema.json")
+            .read_text(encoding="utf-8")
+        )
+        mode_contract = schema["allOf"][1]
+        CANONICAL_MODULE.validate(review, mode_contract, schema)
+        REVIEW_MODULE.validate_root_contract(review)
+
+        review["next_action"] = "remediate deferred residual later"
+        with self.assertRaises(CANONICAL_MODULE.CanonicalValidationError):
+            CANONICAL_MODULE.validate(review, mode_contract, schema)
+        with self.assertRaisesRegex(
+            REVIEW_MODULE.ReviewError, "unexpected next action"
+        ):
+            REVIEW_MODULE.validate_root_contract(review)
+
+        review["user_vault"]["publication_mode"] = "blocked"
+        CANONICAL_MODULE.validate(review, mode_contract, schema)
+        REVIEW_MODULE.validate_root_contract(review)
+        review["next_action"] = None
+        with self.assertRaises(CANONICAL_MODULE.CanonicalValidationError):
+            CANONICAL_MODULE.validate(review, mode_contract, schema)
+        with self.assertRaisesRegex(
+            REVIEW_MODULE.ReviewError, "requires a concrete next action"
+        ):
+            REVIEW_MODULE.validate_root_contract(review)
+
+    def test_canonical_publication_schemas_enforce_terminal_state(self) -> None:
+        """Reject success/ready labels that do not contain publishable commits."""
+        automation_schema = json.loads(
+            (SKILL_ROOT / "references" / "automation-result.schema.json")
+            .read_text(encoding="utf-8")
+        )
+        deferred = {"agents_vault": [], "user_vault": []}
+        published_vault = {
+            "commit_status": "complete",
+            "commit_hashes": ["a" * 40],
+            "push_status": "complete",
+            "local_head": "a" * 40,
+            "remote_head": "a" * 40,
+            "clean": False,
+            "publication_mode": "own_only",
+            "deferred_cleanup": [],
+        }
+        success = {
+            "outcome": "success",
+            "phase": "evidence_finalization",
+            "daily_pipeline_status": "complete",
+            "summary_path": "summary.md",
+            "advisory_path": "advisory.md",
+            "notification_result": None,
+            "agents_vault": published_vault,
+            "user_vault": published_vault,
+            "publication_mode": {
+                "agents_vault": "own_only", "user_vault": "own_only"
+            },
+            "deferred_cleanup": deferred,
+            "evidence_finalization_commit": "b" * 40,
+            "next_action": None,
+        }
+        CANONICAL_MODULE.validate(success, automation_schema, automation_schema)
+        invalid_success = json.loads(json.dumps(success))
+        invalid_success["user_vault"]["commit_hashes"] = []
+        with self.assertRaises(CANONICAL_MODULE.CanonicalValidationError):
+            CANONICAL_MODULE.validate(
+                invalid_success, automation_schema, automation_schema
+            )
+
+        commit_schema = json.loads(
+            (SKILL_ROOT / "references" / "publication-commit-result.schema.json")
+            .read_text(encoding="utf-8")
+        )
+        ready_vault = {
+            "commit_status": "complete",
+            "commit_hashes": ["c" * 40],
+            "pre_local_head": "d" * 40,
+            "local_head": "c" * 40,
+            "pre_dirty_digest": "e" * 64,
+            "post_dirty_digest": "f" * 64,
+            "clean": False,
+            "publication_mode": "own_only",
+            "deferred_cleanup": [],
+        }
+        blocked_vault = {
+            "commit_status": "not_started",
+            "commit_hashes": [],
+            "pre_local_head": "1" * 40,
+            "local_head": "1" * 40,
+            "pre_dirty_digest": "2" * 64,
+            "post_dirty_digest": "2" * 64,
+            "clean": False,
+            "publication_mode": "blocked",
+            "deferred_cleanup": [],
+        }
+        ready = {
+            "outcome": "ready_to_push",
+            "phase": "local_commit",
+            "daily_pipeline_status": "complete",
+            "summary_path": None,
+            "advisory_path": "advisory.md",
+            "notification_result": None,
+            "agents_vault": ready_vault,
+            "user_vault": blocked_vault,
+            "publication_mode": {
+                "agents_vault": "own_only", "user_vault": "blocked"
+            },
+            "deferred_cleanup": deferred,
+            "evidence_finalization_commit": None,
+            "next_action": "repair blocked User Vault",
+        }
+        CANONICAL_MODULE.validate(ready, commit_schema, commit_schema)
+        invalid_ready = json.loads(json.dumps(ready))
+        invalid_ready["agents_vault"] = blocked_vault
+        invalid_ready["publication_mode"]["agents_vault"] = "blocked"
+        with self.assertRaises(CANONICAL_MODULE.CanonicalValidationError):
+            CANONICAL_MODULE.validate(invalid_ready, commit_schema, commit_schema)
+
+        no_op_ready = json.loads(json.dumps(ready))
+        for key in ("agents_vault", "user_vault"):
+            no_op_ready[key] = {
+                **blocked_vault,
+                "commit_status": "not_required",
+                "publication_mode": "own_only",
+            }
+            no_op_ready["publication_mode"][key] = "own_only"
+        with self.assertRaises(CANONICAL_MODULE.CanonicalValidationError):
+            CANONICAL_MODULE.validate(no_op_ready, commit_schema, commit_schema)
+
+        no_op_success = json.loads(json.dumps(success))
+        for key in ("agents_vault", "user_vault"):
+            no_op_success[key]["commit_status"] = "not_required"
+            no_op_success[key]["commit_hashes"] = []
+            no_op_success[key]["push_status"] = "not_required"
+        with self.assertRaises(CANONICAL_MODULE.CanonicalValidationError):
+            CANONICAL_MODULE.validate(
+                no_op_success, automation_schema, automation_schema
+            )
     def test_standing_task_snapshot_is_exclusive_and_nofollow(self) -> None:
         staging = self.workdir / "snapshot-staging"
         staging.mkdir()
@@ -554,6 +706,7 @@ def load_environment(*, checkout_root, environ, require_catalog):
         self.assertEqual(git_environment["GIT_NO_LAZY_FETCH"], "1")
         self.assertEqual(git_environment["GIT_NO_REPLACE_OBJECTS"], "1")
         self.assertEqual(git_environment["GIT_OPTIONAL_LOCKS"], "0")
+        self.assertEqual(git_environment["LC_ALL"], "C")
         content = b"captured dirty bytes\n"
         oid = subprocess.run(
             ["git", "-C", str(self.agents), "hash-object", "--stdin"],
@@ -638,27 +791,549 @@ def load_environment(*, checkout_root, environ, require_catalog):
         with self.assertRaises(OSError):
             REVIEW_MODULE.validate_dirty_snapshots(context, json.loads(pre.read_text()))
 
+    def test_residual_guard_defers_added_home_path_but_allows_historical_path(
+        self,
+    ) -> None:
+        """Constrain unsafe residuals before review without flagging unchanged history."""
+        for repo in (self.agents, self.user):
+            subprocess.run(
+                ["git", "-C", str(repo), "config", "user.name", "Fixture"],
+                check=True,
+            )
+            subprocess.run(
+                [
+                    "git", "-C", str(repo), "config", "user.email",
+                    "fixture@example.invalid",
+                ],
+                check=True,
+            )
+        historical = self.agents / "historical.md"
+        historical.write_text(
+            f"historical evidence: {Path.home()}/old.log\n"
+            f"historical CR evidence:\r{Path.home()}/old-cr.log\n",
+            encoding="utf-8",
+        )
+        peer = self.user / "peer.md"
+        peer.write_text("peer base\n", encoding="utf-8")
+        for repo, path in ((self.agents, historical), (self.user, peer)):
+            subprocess.run(["git", "-C", str(repo), "add", path.name], check=True)
+            subprocess.run(
+                ["git", "-C", str(repo), "commit", "-q", "-m", "base"],
+                check=True,
+            )
+            subprocess.run(["git", "-C", str(repo), "branch", "-M", "main"], check=True)
+            subprocess.run(
+                ["git", "-C", str(repo), "push", "-q", "-u", "origin", "main"],
+                check=True,
+            )
+
+        historical.write_bytes(historical.read_bytes() + b"safe reviewed update\n")
+        unsafe = self.agents / "unsafe.md"
+        unsafe.write_text(
+            f"++ new machine evidence:\r{Path.home()}/new.log\n", encoding="utf-8"
+        )
+        unsafe_binary = self.agents / "unsafe.bin"
+        unsafe_binary.write_bytes(b"\0++" + os.fsencode(str(Path.home())) + b"/binary")
+        peer.write_text("peer base\npeer safe update\n", encoding="utf-8")
+        pre = {
+            "agents_vault": CAPTURE_MODULE.capture(str(self.agents)),
+            "user_vault": CAPTURE_MODULE.capture(str(self.user)),
+        }
+        runtime = {
+            "agents_git_dir": str(self.agents / ".git"),
+            "user_git_dir": str(self.user / ".git"),
+            "agents_vault_root": str(self.agents),
+            "user_vault_root": str(self.user),
+            "gitleaks_bin": str(self.fake_gitleaks),
+        }
+        destination = self.workdir / "guarded-dirty-review"
+        destination.mkdir()
+        manifest = DIRTY_STAGER_MODULE.materialize(runtime, pre, destination)
+        agents_entries = {
+            entry["path"]: entry for entry in manifest["vaults"]["agents_vault"]
+        }
+        self.assertEqual(
+            agents_entries["historical.md"]["materialization_status"], "available"
+        )
+        self.assertEqual(
+            agents_entries["unsafe.md"]["materialization_status"], "deferred"
+        )
+        self.assertEqual(
+            agents_entries["unsafe.md"]["materialization_reason"],
+            "dirty_entry_added_machine_home_path",
+        )
+        self.assertIsNone(agents_entries["unsafe.md"]["snapshot"])
+        self.assertEqual(
+            agents_entries["unsafe.bin"]["materialization_status"], "deferred"
+        )
+        self.assertEqual(
+            agents_entries["unsafe.bin"]["materialization_reason"],
+            "dirty_entry_added_machine_home_path",
+        )
+        self.assertIsNone(agents_entries["unsafe.bin"]["snapshot"])
+        self.assertEqual(
+            manifest["vaults"]["user_vault"][0]["materialization_status"],
+            "available",
+        )
+        manifest_path = destination / "dirty-snapshots.json"
+        REVIEW_MODULE.validate_dirty_snapshots(
+            {
+                "dirty_snapshot_manifest_file": str(manifest_path),
+                "dirty_snapshot_manifest_sha256": hashlib.sha256(
+                    manifest_path.read_bytes()
+                ).hexdigest(),
+            },
+            pre,
+        )
+
+    def test_residual_guard_defers_gitleaks_rejection(self) -> None:
+        """Convert a deterministic residual secret rejection into deferred input."""
+        content = b"++prefix\rnew residual secret fixture\n"
+        oid = subprocess.run(
+            ["git", "-C", str(self.agents), "hash-object", "--stdin"],
+            input=content,
+            check=True,
+            capture_output=True,
+        ).stdout.decode().strip()
+        path = self.agents / "secret.md"
+        path.write_bytes(content)
+        head = subprocess.run(
+            ["git", "-C", str(self.agents), "mktree"],
+            input="",
+            text=True,
+            check=True,
+            capture_output=True,
+        ).stdout.strip()
+        commit = subprocess.run(
+            ["git", "-C", str(self.agents), "commit-tree", head],
+            input="empty\n",
+            text=True,
+            check=True,
+            capture_output=True,
+            env={
+                **os.environ,
+                "GIT_AUTHOR_NAME": "Fixture",
+                "GIT_AUTHOR_EMAIL": "fixture@example.invalid",
+                "GIT_COMMITTER_NAME": "Fixture",
+                "GIT_COMMITTER_EMAIL": "fixture@example.invalid",
+            },
+        ).stdout.strip()
+        pre = {
+            "agents_vault": {
+                "local_head": commit,
+                "dirty_entries": [
+                    {"path": "secret.md", "git_blob_oid": oid, "mode": "100644"}
+                ],
+                "local_commits": [],
+            },
+            "user_vault": {"dirty_entries": [], "local_commits": []},
+        }
+        runtime = {
+            "agents_git_dir": str(self.agents / ".git"),
+            "user_git_dir": str(self.user / ".git"),
+            "agents_vault_root": str(self.agents),
+            "user_vault_root": str(self.user),
+            "gitleaks_bin": str(self.fake_gitleaks),
+        }
+        destination = self.workdir / "secret-guard-review"
+        destination.mkdir()
+        with mock.patch.object(
+            DIRTY_STAGER_MODULE, "gitleaks_rejects", return_value=True
+        ) as scanner:
+            manifest = DIRTY_STAGER_MODULE.materialize(runtime, pre, destination)
+        self.assertIn(
+            b"++prefix\rnew residual secret fixture", scanner.call_args.args[1]
+        )
+        entry = manifest["vaults"]["agents_vault"][0]
+        self.assertEqual(entry["materialization_status"], "deferred")
+        self.assertEqual(
+            entry["materialization_reason"], "dirty_entry_secret_scan_rejected"
+        )
+
     def test_network_git_keeps_process_cwd_outside_vault(self) -> None:
-        """Use explicit Git metadata/work-tree arguments for transport commands."""
+        """Use an isolated Git directory rather than the Vault control plane."""
         completed = subprocess.CompletedProcess(
             args=[], returncode=0, stdout="a" * 40 + "\trefs/heads/main\n", stderr=""
         )
         for module in (PUSH_MODULE, FINALIZER_MODULE):
-            with mock.patch.object(module.subprocess, "run", return_value=completed) as run:
+            with mock.patch.object(
+                module, "run_transport", return_value=completed
+            ) as run:
                 remote = module.remote_head(
                     "/vault/worktree", "ssh://git@example.invalid/repo", "/local/gitdir"
                 )
             self.assertEqual(remote, "a" * 40)
-            command = run.call_args.args[0]
+            command = run.call_args.args
             self.assertEqual(
-                command[:3],
-                [
-                    "git",
-                    "--git-dir=/local/gitdir",
-                    "--work-tree=/vault/worktree",
-                ],
+                command[:2],
+                (
+                    "/local/gitdir",
+                    "ls-remote",
+                ),
             )
-            self.assertNotIn("-C", command)
+            self.assertNotIn("/vault/worktree", command)
+
+    def test_transport_timeout_kills_the_process_group(self) -> None:
+        """Bound every network Git call and reap its complete process group."""
+        transport = object.__new__(TRANSPORT_MODULE.IsolatedGitTransport)
+        transport.git_dir = Path("/isolated/transport.git")
+        transport.environment = {}
+        transport.timeout = 1
+        process = mock.MagicMock()
+        process.pid = 4242
+        process.returncode = -9
+        process.communicate.side_effect = [
+            subprocess.TimeoutExpired(["git", "push"], 1),
+            ("", ""),
+        ]
+        with mock.patch.object(
+            TRANSPORT_MODULE.subprocess, "Popen", return_value=process
+        ) as popen, mock.patch.object(
+            TRANSPORT_MODULE.os, "killpg"
+        ) as killpg:
+            with self.assertRaisesRegex(
+                TRANSPORT_MODULE.TransportError, "exceeded 1 second"
+            ):
+                transport.run("push", "remote", "a" * 40 + ":refs/heads/main")
+        self.assertTrue(popen.call_args.kwargs["start_new_session"])
+        self.assertIn("core.fsmonitor=false", popen.call_args.args[0])
+        self.assertIn("credential.helper=", popen.call_args.args[0])
+        killpg.assert_called_once_with(4242, TRANSPORT_MODULE.signal.SIGKILL)
+
+    def test_local_git_helpers_disable_repo_fsmonitor(self) -> None:
+        """Do not execute repo-local fsmonitor through Git or pinned gitleaks."""
+        tracked = self.user / "initial.md"
+        tracked.write_text("base\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.user), "add", "initial.md"], check=True)
+        subprocess.run(
+            [
+                "git", "-C", str(self.user),
+                "-c", "user.name=Fixture",
+                "-c", "user.email=fixture@example.invalid",
+                "commit", "-q", "-m", "base",
+            ],
+            check=True,
+        )
+        marker = self.workdir / "fsmonitor-executed"
+        monitor = self.workdir / "malicious-fsmonitor.sh"
+        monitor.write_text(
+            f"#!/bin/sh\n/usr/bin/touch '{marker}'\nexit 1\n",
+            encoding="utf-8",
+        )
+        monitor.chmod(0o755)
+        subprocess.run(
+            [
+                "git", "-C", str(self.user), "config", "--local",
+                "core.fsmonitor", str(monitor),
+            ],
+            check=True,
+        )
+        PUSH_MODULE.dirty_digest(str(self.user))
+        tracked.write_text("changed\n", encoding="utf-8")
+        FINALIZER_MODULE.diff_digest(str(self.user), "initial.md")
+
+        gitleaks_git = self.workdir / "gitleaks-that-invokes-git"
+        gitleaks_git.write_text(
+            "#!/bin/sh\n"
+            "[ -z \"${GITLEAKS_CONFIG+x}\" ] || exit 99\n"
+            "repo=\n"
+            "for argument in \"$@\"; do repo=$argument; done\n"
+            "/usr/bin/git -C \"$repo\" status --porcelain >/dev/null\n",
+            encoding="utf-8",
+        )
+        gitleaks_git.chmod(0o755)
+        index_file = str(self.user / ".git" / "index")
+        with mock.patch.dict(
+            os.environ, {"GITLEAKS_CONFIG": "/attacker/gitleaks.toml"}
+        ):
+            COMMITTER_MODULE.scan_staged(
+                str(gitleaks_git), str(self.user), str(self.user / ".git"),
+                ["initial.md"], index_file,
+            )
+            FINALIZER_MODULE.scan_staged(
+                str(gitleaks_git), str(self.user), index_file
+            )
+            head = subprocess.check_output(
+                ["git", "-C", str(self.user), "rev-parse", "HEAD"], text=True
+            ).strip()
+            PUSH_MODULE.scan_commits(str(gitleaks_git), str(self.user), head, head)
+        self.assertFalse(marker.exists())
+
+    def test_unmaterializable_dirty_entry_defers_only_its_vault(self) -> None:
+        """Keep a symlink residual inert while another Vault remains reviewable."""
+        agents_link = self.agents / "unsafe-link"
+        agents_link.symlink_to("outside-target")
+        user_file = self.user / "reviewable.md"
+        user_file.write_text("reviewable\n", encoding="utf-8")
+        link_oid = subprocess.run(
+            ["git", "-C", str(self.agents), "hash-object", "--stdin"],
+            input=b"outside-target",
+            check=True,
+            capture_output=True,
+        ).stdout.decode().strip()
+        user_oid = subprocess.run(
+            ["git", "-C", str(self.user), "hash-object", "--stdin"],
+            input=user_file.read_bytes(),
+            check=True,
+            capture_output=True,
+        ).stdout.decode().strip()
+        runtime = self.workdir / "deferred-runtime.json"
+        runtime.write_text(
+            json.dumps(
+                {
+                    "agents_git_dir": str(self.agents / ".git"),
+                    "user_git_dir": str(self.user / ".git"),
+                    "agents_vault_root": str(self.agents),
+                    "user_vault_root": str(self.user),
+                }
+            ),
+            encoding="utf-8",
+        )
+        state_digest = hashlib.sha256(b"").hexdigest()
+        pre_value = {
+            "agents_vault": {
+                "repo_root": str(self.agents),
+                "history_relation": "equal",
+                "local_commits": [],
+                "dirty_paths": ["unsafe-link"],
+                "dirty_entries": [
+                    {"path": "unsafe-link", "git_blob_oid": link_oid, "mode": "120000"}
+                ],
+                "diff_snapshot_sha256": state_digest,
+                "history_snapshot_sha256": state_digest,
+            },
+            "user_vault": {
+                "repo_root": str(self.user),
+                "history_relation": "equal",
+                "local_commits": [],
+                "dirty_paths": ["reviewable.md"],
+                "dirty_entries": [
+                    {"path": "reviewable.md", "git_blob_oid": user_oid, "mode": "100644"}
+                ],
+                "diff_snapshot_sha256": state_digest,
+                "history_snapshot_sha256": state_digest,
+            },
+        }
+        pre = self.workdir / "deferred-pre.json"
+        pre.write_text(json.dumps(pre_value), encoding="utf-8")
+        destination = self.workdir / "deferred-review"
+        destination.mkdir()
+        self.assertEqual(
+            subprocess.run(
+                [
+                    str(SCRIPTS / "stage-dirty-review-inputs.py"),
+                    str(runtime), str(pre), str(destination),
+                ],
+                check=False,
+            ).returncode,
+            0,
+        )
+        destination.chmod(0o700)
+        materialized = json.loads(
+            (destination / "dirty-snapshots.json").read_text(encoding="utf-8")
+        )
+        agents_materialized = materialized["vaults"]["agents_vault"]
+        user_materialized = materialized["vaults"]["user_vault"]
+        self.assertEqual(agents_materialized[0]["materialization_status"], "deferred")
+        self.assertEqual(user_materialized[0]["materialization_status"], "available")
+
+        artifact = self.agents / "artifact.md"
+        common = {
+            "repo_root": str(self.agents),
+            "task_id": "TSK-AUTH",
+            "core_review_status": "quality_ok",
+            "approved_diff_snapshot_sha256": state_digest,
+            "approved_existing_commits": [],
+            "reviewed_artifacts": [
+                {"role": "agents_security_advisory", "source_sha256": "a" * 64, "target_path": "artifact.md"}
+            ],
+            "validation_evidence": {
+                "file_guard": "passed",
+                "secret_scan": "passed",
+                "secret_scan_tool": "gitleaks",
+                "secret_scan_tool_version": "fixture",
+                "reviewed_snapshot_sha256": state_digest,
+                "reviewed_history_sha256": state_digest,
+            },
+            "review_or_validation_status": "quality_ok",
+            "evidence_finalization": None,
+        }
+        own_only = {
+            **common,
+            "publication_mode": "own_only",
+            "residual_review_status": "deferred",
+            "owned_paths": ["artifact.md"],
+            "excluded_paths": ["unsafe-link"],
+            "deferred_cleanup": [
+                {"path": "unsafe-link", "reason": "snapshot unavailable"}
+            ],
+            "approved_dirty_entries": [],
+            "commit_required": True,
+            "unrelated_dirty_paths": ["unsafe-link"],
+            "commit_groups": [{"message": "publish", "paths": ["artifact.md"]}],
+        }
+        REVIEW_MODULE.validate_manifest(
+            own_only,
+            pre_value["agents_vault"],
+            str(self.agents),
+            "TSK-AUTH",
+            {
+                "role": "agents_security_advisory",
+                "source_sha256": "a" * 64,
+                "target_path": str(artifact),
+            },
+            None,
+            "fixture",
+            {"required_mode": "sweep"},
+            agents_materialized,
+            [],
+        )
+        residual_blocked = {
+            **own_only,
+            "publication_mode": "blocked",
+            "residual_review_status": "blocked",
+            "commit_required": False,
+            "commit_groups": [],
+        }
+        REVIEW_MODULE.validate_manifest(
+            residual_blocked,
+            pre_value["agents_vault"],
+            str(self.agents),
+            "TSK-AUTH",
+            {
+                "role": "agents_security_advisory",
+                "source_sha256": "a" * 64,
+                "target_path": str(artifact),
+            },
+            None,
+            "fixture",
+            {"required_mode": "sweep"},
+            agents_materialized,
+            [],
+        )
+        invalid_history_deferred = json.loads(json.dumps(residual_blocked))
+        invalid_history_deferred["deferred_cleanup"].append(
+            {
+                "path": "local-ahead-only.md",
+                "reason": "unsafe local history belongs in next_action",
+            }
+        )
+        with self.assertRaisesRegex(
+            REVIEW_MODULE.ReviewError,
+            "blocked manifest does not preserve the exact non-actionable scope",
+        ):
+            REVIEW_MODULE.validate_manifest(
+                invalid_history_deferred,
+                pre_value["agents_vault"],
+                str(self.agents),
+                "TSK-AUTH",
+                {
+                    "role": "agents_security_advisory",
+                    "source_sha256": "a" * 64,
+                    "target_path": str(artifact),
+                },
+                None,
+                "fixture",
+                {"required_mode": "sweep"},
+                agents_materialized,
+                [],
+            )
+        with self.assertRaisesRegex(
+            REVIEW_MODULE.ReviewError, "core review status fields disagree"
+        ):
+            REVIEW_MODULE.validate_manifest(
+                {**residual_blocked, "review_or_validation_status": "blocked"},
+                pre_value["agents_vault"],
+                str(self.agents),
+                "TSK-AUTH",
+                {
+                    "role": "agents_security_advisory",
+                    "source_sha256": "a" * 64,
+                    "target_path": str(artifact),
+                },
+                None,
+                "fixture",
+                {"required_mode": "sweep"},
+                agents_materialized,
+                [],
+            )
+        sweep = {
+            **own_only,
+            "publication_mode": "sweep",
+            "residual_review_status": "quality_ok",
+            "owned_paths": ["artifact.md", "unsafe-link"],
+            "excluded_paths": [],
+            "deferred_cleanup": [],
+            "approved_dirty_entries": pre_value["agents_vault"]["dirty_entries"],
+            "unrelated_dirty_paths": [],
+            "commit_groups": [
+                {"message": "publish", "paths": ["artifact.md", "unsafe-link"]}
+            ],
+        }
+        with self.assertRaisesRegex(
+            REVIEW_MODULE.ReviewError, "unreviewable dirty residual"
+        ):
+            REVIEW_MODULE.validate_manifest(
+                sweep,
+                pre_value["agents_vault"],
+                str(self.agents),
+                "TSK-AUTH",
+                {
+                    "role": "agents_security_advisory",
+                    "source_sha256": "a" * 64,
+                    "target_path": str(artifact),
+                },
+                None,
+                "fixture",
+                {"required_mode": "sweep"},
+                agents_materialized,
+                [],
+            )
+
+    def test_oversize_dirty_entry_is_deferred_without_suppressing_peer(self) -> None:
+        """Apply snapshot size limits per Vault instead of aborting both reviews."""
+        large = self.agents / "large.md"
+        small = self.user / "small.md"
+        large.write_bytes(b"12345")
+        small.write_bytes(b"ok")
+        oid = lambda repo, content: subprocess.run(
+            ["git", "-C", str(repo), "hash-object", "--stdin"],
+            input=content,
+            check=True,
+            capture_output=True,
+        ).stdout.decode().strip()
+        pre = {
+            "agents_vault": {
+                "dirty_entries": [
+                    {"path": "large.md", "git_blob_oid": oid(self.agents, b"12345"), "mode": "100644"}
+                ],
+                "local_commits": [],
+            },
+            "user_vault": {
+                "dirty_entries": [
+                    {"path": "small.md", "git_blob_oid": oid(self.user, b"ok"), "mode": "100644"}
+                ],
+                "local_commits": [],
+            },
+        }
+        runtime = {
+            "agents_git_dir": str(self.agents / ".git"),
+            "user_git_dir": str(self.user / ".git"),
+            "agents_vault_root": str(self.agents),
+            "user_vault_root": str(self.user),
+        }
+        destination = self.workdir / "oversize-review"
+        destination.mkdir()
+        with mock.patch.object(DIRTY_STAGER_MODULE, "MAX_BLOB_BYTES", 4):
+            manifest = DIRTY_STAGER_MODULE.materialize(runtime, pre, destination)
+        self.assertEqual(
+            manifest["vaults"]["agents_vault"][0]["materialization_status"],
+            "deferred",
+        )
+        self.assertEqual(
+            manifest["vaults"]["user_vault"][0]["materialization_status"],
+            "available",
+        )
 
     def test_capture_and_review_snapshot_local_ahead_then_diverged(self) -> None:
         """Allow reviewable local-ahead history but classify divergence separately."""
@@ -736,7 +1411,7 @@ def load_environment(*, checkout_root, environ, require_catalog):
         review_input.chmod(0o700)
         manifest_path = review_input / "dirty-snapshots.json"
         manifest = json.loads(manifest_path.read_text())
-        self.assertEqual(manifest["version"], 2)
+        self.assertEqual(manifest["version"], 4)
         self.assertEqual(
             manifest["local_commits"]["user_vault"][0]["commit"], local_head
         )
@@ -828,6 +1503,77 @@ def load_environment(*, checkout_root, environ, require_catalog):
         history.assert_not_called()
         self.assertEqual(state["history_relation"], "local_ahead")
         self.assertEqual(state["local_commits"], [])
+
+        with mock.patch.object(
+            CAPTURE_MODULE,
+            "commit_patch",
+            side_effect=AssertionError("capture materialized a local commit patch"),
+        ) as patch_reader:
+            reviewed = CAPTURE_MODULE.capture(
+                str(self.user), include_local_history=True
+            )
+        patch_reader.assert_not_called()
+        self.assertEqual(reviewed["history_capture_status"], "available")
+        self.assertEqual(len(reviewed["local_commits"]), 1)
+
+    def test_binary_dirty_content_does_not_break_lightweight_capture(self) -> None:
+        """Hash invalid-UTF-8 worktree bytes without decoding the file content."""
+        subprocess.run(["git", "-C", str(self.user), "config", "user.name", "Fixture"], check=True)
+        subprocess.run(
+            ["git", "-C", str(self.user), "config", "user.email", "fixture@example.invalid"],
+            check=True,
+        )
+        (self.user / "base.md").write_text("base\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.user), "add", "base.md"], check=True)
+        subprocess.run(["git", "-C", str(self.user), "commit", "-q", "-m", "base"], check=True)
+        subprocess.run(["git", "-C", str(self.user), "branch", "-M", "main"], check=True)
+        subprocess.run(["git", "-C", str(self.user), "push", "-q", "-u", "origin", "main"], check=True)
+        binary = self.user / "binary-dirty.bin"
+        binary.write_bytes(b"changed-\xff\n")
+        state = CAPTURE_MODULE.capture(str(self.user))
+        self.assertIn("binary-dirty.bin", state["dirty_paths"])
+        entry = next(
+            item for item in state["dirty_entries"]
+            if item["path"] == "binary-dirty.bin"
+        )
+        self.assertIsNotNone(entry["git_blob_oid"])
+        self.assertEqual(state["capture_status"], "available")
+
+    def test_oversize_local_commit_patch_blocks_only_residual_sweep(self) -> None:
+        """Materialize local history under a hard bound after collection only."""
+        repo = self.user
+        subprocess.run(["git", "-C", str(repo), "config", "user.name", "Fixture"], check=True)
+        subprocess.run(
+            ["git", "-C", str(repo), "config", "user.email", "fixture@example.invalid"],
+            check=True,
+        )
+        (repo / "base.md").write_text("base\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "base.md"], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "base"], check=True)
+        subprocess.run(["git", "-C", str(repo), "branch", "-M", "main"], check=True)
+        subprocess.run(["git", "-C", str(repo), "push", "-q", "-u", "origin", "main"], check=True)
+        (repo / "large.md").write_text("12345\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "large.md"], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "large"], check=True)
+        state = CAPTURE_MODULE.capture(str(repo), include_local_history=True)
+        destination = self.workdir / "bounded-local-history"
+        destination.mkdir()
+        runtime = {
+            "agents_git_dir": str(self.agents / ".git"),
+            "user_git_dir": str(repo / ".git"),
+            "agents_vault_root": str(self.agents),
+            "user_vault_root": str(repo),
+        }
+        pre = {
+            "agents_vault": {"dirty_entries": [], "local_commits": []},
+            "user_vault": state,
+        }
+        with mock.patch.object(DIRTY_STAGER_MODULE, "MAX_BLOB_BYTES", 4):
+            manifest = DIRTY_STAGER_MODULE.materialize(runtime, pre, destination)
+        self.assertEqual(
+            manifest["local_commits"]["user_vault"][0]["materialization_status"],
+            "blocked",
+        )
 
     def test_local_commit_patch_helpers_disable_repository_textconv(self) -> None:
         """Do not execute repository-configured textconv while hashing reviewed patches."""
@@ -1090,6 +1836,90 @@ def load_environment(*, checkout_root, environ, require_catalog):
             ],
         )
 
+    def test_evidence_commit_ignores_replace_refs_and_matches_raw_parent(self) -> None:
+        """Prevent a replace ref from hiding extra paths in the committed tree."""
+        repo = self.workdir / "replace-ref-evidence-repo"
+        repo.mkdir()
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.name", "Fixture"], check=True)
+        subprocess.run(
+            ["git", "-C", str(repo), "config", "user.email", "fixture@example.invalid"],
+            check=True,
+        )
+        (repo / "base.md").write_text("base\n", encoding="utf-8")
+        target = repo / "evidence.md"
+        target.write_text(
+            "# Task\n\n### Vault Publication Evidence\n\n## Reviews\n",
+            encoding="utf-8",
+        )
+        subprocess.run(
+            ["git", "-C", str(repo), "add", "base.md", "evidence.md"],
+            check=True,
+        )
+        subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "base"], check=True)
+        base = subprocess.check_output(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True
+        ).strip()
+        (repo / "hidden.md").write_text("hidden\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "hidden.md"], check=True)
+        replacement_tree = subprocess.check_output(
+            ["git", "-C", str(repo), "write-tree"], text=True
+        ).strip()
+        replacement = subprocess.check_output(
+            ["git", "-C", str(repo), "commit-tree", replacement_tree, "-p", base],
+            input="replacement\n",
+            text=True,
+        ).strip()
+        subprocess.run(
+            ["git", "-C", str(repo), "reset", "-q", "HEAD", "--", "hidden.md"],
+            check=True,
+        )
+        (repo / "hidden.md").unlink()
+        subprocess.run(["git", "-C", str(repo), "replace", base, replacement], check=True)
+        before = target.read_bytes()
+        candidate = before.replace(
+            b"## Reviews\n", b"#### Daily evidence\n\n## Reviews\n"
+        )
+        head_candidate = self.workdir / "replace-head-candidate"
+        index_candidate = self.workdir / "replace-index-candidate"
+        patch_path = self.workdir / "replace-evidence.patch"
+        head_candidate.write_bytes(candidate)
+        index_candidate.write_bytes(candidate)
+        patch = FINALIZER_MODULE.canonical_patch("evidence.md", before, candidate)
+        patch_path.write_bytes(patch)
+        runtime = {
+            "agents_vault_root": str(repo),
+            "agents_git_dir": str(repo / ".git"),
+            "gitleaks_bin": str(self.fake_gitleaks),
+        }
+        plan = {
+            "target_path": "evidence.md",
+            "base_head": base,
+            "head_source_sha256": hashlib.sha256(before).hexdigest(),
+            "head_candidate_path": str(head_candidate),
+            "head_candidate_sha256": hashlib.sha256(candidate).hexdigest(),
+            "index_candidate_path": str(index_candidate),
+            "index_candidate_sha256": hashlib.sha256(candidate).hexdigest(),
+            "review_patch_path": str(patch_path),
+            "evidence_diff_sha256": hashlib.sha256(patch).hexdigest(),
+        }
+        commit, _head_blob, _index_blob, _index_bytes = FINALIZER_MODULE.isolated_evidence_commit(
+            runtime,
+            plan,
+            ("Fixture", "fixture@example.invalid"),
+            self.workdir,
+        )
+        environment = FINALIZER_MODULE.clean_environment()
+        raw_paths = subprocess.check_output(
+            [
+                "git", "-C", str(repo), "diff", "--name-only", "--no-renames",
+                base, commit,
+            ],
+            text=True,
+            env=environment,
+        ).splitlines()
+        self.assertEqual(raw_paths, ["evidence.md"])
+
     def test_local_committer_binds_inputs_and_complete_installed_scope(self) -> None:
         """Reject standalone JSON substitution and manifest-external dirty paths."""
         runtime = {"runtime": "reviewed"}
@@ -1127,6 +1957,10 @@ def load_environment(*, checkout_root, environ, require_catalog):
             "dirty_lines": [],
             "dirty_paths": [],
             "dirty_entries": [],
+            "dirty_metadata": [],
+            "staged_paths": [],
+            "index_entries": [],
+            "index_sha256": "0" * 64,
             "dirty_digest": hashlib.sha256(b"").hexdigest(),
             "diff_snapshot_sha256": hashlib.sha256(b"").hexdigest(),
         }
@@ -1136,6 +1970,12 @@ def load_environment(*, checkout_root, environ, require_catalog):
             "dirty_paths": ["artifact.md"],
             "dirty_entries": [
                 {"path": "artifact.md", "git_blob_oid": "c" * 40, "mode": "100644"}
+            ],
+            "dirty_metadata": [
+                {
+                    "path": "artifact.md", "exists": True, "size": 1,
+                    "mtime_ns": 1, "st_mode": 0o100644,
+                }
             ],
         }
         COMMITTER_MODULE.validate_installed_scope(
@@ -1147,6 +1987,12 @@ def load_environment(*, checkout_root, environ, require_catalog):
         external["dirty_paths"].append("external.md")
         external["dirty_entries"].append(
             {"path": "external.md", "git_blob_oid": "d" * 40, "mode": "100644"}
+        )
+        external["dirty_metadata"].append(
+            {
+                "path": "external.md", "exists": True, "size": 1,
+                "mtime_ns": 1, "st_mode": 0o100644,
+            }
         )
         with self.assertRaises(COMMITTER_MODULE.CommitError):
             COMMITTER_MODULE.validate_installed_scope(
@@ -1169,6 +2015,24 @@ def load_environment(*, checkout_root, environ, require_catalog):
             COMMITTER_MODULE.safe_path("reports/advisory.md"),
             "reports/advisory.md",
         )
+
+    def test_owned_artifact_rollback_is_exact_and_refuses_drift(self) -> None:
+        """Undo only an unchanged O_EXCL artifact after a pre-commit failure."""
+        target = self.workdir / "owned-artifact.md"
+        target.write_text("verified\n", encoding="utf-8")
+        digest = hashlib.sha256(target.read_bytes()).hexdigest()
+        receipt = COMMITTER_MODULE.installed_artifact_receipt(target, digest)
+        COMMITTER_MODULE.rollback_owned_artifact(receipt)
+        self.assertFalse(target.exists())
+
+        target.write_text("verified\n", encoding="utf-8")
+        receipt = COMMITTER_MODULE.installed_artifact_receipt(target, digest)
+        target.write_text("other task\n", encoding="utf-8")
+        with self.assertRaisesRegex(
+            COMMITTER_MODULE.CommitError, "rollback refused"
+        ):
+            COMMITTER_MODULE.rollback_owned_artifact(receipt)
+        self.assertEqual(target.read_text(encoding="utf-8"), "other task\n")
 
     def test_local_committer_scans_binary_blobs_and_allows_deletion(self) -> None:
         """Reject a home path in raw bytes without treating deletion as a blob."""
@@ -1243,7 +2107,8 @@ def load_environment(*, checkout_root, environ, require_catalog):
         git_dir = str(repo / ".git")
         historical = repo / "historical.md"
         historical.write_text(
-            f"historical evidence: {Path.home()}/old.log\n",
+            f"historical evidence: {Path.home()}/old.log\n"
+            f"historical CR evidence:\r{Path.home()}/old-cr.log\n",
             encoding="utf-8",
         )
         subprocess.run(["git", "-C", str(repo), "add", "historical.md"], check=True)
@@ -1268,10 +2133,7 @@ def load_environment(*, checkout_root, environ, require_catalog):
             COMMITTER_MODULE.git(
                 str(repo), git_dir, "read-tree", "HEAD", index_file=historical_index
             )
-            historical.write_text(
-                historical.read_text(encoding="utf-8") + "reviewed update\n",
-                encoding="utf-8",
-            )
+            historical.write_bytes(historical.read_bytes() + b"reviewed update\n")
             COMMITTER_MODULE.git(
                 str(repo),
                 git_dir,
@@ -1288,14 +2150,42 @@ def load_environment(*, checkout_root, environ, require_catalog):
                 historical_index,
             )
 
-            added_index = str(Path(temporary) / "added.index")
+            safe_candidate = historical.read_bytes()
+            for index, prefix in enumerate(("", "+", "++", "+++")):
+                with self.subTest(prefix=prefix):
+                    added_index = str(Path(temporary) / f"added-{index}.index")
+                    COMMITTER_MODULE.git(
+                        str(repo), git_dir, "read-tree", "HEAD", index_file=added_index
+                    )
+                    historical.write_bytes(
+                        safe_candidate
+                        + f"{prefix}new evidence: {Path.home()}/new.log\n".encode(
+                            "utf-8"
+                        )
+                    )
+                    COMMITTER_MODULE.git(
+                        str(repo),
+                        git_dir,
+                        "add",
+                        "--",
+                        "historical.md",
+                        index_file=added_index,
+                    )
+                    with self.assertRaises(COMMITTER_MODULE.CommitError):
+                        COMMITTER_MODULE.scan_staged(
+                            str(self.fake_gitleaks),
+                            str(repo),
+                            git_dir,
+                            ["historical.md"],
+                            added_index,
+                        )
+            cr_index = str(Path(temporary) / "added-cr.index")
             COMMITTER_MODULE.git(
-                str(repo), git_dir, "read-tree", "HEAD", index_file=added_index
+                str(repo), git_dir, "read-tree", "HEAD", index_file=cr_index
             )
-            historical.write_text(
-                historical.read_text(encoding="utf-8")
-                + f"new evidence: {Path.home()}/new.log\n",
-                encoding="utf-8",
+            historical.write_bytes(
+                safe_candidate
+                + f"new CR evidence:\r{Path.home()}/new-cr.log\n".encode("utf-8")
             )
             COMMITTER_MODULE.git(
                 str(repo),
@@ -1303,7 +2193,7 @@ def load_environment(*, checkout_root, environ, require_catalog):
                 "add",
                 "--",
                 "historical.md",
-                index_file=added_index,
+                index_file=cr_index,
             )
             with self.assertRaises(COMMITTER_MODULE.CommitError):
                 COMMITTER_MODULE.scan_staged(
@@ -1311,8 +2201,27 @@ def load_environment(*, checkout_root, environ, require_catalog):
                     str(repo),
                     git_dir,
                     ["historical.md"],
-                    added_index,
+                    cr_index,
                 )
+
+    def test_unified_diff_parser_uses_only_lf_as_line_boundary(self) -> None:
+        """Preserve standalone CR and plus-prefixed content inside one Git hunk."""
+        patch_bytes = (
+            b"diff --git a/file b/file\n"
+            b"--- a/file\n"
+            b"+++ b/file\n"
+            b"@@ -0,0 +1 @@\n"
+            b"+++prefix\rsecret-after-cr\n"
+        )
+        self.assertEqual(
+            DIRTY_STAGER_MODULE.unified_diff_added_content(patch_bytes),
+            b"++prefix\rsecret-after-cr\n",
+        )
+        patch_text = patch_bytes.decode("utf-8")
+        self.assertEqual(
+            DIRTY_STAGER_MODULE.unified_diff_added_content(patch_text),
+            "++prefix\rsecret-after-cr\n",
+        )
 
     def test_local_committer_preserves_reviewed_markdown_whitespace(self) -> None:
         """Reviewed Vault content is committed byte-for-byte, including hard breaks."""
@@ -1528,10 +2437,22 @@ def load_environment(*, checkout_root, environ, require_catalog):
             "agents_vault": {
                 "local_head": agents_before,
                 "dirty_digest": "d" * 64,
+                "dirty_paths": [],
+                "dirty_entries": [],
+                "dirty_metadata": [],
+                "staged_paths": [],
+                "index_entries": [],
+                "index_sha256": "0" * 64,
             },
             "user_vault": {
                 "local_head": user_before,
                 "dirty_digest": "e" * 64,
+                "dirty_paths": [],
+                "dirty_entries": [],
+                "dirty_metadata": [],
+                "staged_paths": [],
+                "index_entries": [],
+                "index_sha256": "0" * 64,
             },
         }
         collection = {
@@ -1552,8 +2473,9 @@ def load_environment(*, checkout_root, environ, require_catalog):
         }
         review = {
             "outcome": "approved",
-            "agents_vault": {},
-            "user_vault": {},
+            "agents_vault": {"publication_mode": "sweep", "deferred_cleanup": []},
+            "user_vault": {"publication_mode": "sweep", "deferred_cleanup": []},
+            "next_action": None,
         }
         context_path = resume_root / "context.json"
         context_path.write_text(json.dumps(context), encoding="utf-8")
@@ -1585,6 +2507,8 @@ def load_environment(*, checkout_root, environ, require_catalog):
                 "pre_dirty_digest": "d" * 64,
                 "post_dirty_digest": clean_digest,
                 "clean": True,
+                "publication_mode": "sweep",
+                "deferred_cleanup": [],
             },
             "user_vault": {
                 "commit_status": "not_started",
@@ -1594,7 +2518,11 @@ def load_environment(*, checkout_root, environ, require_catalog):
                 "pre_dirty_digest": "e" * 64,
                 "post_dirty_digest": "f" * 64,
                 "clean": False,
+                "publication_mode": "sweep",
+                "deferred_cleanup": [],
             },
+            "publication_mode": {"agents_vault": "sweep", "user_vault": "sweep"},
+            "deferred_cleanup": {"agents_vault": [], "user_vault": []},
             "evidence_finalization_commit": None,
         }
         actual_agents = {
@@ -1605,6 +2533,8 @@ def load_environment(*, checkout_root, environ, require_catalog):
             "pre_dirty_digest": "d" * 64,
             "post_dirty_digest": clean_digest,
             "clean": True,
+            "publication_mode": "sweep",
+            "deferred_cleanup": [],
         }
         user_result = {
             "commit_status": "complete",
@@ -1614,16 +2544,49 @@ def load_environment(*, checkout_root, environ, require_catalog):
             "pre_dirty_digest": "e" * 64,
             "post_dirty_digest": clean_digest,
             "clean": True,
+            "publication_mode": "sweep",
+            "deferred_cleanup": [],
         }
         captured = {
-            "agents_vault": {"dirty_paths": [], "local_head": agents_after},
+            "agents_vault": {
+                "dirty_paths": [],
+                "dirty_entries": [],
+                "dirty_metadata": [],
+                "staged_paths": [],
+                "index_entries": [],
+                "index_sha256": "0" * 64,
+                "local_head": agents_after,
+            },
             "user_vault": {
                 "dirty_paths": ["summary.md"],
+                "dirty_entries": [
+                    {
+                        "path": "summary.md",
+                        "mode": "100644",
+                        "git_blob_oid": "2" * 40,
+                    }
+                ],
+                "dirty_metadata": [
+                    {
+                        "path": "summary.md",
+                        "exists": True,
+                        "size": summary.stat().st_size,
+                        "mtime_ns": summary.stat().st_mtime_ns,
+                        "st_mode": summary.stat().st_mode,
+                    }
+                ],
+                "staged_paths": [],
+                "index_entries": [],
+                "index_sha256": "0" * 64,
                 "local_head": user_before,
                 "dirty_digest": "f" * 64,
             },
         }
         partial_result["resumable_state"] = captured
+        completed_capture = {
+            "agents_vault": captured["agents_vault"],
+            "user_vault": {"dirty_paths": [], "local_head": "1" * 40},
+        }
         output.write_text(json.dumps(partial_result), encoding="utf-8")
 
         with mock.patch.object(
@@ -1631,7 +2594,10 @@ def load_environment(*, checkout_root, environ, require_catalog):
         ), mock.patch.object(
             COMMITTER_MODULE, "current_state", return_value=actual_agents
         ), mock.patch.object(
-            COMMITTER_MODULE, "capture_state", return_value=captured
+            COMMITTER_MODULE, "capture_state",
+            side_effect=[captured, captured, completed_capture]
+        ), mock.patch.object(
+            COMMITTER_MODULE, "validate_post_commit_state"
         ), mock.patch.object(
             COMMITTER_MODULE, "commit_groups", return_value=user_result
         ) as resumed_commit:
@@ -1664,7 +2630,10 @@ def load_environment(*, checkout_root, environ, require_catalog):
         ), mock.patch.object(
             COMMITTER_MODULE, "current_state", return_value=actual_agents
         ), mock.patch.object(
-            COMMITTER_MODULE, "capture_state", return_value=captured
+            COMMITTER_MODULE, "capture_state",
+            side_effect=[captured, captured, completed_capture]
+        ), mock.patch.object(
+            COMMITTER_MODULE, "validate_post_commit_state"
         ), mock.patch.object(
             COMMITTER_MODULE, "commit_groups", return_value=user_result
         ) as complete_resume_commit:
@@ -1893,6 +2862,57 @@ def load_environment(*, checkout_root, environ, require_catalog):
         with self.assertRaises(CANONICAL_MODULE.CanonicalValidationError):
             CANONICAL_MODULE.validate(incomplete_binding, schema, schema)
 
+        resumable_snapshot = {
+            "agents_vault": {"local_head": "c" * 40},
+            "user_vault": {"local_head": "b" * 40},
+        }
+        deferred = {
+            "agents_vault": [],
+            "user_vault": [
+                {"path": ".codex-handoff/unsafe.md", "reason": "guard rejection"}
+            ],
+        }
+        with mock.patch.object(
+            COMMITTER_MODULE, "current_state", side_effect=[progressed, unchanged]
+        ), mock.patch.object(
+            COMMITTER_MODULE, "capture_state", return_value=resumable_snapshot
+        ):
+            resumable = COMMITTER_MODULE.result_after_failure(
+                {
+                    "agents_vault_root": "/agents",
+                    "agents_git_dir": "/agents/.git",
+                    "user_vault_root": "/user",
+                    "user_git_dir": "/user/.git",
+                },
+                before,
+                {"daily_pipeline_status": "complete"},
+                {
+                    "summary_target": "/user/summary.md",
+                    "advisory_target": "/agents/advisory.md",
+                },
+                "user CAS race",
+                publication_context_sha256="f" * 64,
+                capture="/capture",
+                runtime_file="/runtime",
+                publication_modes={
+                    "agents_vault": "sweep",
+                    "user_vault": "own_only",
+                },
+                deferred_cleanup=deferred,
+            )
+        self.assertEqual(
+            resumable["publication_mode"],
+            {"agents_vault": "sweep", "user_vault": "own_only"},
+        )
+        self.assertEqual(resumable["deferred_cleanup"], deferred)
+        self.assertEqual(resumable["resumable_state"], resumable_snapshot)
+        self.assertEqual(
+            resumable["agents_vault"]["publication_mode"], "sweep"
+        )
+        self.assertEqual(
+            resumable["user_vault"]["publication_mode"], "own_only"
+        )
+
     def test_local_committer_rejects_staged_only_before_head_changes(self) -> None:
         """Fail before commit when reviewed index bytes differ from the worktree."""
         repo = self.agents
@@ -2052,33 +3072,44 @@ def load_environment(*, checkout_root, environ, require_catalog):
 
     def test_fixed_fetch_pins_remote_refspec_and_environment(self) -> None:
         """Reject mutable remote/config behavior in the preflight transport."""
-        completed = subprocess.CompletedProcess(
-            args=[], returncode=0, stdout="", stderr=""
-        )
+        oid = "a" * 40
+        transport = mock.MagicMock()
+        transport.__enter__.return_value = transport
+        transport.__exit__.return_value = None
+        transport.run.side_effect = [
+            subprocess.CompletedProcess([], 0, f"{oid}\trefs/heads/main\n", ""),
+            subprocess.CompletedProcess([], 0, "", ""),
+            subprocess.CompletedProcess([], 0, oid + "\n", ""),
+            subprocess.CompletedProcess([], 0, f"{oid}\trefs/heads/main\n", ""),
+        ]
+        local_results = [
+            subprocess.CompletedProcess([], 1, "", ""),
+            subprocess.CompletedProcess([], 0, "", ""),
+        ]
         with mock.patch.dict(os.environ, {"GIT_DIR": "/attacker/git"}), mock.patch.object(
-            FETCH_MODULE.subprocess, "run", return_value=completed
-        ) as run:
+            FETCH_MODULE, "IsolatedGitTransport", return_value=transport
+        ) as transport_factory, mock.patch.object(
+            FETCH_MODULE.subprocess, "run", side_effect=local_results
+        ) as local_run:
             FETCH_MODULE.fetch_main(
                 "/vault/worktree", "/local/gitdir", "ssh://git@example.invalid/repo"
             )
-        command = run.call_args.args[0]
+        transport_factory.assert_called_once_with("/local/gitdir")
+        fetch_call = transport.run.call_args_list[1]
         self.assertEqual(
-            command[:3],
-            ["git", "--git-dir=/local/gitdir", "--work-tree=/vault/worktree"],
-        )
-        self.assertIn("core.hooksPath=/dev/null", command)
-        self.assertEqual(
-            command[-2:],
-            [
+            fetch_call.args[-2:],
+            (
                 "ssh://git@example.invalid/repo",
                 "refs/heads/main:refs/remotes/origin/main",
-            ],
+            ),
         )
-        self.assertNotIn("origin", command)
-        self.assertNotIn("GIT_DIR", run.call_args.kwargs["env"])
-        self.assertEqual(run.call_args.kwargs["env"]["GIT_CONFIG_NOSYSTEM"], "1")
+        update_command = local_run.call_args_list[-1].args[0]
+        self.assertIn("core.fsmonitor=false", update_command)
+        self.assertNotIn("origin", update_command[-2:])
+        self.assertNotIn("GIT_DIR", local_run.call_args_list[-1].kwargs["env"])
         self.assertEqual(
-            run.call_args.kwargs["env"]["GIT_CONFIG_GLOBAL"], os.devnull
+            local_run.call_args_list[-1].kwargs["env"]["GIT_CONFIG_GLOBAL"],
+            os.devnull,
         )
 
     def test_fixed_fetch_invalid_utf8_uses_standard_failure_contract(self) -> None:
@@ -2136,6 +3167,89 @@ def load_environment(*, checkout_root, environ, require_catalog):
         )
         self.assertEqual(result.returncode, 78)
         self.assertIn("invalid publisher Git email", result.stderr)
+
+    def test_resolver_rejects_git_transport_rewrite_and_include(self) -> None:
+        """Reject repository-local config that can redirect fixed Git transport."""
+        subprocess.run(
+            [
+                "git", "-C", str(self.agents), "config", "--local",
+                "url.ssh://attacker.invalid/.insteadOf", "ssh://git@example.invalid/",
+            ],
+            check=True,
+        )
+        rewritten = subprocess.run(
+            [
+                str(SCRIPTS / "resolve-runtime-context.py"),
+                str(self.config), str(self.workdir),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(rewritten.returncode, 78)
+        self.assertIn("unsafe repository-local Git config", rewritten.stderr)
+        subprocess.run(
+            [
+                "git", "-C", str(self.agents), "config", "--local", "--unset-all",
+                "url.ssh://attacker.invalid/.insteadOf",
+            ],
+            check=True,
+        )
+        included = self.workdir / "attacker-git-config"
+        included.write_text("[core]\n\tsshCommand = attacker\n", encoding="utf-8")
+        subprocess.run(
+            [
+                "git", "-C", str(self.agents), "config", "--local",
+                "include.path", str(included),
+            ],
+            check=True,
+        )
+        include_result = subprocess.run(
+            [
+                str(SCRIPTS / "resolve-runtime-context.py"),
+                str(self.config), str(self.workdir),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(include_result.returncode, 78)
+        self.assertIn("unsafe repository-local Git config", include_result.stderr)
+
+    def test_resolver_rejects_git_execution_config(self) -> None:
+        """Reject filters, attributes indirection, and fsmonitor before collection."""
+        cases = (
+            ("filter.fixture.clean", "sh -c 'exit 1'"),
+            ("core.attributesFile", str(self.workdir / "attributes")),
+            ("core.fsmonitor", "sh -c 'exit 1'"),
+        )
+        for key, value in cases:
+            with self.subTest(key=key):
+                subprocess.run(
+                    [
+                        "git", "-C", str(self.agents), "config", "--local",
+                        key, value,
+                    ],
+                    check=True,
+                )
+                result = subprocess.run(
+                    [
+                        str(SCRIPTS / "resolve-runtime-context.py"),
+                        str(self.config), str(self.workdir),
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(result.returncode, 78)
+                self.assertIn("unsafe repository-local Git config", result.stderr)
+                subprocess.run(
+                    [
+                        "git", "-C", str(self.agents), "config", "--local",
+                        "--unset-all", key,
+                    ],
+                    check=True,
+                )
 
     def test_resolver_accepts_bound_absolute_gitdir_file(self) -> None:
         """Support the Vault layout while binding its indirection file."""
@@ -2307,6 +3421,47 @@ def load_environment(*, checkout_root, environ, require_catalog):
         ).strip()
         self.assertEqual(state["dirty_paths"], ["tracked.md"])
         self.assertEqual(state["dirty_entries"][0]["git_blob_oid"], expected_oid)
+        permissions = self.agents / "permissions.md"
+        permissions.write_text("same bytes\n", encoding="utf-8")
+        permissions.chmod(0o640)
+        before_permissions_all = json.loads(
+            subprocess.run(
+                [str(SCRIPTS / "capture-vault-state.py"), str(context)],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+        )
+        before_permissions = before_permissions_all["agents_vault"]
+        before_metadata = next(
+            item for item in before_permissions["dirty_metadata"]
+            if item["path"] == "permissions.md"
+        )
+        permissions.chmod(0o600)
+        after_permissions_all = json.loads(
+            subprocess.run(
+                [str(SCRIPTS / "capture-vault-state.py"), str(context)],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+        )
+        after_permissions = after_permissions_all["agents_vault"]
+        after_metadata = next(
+            item for item in after_permissions["dirty_metadata"]
+            if item["path"] == "permissions.md"
+        )
+        self.assertNotEqual(before_metadata["st_mode"], after_metadata["st_mode"])
+        self.assertNotEqual(
+            before_permissions["dirty_worktree_sha256"],
+            after_permissions["dirty_worktree_sha256"],
+        )
+        with self.assertRaisesRegex(
+            COMMITTER_MODULE.CommitError, "dirty metadata changed"
+        ):
+            COMMITTER_MODULE.validate_installed_scope(
+                before_permissions_all, after_permissions_all, {}
+            )
         dangling = self.agents / "dangling-link"
         dangling.symlink_to("missing-target")
         result = subprocess.run(
@@ -2349,6 +3504,158 @@ def load_environment(*, checkout_root, environ, require_catalog):
             ).stdout
         )["agents_vault"]["git_control_sha256"]
         self.assertNotEqual(before_mode, after_mode)
+
+    def test_mode_determiner_constrains_each_vault_independently(self) -> None:
+        """Convert collection-time drift and staged state into own_only, not failure."""
+        base = {
+            "repo_root": "/vault",
+            "branch": "main",
+            "upstream": "origin/main",
+            "local_head": "a" * 40,
+            "history_relation": "equal",
+            "operation_in_progress": False,
+            "git_control_sha256": "1" * 64,
+            "index_sha256": "2" * 64,
+            "dirty_worktree_sha256": "3" * 64,
+            "dirty_digest": "4" * 64,
+            "diff_snapshot_sha256": "5" * 64,
+            "dirty_paths": [],
+            "staged_paths": [],
+        }
+        changed = json.loads(json.dumps(base))
+        changed["dirty_worktree_sha256"] = "6" * 64
+        changed["dirty_paths"] = ["other-task.md"]
+        result = MODE_MODULE.vault_mode(base, changed, "summary.md")
+        self.assertEqual(result["required_mode"], "own_only")
+        self.assertTrue(result["state_changed"])
+        stable = json.loads(json.dumps(base))
+        stable["staged_paths"] = ["staged.md"]
+        staged = MODE_MODULE.vault_mode(stable, stable, "advisory.md")
+        self.assertEqual(staged["required_mode"], "own_only")
+        self.assertIn("existing_staged_changes", staged["reasons"])
+        conflicted = MODE_MODULE.vault_mode(
+            base, base, "summary.md", target_conflict=True
+        )
+        self.assertEqual(conflicted["required_mode"], "blocked")
+        self.assertIn(
+            "planned_target_changed_before_publication", conflicted["reasons"]
+        )
+        self.assertEqual(conflicted["retry_disposition"], "replan")
+        active = json.loads(json.dumps(base))
+        active["operation_in_progress"] = True
+        blocked_active = MODE_MODULE.vault_mode(base, active, "summary.md")
+        self.assertEqual(blocked_active["required_mode"], "blocked")
+        self.assertEqual(blocked_active["retry_disposition"], "none")
+        self.assertIn("active_git_operation", blocked_active["reasons"])
+        control_changed = json.loads(json.dumps(base))
+        control_changed["git_control_sha256"] = "9" * 64
+        blocked_control = MODE_MODULE.vault_mode(
+            base, control_changed, "summary.md"
+        )
+        self.assertEqual(blocked_control["required_mode"], "blocked")
+        self.assertIn("git_control_plane_changed", blocked_control["reasons"])
+
+    def test_sealed_residual_guard_raises_only_affected_mode_floor(self) -> None:
+        """Turn a deterministic dirty deferral into an own_only mode hint."""
+        hint = {
+            "version": 1,
+            "agents_vault": {
+                "required_mode": "sweep",
+                "reasons": ["stable_sweep_candidate"],
+            },
+            "user_vault": {
+                "required_mode": "sweep",
+                "reasons": ["stable_sweep_candidate"],
+            },
+        }
+        manifest = {
+            "version": 4,
+            "vaults": {
+                "agents_vault": [
+                    {
+                        "path": "unsafe.md",
+                        "materialization_status": "deferred",
+                    }
+                ],
+                "user_vault": [
+                    {"path": "safe.md", "materialization_status": "available"}
+                ],
+            },
+        }
+        guarded = MODE_MODULE.apply_residual_guards(hint, manifest)
+        self.assertEqual(guarded["agents_vault"]["required_mode"], "own_only")
+        self.assertEqual(
+            guarded["agents_vault"]["guard_deferred_paths"], ["unsafe.md"]
+        )
+        self.assertIn(
+            "sealed_residual_guard_deferred", guarded["agents_vault"]["reasons"]
+        )
+        self.assertNotIn(
+            "stable_sweep_candidate", guarded["agents_vault"]["reasons"]
+        )
+        self.assertEqual(guarded["user_vault"]["required_mode"], "sweep")
+        self.assertEqual(guarded["user_vault"]["guard_deferred_paths"], [])
+
+    def test_own_only_commit_preserves_unrelated_staged_and_untracked_state(self) -> None:
+        """Commit only the artifact while preserving unsafe residual bytes and metadata."""
+        repo = self.user
+        subprocess.run(["git", "-C", str(repo), "config", "user.name", "Fixture"], check=True)
+        subprocess.run(
+            ["git", "-C", str(repo), "config", "user.email", "fixture@example.invalid"],
+            check=True,
+        )
+        (repo / "staged.md").write_text("base\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "staged.md"], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "base"], check=True)
+        subprocess.run(["git", "-C", str(repo), "branch", "-M", "main"], check=True)
+        subprocess.run(["git", "-C", str(repo), "push", "-q", "-u", "origin", "main"], check=True)
+        (repo / "staged.md").write_text("other task staged\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "staged.md"], check=True)
+        handoff = repo / ".codex-handoff" / "unsafe.md"
+        handoff.parent.mkdir()
+        handoff.write_text(f"unsafe existing path {Path.home()}\n", encoding="utf-8")
+        handoff.chmod(0o640)
+        before_stat = handoff.stat()
+        before_bytes = handoff.read_bytes()
+        staged_oid = subprocess.check_output(
+            ["git", "-C", str(repo), "rev-parse", ":staged.md"], text=True
+        ).strip()
+        pre = CAPTURE_MODULE.capture(str(repo), include_local_history=True)
+        artifact = repo / "summary.md"
+        artifact.write_text("verified artifact\n", encoding="utf-8")
+        manifest = {
+            "approved_dirty_entries": [],
+            "commit_groups": [{"message": "docs: publish summary", "paths": ["summary.md"]}],
+            "deferred_cleanup": [
+                {"path": path, "reason": "existing unrelated change"}
+                for path in pre["dirty_paths"]
+            ],
+        }
+        result = COMMITTER_MODULE.commit_groups(
+            str(repo), str(repo / ".git"), str(self.fake_gitleaks), pre,
+            manifest, "summary.md", hashlib.sha256(artifact.read_bytes()).hexdigest(),
+            self.workdir, ("Fixture Publisher", "publisher@example.invalid"),
+            publication_mode="own_only",
+        )
+        after = CAPTURE_MODULE.capture(str(repo), include_local_history=True)
+        COMMITTER_MODULE.validate_post_commit_state(pre, after, "summary.md", "own_only")
+        self.assertEqual(result["publication_mode"], "own_only")
+        self.assertFalse(result["clean"])
+        self.assertEqual(
+            subprocess.check_output(
+                ["git", "-C", str(repo), "rev-parse", ":staged.md"], text=True
+            ).strip(),
+            staged_oid,
+        )
+        self.assertEqual(handoff.read_bytes(), before_bytes)
+        after_stat = handoff.stat()
+        self.assertEqual(after_stat.st_mode, before_stat.st_mode)
+        self.assertEqual(after_stat.st_mtime_ns, before_stat.st_mtime_ns)
+        committed_paths = subprocess.check_output(
+            ["git", "-C", str(repo), "diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"],
+            text=True,
+        ).splitlines()
+        self.assertEqual(committed_paths, ["summary.md"])
 
     def test_capture_invalid_utf8_context_fails_closed(self) -> None:
         """Return status 75 instead of leaking a decode traceback."""
@@ -2949,6 +4256,16 @@ def load_environment(*, checkout_root, environ, require_catalog):
         collection_path = self.workdir / "collection.json"
         context_path.write_text(json.dumps(context), encoding="utf-8")
         collection_path.write_text(json.dumps(collection), encoding="utf-8")
+        existing_summary = (
+            self.user
+            / "10_Prompt"
+            / "2026"
+            / "07"
+            / "31"
+            / summary.name
+        )
+        existing_summary.parent.mkdir(parents=True)
+        existing_summary.write_text("existing summary\n", encoding="utf-8")
         plan_path = self.workdir / "plan.json"
         with plan_path.open("w", encoding="utf-8") as output:
             subprocess.run(
@@ -2962,20 +4279,64 @@ def load_environment(*, checkout_root, environ, require_catalog):
                 stdout=output,
                 text=True,
             )
-        result = subprocess.run(
+        plan = json.loads(plan_path.read_text(encoding="utf-8"))
+        self.assertEqual(Path(plan["summary_target"]).name, "SUMMARY-IT-NEWS-2026-07-31-2.md")
+        blocked_summary = Path(plan["summary_target"])
+        blocked_summary.parent.mkdir(parents=True, exist_ok=True)
+        blocked_summary.write_text("concurrent user target\n", encoding="utf-8")
+        agents_only = subprocess.run(
             [
                 str(SCRIPTS / "install-verified-artifacts.py"),
                 str(context_path),
                 str(collection_path),
                 str(plan_path),
+                "agents_security_advisory",
             ],
             check=True,
             capture_output=True,
             text=True,
         )
-        installed = json.loads(result.stdout)
+        agents_only_result = json.loads(agents_only.stdout)
+        installed_advisory = Path(agents_only_result["advisory_target"])
+        self.assertEqual(
+            blocked_summary.read_text(encoding="utf-8"),
+            "concurrent user target\n",
+        )
+        self.assertTrue(installed_advisory.is_file())
+        blocked_summary.unlink()
+        installed_advisory.unlink()
+
+        summary_result = subprocess.run(
+            [
+                str(SCRIPTS / "install-verified-artifacts.py"),
+                str(context_path),
+                str(collection_path),
+                str(plan_path),
+                "user_it_news_summary",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        advisory_result = subprocess.run(
+            [
+                str(SCRIPTS / "install-verified-artifacts.py"),
+                str(context_path),
+                str(collection_path),
+                str(plan_path),
+                "agents_security_advisory",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        installed = {
+            **json.loads(summary_result.stdout),
+            **json.loads(advisory_result.stdout),
+        }
         self.assertTrue(Path(installed["summary_target"]).is_file())
         self.assertTrue(Path(installed["advisory_target"]).is_file())
+        self.assertEqual(existing_summary.read_text(encoding="utf-8"), "existing summary\n")
 
         context["it_news_archive_relative"] = ""
         context_path.write_text(json.dumps(context), encoding="utf-8")
@@ -3192,6 +4553,37 @@ def load_environment(*, checkout_root, environ, require_catalog):
                 self.agents, relative, block
             )
 
+    def test_evidence_inputs_are_bounded_before_allocation(self) -> None:
+        """Reject oversized control files and Git blobs through streaming gates."""
+        oversized = self.workdir / "oversized-evidence-input"
+        with oversized.open("wb") as output:
+            output.truncate(EVIDENCE_MODULE.MAX_TASK_BYTES + 1)
+        with self.assertRaisesRegex(EVIDENCE_MODULE.EvidenceError, "allowed size"):
+            EVIDENCE_MODULE.read_regular_nofollow(oversized)
+        with self.assertRaisesRegex(FINALIZER_MODULE.FinalizationError, "allowed size"):
+            FINALIZER_MODULE.stable_regular_bytes(oversized)
+
+        content = b"12345"
+        oid = subprocess.run(
+            ["git", "-C", str(self.agents), "hash-object", "-w", "--stdin"],
+            input=content,
+            check=True,
+            capture_output=True,
+        ).stdout.decode().strip()
+        with mock.patch.object(EVIDENCE_MODULE, "MAX_TASK_BYTES", 4):
+            with self.assertRaisesRegex(EVIDENCE_MODULE.EvidenceError, "exceeds"):
+                EVIDENCE_MODULE.git_bytes(
+                    str(self.agents), str(self.agents / ".git"),
+                    "cat-file", "blob", oid,
+                )
+        with mock.patch.object(FINALIZER_MODULE, "MAX_TASK_BYTES", 4):
+            with self.assertRaisesRegex(
+                FINALIZER_MODULE.FinalizationError, "exceeds"
+            ):
+                FINALIZER_MODULE.git_object_bytes(
+                    str(self.agents), str(self.agents / ".git"), oid
+                )
+
     def test_evidence_atomic_failure_preserves_original_target(self) -> None:
         """Leave the canonical task unchanged after partial or zero writes."""
         task = self.agents / "tasks" / "standing.md"
@@ -3311,6 +4703,8 @@ def load_environment(*, checkout_root, environ, require_catalog):
                 "pre_dirty_digest": pre[key]["dirty_digest"],
                 "post_dirty_digest": empty_digest,
                 "clean": True,
+                "publication_mode": "sweep",
+                "deferred_cleanup": [],
             }
         commit_result = {
             "outcome": "ready_to_push",
@@ -3321,6 +4715,10 @@ def load_environment(*, checkout_root, environ, require_catalog):
             "notification_result": "none",
             "agents_vault": commits["agents_vault"],
             "user_vault": commits["user_vault"],
+            "publication_mode": {
+                "agents_vault": "sweep", "user_vault": "sweep"
+            },
+            "deferred_cleanup": {"agents_vault": [], "user_vault": []},
             "evidence_finalization_commit": None,
             "next_action": None,
         }
@@ -3329,14 +4727,16 @@ def load_environment(*, checkout_root, environ, require_catalog):
         context_path = self.workdir / "fixed-context.json"
         review_path = self.workdir / "fixed-review.json"
         plan_path = self.workdir / "fixed-plan.json"
-        context_path.write_text("{}", encoding="utf-8")
-        context_digest = hashlib.sha256(context_path.read_bytes()).hexdigest()
         artifact_hash = hashlib.sha256(b"published\n").hexdigest()
         manifest = lambda root: {
             "repo_root": str(root),
             "task_id": "TSK-AUTH",
+            "publication_mode": "sweep",
+            "core_review_status": "quality_ok",
+            "residual_review_status": "quality_ok",
             "owned_paths": ["published.md"],
             "excluded_paths": [],
+            "deferred_cleanup": [],
             "approved_diff_snapshot_sha256": hashlib.sha256(b"").hexdigest(),
             "approved_existing_commits": [],
             "approved_dirty_entries": [],
@@ -3365,6 +4765,22 @@ def load_environment(*, checkout_root, environ, require_catalog):
             "commit_groups": [{"message": "publish", "paths": ["published.md"]}],
             "evidence_finalization": None,
         }
+        plan_payload = {
+            "summary_target": str(self.user / "published.md"),
+            "advisory_target": str(self.agents / "published.md"),
+        }
+        plan_path.write_text(json.dumps(plan_payload), encoding="utf-8")
+        context_path.write_text(
+            json.dumps(
+                {
+                    "runtime": runtime,
+                    "pre_collection_state": pre,
+                    "artifact_plan": plan_payload,
+                }
+            ),
+            encoding="utf-8",
+        )
+        context_digest = hashlib.sha256(context_path.read_bytes()).hexdigest()
         review_payload = {
             "outcome": "approved",
             "publication_context_sha256": context_digest,
@@ -3372,15 +4788,6 @@ def load_environment(*, checkout_root, environ, require_catalog):
             "user_vault": manifest(self.user),
             "next_action": None,
         }
-        plan_path.write_text(
-            json.dumps(
-                {
-                    "summary_target": str(self.user / "published.md"),
-                    "advisory_target": str(self.agents / "published.md"),
-                }
-            ),
-            encoding="utf-8",
-        )
         commit_path.write_text(json.dumps(commit_result), encoding="utf-8")
         command = [
             str(SCRIPTS / "push-committed-heads.py"),
@@ -3420,7 +4827,12 @@ def load_environment(*, checkout_root, environ, require_catalog):
                 ["git", "-C", str(repo), "ls-remote", "origin", "refs/heads/main"],
                 text=True,
             ).split()[0]
-            self.assertEqual(remote, pre[key]["remote_head"])
+            expected = (
+                commit_result["agents_vault"]["local_head"]
+                if key == "agents_vault"
+                else pre[key]["remote_head"]
+            )
+            self.assertEqual(remote, expected)
 
         bad_status = list(command)
         bad_status[5] = "not-a-number"
@@ -3428,9 +4840,37 @@ def load_environment(*, checkout_root, environ, require_catalog):
         self.assertEqual(rejected.returncode, 75)
         self.assertTrue(final_path.is_file())
 
+        remote_before_rejections = {
+            key: subprocess.check_output(
+                ["git", "-C", str(repo), "ls-remote", "origin", "refs/heads/main"],
+                text=True,
+            ).split()[0]
+            for key, repo in (("agents", self.agents), ("user", self.user))
+        }
+        failed_process = list(command)
+        failed_process[5] = "75"
+        self.assertEqual(subprocess.run(failed_process, check=False).returncode, 75)
+        tampered_runtime = dict(runtime)
+        tampered_runtime["user_remote_url"] = str(self.origins["agents"])
+        tampered_runtime_path = self.workdir / "tampered-runtime.json"
+        tampered_runtime_path.write_text(json.dumps(tampered_runtime), encoding="utf-8")
+        tampered_command = list(command)
+        tampered_command[1] = str(tampered_runtime_path)
+        self.assertEqual(subprocess.run(tampered_command, check=False).returncode, 75)
+        for key, repo in (("agents", self.agents), ("user", self.user)):
+            observed = subprocess.check_output(
+                ["git", "-C", str(repo), "ls-remote", "origin", "refs/heads/main"],
+                text=True,
+            ).split()[0]
+            self.assertEqual(observed, remote_before_rejections[key])
+
         commit_path.write_text(json.dumps(commit_result), encoding="utf-8")
         result = subprocess.run(command, check=False)
-        self.assertEqual(result.returncode, 0)
+        self.assertEqual(
+            result.returncode,
+            0,
+            msg=final_path.read_text(encoding="utf-8") if final_path.exists() else "missing result",
+        )
         final = json.loads(final_path.read_text(encoding="utf-8"))
         self.assertEqual(final["outcome"], "partial_publication")
         self.assertEqual(
@@ -3438,8 +4878,8 @@ def load_environment(*, checkout_root, environ, require_catalog):
             final["agents_vault"]["remote_head"],
         )
 
-    def test_pusher_scans_remote_to_final_and_rejects_remote_race(self) -> None:
-        """Fix both secret-scan coverage and the pre-push remote race gate."""
+    def test_pusher_scans_remote_to_final_and_isolates_remote_races(self) -> None:
+        """Scan the full range and contain a remote race to the affected Vault."""
         completed = subprocess.CompletedProcess([], 0, "", "")
         with mock.patch.object(PUSH_MODULE.subprocess, "run", return_value=completed) as run:
             PUSH_MODULE.scan_commits("/tools/gitleaks", "/vault", "a" * 40, "b" * 40)
@@ -3447,13 +4887,88 @@ def load_environment(*, checkout_root, environ, require_catalog):
             f"{'a' * 40}..{'b' * 40}",
             run.call_args.args[0],
         )
-        pre = {
-            "agents_vault": {"remote_head": "a" * 40},
-            "user_vault": {"remote_head": "b" * 40},
-        }
-        PUSH_MODULE.require_unchanged_remote_heads("a" * 40, "b" * 40, pre)
-        with self.assertRaisesRegex(PUSH_MODULE.PushError, "remote main moved"):
-            PUSH_MODULE.require_unchanged_remote_heads("c" * 40, "b" * 40, pre)
+        with mock.patch.object(
+            PUSH_MODULE, "remote_head", return_value="a" * 40
+        ), mock.patch.object(
+            PUSH_MODULE, "push_one", return_value=("complete", "b" * 40)
+        ) as push:
+            self.assertEqual(
+                PUSH_MODULE.push_one_independently(
+                    "/vault", "remote", "b" * 40, "a" * 40, "own_only"
+                ),
+                ("complete", "b" * 40),
+            )
+            push.assert_called_once()
+        with mock.patch.object(
+            PUSH_MODULE, "remote_head", return_value="c" * 40
+        ), mock.patch.object(PUSH_MODULE, "push_one") as push:
+            self.assertEqual(
+                PUSH_MODULE.push_one_independently(
+                    "/vault", "remote", "b" * 40, "a" * 40, "sweep"
+                ),
+                ("failed", "c" * 40),
+            )
+            push.assert_not_called()
+            self.assertEqual(
+                PUSH_MODULE.push_one_independently(
+                    "/vault", "remote", "a" * 40, "a" * 40, "blocked"
+                ),
+                ("not_started", "c" * 40),
+            )
+        with mock.patch.object(
+            PUSH_MODULE,
+            "remote_head",
+            side_effect=TRANSPORT_MODULE.TransportError("deadline"),
+        ):
+            self.assertEqual(
+                PUSH_MODULE.push_one_independently(
+                    "/agents", "remote", "b" * 40, "a" * 40, "own_only"
+                ),
+                ("failed", "a" * 40),
+            )
+        with mock.patch.object(
+            PUSH_MODULE, "remote_head", return_value="a" * 40
+        ), mock.patch.object(
+            PUSH_MODULE, "push_one", return_value=("complete", "b" * 40)
+        ):
+            self.assertEqual(
+                PUSH_MODULE.push_one_independently(
+                    "/user", "remote", "b" * 40, "a" * 40, "own_only"
+                ),
+                ("complete", "b" * 40),
+            )
+
+    def test_fixed_push_is_non_force_and_bounded(self) -> None:
+        """Retry a fixed refspec at most three times and stop on remote drift."""
+        before = "a" * 40
+        local = "b" * 40
+        failed = subprocess.CompletedProcess([], 1, "", "rejected")
+        with mock.patch.object(
+            PUSH_MODULE, "remote_head", return_value=before
+        ), mock.patch.object(PUSH_MODULE, "git", return_value=failed) as git:
+            self.assertEqual(
+                PUSH_MODULE.push_one(
+                    "/vault", "remote", local, True, before, "/vault/.git"
+                ),
+                ("failed", before),
+            )
+            self.assertEqual(git.call_count, 3)
+            for call in git.call_args_list:
+                self.assertEqual(
+                    call.args[1:],
+                    ("push", "remote", f"{local}:refs/heads/main"),
+                )
+                self.assertNotIn("--force", call.args)
+        with mock.patch.object(
+            PUSH_MODULE, "remote_head", return_value="c" * 40
+        ), mock.patch.object(PUSH_MODULE, "git") as git:
+            self.assertEqual(
+                PUSH_MODULE.push_one(
+                    "/vault", "remote", local, True, before, "/vault/.git"
+                ),
+                ("failed", "c" * 40),
+            )
+            git.assert_not_called()
 
     def test_review_rejects_forbidden_path_in_local_only_history(self) -> None:
         """Apply the .obsidian guard to commits that already exist locally."""
@@ -3470,7 +4985,6 @@ def load_environment(*, checkout_root, environ, require_catalog):
                     "tree": "c" * 40,
                     "message": "unsafe",
                     "changed_paths": [".obsidian/workspace.json"],
-                    "patch_sha256": "d" * 64,
                 }
             ],
             "dirty_paths": [],
@@ -3480,7 +4994,10 @@ def load_environment(*, checkout_root, environ, require_catalog):
                 {
                     "repo_root": str(self.agents),
                     "task_id": "TSK-AUTH",
-                    "approved_existing_commits": state["local_commits"],
+                    "publication_mode": "sweep",
+                    "approved_existing_commits": [
+                        {**state["local_commits"][0], "patch_sha256": "d" * 64}
+                    ],
                 },
                 state,
                 str(self.agents),
@@ -3492,6 +5009,8 @@ def load_environment(*, checkout_root, environ, require_catalog):
                 },
                 None,
                 "fixture-gitleaks 1.0",
+                {"required_mode": "sweep"},
+                materialized_commits=[{"patch_sha256": "d" * 64}],
             )
 
     def test_partial_evidence_keeps_initial_and_finalization_commits(self) -> None:
@@ -3548,7 +5067,7 @@ def load_environment(*, checkout_root, environ, require_catalog):
         }
         with self.assertRaises(REVIEW_MODULE.ReviewError):
             REVIEW_MODULE.validate_manifest(
-                {"repo_root": str(self.agents), "task_id": "TSK-AUTH"},
+                {"repo_root": str(self.agents), "task_id": "TSK-AUTH", "publication_mode": "sweep"},
                 state,
                 str(self.agents),
                 "TSK-AUTH",
@@ -3559,6 +5078,7 @@ def load_environment(*, checkout_root, environ, require_catalog):
                 },
                 str(self.agents / "tasks" / "standing.md"),
                 "fixture-gitleaks 1.0",
+                {"required_mode": "sweep"},
             )
 
     def test_review_rejects_standing_task_as_manifest_identity(self) -> None:
@@ -3574,6 +5094,7 @@ def load_environment(*, checkout_root, environ, require_catalog):
                 {},
                 None,
                 "fixture-gitleaks 1.0",
+                {"required_mode": "sweep"},
             )
 
     def test_review_prompt_selects_authorization_task_for_both_manifests(self) -> None:
@@ -3800,6 +5321,7 @@ def load_environment(*, checkout_root, environ, require_catalog):
             SCRIPTS / "resolve-runtime-context.py",
             SCRIPTS / "fetch-vault-main.py",
             SCRIPTS / "capture-vault-state.py",
+            SCRIPTS / "determine-publication-modes.py",
             SCRIPTS / "validate-collection-result.py",
             SCRIPTS / "install-verified-artifacts.py",
             SCRIPTS / "commit-reviewed-publication.py",
@@ -3807,7 +5329,9 @@ def load_environment(*, checkout_root, environ, require_catalog):
             SCRIPTS / "push-committed-heads.py",
             SCRIPTS / "prepare-publication-evidence.py",
             SCRIPTS / "commit-push-publication-evidence.py",
+            SCRIPTS / "evidence_hunk.py",
             SCRIPTS / "git_diff_digest.py",
+            SCRIPTS / "isolated_git_transport.py",
             SCRIPTS / "prepare-codex-output-schema.py",
             SCRIPTS / "validate-canonical-result.py",
             SCRIPTS / "stage-standing-task.py",
@@ -3817,6 +5341,30 @@ def load_environment(*, checkout_root, environ, require_catalog):
             SOURCE_CATALOG,
         ):
             shutil.copy2(source, runtime / source.name)
+
+        installer = runtime / "install-verified-artifacts.py"
+        real_installer = runtime / "install-verified-artifacts.real.py"
+        installer.rename(real_installer)
+        installer.write_text(
+            """#!/usr/bin/env python3
+import json, os, subprocess, sys
+from pathlib import Path
+real=Path(__file__).with_name("install-verified-artifacts.real.py")
+marker=Path(__file__).with_name("artifact-target-conflict-once.marker")
+completed=subprocess.run([str(real),*sys.argv[1:]],check=False,capture_output=True,text=True)
+if completed.returncode == 0 and len(sys.argv) > 1 and sys.argv[1] == "--plan" and os.environ.get("FAKE_PLAN_TARGET_CONFLICT_ONCE") == "1" and not marker.exists():
+    plan=json.loads(completed.stdout)
+    target=Path(plan["summary_target"])
+    target.parent.mkdir(parents=True,exist_ok=True)
+    target.write_text("concurrent target must survive\\n")
+    marker.write_text(str(target)+"\\n")
+sys.stdout.write(completed.stdout)
+sys.stderr.write(completed.stderr)
+raise SystemExit(completed.returncode)
+""",
+            encoding="utf-8",
+        )
+        installer.chmod(0o755)
 
         (runtime / "collect-public-sources.py").write_text(
             """#!/usr/bin/env python3
@@ -3865,6 +5413,36 @@ raise SystemExit(completed.returncode)
         )
         finalizer.chmod(0o755)
 
+        committer = runtime / "commit-reviewed-publication.py"
+        real_committer = runtime / "commit-reviewed-publication.real.py"
+        committer.rename(real_committer)
+        committer.write_text(
+            """#!/usr/bin/env python3
+import json, os, subprocess, sys
+from pathlib import Path
+real=Path(__file__).with_name("commit-reviewed-publication.real.py")
+marker=Path(__file__).with_name("commit-head-drift-once.marker")
+if os.environ.get("FAKE_COMMIT_HEAD_DRIFT_ONCE") == "1" and not marker.exists():
+    runtime=json.loads(Path(sys.argv[1]).read_text())
+    for key in ("agents_vault_root",):
+        repo=runtime[key]
+        original=subprocess.check_output(["git","-C",repo,"rev-parse","HEAD"],text=True).strip()
+        tree=subprocess.check_output(["git","-C",repo,"show","-s","--format=%T",original],text=True).strip()
+        drift=subprocess.check_output(
+            ["git","-C",repo,"-c","user.name=Fixture","-c","user.email=fixture@example.invalid","commit-tree",tree,"-p",original],
+            input="fixture persistent HEAD drift\\n",text=True,
+        ).strip()
+        subprocess.run(["git","-C",repo,"update-ref","HEAD",drift,original],check=True)
+    marker.write_text("replanned\\n")
+    completed=subprocess.run([str(real),*sys.argv[1:]],check=False)
+    raise SystemExit(completed.returncode)
+completed=subprocess.run([str(real),*sys.argv[1:]],check=False)
+raise SystemExit(completed.returncode)
+""",
+            encoding="utf-8",
+        )
+        committer.chmod(0o755)
+
         for repo, key in ((self.agents, "agents"), (self.user, "user")):
             subprocess.run(["git", "-C", str(repo), "config", "user.name", "Fixture"], check=True)
             subprocess.run(["git", "-C", str(repo), "config", "user.email", "fixture@example.invalid"], check=True)
@@ -3881,13 +5459,24 @@ import hashlib, json, os, subprocess, sys
 from pathlib import Path
 args=sys.argv[1:]
 output=Path(args[args.index("--output-last-message")+1])
-context=json.loads(args[-1].split("Runtime context JSON:\\n",1)[1])
+assert args[-1] == "-"
+prompt=sys.stdin.read()
+context=json.loads(prompt.split("Runtime context JSON:\\n",1)[1])
+def contains_key(value,key):
+    if isinstance(value,dict):
+        return key in value or any(contains_key(item,key) for item in value.values())
+    if isinstance(value,list):
+        return any(contains_key(item,key) for item in value)
+    return False
 schema=Path(args[args.index("--output-schema")+1]).name
 schema_document=json.loads(Path(args[args.index("--output-schema")+1]).read_text())
 schema_encoded=json.dumps(schema_document,sort_keys=True)
 assert all(f'"{keyword}"' not in schema_encoded for keyword in ("allOf","if","then","else","oneOf","uniqueItems"))
-with (output.parent/"invocations.log").open("a") as log:
-    stage="collection" if "--search" in args else ("review" if schema=="publication-review-result.schema.json" else ("evidence_review" if schema=="evidence-review-result.schema.json" else "publication"))
+stage="collection" if "--search" in args else ("review" if schema=="publication-review-result.schema.json" else ("evidence_review" if schema=="evidence-review-result.schema.json" else "publication"))
+log_path=output.parent/"invocations.log"
+if stage=="review":
+    log_path=Path(context["publication_context_file"]).parent.parent/"invocations.log"
+with log_path.open("a") as log:
     log.write(stage+"\\n")
 if "--search" in args:
     staging=Path(context["collection_output_root"])
@@ -3914,6 +5503,8 @@ if "--search" in args:
     if os.environ.get("FAKE_CANONICAL_INVALID_COLLECTION") == "1":
         result["next_action"]="must be null for a complete result"
 elif stage=="review":
+    assert context["publication_context_projection"] == "review_without_index_entries_v1"
+    assert not contains_key(context,"index_entries")
     publication=context["publication_context"]
     authorization=Path(publication["authorization_task"])
     assert authorization.name == "authorization-task.md"
@@ -3922,9 +5513,11 @@ elif stage=="review":
     dirty_manifest=Path(publication["dirty_snapshot_manifest_file"])
     assert hashlib.sha256(dirty_manifest.read_bytes()).hexdigest() == publication["dirty_snapshot_manifest_sha256"]
     snapshot_manifest=json.loads(dirty_manifest.read_text())
-    assert snapshot_manifest["version"] == 2
+    assert snapshot_manifest["version"] == 4
     runtime_context=publication["runtime"]
     pre=publication["pre_collection_state"]
+    assert all("index_entries" not in state for state in pre.values())
+    mode_hint=publication["publication_mode_hint"]
     plan=context["artifact_plan"]
     artifacts=publication["publication_manifest"]["artifact_manifest"]
     def rel(root,target):
@@ -3937,17 +5530,37 @@ elif stage=="review":
             state=pre["user_vault"]; root=runtime_context["user_vault_root"]; item=artifacts["summary"]; target=plan["summary_target"]
             evidence=None
         target_rel=rel(root,target)
+        key="agents_vault" if kind=="agents" else "user_vault"
+        mode=mode_hint[key]["required_mode"]
+        dirty_materialization=snapshot_manifest["vaults"][key]
+        commit_materialization=snapshot_manifest["local_commits"][key]
+        assert all(entry["materialization_status"]!="blocked" for entry in commit_materialization)
+        if any(entry["materialization_status"]=="deferred" for entry in dirty_materialization):
+            assert mode=="own_only"
         initial=sorted(set(state["dirty_paths"]+[target_rel]))
         existing_paths=[path for commit in state["local_commits"] for path in commit["changed_paths"]]
-        owned=sorted(set(initial+existing_paths+([evidence] if evidence else [])))
-        return {"repo_root":root,"task_id":publication["authorization_task_id"],"owned_paths":owned,"excluded_paths":[],"approved_diff_snapshot_sha256":state["diff_snapshot_sha256"],"approved_existing_commits":state["local_commits"],"approved_dirty_entries":state["dirty_entries"],"reviewed_artifacts":[{"role":item["role"],"source_sha256":item["sha256"],"target_path":target_rel}],"validation_evidence":{"file_guard":"passed","secret_scan":"passed","secret_scan_tool":"gitleaks","secret_scan_tool_version":runtime_context["gitleaks_version"],"reviewed_snapshot_sha256":state["diff_snapshot_sha256"],"reviewed_history_sha256":state["history_snapshot_sha256"]},"review_or_validation_status":"quality_ok","commit_required":True,"unrelated_dirty_paths":[],"commit_groups":[{"message":"fixture publication","paths":initial}],"evidence_finalization":({"target_path":evidence,"template":"daily_publication_v1"} if evidence else None)}
-    result={"outcome":"approved","publication_context_sha256":context["publication_context_sha256"],"agents_vault":manifest("agents"),"user_vault":manifest("user"),"next_action":None}
+        if mode=="sweep":
+            owned=sorted(set(initial+existing_paths+([evidence] if evidence else [])))
+            excluded=[]; deferred=[]; approved_dirty=state["dirty_entries"]; groups=[{"message":"fixture publication","paths":initial}]; residual="quality_ok"; commit_required=True; finalization=({"target_path":evidence,"template":"daily_publication_v1"} if evidence else None)
+        elif mode=="own_only":
+            owned=sorted(set([target_rel]+([evidence] if evidence else [])))
+            excluded=state["dirty_paths"]; deferred=[{"path":path,"reason":"fixture deferred residual"} for path in excluded]; approved_dirty=[]; groups=[{"message":"fixture publication","paths":[target_rel]}]; residual="deferred"; commit_required=True; finalization=({"target_path":evidence,"template":"daily_publication_v1"} if evidence else None)
+        else:
+            owned=[target_rel]; excluded=state["dirty_paths"]; deferred=[{"path":path,"reason":"fixture blocked state"} for path in excluded]; approved_dirty=[]; groups=[]; residual="blocked"; commit_required=False; finalization=None
+        approved_commits=[{**commit,"patch_sha256":material.get("patch_sha256")} for commit,material in zip(state["local_commits"],commit_materialization)]
+        return {"repo_root":root,"task_id":publication["authorization_task_id"],"publication_mode":mode,"core_review_status":"quality_ok","residual_review_status":residual,"owned_paths":owned,"excluded_paths":excluded,"deferred_cleanup":deferred,"approved_diff_snapshot_sha256":state["diff_snapshot_sha256"],"approved_existing_commits":approved_commits,"approved_dirty_entries":approved_dirty,"reviewed_artifacts":[{"role":item["role"],"source_sha256":item["sha256"],"target_path":target_rel}],"validation_evidence":{"file_guard":"passed","secret_scan":"passed","secret_scan_tool":"gitleaks","secret_scan_tool_version":runtime_context["gitleaks_version"],"reviewed_snapshot_sha256":state["diff_snapshot_sha256"],"reviewed_history_sha256":state["history_snapshot_sha256"]},"review_or_validation_status":"quality_ok","commit_required":commit_required,"unrelated_dirty_paths":excluded,"commit_groups":groups,"evidence_finalization":finalization}
+    agents_manifest=manifest("agents"); user_manifest=manifest("user")
+    blocked_modes=agents_manifest["publication_mode"]=="blocked" or user_manifest["publication_mode"]=="blocked"
+    both_blocked=agents_manifest["publication_mode"]=="blocked" and user_manifest["publication_mode"]=="blocked"
+    result={"outcome":"blocked" if both_blocked else "approved","publication_context_sha256":context["publication_context_sha256"],"agents_vault":agents_manifest,"user_vault":user_manifest,"next_action":"fixture blocked Vault" if blocked_modes else None}
 elif stage=="publication":
     publication=context["publication_context"]
     runtime_context=publication["runtime"]
     pre=publication["pre_collection_state"]
     approved=context["approved_review"]
-    installed=json.loads(subprocess.check_output([publication["installer"],publication["runtime_context_file"],publication["collection_result_file"],publication["artifact_plan_file"]],text=True))
+    installed={}
+    for role in ("agents_security_advisory","user_it_news_summary"):
+        installed.update(json.loads(subprocess.check_output([publication["installer"],publication["runtime_context_file"],publication["collection_result_file"],publication["artifact_plan_file"],role],text=True)))
     def publish(key,root):
         manifest=approved[key]
         for group in manifest["commit_groups"]:
@@ -3960,20 +5573,24 @@ elif stage=="publication":
     verified=publication["verified_collection"]
     result={"outcome":"ready_to_push","phase":"local_commit","daily_pipeline_status":"complete","summary_path":installed["summary_target"],"advisory_path":installed["advisory_target"],"notification_result":"none","agents_vault":publish("agents_vault",runtime_context["agents_vault_root"]),"user_vault":publish("user_vault",runtime_context["user_vault_root"]),"evidence_finalization_commit":None,"next_action":None}
 else:
+    assert context["publication_context_projection"] == "review_without_index_entries_v1"
+    assert not contains_key(context,"index_entries")
     plan=context["evidence_plan"]
     publication=context["publication_context"]
-    evidence_diff=subprocess.check_output(
-        ["git","-C",publication["runtime"]["agents_vault_root"],"diff","--",plan["target_path"]],
-        text=True,
-    )
-    payload_lines=[line[1:] for line in evidence_diff.splitlines() if line.startswith('+{')]
+    evidence_diff=Path(plan["review_patch_path"]).read_bytes()
+    assert hashlib.sha256(evidence_diff).hexdigest() == plan["evidence_diff_sha256"]
+    payload_lines=[line[1:] for line in evidence_diff.decode().splitlines() if line.startswith('+{')]
     assert len(payload_lines) == 1
     evidence_payload=json.loads(payload_lines[0])
     assert set(evidence_payload) == {
         "run_id","publication_context_sha256","agents_vault","user_vault",
-        "summary_repo_path","advisory_repo_path",
+        "summary_repo_path","advisory_repo_path","publication_mode",
+        "deferred_cleanup",
     }
-    result={"outcome":"approved","target_path":plan["target_path"],"evidence_diff_sha256":plan["evidence_diff_sha256"],"publication_context_sha256":plan["publication_context_sha256"],"review_status":"quality_ok","next_action":None}
+    if os.environ.get("FAKE_EVIDENCE_REVIEW_BLOCKED") == "1":
+        result={"outcome":"blocked","target_path":plan["target_path"],"evidence_diff_sha256":plan["evidence_diff_sha256"],"publication_context_sha256":plan["publication_context_sha256"],"review_status":"blocked","next_action":"fixture evidence review rejection"}
+    else:
+        result={"outcome":"approved","target_path":plan["target_path"],"evidence_diff_sha256":plan["evidence_diff_sha256"],"publication_context_sha256":plan["publication_context_sha256"],"review_status":"quality_ok","next_action":None}
 output.write_text(json.dumps(result))
 """,
             encoding="utf-8",
@@ -4000,10 +5617,11 @@ output.write_text(json.dumps(result))
         self.assertEqual(len(missing_upstream_logs), 1)
         self.assertEqual(
             missing_upstream_logs[0].read_text(encoding="utf-8").splitlines(),
-            ["collection"],
+            ["collection", "review"],
+            msg=(runtime / "last-status.txt").read_text(encoding="utf-8"),
         )
         self.assertIn(
-            "phase=publication_preflight",
+            "phase=publication",
             (runtime / "last-status.txt").read_text(encoding="utf-8"),
         )
         subprocess.run(  # noqa: S603 -- controlled Git fixture command
@@ -4059,10 +5677,10 @@ output.write_text(json.dumps(result))
         self.assertEqual(len(blocked_logs), 1)
         self.assertEqual(
             blocked_logs[0].read_text(encoding="utf-8").splitlines(),
-            ["collection"],
+            ["collection", "review"],
         )
         self.assertIn(
-            "phase=publication_preflight",
+            "phase=publication",
             (runtime / "last-status.txt").read_text(encoding="utf-8"),
         )
         subprocess.run(
@@ -4104,7 +5722,42 @@ output.write_text(json.dumps(result))
         shutil.rmtree(runtime / "logs")
         (runtime / "last-status.txt").unlink()
 
+        standing = self.agents / "tasks" / "standing.md"
+        standing_relative = "tasks/standing.md"
+        standing_head_before = subprocess.check_output(
+            ["git", "-C", str(self.agents), "show", f"HEAD:{standing_relative}"]
+        )
+        standing.write_bytes(standing.read_bytes() + b"staged parallel evidence\n")
+        subprocess.run(
+            ["git", "-C", str(self.agents), "add", standing_relative], check=True
+        )
+        standing_index_before = subprocess.check_output(
+            ["git", "-C", str(self.agents), "show", f":{standing_relative}"]
+        )
+        standing.write_bytes(standing.read_bytes() + b"unstaged parallel evidence\n")
+        standing_worktree_before = standing.read_bytes()
+        standing_status_before = subprocess.check_output(
+            ["git", "-C", str(self.agents), "status", "--porcelain=v1", "--", standing_relative],
+            text=True,
+        )
+
         (self.user / "local-ahead.md").write_text("local ahead\n", encoding="utf-8")
+        unsafe_handoff = self.user / ".codex-handoff" / "unsafe.md"
+        unsafe_handoff.parent.mkdir()
+        unsafe_handoff.write_text(
+            f"existing unsafe handoff {Path.home()}\n", encoding="utf-8"
+        )
+        unsafe_handoff.chmod(0o640)
+        unsafe_before = unsafe_handoff.read_bytes()
+        unsafe_stat_before = unsafe_handoff.stat()
+        agents_unsafe = self.agents / ".codex-handoff" / "unsafe-agents.md"
+        agents_unsafe.parent.mkdir()
+        agents_unsafe.write_text(
+            f"existing unsafe agents residual {Path.home()}\n", encoding="utf-8"
+        )
+        agents_unsafe.chmod(0o640)
+        agents_unsafe_before = agents_unsafe.read_bytes()
+        agents_unsafe_stat_before = agents_unsafe.stat()
         subprocess.run(
             ["git", "-C", str(self.user), "add", "local-ahead.md"], check=True
         )
@@ -4119,14 +5772,41 @@ output.write_text(json.dumps(result))
         result = subprocess.run(
             [str(runtime / "run-daily-it-news-vulnerability-check.sh")],
             check=False,
-            env={**os.environ, "PATH": os.environ["PATH"]},
+            env={
+                **os.environ,
+                "PATH": os.environ["PATH"],
+                "FAKE_COMMIT_HEAD_DRIFT_ONCE": "1",
+                "FAKE_PLAN_TARGET_CONFLICT_ONCE": "1",
+            },
         )
-        self.assertEqual(result.returncode, 0)
+        self.assertEqual(
+            result.returncode,
+            0,
+            msg=(runtime / "last-status.txt").read_text(encoding="utf-8")
+            + "\n"
+            + "\n".join(
+                path.read_text(encoding="utf-8", errors="replace")
+                for path in (runtime / "logs").rglob("*.stderr.log")
+            )
+            + "\nRESULTS\n"
+            + "\n".join(
+                path.name + ":" + path.read_text(encoding="utf-8", errors="replace")
+                for path in (runtime / "logs").rglob("*result.json")
+            ),
+        )
         invocation_logs = list((runtime / "logs").rglob("invocations.log"))
         self.assertEqual(len(invocation_logs), 1)
         self.assertEqual(
             invocation_logs[0].read_text(encoding="utf-8").splitlines(),
-            ["collection", "review", "evidence_review"],
+            ["collection", "review", "review", "evidence_review"],
+        )
+        self.assertTrue((runtime / "commit-head-drift-once.marker").is_file())
+        conflict_marker = runtime / "artifact-target-conflict-once.marker"
+        self.assertTrue(conflict_marker.is_file())
+        conflicted_target = Path(conflict_marker.read_text(encoding="utf-8").strip())
+        self.assertEqual(
+            conflicted_target.read_text(encoding="utf-8"),
+            "concurrent target must survive\n",
         )
         status_files = list(runtime.glob("last-status.txt"))
         self.assertEqual(len(status_files), 1)
@@ -4141,6 +5821,57 @@ output.write_text(json.dumps(result))
             publication_result["user_vault"]["local_head"],
             publication_result["user_vault"]["remote_head"],
         )
+        self.assertEqual(publication_result["publication_mode"]["user_vault"], "own_only")
+        self.assertEqual(
+            publication_result["publication_mode"]["agents_vault"], "own_only"
+        )
+        self.assertEqual(
+            [item["path"] for item in publication_result["deferred_cleanup"]["user_vault"]],
+            [
+                ".codex-handoff/unsafe.md",
+                str(conflicted_target.resolve().relative_to(self.user.resolve())),
+            ],
+        )
+        self.assertEqual(
+            [
+                item["path"]
+                for item in publication_result["deferred_cleanup"]["agents_vault"]
+            ],
+            [".codex-handoff/unsafe-agents.md", standing_relative],
+        )
+        self.assertEqual(unsafe_handoff.read_bytes(), unsafe_before)
+        unsafe_stat_after = unsafe_handoff.stat()
+        self.assertEqual(unsafe_stat_after.st_mode, unsafe_stat_before.st_mode)
+        self.assertEqual(unsafe_stat_after.st_mtime_ns, unsafe_stat_before.st_mtime_ns)
+        self.assertEqual(agents_unsafe.read_bytes(), agents_unsafe_before)
+        agents_unsafe_stat_after = agents_unsafe.stat()
+        self.assertEqual(
+            agents_unsafe_stat_after.st_mode, agents_unsafe_stat_before.st_mode
+        )
+        self.assertEqual(
+            agents_unsafe_stat_after.st_mtime_ns,
+            agents_unsafe_stat_before.st_mtime_ns,
+        )
+        standing_head_after = subprocess.check_output(
+            ["git", "-C", str(self.agents), "show", f"HEAD:{standing_relative}"]
+        )
+        standing_index_after = subprocess.check_output(
+            ["git", "-C", str(self.agents), "show", f":{standing_relative}"]
+        )
+        standing_worktree_after = standing.read_bytes()
+        standing_status_after = subprocess.check_output(
+            ["git", "-C", str(self.agents), "status", "--porcelain=v1", "--", standing_relative],
+            text=True,
+        )
+        self.assertNotIn(b"staged parallel evidence", standing_head_after)
+        self.assertIn(b"vault-change-publisher:", standing_head_after)
+        self.assertIn(b"staged parallel evidence", standing_index_after)
+        self.assertNotIn(b"unstaged parallel evidence", standing_index_after)
+        self.assertIn(b"vault-change-publisher:", standing_index_after)
+        self.assertIn(b"staged parallel evidence", standing_worktree_after)
+        self.assertIn(b"unstaged parallel evidence", standing_worktree_after)
+        self.assertIn(b"vault-change-publisher:", standing_worktree_after)
+        self.assertEqual(standing_status_after, standing_status_before)
 
         subprocess.run(["chmod", "-R", "u+w", str(runtime / "logs")], check=True)
         shutil.rmtree(runtime / "logs")
@@ -4158,6 +5889,27 @@ output.write_text(json.dumps(result))
         self.assertIn(
             "semantic_status=process_error",
             (runtime / "last-status.txt").read_text(encoding="utf-8"),
+        )
+
+        subprocess.run(["chmod", "-R", "u+w", str(runtime / "logs")], check=True)
+        shutil.rmtree(runtime / "logs")
+        (runtime / "last-status.txt").unlink()
+        evidence_rejection_before = standing.read_bytes()
+        evidence_rejection_stat = standing.stat()
+        rejected_evidence = subprocess.run(
+            [str(runtime / "run-daily-it-news-vulnerability-check.sh")],
+            check=False,
+            env={
+                **os.environ,
+                "PATH": os.environ["PATH"],
+                "FAKE_EVIDENCE_REVIEW_BLOCKED": "1",
+            },
+        )
+        self.assertEqual(rejected_evidence.returncode, 75)
+        self.assertEqual(standing.read_bytes(), evidence_rejection_before)
+        self.assertEqual(standing.stat().st_mode, evidence_rejection_stat.st_mode)
+        self.assertEqual(
+            standing.stat().st_mtime_ns, evidence_rejection_stat.st_mtime_ns
         )
 
 

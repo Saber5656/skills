@@ -6,6 +6,10 @@ from __future__ import annotations
 import hashlib
 import os
 import subprocess
+from typing import TypeVar
+
+
+DiffText = TypeVar("DiffText", str, bytes)
 
 
 def clean_git_environment() -> dict[str, str]:
@@ -15,7 +19,44 @@ def clean_git_environment() -> dict[str, str]:
     }
     environment["GIT_CONFIG_NOSYSTEM"] = "1"
     environment["GIT_CONFIG_GLOBAL"] = os.devnull
+    environment["GIT_NO_LAZY_FETCH"] = "1"
+    environment["GIT_NO_REPLACE_OBJECTS"] = "1"
+    environment["GIT_OPTIONAL_LOCKS"] = "0"
+    environment["LC_ALL"] = "C"
+    environment["LANG"] = "C"
+    environment["GIT_CONFIG_COUNT"] = "1"
+    environment["GIT_CONFIG_KEY_0"] = "core.fsmonitor"
+    environment["GIT_CONFIG_VALUE_0"] = "false"
     return environment
+
+
+def unified_diff_added_content(patch: DiffText) -> DiffText:
+    """Extract added hunk content without confusing `+++` content with headers."""
+    binary = isinstance(patch, bytes)
+    hunk_prefix = b"@@ " if binary else "@@ "
+    addition = b"+" if binary else "+"
+    context = b" " if binary else " "
+    deletion = b"-" if binary else "-"
+    marker = b"\\" if binary else "\\"
+    empty = b"" if binary else ""
+    in_hunk = False
+    added: list[DiffText] = []
+    lf = b"\n" if binary else "\n"
+    segments = patch.split(lf)
+    for index, segment in enumerate(segments):
+        line = segment + (lf if index < len(segments) - 1 else empty)
+        if line.startswith(hunk_prefix):
+            in_hunk = True
+            continue
+        if not in_hunk:
+            continue
+        if line.startswith(addition):
+            added.append(line[1:])
+            continue
+        if line.startswith((context, deletion, marker)):
+            continue
+        in_hunk = False
+    return empty.join(added)  # type: ignore[return-value]
 
 
 def git_diff_digest(repo: str, relative: str, *, cached: bool = False) -> str:
@@ -26,11 +67,13 @@ def git_diff_digest(repo: str, relative: str, *, cached: bool = False) -> str:
         repo,
         "-c",
         f"core.hooksPath={os.devnull}",
+        "-c",
+        "core.fsmonitor=false",
         "diff",
     ]
     if cached:
         command.append("--cached")
-    command.extend(("--binary", "--no-ext-diff", "--", relative))
+    command.extend(("--binary", "--no-ext-diff", "--no-textconv", "--", relative))
     result = subprocess.run(
         command,
         check=True,

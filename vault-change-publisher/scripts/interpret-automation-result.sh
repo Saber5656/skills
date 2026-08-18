@@ -28,7 +28,12 @@ if ! "$JQ_BIN" -e '
     and (.push_status | IN("complete", "not_required", "failed", "not_started"))
     and (.local_head | type == "string" or . == null)
     and (.remote_head | type == "string" or . == null)
-    and (.clean | type == "boolean");
+    and (.clean | type == "boolean")
+    and (.publication_mode | IN("sweep", "own_only", "blocked"))
+    and (.deferred_cleanup | type == "array" and all(.[];
+      type == "object"
+      and (.path | type == "string" and length > 0)
+      and (.reason | type == "string" and length > 0)));
   type == "object"
   and (.outcome | IN("success", "blocked", "partial_publication"))
   and (.phase | type == "string" and length > 0)
@@ -38,6 +43,12 @@ if ! "$JQ_BIN" -e '
   and (.notification_result | type == "string" or . == null)
   and (.agents_vault | valid_vault)
   and (.user_vault | valid_vault)
+  and (.publication_mode | type == "object")
+  and (.publication_mode.agents_vault == .agents_vault.publication_mode)
+  and (.publication_mode.user_vault == .user_vault.publication_mode)
+  and (.deferred_cleanup | type == "object")
+  and (.deferred_cleanup.agents_vault == .agents_vault.deferred_cleanup)
+  and (.deferred_cleanup.user_vault == .user_vault.deferred_cleanup)
   and (.evidence_finalization_commit | type == "string" or . == null)
   and (.next_action | type == "string" or . == null)
 ' "$RESULT_FILE" >/dev/null 2>&1; then
@@ -56,9 +67,11 @@ case "$OUTCOME" in
       and (.evidence_finalization_commit | type == "string" and length > 0)
       and .next_action == null
       and all(.agents_vault, .user_vault;
-        (.commit_status | IN("complete", "not_required"))
-        and (.push_status | IN("complete", "not_required"))
-        and .clean == true
+        .commit_status == "complete"
+        and .push_status == "complete"
+        and (.commit_hashes | length > 0)
+        and (.publication_mode | IN("sweep", "own_only"))
+        and (if .publication_mode == "sweep" then .clean == true else true end)
         and (.local_head | type == "string" and length > 0)
         and .local_head == .remote_head)
     '

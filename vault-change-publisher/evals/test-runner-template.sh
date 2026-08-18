@@ -3,6 +3,7 @@ set -eu
 
 SCRIPT_DIR="${0:A:h}"
 RUNNER="$SCRIPT_DIR/../assets/run-daily-it-news-vulnerability-check.sh"
+REPO_ROOT="$SCRIPT_DIR/../.."
 
 /usr/bin/grep -F -- 'automation.local.env' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- 'daily-it-news.collect.prompt.md' "$RUNNER" >/dev/null
@@ -12,6 +13,57 @@ RUNNER="$SCRIPT_DIR/../assets/run-daily-it-news-vulnerability-check.sh"
 /usr/bin/grep -F -- '--add-dir "$STAGING_ROOT"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- 'COLLECTION_FETCHER="$WORKDIR/collect-public-sources.py"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- 'SOURCE_CATALOG="$WORKDIR/it-news-sources.json"' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- '[[ ! -x "$COLLECTION_FETCHER" ]]' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- 'required daily automation asset is not executable' "$RUNNER" >/dev/null
+COLLECTOR_SOURCE="$REPO_ROOT/summarize-it-news/scripts/collect-public-sources.py"
+TRACKED_COLLECTOR_MODE="$(/usr/bin/git -C "$REPO_ROOT" ls-files -s \
+  summarize-it-news/scripts/collect-public-sources.py \
+  | /usr/bin/awk '{print $1}')"
+if [[ ! -x "$COLLECTOR_SOURCE" ]] || {
+  [[ "$TRACKED_COLLECTOR_MODE" != "100755" ]] \
+    && ! /usr/bin/git -C "$REPO_ROOT" diff --summary HEAD -- \
+      summarize-it-news/scripts/collect-public-sources.py \
+      | /usr/bin/grep -F -- 'mode change 100644 => 100755' >/dev/null
+}; then
+  echo "collector must be tracked as executable" >&2
+  exit 1
+fi
+
+MODE_FIXTURE_ROOT="$(mktemp -d)"
+trap 'rm -rf "$MODE_FIXTURE_ROOT"' EXIT
+/bin/cp "$RUNNER" "$MODE_FIXTURE_ROOT/run-daily-it-news-vulnerability-check.sh"
+for required_name in \
+  automation.local.env resolve-runtime-context.py fetch-vault-main.py \
+  capture-vault-state.py determine-publication-modes.py \
+  validate-collection-result.py collect-public-sources.py \
+  it-news-sources.json install-verified-artifacts.py \
+  commit-reviewed-publication.py validate-publication-review.py \
+  push-committed-heads.py prepare-publication-evidence.py \
+  commit-push-publication-evidence.py evidence_hunk.py git_diff_digest.py \
+  isolated_git_transport.py \
+  prepare-codex-output-schema.py validate-canonical-result.py \
+  stage-standing-task.py stage-dirty-review-inputs.py \
+  daily-it-news.collect.prompt.md daily-it-news.review.prompt.md \
+  daily-it-news.evidence-review.prompt.md collection-result.schema.json \
+  publication-review-result.schema.json publication-commit-result.schema.json \
+  evidence-review-result.schema.json automation-result.schema.json \
+  interpret-automation-result.sh; do
+  /usr/bin/touch "$MODE_FIXTURE_ROOT/$required_name"
+done
+/bin/chmod 0644 "$MODE_FIXTURE_ROOT/collect-public-sources.py"
+set +e
+/bin/zsh "$MODE_FIXTURE_ROOT/run-daily-it-news-vulnerability-check.sh" \
+  >"$MODE_FIXTURE_ROOT/stdout.log" 2>"$MODE_FIXTURE_ROOT/stderr.log"
+MODE_FIXTURE_STATUS=$?
+set -e
+if [[ "$MODE_FIXTURE_STATUS" -ne 66 ]] \
+  || ! /usr/bin/grep -F -- \
+    'required daily automation asset is not executable:' \
+    "$MODE_FIXTURE_ROOT/stderr.log" >/dev/null \
+  || [[ -d "$MODE_FIXTURE_ROOT/logs" ]]; then
+  echo "non-executable collector must fail preflight with status 66" >&2
+  exit 1
+fi
 
 COLLECTION_BLOCK="$(sed -n '/CODEX_BIN.*--search/,/COLLECTION_STATUS=/p' "$RUNNER")"
 REVIEW_BLOCK="$(sed -n '/^"\$CODEX_BIN" -a never exec/,/REVIEW_STATUS=/p' "$RUNNER" | sed -n '1,/REVIEW_STATUS=/p')"
@@ -34,12 +86,20 @@ if ! print -r -- "$COLLECTION_BLOCK" | /usr/bin/grep -F -- 'model_reasoning_effo
   echo "collection must pin Luna reasoning effort" >&2
   exit 1
 fi
+if ! print -r -- "$COLLECTION_BLOCK" | /usr/bin/grep -F -- '<<< "$COLLECTION_PROMPT_CONTENT"' >/dev/null; then
+  echo "collection prompt must use stdin instead of argv" >&2
+  exit 1
+fi
 if print -r -- "$COLLECTION_BLOCK" | /usr/bin/grep -F -- '-C "$WORKDIR"' >/dev/null; then
   echo "collection must not make the automation root writable" >&2
   exit 1
 fi
 if ! print -r -- "$REVIEW_BLOCK" | /usr/bin/grep -F -- '--sandbox read-only' >/dev/null; then
   echo "publication review must be read-only" >&2
+  exit 1
+fi
+if ! print -r -- "$REVIEW_BLOCK" | /usr/bin/grep -F -- '<<< "$REVIEW_PROMPT_CONTENT"' >/dev/null; then
+  echo "publication review prompt must use stdin instead of argv" >&2
   exit 1
 fi
 if print -r -- "$PUBLICATION_BLOCK" | /usr/bin/grep -F -- 'CODEX_BIN' >/dev/null; then
@@ -54,14 +114,19 @@ if ! print -r -- "$EVIDENCE_REVIEW_BLOCK" | /usr/bin/grep -F -- '--sandbox read-
   echo "evidence finalization review must be read-only" >&2
   exit 1
 fi
+if ! print -r -- "$EVIDENCE_REVIEW_BLOCK" | /usr/bin/grep -F -- '<<< "$EVIDENCE_REVIEW_PROMPT_CONTENT"' >/dev/null; then
+  echo "evidence review prompt must use stdin instead of argv" >&2
+  exit 1
+fi
 /usr/bin/grep -F -- '"$REVIEW_RESULT"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- '"$REVIEW_RESULT_SHA256"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- '"$PUBLICATION_CONTEXT_FILE"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- '"$ARTIFACT_PLAN"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- 'mkdir "$RUN_ROOT"' "$RUNNER" >/dev/null
-/usr/bin/grep -F -- 'fail_run 75 collection_isolation' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- 'COLLECTION_START_STATE="$RUN_ROOT/collection-start-state.json"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- '"$EVIDENCE_FINALIZER"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- 'git_diff_digest.py' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- 'isolated_git_transport.py' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- 'fail_run 75 artifact_plan' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- '/bin/cp "$INITIAL_PUSH_RESULT" "$PUBLICATION_RESULT"' "$RUNNER" >/dev/null
 EVIDENCE_PREPARATION_BLOCK="$(sed -n '/^if \[\[ "\$EVIDENCE_PREPARE_STATUS" -eq 0 \]\]; then$/,/^fi$/p' "$RUNNER")"
@@ -83,12 +148,16 @@ fi
 /usr/bin/grep -F -- 'CANONICAL_VALIDATOR="$WORKDIR/validate-canonical-result.py"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- 'STANDING_TASK_STAGER="$WORKDIR/stage-standing-task.py"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- 'DIRTY_REVIEW_STAGER="$WORKDIR/stage-dirty-review-inputs.py"' "$RUNNER" >/dev/null
-/usr/bin/grep -F -- '(.history_relation | IN("equal", "local_ahead"))' "$RUNNER" >/dev/null
-/usr/bin/grep -F -- 'remote-ahead, diverged' "$RUNNER" >/dev/null
-/usr/bin/grep -F -- 'phase=publication_preflight' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- 'MODE_DETERMINER="$WORKDIR/determine-publication-modes.py"' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- 'PUBLICATION_MODE_HINT="$ATTEMPT_ROOT/publication-mode-hint.json"' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- '"$MODE_DETERMINER" --apply-residual-guards' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- '"$DIRTY_SNAPSHOT_MANIFEST"' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- '/usr/bin/shlock -f "$PUBLICATION_LOCK" -p $$' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- '[[ "$observed_owner" == "$$" ]] || return 1' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- 'Vault state did not stabilize during bounded snapshot retries' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- '"$STATE_CAPTURE" --include-local-history' "$RUNNER" >/dev/null
 collection_line="$(/usr/bin/grep -n -F -- 'COLLECTION_STATUS=$?' "$RUNNER" | /usr/bin/cut -d: -f1)"
-history_line="$(/usr/bin/grep -n -F -- '"$STATE_CAPTURE" --include-local-history' "$RUNNER" | /usr/bin/cut -d: -f1)"
+history_line="$(/usr/bin/grep -n -F -- '"$STATE_CAPTURE" --include-local-history' "$RUNNER" | /usr/bin/head -n 1 | /usr/bin/cut -d: -f1)"
 if [[ -z "$collection_line" || -z "$history_line" || "$history_line" -le "$collection_line" ]]; then
   echo "local-only history materialization must happen after collection" >&2
   exit 1
@@ -104,7 +173,9 @@ fi
 /usr/bin/grep -F -- 'AUTHORIZATION_TASK_SNAPSHOT="$REVIEW_INPUT_ROOT/authorization-task.md"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- '"$RUNTIME_CONTEXT_FILE" "$REVIEW_INPUT_ROOT" authorization' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- '--arg authorization_task "$AUTHORIZATION_TASK_SNAPSHOT"' "$RUNNER" >/dev/null
-/usr/bin/grep -F -- '"$RUNTIME_CONTEXT_FILE" "$PRE_COLLECTION_STATE" "$SEALED_REVIEW_ROOT"' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- '"$RUNTIME_CONTEXT_FILE" "$REVIEWED_PUBLICATION_STATE" "$SEALED_REVIEW_ROOT"' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- 'while [[ "$PUBLICATION_ATTEMPT" -le 3 ]]' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- '.retry_disposition == "replan"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- 'chmod 700 "$SEALED_REVIEW_ROOT"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- '--arg dirty_snapshot_manifest_file "$DIRTY_SNAPSHOT_MANIFEST"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- '--output-schema "$CODEX_COLLECTION_SCHEMA"' "$RUNNER" >/dev/null
@@ -118,6 +189,7 @@ if /usr/bin/grep -F -- 'local status="$1"' "$RUNNER" >/dev/null; then
   exit 1
 fi
 FAIL_RUN_FUNCTION="$(sed -n '/^fail_run() {/,/^}/p' "$RUNNER")"
+LOCK_RELEASE_FUNCTION="$(sed -n '/^release_publication_lock() {/,/^}/p' "$RUNNER")"
 FAIL_RUN_ROOT="$(mktemp -d)"
 if /bin/zsh -c '
   set -u
@@ -138,6 +210,44 @@ if [[ "$FAIL_RUN_STATUS" -ne 75 ]] \
   echo "fail_run did not preserve the structured status contract" >&2
   exit 1
 fi
+print -r -- foreign-owner > "$FAIL_RUN_ROOT/publication.lock"
+if /bin/zsh -c '
+  set -u
+  PUBLICATION_LOCK="$1"
+  PUBLICATION_LOCK_OWNED=1
+  eval "$2"
+  release_publication_lock
+' -- "$FAIL_RUN_ROOT/publication.lock" "$LOCK_RELEASE_FUNCTION"; then
+  echo "foreign publication lock was treated as owned" >&2
+  exit 1
+fi
+if [[ ! -f "$FAIL_RUN_ROOT/publication.lock" ]]; then
+  echo "foreign publication lock was removed" >&2
+  exit 1
+fi
+/bin/rm -f "$FAIL_RUN_ROOT/publication.lock"
+if /bin/zsh -c '
+  set -u
+  PUBLICATION_LOCK="$1"
+  PUBLICATION_LOCK_OWNED=1
+  eval "$2"
+  release_publication_lock
+' -- "$FAIL_RUN_ROOT/publication.lock" "$LOCK_RELEASE_FUNCTION"; then
+  echo "missing owned publication lock was treated as released" >&2
+  exit 1
+fi
+/bin/zsh -c '
+  set -u
+  PUBLICATION_LOCK="$1"
+  PUBLICATION_LOCK_OWNED=1
+  print -r -- "$$" > "$PUBLICATION_LOCK"
+  eval "$2"
+  release_publication_lock
+  [[ ! -e "$PUBLICATION_LOCK" ]]
+' -- "$FAIL_RUN_ROOT/publication.lock" "$LOCK_RELEASE_FUNCTION" || {
+  echo "owned publication lock was not released" >&2
+  exit 1
+}
 rm -rf "$FAIL_RUN_ROOT"
 for forbidden in "/""Users/" "Library/Mobile"" Documents" "Yasu""'s Vault"; do
   if /usr/bin/grep -F -- "$forbidden" "$RUNNER" >/dev/null; then
@@ -146,4 +256,4 @@ for forbidden in "/""Users/" "Library/Mobile"" Documents" "Yasu""'s Vault"; do
   fi
 done
 
-echo "runner isolation contract: 30/30 passed"
+echo "runner isolation contract: 39/39 passed"

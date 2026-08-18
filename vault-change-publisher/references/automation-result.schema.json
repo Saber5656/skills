@@ -3,15 +3,9 @@
   "type": "object",
   "additionalProperties": false,
   "required": [
-    "outcome",
-    "phase",
-    "daily_pipeline_status",
-    "summary_path",
-    "advisory_path",
-    "notification_result",
-    "agents_vault",
-    "user_vault",
-    "evidence_finalization_commit",
+    "outcome", "phase", "daily_pipeline_status", "summary_path",
+    "advisory_path", "notification_result", "agents_vault", "user_vault",
+    "publication_mode", "deferred_cleanup", "evidence_finalization_commit",
     "next_action"
   ],
   "properties": {
@@ -23,6 +17,8 @@
     "notification_result": {"type": ["string", "null"]},
     "agents_vault": {"$ref": "#/$defs/vaultResult"},
     "user_vault": {"$ref": "#/$defs/vaultResult"},
+    "publication_mode": {"$ref": "#/$defs/modeMap"},
+    "deferred_cleanup": {"$ref": "#/$defs/deferredMap"},
     "evidence_finalization_commit": {"type": ["string", "null"]},
     "next_action": {"type": ["string", "null"]}
   },
@@ -34,8 +30,8 @@
           "daily_pipeline_status": {"const": "complete"},
           "summary_path": {"type": "string", "minLength": 1},
           "advisory_path": {"type": "string", "minLength": 1},
-          "agents_vault": {"$ref": "#/$defs/successVaultResult"},
-          "user_vault": {"$ref": "#/$defs/successVaultResult"},
+          "agents_vault": {"$ref": "#/$defs/publishedVaultResult"},
+          "user_vault": {"$ref": "#/$defs/publishedVaultResult"},
           "evidence_finalization_commit": {"type": "string", "minLength": 1},
           "next_action": {"type": "null"}
         }
@@ -55,9 +51,7 @@
     {
       "if": {"properties": {"outcome": {"const": "partial_publication"}}},
       "then": {
-        "properties": {
-          "next_action": {"type": "string", "minLength": 1}
-        },
+        "properties": {"next_action": {"type": "string", "minLength": 1}},
         "anyOf": [
           {"properties": {"agents_vault": {"$ref": "#/$defs/progressedVaultResult"}}},
           {"properties": {"user_vault": {"$ref": "#/$defs/progressedVaultResult"}}}
@@ -66,17 +60,45 @@
     }
   ],
   "$defs": {
+    "deferredPath": {
+      "type": "object", "additionalProperties": false,
+      "required": ["path", "reason"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "reason": {"type": "string", "minLength": 1}
+      }
+    },
+    "modeMap": {
+      "type": "object", "additionalProperties": false,
+      "required": ["agents_vault", "user_vault"],
+      "properties": {
+        "agents_vault": {"enum": ["sweep", "own_only", "blocked"]},
+        "user_vault": {"enum": ["sweep", "own_only", "blocked"]}
+      }
+    },
+    "deferredMap": {
+      "type": "object", "additionalProperties": false,
+      "required": ["agents_vault", "user_vault"],
+      "properties": {
+        "agents_vault": {"type": "array", "items": {"$ref": "#/$defs/deferredPath"}},
+        "user_vault": {"type": "array", "items": {"$ref": "#/$defs/deferredPath"}}
+      }
+    },
     "vaultResult": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["commit_status", "commit_hashes", "push_status", "local_head", "remote_head", "clean"],
+      "type": "object", "additionalProperties": false,
+      "required": [
+        "commit_status", "commit_hashes", "push_status", "local_head",
+        "remote_head", "clean", "publication_mode", "deferred_cleanup"
+      ],
       "properties": {
         "commit_status": {"enum": ["complete", "not_required", "failed", "not_started"]},
         "commit_hashes": {"type": "array", "items": {"type": "string", "minLength": 1}},
         "push_status": {"enum": ["complete", "not_required", "failed", "not_started"]},
         "local_head": {"type": ["string", "null"]},
         "remote_head": {"type": ["string", "null"]},
-        "clean": {"type": "boolean"}
+        "clean": {"type": "boolean"},
+        "publication_mode": {"enum": ["sweep", "own_only", "blocked"]},
+        "deferred_cleanup": {"type": "array", "items": {"$ref": "#/$defs/deferredPath"}}
       },
       "allOf": [
         {
@@ -85,17 +107,21 @@
         }
       ]
     },
-    "successVaultResult": {
+    "publishedVaultResult": {
       "allOf": [
         {"$ref": "#/$defs/vaultResult"},
         {
           "properties": {
-            "commit_status": {"enum": ["complete", "not_required"]},
-            "push_status": {"enum": ["complete", "not_required"]},
+            "commit_status": {"const": "complete"},
+            "push_status": {"const": "complete"},
             "local_head": {"type": "string", "minLength": 1},
             "remote_head": {"type": "string", "minLength": 1},
-            "clean": {"const": true}
+            "publication_mode": {"enum": ["sweep", "own_only"]}
           }
+        },
+        {
+          "if": {"properties": {"publication_mode": {"const": "sweep"}}},
+          "then": {"properties": {"clean": {"const": true}}}
         }
       ]
     },
@@ -106,7 +132,8 @@
           "properties": {
             "commit_status": {"enum": ["failed", "not_started", "not_required"]},
             "commit_hashes": {"maxItems": 0},
-            "push_status": {"enum": ["failed", "not_started", "not_required"]}
+            "push_status": {"enum": ["failed", "not_started", "not_required"]},
+            "publication_mode": {"const": "blocked"}
           }
         }
       ]

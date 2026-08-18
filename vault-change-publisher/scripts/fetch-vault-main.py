@@ -9,6 +9,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from isolated_git_transport import IsolatedGitTransport, TransportError
+
 
 class FetchError(RuntimeError):
     """Represent an invalid runtime context or rejected fixed fetch."""
@@ -21,31 +23,81 @@ def clean_environment() -> dict[str, str]:
     }
     environment["GIT_CONFIG_NOSYSTEM"] = "1"
     environment["GIT_CONFIG_GLOBAL"] = os.devnull
+    environment["GIT_NO_LAZY_FETCH"] = "1"
+    environment["GIT_NO_REPLACE_OBJECTS"] = "1"
+    environment["GIT_OPTIONAL_LOCKS"] = "0"
+    environment["GIT_CONFIG_COUNT"] = "1"
+    environment["GIT_CONFIG_KEY_0"] = "core.fsmonitor"
+    environment["GIT_CONFIG_VALUE_0"] = "false"
     return environment
 
 
 def fetch_main(repo: str, git_dir: str, remote_url: str) -> None:
     """Fetch one literal remote main into the exact tracking ref without force."""
-    result = subprocess.run(
-        [
-            "git",
-            f"--git-dir={git_dir}",
-            f"--work-tree={repo}",
-            "-c",
-            f"core.hooksPath={os.devnull}",
-            "fetch",
-            "--no-tags",
-            "--no-recurse-submodules",
-            remote_url,
-            "refs/heads/main:refs/remotes/origin/main",
-        ],
+    fetched = None
+    with IsolatedGitTransport(git_dir) as transport:
+        for _ in range(3):
+            before = transport.run(
+                "ls-remote", "--exit-code", remote_url, "refs/heads/main"
+            ).stdout.split()
+            if len(before) != 2:
+                raise FetchError("could not resolve fixed remote main")
+            result = transport.run(
+                "fetch",
+                "--no-tags",
+                "--no-recurse-submodules",
+                "--no-write-fetch-head",
+                remote_url,
+                "refs/heads/main:refs/remotes/origin/main",
+                check=False,
+            )
+            if result.returncode != 0:
+                continue
+            candidate = transport.run(
+                "rev-parse", "--verify", "refs/remotes/origin/main"
+            ).stdout.strip()
+            after = transport.run(
+                "ls-remote", "--exit-code", remote_url, "refs/heads/main"
+            ).stdout.split()
+            if len(after) == 2 and before[0] == candidate == after[0]:
+                fetched = candidate
+                break
+    if fetched is None:
+        raise FetchError("fixed main fetch did not stabilize")
+    local_command = [
+        "git",
+        f"--git-dir={git_dir}",
+        f"--work-tree={repo}",
+        "-c",
+        f"core.hooksPath={os.devnull}",
+        "-c",
+        "core.fsmonitor=false",
+    ]
+    existing = subprocess.run(
+        [*local_command, "rev-parse", "--verify", "refs/remotes/origin/main"],
         check=False,
         capture_output=True,
         text=True,
         env=clean_environment(),
     )
-    if result.returncode != 0:
-        raise FetchError("fixed main fetch failed")
+    old = existing.stdout.strip() if existing.returncode == 0 else "0" * 40
+    if old != "0" * 40 and old != fetched:
+        ancestry = subprocess.run(
+            [*local_command, "merge-base", "--is-ancestor", old, fetched],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=clean_environment(),
+        )
+        if ancestry.returncode != 0:
+            raise FetchError("fixed main fetch would move tracking history backwards")
+    subprocess.run(
+        [*local_command, "update-ref", "refs/remotes/origin/main", fetched, old],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=clean_environment(),
+    )
 
 
 def main(argv: list[str]) -> int:
@@ -70,6 +122,7 @@ def main(argv: list[str]) -> int:
         ValueError,
         json.JSONDecodeError,
         subprocess.SubprocessError,
+        TransportError,
     ) as exc:
         print(f"fixed fetch blocked:{exc}", file=sys.stderr)
         return 75

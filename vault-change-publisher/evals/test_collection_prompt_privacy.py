@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import unittest
 from pathlib import Path
 
@@ -88,6 +89,15 @@ class CollectionPromptPrivacyTests(unittest.TestCase):
         self.assertIn("copy the trusted", prompt)
         self.assertIn("再集計・上書きしない", skill)
 
+    def test_coverage_tier_is_exact_catalog_integer(self) -> None:
+        prompt = (
+            ROOT / "vault-change-publisher/assets/daily-it-news.collect.prompt.md"
+        ).read_text(encoding="utf-8")
+        flat = self._flat(prompt)
+        self.assertIn("catalog's exact integer (`1` or `2`)", flat)
+        self.assertIn("Do not write a display label", flat)
+        self.assertIn("`Tier 1` or `Tier 2`", flat)
+
     def test_approved_publication_has_no_excluded_path_placeholders(self) -> None:
         prompt = (
             ROOT / "vault-change-publisher/assets/daily-it-news.review.prompt.md"
@@ -97,6 +107,129 @@ class CollectionPromptPrivacyTests(unittest.TestCase):
         self.assertIn("must be empty arrays", prompt)
         self.assertIn("`.obsidian/`", prompt)
         self.assertIn("return `blocked`", flat)
+
+    def test_dirty_regular_files_are_not_blocked_by_lifecycle_inference(self) -> None:
+        prompt = (
+            ROOT / "vault-change-publisher/assets/daily-it-news.review.prompt.md"
+        ).read_text(encoding="utf-8")
+        flat = self._flat(prompt)
+        self.assertIn("Review captured regular files as inert", flat)
+        self.assertIn("temporary handoff", flat)
+        self.assertIn("Do not execute or simulate", flat)
+        self.assertIn("lifecycle and usefulness judgments are not", flat)
+        self.assertIn("Block a captured dirty file only for a concrete", flat)
+
+    def test_sweep_owned_scope_separates_existing_history_and_later_evidence(self) -> None:
+        """Make the reviewer emit the exact scope expected by the validator."""
+        prompt = (
+            ROOT / "vault-change-publisher/assets/daily-it-news.review.prompt.md"
+        ).read_text(encoding="utf-8")
+        flat = self._flat(prompt)
+        self.assertIn("exact sorted union", flat)
+        self.assertIn("every `changed_paths` entry", flat)
+        self.assertIn("do not create a new commit group", flat)
+        self.assertIn("must not appear in an initial publication commit group", flat)
+        self.assertIn("neither local-ahead-only paths nor the later evidence target", flat)
+
+    def test_publication_review_keeps_core_and_residual_status_separate(self) -> None:
+        """Keep the legacy aggregate field bound only to current-run quality."""
+        prompt = (
+            ROOT / "vault-change-publisher/assets/daily-it-news.review.prompt.md"
+        ).read_text(encoding="utf-8")
+        flat = self._flat(prompt)
+        self.assertIn(
+            "review_or_validation_status` is the backward-compatible mirror of `core_review_status`, not an aggregate",
+            flat,
+        )
+        self.assertIn(
+            "A residual-history block sets only `residual_review_status` to `blocked`",
+            flat,
+        )
+        schema = json.loads(
+            (
+                ROOT
+                / "vault-change-publisher/references/publication-review-result.schema.json"
+            ).read_text(encoding="utf-8")
+        )
+        status_contract = schema["$defs"]["taskChangeManifest"]["allOf"]
+        self.assertEqual(
+            status_contract[0]["then"]["properties"]["review_or_validation_status"]["const"],
+            "quality_ok",
+        )
+        self.assertEqual(
+            status_contract[1]["then"]["properties"]["review_or_validation_status"]["const"],
+            "blocked",
+        )
+
+    def test_blocked_local_history_does_not_expand_dirty_residual_scope(self) -> None:
+        """Keep local-ahead identity out of dirty-only deferred arrays."""
+        prompt = (
+            ROOT / "vault-change-publisher/assets/daily-it-news.review.prompt.md"
+        ).read_text(encoding="utf-8")
+        flat = self._flat(prompt)
+        self.assertIn(
+            "must each cover exactly the captured dirty paths and no other paths",
+            flat,
+        )
+        self.assertIn(
+            "never add a local-ahead commit's `changed_paths`",
+            flat,
+        )
+        self.assertIn(
+            "Preserve local-ahead identity only in `approved_existing_commits`",
+            flat,
+        )
+        schema = json.loads(
+            (
+                ROOT
+                / "vault-change-publisher/references/publication-review-result.schema.json"
+            ).read_text(encoding="utf-8")
+        )
+        blocked_contract = schema["$defs"]["taskChangeManifest"]["allOf"][2]
+        properties = blocked_contract["then"]["properties"]
+        self.assertEqual(properties["commit_required"], {"const": False})
+        self.assertEqual(properties["commit_groups"], {"maxItems": 0})
+        self.assertEqual(properties["approved_dirty_entries"], {"maxItems": 0})
+        self.assertEqual(properties["evidence_finalization"], {"type": "null"})
+
+    def test_successful_publication_review_requires_null_next_action(self) -> None:
+        """Keep deferred cleanup structured without turning success into a stop."""
+        prompt = (
+            ROOT / "vault-change-publisher/assets/daily-it-news.review.prompt.md"
+        ).read_text(encoding="utf-8")
+        flat = self._flat(prompt)
+        self.assertIn("if and only if both Vault publication modes", flat)
+        self.assertIn("belong only in `deferred_cleanup`", flat)
+        self.assertIn("never duplicate them in `next_action`", flat)
+        self.assertIn("only when at least one Vault is `blocked`", flat)
+
+        schema = json.loads(
+            (
+                ROOT
+                / "vault-change-publisher/references/publication-review-result.schema.json"
+            ).read_text(encoding="utf-8")
+        )
+        mode_contract = schema["allOf"][1]
+        self.assertEqual(
+            mode_contract["then"]["properties"]["next_action"],
+            {"type": "null"},
+        )
+        self.assertEqual(
+            mode_contract["else"]["properties"]["next_action"],
+            {"type": "string", "minLength": 1},
+        )
+
+    def test_sealed_residual_guard_forces_own_only_before_review(self) -> None:
+        """Keep reviewer mistakes from sending unsafe residuals to the committer."""
+        prompt = (
+            ROOT / "vault-change-publisher/assets/daily-it-news.review.prompt.md"
+        ).read_text(encoding="utf-8")
+        flat = self._flat(prompt)
+        self.assertIn("deterministic residual guard compares", flat)
+        self.assertIn("newly added machine-home paths", flat)
+        self.assertIn("pinned gitleaks failures", flat)
+        self.assertIn("guarded mode hint already forces", flat)
+        self.assertIn("Never upgrade it", flat)
 
     def test_resolution_request_is_limited_to_unresolved_sources(self) -> None:
         prompt = (
@@ -121,6 +254,24 @@ class CollectionPromptPrivacyTests(unittest.TestCase):
         self.assertIn("do not write `RSS / 公開ページ`", prompt)
         self.assertIn("exact sealed constraint in `理由`", prompt)
         self.assertIn("Never describe a sealed `robots` constraint as `購読`", prompt)
+
+    def test_fallback_handoff_does_not_wait_for_post_response_evidence(self) -> None:
+        """Collection submits candidates; the runner verifies them afterwards."""
+        prompt = (
+            ROOT / "vault-change-publisher/assets/daily-it-news.collect.prompt.md"
+        ).read_text(encoding="utf-8")
+        flat = self._flat(prompt)
+        self.assertIn("does not exist and is not readable during", flat)
+        self.assertIn("treat that source as provisionally resolved", flat)
+        self.assertIn("Do not return blocked only because", flat)
+        self.assertIn("After this response", flat)
+        self.assertIn("fails closed before publication", flat)
+        self.assertIn("A direct `fetched` or `access_constraint` source", flat)
+        self.assertIn("A fallback coverage row must match the submitted", flat)
+        self.assertNotIn(
+            "search/official-alternate result is verified by the fetcher's source manifest",
+            flat,
+        )
 
 
 if __name__ == "__main__":
