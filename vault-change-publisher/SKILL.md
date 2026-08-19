@@ -35,7 +35,7 @@ Web入力を扱う収集phaseからプロセスとsandbox権限を分離し、�
 
 ## Process Isolation
 
-publication review processはread-only/no-networkで実行し、artifact配置やGit mutationより前にdigest-bound Task Change Manifestを完成させる。review inputをsealedする際、deterministic residual guardがHEADとの差分へ新規machine-home path、`.obsidian/`、pinned gitleaksを検査し、不合格entryをbytes非公開の`deferred`へ変換して当該Vaultのmode hintを`own_only`へ固定する。reviewerが誤って`sweep`へ戻すことはvalidatorが拒否する。local publication processにはVault working treeと対応gitdirだけを与え、networkを無効にし、承認済みManifestを変更させない。初回固定push後のevidence hunkは別のread-only/no-network processで再レビューする。いずれにも`--search`を付けず、収集phaseと同じCodex processを再利用しない。pushはagent外の検証済みrunnerが、review、local result、実history、blob hash、Git control-plane digestを照合して固定refspecだけで行う。
+publication review processはread-only/no-networkで実行し、artifact配置やGit mutationより前にdigest-bound Task Change Manifestを完成させる。review inputをsealedする際、deterministic residual guardがHEADとの差分へ新規machine-home path、`.obsidian/`、pinned gitleaksを検査し、不合格entryをbytes非公開の`deferred`へ変換して当該Vaultのmode hintを`own_only`へ固定する。全Gitleaks scanはdigest固定した`[extend] useDefault = true` config bytesを匿名file descriptorへ封印し、そのfdをscanner processへ継承して`/dev/fd/N`から読む。検証後のpathname再lookupやVault内`.gitleaks.toml`をconfig sourceにしない。reviewerが誤って`sweep`へ戻すことはvalidatorが拒否する。local publication processにはVault working treeと対応gitdirだけを与え、networkを無効にし、承認済みManifestを変更させない。初回固定push後のevidence hunkは別のread-only/no-network processで再レビューする。いずれにも`--search`を付けず、収集phaseと同じCodex processを再利用しない。pushはagent外の検証済みrunnerが、review、local result、実history、blob hash、Git control-plane digestを照合して固定refspecだけで行う。
 
 収集phaseはrun専用stagingだけに書き込み、Vault working treeやgitdirへ書き込めないことをrunner側で保証する。
 
@@ -57,7 +57,7 @@ Saihai primary checkoutの`directory-path.env`だけをsourceにし、空mapping
 | artifact | regular non-symlink file、staging配下、hash一致 |
 | remote evidence | credentialを除去したremote名・host・repository |
 
-Vault履歴・dirty・staged状態は日次収集を止めない。artifact生成とdeterministic validation後、短時間のcooperative publication lock下で状態を再取得し、Vaultごとにmode hintを固定する。collection前後のHEAD、index、dirty fingerprint、Git control-planeの変化、または既存staged変更は`own_only`制約とし、artifactを失敗扱いにしない。remote-ahead、diverged、active Git operationは当該Vaultだけ`blocked`とする。plan後のtarget競合やcommit前のretry-safeなsnapshot driftはmutationせずlockを解放し、最新状態からartifact plan、mode hint、reviewをbounded replanする。
+Vault履歴・dirty・staged状態は日次収集を止めない。artifact生成とdeterministic validation後、短時間のcooperative publication lock下で状態を再取得し、Vaultごとにmode hintを固定する。collection前後のHEAD、index、dirty fingerprint、Git control-planeの変化、または既存staged変更は`own_only`制約とし、artifactを失敗扱いにしない。remote-ahead、diverged、active Git operationは当該Vaultだけ`blocked`とする。bounded snapshotで片方だけ安定しない場合は、そのVaultのlatest identityを封印してlive residualを読まず`blocked`にし、安定したpeer Vaultのpublicationを継続する。plan後のtarget競合やcommit前のretry-safeなsnapshot driftはmutationせずlockを解放し、最新状態からartifact plan、mode hint、reviewをbounded replanする。replan上限後も競合する場合は競合Vaultだけを`blocked`にする。
 
 local-aheadの場合は各commitのhash、parents、tree、message、changed paths、first-parent patchを封印し、residual reviewとpinned gitleaks scanへ含める。安全なら既存commit境界を維持してpushし、unsafeなら祖先として避けられないため当該Vaultだけ`blocked`にする。停止をcheckout、pull、merge、rebase、reset、stashで回避しない。
 
@@ -73,7 +73,7 @@ Agents/Userのmodeは独立でよい。residual review失敗は`sweep`から`own
 
 ## Artifact Install
 
-review済み`install-verified-artifacts.py --plan`でmutation前にexact destinationを決定し、Task Change Manifestへ固定する。同名fileが存在する時は既存deterministic suffix規則で未使用targetを選ぶ。承認後はnon-blocked Vaultのartifact roleだけをdescriptor-relativeかつ`O_EXCL`で配置する。plan後のtarget競合は上書きせず、最新snapshotからdeterministic suffixを再選択してreviewをやり直す。bounded replan後も競合が続く場合だけ当該Vaultを`blocked`とする。
+review済み`install-verified-artifacts.py --plan`でmutation前にexact destinationを決定し、Task Change Manifestへ固定する。同名fileが存在する時は既存deterministic suffix規則で未使用targetを選ぶ。承認後はnon-blocked Vaultのartifact roleだけをdescriptor-relativeかつ`O_EXCL`で配置し、installerが同じopen fdからbytes、SHA-256、stable inode identity（device/inode）、size、modeをreceiptへ封印してcommitterへ渡す。iCloud File Providerがchild close後に正規化し得る`mtime/ctime`は所有identityに含めず、同一inodeのtimestamp-only driftを許容する一方、別inode、content、size、modeの変更はfail closedにする。write/fsync失敗時もtarget名を直接unlinkせずatomic quarantine後にinstaller inode一致を確認し、差替えられた第三者entryはentry typeに依存しないdescriptor-relative no-replace renameで元名へ復元する。no-replace primitiveは第三者entryを動かす前に同一filesystemのprivate quarantine内でprobeし、復元先が再占有された場合は上書きや削除をせずquarantineへ保持してfail closedにする。committerはpathを再読込して所有権を付け替えず、このreceiptと一致するinodeだけをrollback対象にする。別processからのpartial resumeではreceiptをpathnameから再生成せず、commit失敗時のartifactを残してfail closedにする。plan後のtarget競合は上書きせず、最新snapshotからdeterministic suffixを再選択してreviewをやり直す。bounded replan後も競合が続く場合だけ当該Vaultを`blocked`とする。
 
 定期バッチでは、read-only publication reviewが承認した`commit_groups`を`commit-reviewed-publication.py`が順序通りにlocal commitする。`own_only`では共有indexへ`git add`せず、一時`GIT_INDEX_FILE`へ`read-tree`、`update-index --cacheinfo`、`write-tree`、`commit-tree`を行い、commit path完全一致後にold OID付き`update-ref`でCASする。共有indexは所有artifact entryだけ同期し、既存staged entryを完全保持する。network、hook、署名、forceは使わない。
 
@@ -108,7 +108,7 @@ commit前後で非所有pathのblob、mode、mtime、porcelain、staged paths、
 
 `blocked`がunsafe local-ahead由来の場合、artifact targetは`owned_paths` / `reviewed_artifacts`へ非actionable identity bindingとして残すが、`commit_required=false`、`commit_groups=[]`、`approved_dirty_entries=[]`、`evidence_finalization=null`とする。`excluded_paths`、`unrelated_dirty_paths`、`deferred_cleanup`はcaptured dirty pathsだけをexactに列挙し、local-ahead commitのidentityは`approved_existing_commits`、停止理由と復旧方法は`residual_review_status=blocked`とroot `next_action`へ記録する。
 
-`sweep`は明示pathだけをstageし、`own_only`は通常indexへstageしない。`git add .`、`git add -A`、`--no-verify`は禁止する。isolated indexに対する`gitleaks git --staged --redact`、file type/size/mode/symlink guard、snapshot一致を必須とする。
+`sweep`は明示pathだけをstageし、`own_only`は通常indexへstageしない。`git add .`、`git add -A`、`--no-verify`は禁止する。isolated indexに対するtrusted-config付き`gitleaks git --staged --redact`、file type/size/mode/symlink guard、snapshot一致を必須とする。
 
 ## Push Phase
 
@@ -119,7 +119,7 @@ non-blocked Vaultの今回artifact commitが`complete`で、1件以上のcommit 
 - pinned gitleaksでremote HEADから最終local HEADまで（pre-existing local commitsを含む）を再scanしてからplain non-force pushする。
 - push直前のremote HEADがpre-collectionで固定したremote HEADから動いていた場合はpushせず停止する。
 - remote race、network failure、blocked modeはVault単位で扱う。一方の失敗で他方の検証済みfixed pushを抑止せず、片側だけ進んだ結果は`partial_publication`として非0にする。
-- 片側commit完了後、peer側がmutation前のretry-safe競合で止まった場合は、まだpushしていない今回runのcommitだけをold OID付きCASで取り消し、共有indexとartifact inodeをexact backupへ戻して全plan/reviewをやり直す。pre-existing commit、既存dirty/staged差分、すでにpush済みのcommitはrollbackしない。
+- 片側commit完了後、peer側がmutation前のretry-safe競合で止まった場合は、まだpushしていない今回runのcommitだけをold OID付きCASで取り消し、共有indexとinstaller-sealed receiptに一致するartifact inodeをexact backupへ戻して全plan/reviewをやり直す。receipt不一致時は第三者inodeを削除せずfail closedにする。pre-existing commit、既存dirty/staged差分、すでにpush済みのcommitはrollbackしない。
 - local publication agentにはnetworkを与えず、任意remoteや任意refspecを操作させない。
 - 両commit成功後に両pushが失敗した場合も、local stateが進んだため`partial_publication`とする。
 - 片側だけのcommit/push、またはevidence finalization失敗も`partial_publication`とする。

@@ -8,12 +8,19 @@ import json
 import os
 import re
 import secrets
+import selectors
 import stat
 import subprocess
 import sys
+import time
 from pathlib import Path, PurePosixPath
 
 from evidence_hunk import canonical_patch, insert_evidence_block
+from isolated_git_transport import (
+    LOCAL_COMMAND_TIMEOUT_SECONDS,
+    kill_process_group,
+    run_local_command,
+)
 
 
 class EvidenceError(RuntimeError):
@@ -79,7 +86,7 @@ def relative_path(root: str, absolute: str) -> str:
 def capture_complete(runtime_file: str) -> dict[str, object]:
     """Capture the exact two-Vault baseline before evidence mutation."""
     helper = Path(__file__).with_name("capture-vault-state.py")
-    completed = subprocess.run(
+    completed = run_local_command(
         [str(helper), "--include-local-history", runtime_file],
         check=True,
         capture_output=True,
@@ -92,6 +99,7 @@ def capture_complete(runtime_file: str) -> dict[str, object]:
             "GIT_NO_REPLACE_OBJECTS": "1",
             "GIT_OPTIONAL_LOCKS": "0",
         },
+        timeout=LOCAL_COMMAND_TIMEOUT_SECONDS,
     )
     return json.loads(completed.stdout)
 
@@ -123,7 +131,7 @@ def clean_git_environment() -> dict[str, str]:
 
 
 def git_bytes(repo: str, git_dir: str, *arguments: str) -> bytes:
-    """Read bounded local Git object data without filters or replacement refs."""
+    """Read size- and time-bounded local Git data without ambient controls."""
     process = subprocess.Popen(
         [
             "git", f"--git-dir={git_dir}", f"--work-tree={repo}",
@@ -135,24 +143,44 @@ def git_bytes(repo: str, git_dir: str, *arguments: str) -> bytes:
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
         env=clean_git_environment(),
+        start_new_session=True,
     )
     assert process.stdout is not None
+    selector = selectors.DefaultSelector()
+    selector.register(process.stdout, selectors.EVENT_READ)
+    deadline = time.monotonic() + LOCAL_COMMAND_TIMEOUT_SECONDS
     content = bytearray()
+    finished = False
     try:
-        while chunk := process.stdout.read(
-            min(65536, MAX_TASK_BYTES + 1 - len(content))
-        ):
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not selector.select(remaining):
+                raise EvidenceError("evidence Git object read exceeded its deadline")
+            chunk = os.read(
+                process.stdout.fileno(),
+                min(65536, MAX_TASK_BYTES + 1 - len(content)),
+            )
+            if not chunk:
+                break
             content.extend(chunk)
             if len(content) > MAX_TASK_BYTES:
-                process.kill()
-                process.wait()
                 raise EvidenceError("evidence Git object exceeds the allowed size")
-        return_code = process.wait()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise EvidenceError("evidence Git object command exceeded its deadline")
+        try:
+            return_code = process.wait(timeout=remaining)
+        except subprocess.TimeoutExpired as exc:
+            raise EvidenceError("evidence Git object command exceeded its deadline") from exc
+        finished = True
     finally:
+        selector.close()
         process.stdout.close()
-        if process.poll() is None:
-            process.kill()
-            process.wait()
+        if not finished:
+            try:
+                kill_process_group(process)
+            except subprocess.SubprocessError as exc:
+                raise EvidenceError("evidence Git process could not be reaped") from exc
     if return_code != 0:
         raise EvidenceError("evidence Git object is unavailable")
     return bytes(content)
@@ -165,7 +193,9 @@ def target_entries(
     repo = str(runtime["agents_vault_root"])
     git_dir = str(runtime["agents_git_dir"])
     raw = git_bytes(repo, git_dir, "ls-tree", "-z", "HEAD", "--", target)
-    metadata, separator, path = raw.rstrip(b"\0").partition(b"\t")
+    if not raw.endswith(b"\0") or raw.count(b"\0") != 1:
+        raise EvidenceError("evidence target HEAD entry is missing or ambiguous")
+    metadata, separator, path = raw[:-1].partition(b"\t")
     fields = metadata.split()
     if separator != b"\t" or len(fields) != 3 or path.decode("utf-8") != target:
         raise EvidenceError("evidence target is missing from HEAD")
@@ -227,6 +257,7 @@ def markdown_evidence_boundary(lines: list[str]) -> int:
     headings = []
     fence_character = None
     fence_length = 0
+    fence_start_index = None
     for index, line in enumerate(lines):
         text = line.rstrip("\r\n")
         if fence_character is not None:
@@ -237,14 +268,23 @@ def markdown_evidence_boundary(lines: list[str]) -> int:
             if closing:
                 fence_character = None
                 fence_length = 0
+                fence_start_index = None
             continue
         opening = FENCE_START.match(text)
         if opening:
             fence_character = opening.group(1)[0]
             fence_length = len(opening.group(1))
+            fence_start_index = index
             continue
         if text == EVIDENCE_HEADING:
             headings.append(index)
+    if fence_character is not None:
+        location = (
+            "in evidence section"
+            if headings and fence_start_index is not None and fence_start_index > headings[0]
+            else "before evidence heading"
+        )
+        raise EvidenceError(f"unterminated fenced block {location}")
     if len(headings) != 1:
         raise EvidenceError("canonical evidence heading is missing or duplicated")
 

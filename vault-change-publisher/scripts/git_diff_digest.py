@@ -8,6 +8,8 @@ import os
 import subprocess
 from typing import TypeVar
 
+from isolated_git_transport import LOCAL_COMMAND_TIMEOUT_SECONDS, run_local_command
+
 
 DiffText = TypeVar("DiffText", str, bytes)
 
@@ -22,6 +24,7 @@ def clean_git_environment() -> dict[str, str]:
     environment["GIT_NO_LAZY_FETCH"] = "1"
     environment["GIT_NO_REPLACE_OBJECTS"] = "1"
     environment["GIT_OPTIONAL_LOCKS"] = "0"
+    environment["GIT_LITERAL_PATHSPECS"] = "1"
     environment["LC_ALL"] = "C"
     environment["LANG"] = "C"
     environment["GIT_CONFIG_COUNT"] = "1"
@@ -74,10 +77,11 @@ def git_diff_digest(repo: str, relative: str, *, cached: bool = False) -> str:
     if cached:
         command.append("--cached")
     command.extend(("--binary", "--no-ext-diff", "--no-textconv", "--", relative))
-    result = subprocess.run(
+    result = run_local_command(
         command,
         check=True,
         capture_output=True,
         env=clean_git_environment(),
+        timeout=LOCAL_COMMAND_TIMEOUT_SECONDS,
     )
     return hashlib.sha256(result.stdout).hexdigest()

@@ -18,6 +18,20 @@ class CollectionPromptPrivacyTests(unittest.TestCase):
     def _flat(content: str) -> str:
         return " ".join(content.split())
 
+    @staticmethod
+    def _contract_with_if_const(
+        contracts: list[dict[str, object]], property_name: str, value: str
+    ) -> dict[str, object]:
+        """Select a schema branch by meaning instead of array position."""
+        return next(
+            contract
+            for contract in contracts
+            if contract.get("if", {}).get("properties", {}).get(property_name, {}).get(
+                "const"
+            )
+            == value
+        )
+
     def test_collection_prompt_requires_formatter_and_forbids_staging_path(self) -> None:
         prompt = (
             ROOT / "vault-change-publisher/assets/daily-it-news.collect.prompt.md"
@@ -152,12 +166,18 @@ class CollectionPromptPrivacyTests(unittest.TestCase):
             ).read_text(encoding="utf-8")
         )
         status_contract = schema["$defs"]["taskChangeManifest"]["allOf"]
+        quality_contract = self._contract_with_if_const(
+            status_contract, "core_review_status", "quality_ok"
+        )
+        blocked_contract = self._contract_with_if_const(
+            status_contract, "core_review_status", "blocked"
+        )
         self.assertEqual(
-            status_contract[0]["then"]["properties"]["review_or_validation_status"]["const"],
+            quality_contract["then"]["properties"]["review_or_validation_status"]["const"],
             "quality_ok",
         )
         self.assertEqual(
-            status_contract[1]["then"]["properties"]["review_or_validation_status"]["const"],
+            blocked_contract["then"]["properties"]["review_or_validation_status"]["const"],
             "blocked",
         )
 
@@ -185,7 +205,11 @@ class CollectionPromptPrivacyTests(unittest.TestCase):
                 / "vault-change-publisher/references/publication-review-result.schema.json"
             ).read_text(encoding="utf-8")
         )
-        blocked_contract = schema["$defs"]["taskChangeManifest"]["allOf"][2]
+        blocked_contract = self._contract_with_if_const(
+            schema["$defs"]["taskChangeManifest"]["allOf"],
+            "publication_mode",
+            "blocked",
+        )
         properties = blocked_contract["then"]["properties"]
         self.assertEqual(properties["commit_required"], {"const": False})
         self.assertEqual(properties["commit_groups"], {"maxItems": 0})
@@ -209,7 +233,17 @@ class CollectionPromptPrivacyTests(unittest.TestCase):
                 / "vault-change-publisher/references/publication-review-result.schema.json"
             ).read_text(encoding="utf-8")
         )
-        mode_contract = schema["allOf"][1]
+        mode_contract = next(
+            contract
+            for contract in schema["allOf"]
+            if contract.get("if", {})
+            .get("properties", {})
+            .get("agents_vault", {})
+            .get("properties", {})
+            .get("publication_mode", {})
+            .get("enum")
+            == ["sweep", "own_only"]
+        )
         self.assertEqual(
             mode_contract["then"]["properties"]["next_action"],
             {"type": "null"},

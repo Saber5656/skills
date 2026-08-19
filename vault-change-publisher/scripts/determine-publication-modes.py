@@ -132,7 +132,11 @@ def apply_residual_guards(
     if snapshot_manifest.get("version") != 4:
         raise ModeError("dirty snapshot manifest version is invalid")
     vaults = snapshot_manifest.get("vaults")
+    local_commits = snapshot_manifest.get("local_commits")
     if not isinstance(vaults, dict) or set(vaults) != {
+        "agents_vault",
+        "user_vault",
+    } or not isinstance(local_commits, dict) or set(local_commits) != {
         "agents_vault",
         "user_vault",
     }:
@@ -141,7 +145,12 @@ def apply_residual_guards(
     for key in ("agents_vault", "user_vault"):
         entry = result.get(key)
         snapshots = vaults.get(key)
-        if not isinstance(entry, dict) or not isinstance(snapshots, list):
+        commit_snapshots = local_commits.get(key)
+        if (
+            not isinstance(entry, dict)
+            or not isinstance(snapshots, list)
+            or not isinstance(commit_snapshots, list)
+        ):
             raise ModeError("publication mode hint shape is invalid")
         deferred_paths = sorted(
             snapshot.get("path")
@@ -153,13 +162,30 @@ def apply_residual_guards(
         if len(deferred_paths) != len(set(deferred_paths)):
             raise ModeError("deferred residual path is duplicated")
         entry["guard_deferred_paths"] = deferred_paths
+        blocked_commits = [
+            snapshot.get("commit")
+            for snapshot in commit_snapshots
+            if isinstance(snapshot, dict)
+            and snapshot.get("materialization_status") != "available"
+            and isinstance(snapshot.get("commit"), str)
+        ]
+        if len(blocked_commits) != len(set(blocked_commits)):
+            raise ModeError("blocked local commit is duplicated")
+        entry["guard_blocked_commits"] = blocked_commits
+        reasons = entry.get("reasons")
+        if not isinstance(reasons, list) or any(
+            not isinstance(reason, str) for reason in reasons
+        ):
+            raise ModeError("publication mode reasons are invalid")
+        if blocked_commits:
+            entry["required_mode"] = "blocked"
+            entry["retry_disposition"] = "none"
+            entry["reasons"] = [
+                reason for reason in reasons if reason != "stable_sweep_candidate"
+            ] + ["sealed_local_history_guard_blocked"]
+            continue
         if deferred_paths and entry.get("required_mode") == "sweep":
             entry["required_mode"] = "own_only"
-            reasons = entry.get("reasons")
-            if not isinstance(reasons, list) or any(
-                not isinstance(reason, str) for reason in reasons
-            ):
-                raise ModeError("publication mode reasons are invalid")
             entry["reasons"] = [
                 reason for reason in reasons if reason != "stable_sweep_candidate"
             ] + ["sealed_residual_guard_deferred"]

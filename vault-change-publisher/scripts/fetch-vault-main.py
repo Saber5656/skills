@@ -7,9 +7,15 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
-from isolated_git_transport import IsolatedGitTransport, TransportError
+from isolated_git_transport import (
+    IsolatedGitTransport,
+    LOCAL_COMMAND_TIMEOUT_SECONDS,
+    TransportError,
+    run_local_command,
+)
 
 
 class FetchError(RuntimeError):
@@ -36,7 +42,7 @@ def fetch_main(repo: str, git_dir: str, remote_url: str) -> None:
     """Fetch one literal remote main into the exact tracking ref without force."""
     fetched = None
     with IsolatedGitTransport(git_dir) as transport:
-        for _ in range(3):
+        for attempt in range(3):
             before = transport.run(
                 "ls-remote", "--exit-code", remote_url, "refs/heads/main"
             ).stdout.split()
@@ -52,6 +58,8 @@ def fetch_main(repo: str, git_dir: str, remote_url: str) -> None:
                 check=False,
             )
             if result.returncode != 0:
+                if attempt < 2:
+                    time.sleep(0.2)
                 continue
             candidate = transport.run(
                 "rev-parse", "--verify", "refs/remotes/origin/main"
@@ -62,6 +70,8 @@ def fetch_main(repo: str, git_dir: str, remote_url: str) -> None:
             if len(after) == 2 and before[0] == candidate == after[0]:
                 fetched = candidate
                 break
+            if attempt < 2:
+                time.sleep(0.2)
     if fetched is None:
         raise FetchError("fixed main fetch did not stabilize")
     local_command = [
@@ -73,30 +83,33 @@ def fetch_main(repo: str, git_dir: str, remote_url: str) -> None:
         "-c",
         "core.fsmonitor=false",
     ]
-    existing = subprocess.run(
+    existing = run_local_command(
         [*local_command, "rev-parse", "--verify", "refs/remotes/origin/main"],
         check=False,
         capture_output=True,
         text=True,
         env=clean_environment(),
+        timeout=LOCAL_COMMAND_TIMEOUT_SECONDS,
     )
     old = existing.stdout.strip() if existing.returncode == 0 else "0" * 40
     if old != "0" * 40 and old != fetched:
-        ancestry = subprocess.run(
+        ancestry = run_local_command(
             [*local_command, "merge-base", "--is-ancestor", old, fetched],
             check=False,
             capture_output=True,
             text=True,
             env=clean_environment(),
+            timeout=LOCAL_COMMAND_TIMEOUT_SECONDS,
         )
         if ancestry.returncode != 0:
             raise FetchError("fixed main fetch would move tracking history backwards")
-    subprocess.run(
+    run_local_command(
         [*local_command, "update-ref", "refs/remotes/origin/main", fetched, old],
         check=True,
         capture_output=True,
         text=True,
         env=clean_environment(),
+        timeout=LOCAL_COMMAND_TIMEOUT_SECONDS,
     )
 
 

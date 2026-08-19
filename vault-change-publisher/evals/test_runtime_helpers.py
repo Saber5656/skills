@@ -8,12 +8,14 @@ import importlib.util
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from datetime import date, timedelta
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Optional
 from unittest import mock
 
@@ -71,6 +73,12 @@ COMMITTER_SPEC = importlib.util.spec_from_file_location(
 assert COMMITTER_SPEC and COMMITTER_SPEC.loader
 COMMITTER_MODULE = importlib.util.module_from_spec(COMMITTER_SPEC)
 COMMITTER_SPEC.loader.exec_module(COMMITTER_MODULE)
+INSTALLER_SPEC = importlib.util.spec_from_file_location(
+    "install_verified_artifacts", SCRIPTS / "install-verified-artifacts.py"
+)
+assert INSTALLER_SPEC and INSTALLER_SPEC.loader
+INSTALLER_MODULE = importlib.util.module_from_spec(INSTALLER_SPEC)
+INSTALLER_SPEC.loader.exec_module(INSTALLER_MODULE)
 EVIDENCE_SPEC = importlib.util.spec_from_file_location(
     "prepare_publication_evidence", SCRIPTS / "prepare-publication-evidence.py"
 )
@@ -95,7 +103,15 @@ COLLECTION_VALIDATOR_SPEC = importlib.util.spec_from_file_location(
 assert COLLECTION_VALIDATOR_SPEC and COLLECTION_VALIDATOR_SPEC.loader
 COLLECTION_VALIDATOR_MODULE = importlib.util.module_from_spec(COLLECTION_VALIDATOR_SPEC)
 COLLECTION_VALIDATOR_SPEC.loader.exec_module(COLLECTION_VALIDATOR_MODULE)
+RESOLVER_SPEC = importlib.util.spec_from_file_location(
+    "resolve_runtime_context", SCRIPTS / "resolve-runtime-context.py"
+)
+assert RESOLVER_SPEC and RESOLVER_SPEC.loader
+RESOLVER_MODULE = importlib.util.module_from_spec(RESOLVER_SPEC)
+RESOLVER_SPEC.loader.exec_module(RESOLVER_MODULE)
 import isolated_git_transport as TRANSPORT_MODULE
+import git_diff_digest as DIFF_MODULE
+import trusted_gitleaks as TRUSTED_GITLEAKS_MODULE
 
 
 def source_coverage_markdown() -> str:
@@ -121,6 +137,22 @@ def source_coverage_markdown() -> str:
             f"{method} | {url} | {count} | {reason} |"
         )
     return "\n".join(lines) + "\n"
+
+
+def create_empty_base(repo: Path) -> str:
+    """Create one valid HEAD for residual-guard fixtures."""
+    subprocess.run(
+        [
+            "git", "-C", str(repo),
+            "-c", "user.name=Fixture",
+            "-c", "user.email=fixture@example.invalid",
+            "commit", "-q", "--allow-empty", "-m", "base",
+        ],
+        check=True,
+    )
+    return subprocess.check_output(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True
+    ).strip()
 
 
 def write_source_manifest(root: Path) -> Path:
@@ -334,7 +366,7 @@ def load_environment(*, checkout_root, environ, require_catalog):
         authorization_hash = hashlib.sha256(authorization.read_bytes()).hexdigest()
         self.fake_gitleaks = self.workdir / "fake-gitleaks"
         self.fake_gitleaks.write_text(
-            "#!/bin/sh\n[ \"$1\" = version ] && echo 'fixture-gitleaks 1.0'\nexit 0\n",
+            "#!/bin/sh\n[ \"$1\" = version ] && echo 'fixture-gitleaks 8.30.1'\nexit 0\n",
             encoding="utf-8",
         )
         self.fake_gitleaks.chmod(0o755)
@@ -707,6 +739,13 @@ def load_environment(*, checkout_root, environ, require_catalog):
         self.assertEqual(git_environment["GIT_NO_REPLACE_OBJECTS"], "1")
         self.assertEqual(git_environment["GIT_OPTIONAL_LOCKS"], "0")
         self.assertEqual(git_environment["LC_ALL"], "C")
+        self.assertEqual(
+            DIFF_MODULE.clean_git_environment()["GIT_LITERAL_PATHSPECS"], "1"
+        )
+        heads = {
+            "agents": create_empty_base(self.agents),
+            "user": create_empty_base(self.user),
+        }
         content = b"captured dirty bytes\n"
         oid = subprocess.run(
             ["git", "-C", str(self.agents), "hash-object", "--stdin"],
@@ -730,6 +769,7 @@ def load_environment(*, checkout_root, environ, require_catalog):
                     "user_git_dir": user_git_dir,
                     "agents_vault_root": str(self.agents),
                     "user_vault_root": str(self.user),
+                    "gitleaks_bin": str(self.fake_gitleaks),
                 }
             ),
             encoding="utf-8",
@@ -739,6 +779,7 @@ def load_environment(*, checkout_root, environ, require_catalog):
             json.dumps(
                 {
                     "agents_vault": {
+                        "local_head": heads["agents"],
                         "local_commits": [],
                         "dirty_entries": [
                             {
@@ -748,7 +789,11 @@ def load_environment(*, checkout_root, environ, require_catalog):
                             }
                         ]
                     },
-                    "user_vault": {"local_commits": [], "dirty_entries": []},
+                    "user_vault": {
+                        "local_head": heads["user"],
+                        "local_commits": [],
+                        "dirty_entries": [],
+                    },
                 }
             ),
             encoding="utf-8",
@@ -950,6 +995,190 @@ def load_environment(*, checkout_root, environ, require_catalog):
             entry["materialization_reason"], "dirty_entry_secret_scan_rejected"
         )
 
+    def test_gitleaks_v8_invocation_contracts_are_exact(self) -> None:
+        """Pin the reviewed stdin, staged-index, and commit-range CLI shapes."""
+        completed_bytes = subprocess.CompletedProcess([], 0, stdout=b"", stderr=b"")
+
+        def assert_bound_config(arguments: list[str], **kwargs: object):
+            if "--config" not in arguments:
+                return completed_bytes
+            pass_fds = kwargs.get("pass_fds")
+            self.assertIsInstance(pass_fds, tuple)
+            self.assertEqual(len(pass_fds), 1)
+            descriptor = pass_fds[0]
+            config_index = arguments.index("--config") + 1
+            self.assertEqual(arguments[config_index], f"/dev/fd/{descriptor}")
+            self.assertEqual(
+                hashlib.sha256(os.pread(descriptor, 4096, 0)).hexdigest(),
+                TRUSTED_GITLEAKS_MODULE.EXPECTED_CONFIG_SHA256,
+            )
+            return completed_bytes
+
+        with mock.patch.object(
+            DIRTY_STAGER_MODULE, "run_local_command", side_effect=assert_bound_config
+        ) as stdin_run:
+            self.assertFalse(
+                DIRTY_STAGER_MODULE.gitleaks_rejects(
+                    str(self.fake_gitleaks), b"candidate additions\n"
+                )
+            )
+        stdin_arguments = stdin_run.call_args.args[0]
+        self.assertEqual(stdin_arguments[0], str(self.fake_gitleaks))
+        self.assertEqual(stdin_arguments[-1], "stdin")
+        self.assertEqual(stdin_run.call_args.kwargs["cwd"], "/")
+        self.assertEqual(
+            stdin_run.call_args.kwargs["input"], b"candidate additions\n"
+        )
+
+        with mock.patch.object(
+            COMMITTER_MODULE, "run_local_command", side_effect=assert_bound_config
+        ) as staged_run, mock.patch.object(
+            COMMITTER_MODULE,
+            "git_bytes",
+            return_value=subprocess.CompletedProcess([], 0, stdout=b"", stderr=b""),
+        ):
+            COMMITTER_MODULE.scan_staged(
+                str(self.fake_gitleaks),
+                str(self.user),
+                str(self.user / ".git"),
+                ["summary.md"],
+                str(self.user / ".git" / "review-index"),
+            )
+        self.assertEqual(
+            staged_run.call_args_list[0].args[0][-3:],
+            ["git", "--staged", str(self.user)],
+        )
+        self.assertEqual(staged_run.call_args_list[0].kwargs["cwd"], "/")
+
+        def assert_bound_config_text(arguments: list[str], **kwargs: object):
+            assert_bound_config(arguments, **kwargs)
+            return subprocess.CompletedProcess(arguments, 0, stdout="", stderr="")
+
+        with mock.patch.object(
+            PUSH_MODULE, "run_local_command", side_effect=assert_bound_config_text
+        ) as history_run:
+            PUSH_MODULE.scan_commits(
+                str(self.fake_gitleaks), str(self.user), "a" * 40, "b" * 40
+            )
+        self.assertEqual(
+            history_run.call_args.args[0][-4:],
+            [
+                "git",
+                "--log-opts",
+                f"{'a' * 40}..{'b' * 40}",
+                str(self.user),
+            ],
+        )
+        self.assertEqual(history_run.call_args.kwargs["cwd"], "/")
+
+        with mock.patch.object(
+            FINALIZER_MODULE,
+            "run_local_command",
+            side_effect=assert_bound_config_text,
+        ) as evidence_run:
+            FINALIZER_MODULE.scan_staged(
+                str(self.fake_gitleaks),
+                str(self.agents),
+                str(self.agents / ".git" / "review-index"),
+            )
+        self.assertEqual(
+            evidence_run.call_args.args[0][-3:],
+            ["git", "--staged", str(self.agents)],
+        )
+
+    @unittest.skipUnless(shutil.which("gitleaks"), "gitleaks is not installed")
+    def test_trusted_gitleaks_config_overrides_vault_local_rules(self) -> None:
+        """Detect a fixture leak even when the Vault config disables defaults."""
+        repo = self.workdir / "gitleaks-local-config"
+        repo.mkdir()
+        subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True)
+        subprocess.run(
+            ["git", "-C", str(repo), "config", "user.name", "Fixture"], check=True
+        )
+        subprocess.run(
+            [
+                "git", "-C", str(repo), "config", "user.email",
+                "fixture@example.invalid",
+            ],
+            check=True,
+        )
+        (repo / "base.md").write_text("base\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "base.md"], check=True)
+        subprocess.run(
+            ["git", "-C", str(repo), "commit", "-q", "-m", "base"], check=True
+        )
+        before = subprocess.check_output(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True
+        ).strip()
+        (repo / ".gitleaks.toml").write_text(
+            "title = \"untrusted weak rules\"\n\n"
+            "[[rules]]\n"
+            "id = \"never-match\"\n"
+            "regex = '''THIS_PATTERN_DOES_NOT_MATCH'''\n",
+            encoding="utf-8",
+        )
+        fixture_token = "xoxb-" + "123456789012-123456789012-abcdefghijklmnopqrstuvwx"
+        (repo / "secret.md").write_text(
+            f"token = {fixture_token}\n", encoding="utf-8"
+        )
+        subprocess.run(["git", "-C", str(repo), "add", "--all"], check=True)
+        subprocess.run(
+            ["git", "-C", str(repo), "commit", "-q", "-m", "fixture"],
+            check=True,
+        )
+        after = subprocess.check_output(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True
+        ).strip()
+        with self.assertRaisesRegex(PUSH_MODULE.PushError, "gitleaks rejected"):
+            PUSH_MODULE.scan_commits(
+                str(shutil.which("gitleaks")), str(repo), before, after
+            )
+        self.assertEqual(
+            hashlib.sha256(
+                (SCRIPTS / "gitleaks-default.toml").read_bytes()
+            ).hexdigest(),
+            TRUSTED_GITLEAKS_MODULE.EXPECTED_CONFIG_SHA256,
+        )
+
+    @unittest.skipUnless(shutil.which("gitleaks"), "gitleaks is not installed")
+    def test_trusted_gitleaks_config_swap_cannot_weaken_active_scan(self) -> None:
+        """Keep the validated config on an inherited fd across pathname replacement."""
+        trusted_root = self.workdir / "trusted-config-swap"
+        trusted_root.mkdir()
+        trusted_module = trusted_root / "trusted_gitleaks.py"
+        trusted_module.write_text("fixture module path\n", encoding="utf-8")
+        trusted_config = trusted_root / "gitleaks-default.toml"
+        shutil.copy2(SCRIPTS / "gitleaks-default.toml", trusted_config)
+        weak_config = trusted_root / "weak.toml"
+        weak_config.write_text(
+            "title = \"weak replacement\"\n\n"
+            "[[rules]]\n"
+            "id = \"never-match\"\n"
+            "regex = '''THIS_PATTERN_DOES_NOT_MATCH'''\n",
+            encoding="utf-8",
+        )
+        real_run = DIRTY_STAGER_MODULE.run_local_command
+
+        def replace_then_run(arguments: list[str], **kwargs: object):
+            os.replace(weak_config, trusted_config)
+            return real_run(arguments, **kwargs)
+
+        fixture_token = "xoxb-" + "123456789012-123456789012-abcdefghijklmnopqrstuvwx"
+        with mock.patch.object(
+            TRUSTED_GITLEAKS_MODULE, "__file__", str(trusted_module)
+        ), mock.patch.object(
+            DIRTY_STAGER_MODULE,
+            "run_local_command",
+            side_effect=replace_then_run,
+        ):
+            self.assertTrue(
+                DIRTY_STAGER_MODULE.gitleaks_rejects(
+                    str(shutil.which("gitleaks")),
+                    f"token = {fixture_token}\n".encode(),
+                )
+            )
+        self.assertIn("weak replacement", trusted_config.read_text(encoding="utf-8"))
+
     def test_network_git_keeps_process_cwd_outside_vault(self) -> None:
         """Use an isolated Git directory rather than the Vault control plane."""
         completed = subprocess.CompletedProcess(
@@ -982,10 +1211,8 @@ def load_environment(*, checkout_root, environ, require_catalog):
         process = mock.MagicMock()
         process.pid = 4242
         process.returncode = -9
-        process.communicate.side_effect = [
-            subprocess.TimeoutExpired(["git", "push"], 1),
-            ("", ""),
-        ]
+        process.communicate.side_effect = subprocess.TimeoutExpired(["git", "push"], 1)
+        process.wait.return_value = -9
         with mock.patch.object(
             TRANSPORT_MODULE.subprocess, "Popen", return_value=process
         ) as popen, mock.patch.object(
@@ -999,6 +1226,112 @@ def load_environment(*, checkout_root, environ, require_catalog):
         self.assertIn("core.fsmonitor=false", popen.call_args.args[0])
         self.assertIn("credential.helper=", popen.call_args.args[0])
         killpg.assert_called_once_with(4242, TRANSPORT_MODULE.signal.SIGKILL)
+        process.wait.assert_called_once_with(
+            timeout=TRANSPORT_MODULE.PROCESS_CLEANUP_TIMEOUT_SECONDS
+        )
+
+    def test_transport_timeout_has_a_bounded_reap_failure(self) -> None:
+        """Never block forever when a killed transport cannot be reaped."""
+        transport = object.__new__(TRANSPORT_MODULE.IsolatedGitTransport)
+        transport.git_dir = Path("/isolated/transport.git")
+        transport.environment = {}
+        transport.timeout = 1
+        process = mock.MagicMock()
+        process.pid = 4242
+        process.communicate.side_effect = subprocess.TimeoutExpired(["git"], 1)
+        process.wait.side_effect = [
+            subprocess.TimeoutExpired(["git"], 5),
+            subprocess.TimeoutExpired(["git"], 5),
+        ]
+        with mock.patch.object(
+            TRANSPORT_MODULE.subprocess, "Popen", return_value=process
+        ), mock.patch.object(TRANSPORT_MODULE.os, "killpg"):
+            with self.assertRaisesRegex(
+                TRANSPORT_MODULE.TransportError, "could not be reaped"
+            ):
+                transport.run("push", "remote", "a" * 40 + ":refs/heads/main")
+        self.assertEqual(process.wait.call_count, 2)
+        process.kill.assert_called_once()
+
+    def test_local_runner_timeout_kills_descendant_process_group(self) -> None:
+        """Kill a spawned descendant, not only the timed-out direct helper."""
+        pid_file = self.workdir / "local-runner-descendant.pid"
+        program = (
+            "import subprocess,time; from pathlib import Path; "
+            "child=subprocess.Popen(['/bin/sleep','30']); "
+            f"Path({str(pid_file)!r}).write_text(str(child.pid)); "
+            "time.sleep(30)"
+        )
+        with self.assertRaises(subprocess.TimeoutExpired):
+            TRANSPORT_MODULE.run_local_command(
+                [sys.executable, "-c", program], timeout=1, capture_output=True
+            )
+        child_pid = int(pid_file.read_text())
+        for _ in range(20):
+            try:
+                os.kill(child_pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.05)
+        else:
+            self.fail("timed-out local helper descendant remained alive")
+
+    def test_materializer_bounded_read_kills_descendant_on_deadline(self) -> None:
+        """Apply the same wall deadline and process-group cleanup to review input."""
+        pid_file = self.workdir / "materializer-descendant.pid"
+        program = (
+            "import subprocess,time; from pathlib import Path; "
+            "child=subprocess.Popen(['/bin/sleep','30']); "
+            f"Path({str(pid_file)!r}).write_text(str(child.pid)); "
+            "time.sleep(30)"
+        )
+        with mock.patch.object(
+            DIRTY_STAGER_MODULE, "LOCAL_COMMAND_TIMEOUT_SECONDS", 1
+        ):
+            with self.assertRaisesRegex(
+                DIRTY_STAGER_MODULE.DirtySnapshotError, "deadline"
+            ):
+                DIRTY_STAGER_MODULE.run_bounded(
+                    [sys.executable, "-c", program], 1024
+                )
+        child_pid = int(pid_file.read_text())
+        for _ in range(20):
+            try:
+                os.kill(child_pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.05)
+        else:
+            self.fail("timed-out review materializer descendant remained alive")
+
+    def test_evidence_reader_kills_group_after_leader_exits(self) -> None:
+        """Kill pipe-holding descendants even when the direct process already exited."""
+        pid_file = self.workdir / "evidence-descendant.pid"
+        program = (
+            "import subprocess; from pathlib import Path; "
+            "child=subprocess.Popen(['/bin/sleep','30']); "
+            f"Path({str(pid_file)!r}).write_text(str(child.pid))"
+        )
+        process = subprocess.Popen(
+            [sys.executable, "-c", program],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        with mock.patch.object(
+            EVIDENCE_MODULE.subprocess, "Popen", return_value=process
+        ), mock.patch.object(EVIDENCE_MODULE, "LOCAL_COMMAND_TIMEOUT_SECONDS", 1):
+            with self.assertRaisesRegex(EVIDENCE_MODULE.EvidenceError, "deadline"):
+                EVIDENCE_MODULE.git_bytes("/vault", "/vault/.git", "show", "HEAD:x")
+        child_pid = int(pid_file.read_text())
+        for _ in range(20):
+            try:
+                os.kill(child_pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.05)
+        else:
+            self.fail("pipe-holding evidence descendant remained alive")
 
     def test_local_git_helpers_disable_repo_fsmonitor(self) -> None:
         """Do not execute repo-local fsmonitor through Git or pinned gitleaks."""
@@ -1061,6 +1394,8 @@ def load_environment(*, checkout_root, environ, require_catalog):
 
     def test_unmaterializable_dirty_entry_defers_only_its_vault(self) -> None:
         """Keep a symlink residual inert while another Vault remains reviewable."""
+        agents_head = create_empty_base(self.agents)
+        user_head = create_empty_base(self.user)
         agents_link = self.agents / "unsafe-link"
         agents_link.symlink_to("outside-target")
         user_file = self.user / "reviewable.md"
@@ -1085,6 +1420,7 @@ def load_environment(*, checkout_root, environ, require_catalog):
                     "user_git_dir": str(self.user / ".git"),
                     "agents_vault_root": str(self.agents),
                     "user_vault_root": str(self.user),
+                    "gitleaks_bin": str(self.fake_gitleaks),
                 }
             ),
             encoding="utf-8",
@@ -1092,6 +1428,7 @@ def load_environment(*, checkout_root, environ, require_catalog):
         state_digest = hashlib.sha256(b"").hexdigest()
         pre_value = {
             "agents_vault": {
+                "local_head": agents_head,
                 "repo_root": str(self.agents),
                 "history_relation": "equal",
                 "local_commits": [],
@@ -1103,6 +1440,7 @@ def load_environment(*, checkout_root, environ, require_catalog):
                 "history_snapshot_sha256": state_digest,
             },
             "user_vault": {
+                "local_head": user_head,
                 "repo_root": str(self.user),
                 "history_relation": "equal",
                 "local_commits": [],
@@ -1292,6 +1630,8 @@ def load_environment(*, checkout_root, environ, require_catalog):
 
     def test_oversize_dirty_entry_is_deferred_without_suppressing_peer(self) -> None:
         """Apply snapshot size limits per Vault instead of aborting both reviews."""
+        agents_head = create_empty_base(self.agents)
+        user_head = create_empty_base(self.user)
         large = self.agents / "large.md"
         small = self.user / "small.md"
         large.write_bytes(b"12345")
@@ -1304,12 +1644,14 @@ def load_environment(*, checkout_root, environ, require_catalog):
         ).stdout.decode().strip()
         pre = {
             "agents_vault": {
+                "local_head": agents_head,
                 "dirty_entries": [
                     {"path": "large.md", "git_blob_oid": oid(self.agents, b"12345"), "mode": "100644"}
                 ],
                 "local_commits": [],
             },
             "user_vault": {
+                "local_head": user_head,
                 "dirty_entries": [
                     {"path": "small.md", "git_blob_oid": oid(self.user, b"ok"), "mode": "100644"}
                 ],
@@ -1321,6 +1663,7 @@ def load_environment(*, checkout_root, environ, require_catalog):
             "user_git_dir": str(self.user / ".git"),
             "agents_vault_root": str(self.agents),
             "user_vault_root": str(self.user),
+            "gitleaks_bin": str(self.fake_gitleaks),
         }
         destination = self.workdir / "oversize-review"
         destination.mkdir()
@@ -1574,6 +1917,9 @@ def load_environment(*, checkout_root, environ, require_catalog):
             manifest["local_commits"]["user_vault"][0]["materialization_status"],
             "blocked",
         )
+        self.assertIsNone(
+            manifest["local_commits"]["user_vault"][0]["patch_sha256"]
+        )
 
     def test_local_commit_patch_helpers_disable_repository_textconv(self) -> None:
         """Do not execute repository-configured textconv while hashing reviewed patches."""
@@ -1682,7 +2028,7 @@ def load_environment(*, checkout_root, environ, require_catalog):
         with mock.patch.dict(
             os.environ,
             {"GIT_DIR": "/attacker/git", "GIT_ASKPASS": "/attacker/askpass"},
-        ), mock.patch.object(COMMITTER_MODULE.subprocess, "run", return_value=completed) as run:
+        ), mock.patch.object(COMMITTER_MODULE, "run_local_command", return_value=completed) as run:
             COMMITTER_MODULE.git(
                 "/vault/worktree",
                 "/vault/gitdir",
@@ -2022,7 +2368,11 @@ def load_environment(*, checkout_root, environ, require_catalog):
         target.write_text("verified\n", encoding="utf-8")
         digest = hashlib.sha256(target.read_bytes()).hexdigest()
         receipt = COMMITTER_MODULE.installed_artifact_receipt(target, digest)
-        COMMITTER_MODULE.rollback_owned_artifact(receipt)
+        with mock.patch.object(
+            COMMITTER_MODULE.os, "unlink", wraps=os.unlink
+        ) as unlink:
+            COMMITTER_MODULE.rollback_owned_artifact(receipt)
+        self.assertIsNotNone(unlink.call_args.kwargs.get("dir_fd"))
         self.assertFalse(target.exists())
 
         target.write_text("verified\n", encoding="utf-8")
@@ -2033,6 +2383,352 @@ def load_environment(*, checkout_root, environ, require_catalog):
         ):
             COMMITTER_MODULE.rollback_owned_artifact(receipt)
         self.assertEqual(target.read_text(encoding="utf-8"), "other task\n")
+
+        target.write_text("verified\n", encoding="utf-8")
+        receipt = COMMITTER_MODULE.installed_artifact_receipt(target, digest)
+        real_rename = os.rename
+
+        def replace_before_quarantine(*args: object, **kwargs: object) -> None:
+            target.unlink()
+            target.write_text("third party\n", encoding="utf-8")
+            real_rename(*args, **kwargs)
+
+        with mock.patch.object(
+            COMMITTER_MODULE.os,
+            "rename",
+            side_effect=replace_before_quarantine,
+        ):
+            with self.assertRaisesRegex(
+                COMMITTER_MODULE.CommitError, "rollback quarantined"
+            ):
+                COMMITTER_MODULE.rollback_owned_artifact(receipt)
+        self.assertEqual(target.read_text(encoding="utf-8"), "third party\n")
+        self.assertEqual(
+            list(self.workdir.glob(".vault-publisher-rollback-*")), []
+        )
+
+        target.write_text("verified\n", encoding="utf-8")
+        real_read = os.read
+        replaced = False
+
+        def replace_between_read_and_identity(
+            descriptor: int, count: int
+        ) -> bytes:
+            nonlocal replaced
+            chunk = real_read(descriptor, count)
+            if chunk and not replaced:
+                replaced = True
+                target.unlink()
+                target.write_text("verified\n", encoding="utf-8")
+            return chunk
+
+        with mock.patch.object(
+            COMMITTER_MODULE.os,
+            "read",
+            side_effect=replace_between_read_and_identity,
+        ):
+            swapped_receipt = COMMITTER_MODULE.installed_artifact_receipt(
+                target, digest
+            )
+        with self.assertRaisesRegex(
+            COMMITTER_MODULE.CommitError, "changed before publication"
+        ):
+            COMMITTER_MODULE.require_owned_artifact(swapped_receipt)
+        self.assertEqual(target.read_text(encoding="utf-8"), "verified\n")
+
+    def test_owned_artifact_receipt_allows_timestamp_only_file_provider_drift(self) -> None:
+        """Treat File Provider timestamp normalization as non-identity metadata."""
+        target = self.workdir / "file-provider-artifact.md"
+        target.write_text("verified\n", encoding="utf-8")
+        digest = hashlib.sha256(target.read_bytes()).hexdigest()
+        receipt = COMMITTER_MODULE.installed_artifact_receipt(target, digest)
+        before = target.stat()
+        normalized_mtime = max(1, before.st_mtime_ns - 1_000_000_000)
+        os.utime(target, ns=(normalized_mtime, normalized_mtime))
+        after = target.stat()
+        self.assertEqual((after.st_dev, after.st_ino), (before.st_dev, before.st_ino))
+        self.assertNotEqual(after.st_mtime_ns, before.st_mtime_ns)
+        self.assertNotEqual(after.st_ctime_ns, before.st_ctime_ns)
+        COMMITTER_MODULE.require_owned_artifact(receipt)
+        COMMITTER_MODULE.rollback_owned_artifact(receipt)
+        self.assertFalse(target.exists())
+
+    def test_owned_artifact_receipt_rejects_mode_drift(self) -> None:
+        """Keep mode changes fail-closed even when inode and bytes are unchanged."""
+        target = self.workdir / "mode-drift-artifact.md"
+        target.write_text("verified\n", encoding="utf-8")
+        digest = hashlib.sha256(target.read_bytes()).hexdigest()
+        receipt = COMMITTER_MODULE.installed_artifact_receipt(target, digest)
+        os.chmod(target, 0o600)
+        with self.assertRaisesRegex(
+            COMMITTER_MODULE.CommitError, "changed before publication"
+        ):
+            COMMITTER_MODULE.require_owned_artifact(receipt)
+        with self.assertRaisesRegex(
+            COMMITTER_MODULE.CommitError, "rollback refused"
+        ):
+            COMMITTER_MODULE.rollback_owned_artifact(receipt)
+        self.assertEqual(target.read_text(encoding="utf-8"), "verified\n")
+        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o600)
+
+    def test_owned_artifact_rollback_revalidates_after_quarantine(self) -> None:
+        """Restore same-inode content, size, or mode drift instead of deleting it."""
+        target = self.workdir / "quarantine-revalidation.md"
+        digest = hashlib.sha256(b"verified\n").hexdigest()
+
+        for drift in ("content", "size", "mode"):
+            with self.subTest(drift=drift):
+                target.write_text("verified\n", encoding="utf-8")
+                os.chmod(target, 0o644)
+                receipt = COMMITTER_MODULE.installed_artifact_receipt(target, digest)
+                original_identity = (target.stat().st_dev, target.stat().st_ino)
+                real_rename = os.rename
+
+                def drift_before_quarantine(
+                    *args: object, **kwargs: object
+                ) -> None:
+                    if drift == "content":
+                        target.write_text("tampered\n", encoding="utf-8")
+                    elif drift == "size":
+                        target.write_text("verified plus drift\n", encoding="utf-8")
+                    else:
+                        os.chmod(target, 0o600)
+                    real_rename(*args, **kwargs)
+
+                with mock.patch.object(
+                    COMMITTER_MODULE.os,
+                    "rename",
+                    side_effect=drift_before_quarantine,
+                ), self.assertRaisesRegex(
+                    COMMITTER_MODULE.CommitError,
+                    "changed during rollback; rollback refused",
+                ):
+                    COMMITTER_MODULE.rollback_owned_artifact(receipt)
+                self.assertTrue(target.is_file())
+                self.assertEqual(
+                    (target.stat().st_dev, target.stat().st_ino),
+                    original_identity,
+                )
+                if drift == "content":
+                    self.assertEqual(target.read_text(encoding="utf-8"), "tampered\n")
+                elif drift == "size":
+                    self.assertEqual(
+                        target.read_text(encoding="utf-8"), "verified plus drift\n"
+                    )
+                else:
+                    self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o600)
+                self.assertEqual(
+                    list(self.workdir.glob(".vault-publisher-rollback-*")), []
+                )
+                target.unlink()
+
+        target.write_text("verified\n", encoding="utf-8")
+        receipt = COMMITTER_MODULE.installed_artifact_receipt(target, digest)
+        owned_identity = (target.stat().st_dev, target.stat().st_ino)
+        real_rename = os.rename
+
+        def drift_and_reoccupy(*args: object, **kwargs: object) -> None:
+            os.chmod(target, 0o600)
+            real_rename(*args, **kwargs)
+            target.write_text("new occupant\n", encoding="utf-8")
+
+        with mock.patch.object(
+            COMMITTER_MODULE.os,
+            "rename",
+            side_effect=drift_and_reoccupy,
+        ), self.assertRaisesRegex(
+            COMMITTER_MODULE.CommitError,
+            "changed during rollback; rollback quarantined it",
+        ):
+            COMMITTER_MODULE.rollback_owned_artifact(receipt)
+        self.assertEqual(target.read_text(encoding="utf-8"), "new occupant\n")
+        quarantines = list(self.workdir.glob(".vault-publisher-rollback-*"))
+        self.assertEqual(len(quarantines), 1)
+        held = quarantines[0] / "artifact"
+        self.assertEqual((held.stat().st_dev, held.stat().st_ino), owned_identity)
+        self.assertEqual(held.read_text(encoding="utf-8"), "verified\n")
+        self.assertEqual(stat.S_IMODE(held.stat().st_mode), 0o600)
+
+    def test_owned_artifact_rollback_restores_non_hardlinkable_replacements(self) -> None:
+        """Restore directory and symlink replacements without changing Git state."""
+        staged = self.user / "unrelated-staged.md"
+        staged.write_text("staged\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.user), "add", staged.name], check=True)
+        fixed_mtime = 1_700_000_000_000_000_000
+
+        for replacement_type in ("directory", "symlink"):
+            with self.subTest(replacement_type=replacement_type):
+                target = self.user / f"rollback-{replacement_type}.md"
+                target.write_text("verified\n", encoding="utf-8")
+                digest = hashlib.sha256(target.read_bytes()).hexdigest()
+                receipt = COMMITTER_MODULE.installed_artifact_receipt(target, digest)
+                symlink_source = self.user / f"rollback-{replacement_type}-source"
+                if replacement_type == "symlink":
+                    symlink_source.write_text("symlink target\n", encoding="utf-8")
+                replacement_fingerprint: tuple[int, int, int, int, int] | None = None
+                status_before = b""
+                index_before = b""
+                real_rename = os.rename
+
+                def replace_before_quarantine(*args: object, **kwargs: object) -> None:
+                    nonlocal replacement_fingerprint, status_before, index_before
+                    target.unlink()
+                    if replacement_type == "directory":
+                        target.mkdir(mode=0o750)
+                        (target / "preserved.txt").write_text(
+                            "directory content\n", encoding="utf-8"
+                        )
+                        os.chmod(target, 0o750)
+                    else:
+                        target.symlink_to(symlink_source.name)
+                    os.utime(
+                        target,
+                        ns=(fixed_mtime, fixed_mtime),
+                        follow_symlinks=False,
+                    )
+                    metadata = os.lstat(target)
+                    replacement_fingerprint = (
+                        metadata.st_dev,
+                        metadata.st_ino,
+                        metadata.st_mode,
+                        metadata.st_size,
+                        metadata.st_mtime_ns,
+                    )
+                    status_before = subprocess.check_output(
+                        [
+                            "git", "-C", str(self.user), "status",
+                            "--porcelain=v2", "-z", "--untracked-files=all",
+                        ]
+                    )
+                    index_before = (self.user / ".git" / "index").read_bytes()
+                    real_rename(*args, **kwargs)
+
+                with mock.patch.object(
+                    COMMITTER_MODULE.os,
+                    "rename",
+                    side_effect=replace_before_quarantine,
+                ):
+                    with self.assertRaisesRegex(
+                        COMMITTER_MODULE.CommitError, "rollback quarantined"
+                    ):
+                        COMMITTER_MODULE.rollback_owned_artifact(receipt)
+                metadata = os.lstat(target)
+                self.assertEqual(
+                    (
+                        metadata.st_dev,
+                        metadata.st_ino,
+                        metadata.st_mode,
+                        metadata.st_size,
+                        metadata.st_mtime_ns,
+                    ),
+                    replacement_fingerprint,
+                )
+                if replacement_type == "directory":
+                    self.assertEqual(
+                        (target / "preserved.txt").read_text(encoding="utf-8"),
+                        "directory content\n",
+                    )
+                else:
+                    self.assertEqual(os.readlink(target), symlink_source.name)
+                self.assertEqual(
+                    subprocess.check_output(
+                        [
+                            "git", "-C", str(self.user), "status",
+                            "--porcelain=v2", "-z", "--untracked-files=all",
+                        ]
+                    ),
+                    status_before,
+                )
+                self.assertEqual(
+                    (self.user / ".git" / "index").read_bytes(), index_before
+                )
+                self.assertEqual(
+                    list(self.user.glob(".vault-publisher-rollback-*")), []
+                )
+
+    def test_partial_resume_never_rebinds_path_into_rollback_ownership(self) -> None:
+        """Leave an unowned resumed artifact intact when publication fails."""
+        target = self.user / "summary.md"
+        digest = hashlib.sha256(b"verified\n").hexdigest()
+        snapshot = {
+            "local_head": "a" * 40,
+            "dirty_digest": "b" * 64,
+            "dirty_lines": ["? summary.md"],
+        }
+        manifest = {"publication_mode": "own_only", "deferred_cleanup": []}
+        runtime = {
+            "user_vault_root": str(self.user),
+            "user_git_dir": str(self.user / ".git"),
+            "gitleaks_bin": str(self.fake_gitleaks),
+        }
+        plan = {
+            "summary_target": str(target),
+            "advisory_target": str(self.agents / "advisory.md"),
+        }
+        collection = {"summary_sha256": digest}
+        with mock.patch.object(
+            COMMITTER_MODULE, "capture_one_exact"
+        ), mock.patch.object(
+            COMMITTER_MODULE, "validate_installed_vault"
+        ), mock.patch.object(
+            COMMITTER_MODULE,
+            "validate_final_worktree",
+            side_effect=COMMITTER_MODULE.CommitError("fixture failure"),
+        ), mock.patch.object(
+            COMMITTER_MODULE, "capture_one", return_value=snapshot
+        ), mock.patch.object(
+            COMMITTER_MODULE, "installed_artifact_receipt"
+        ) as rebind, mock.patch.object(
+            COMMITTER_MODULE, "rollback_uncommitted_artifact"
+        ) as rollback:
+            result, succeeded, retry_safe, reason, handle = (
+                COMMITTER_MODULE.publish_one_vault(
+                    key="user_vault",
+                    prefix="user",
+                    role="user_it_news_summary",
+                    artifact_plan_key="summary_target",
+                    collection_sha_key="summary_sha256",
+                    runtime=runtime,
+                    pre={"user_vault": snapshot},
+                    collection=collection,
+                    plan=plan,
+                    manifest=manifest,
+                    installer="/unused-installer",
+                    capture="/unused-capture",
+                    runtime_file="/runtime.json",
+                    collection_file="/collection.json",
+                    plan_file="/plan.json",
+                    output_directory=self.workdir,
+                    publisher_identity=("Fixture", "fixture@example.invalid"),
+                    resume_state=snapshot,
+                )
+            )
+        rebind.assert_not_called()
+        rollback.assert_not_called()
+        self.assertFalse(succeeded)
+        self.assertTrue(retry_safe)
+        self.assertIn("fixture failure", reason)
+        self.assertEqual(result["commit_hashes"], [])
+        self.assertIsNone(handle)
+
+    def test_blocked_mode_is_rejected_before_local_git_mutation(self) -> None:
+        """Validate publication mode before writing blobs or commit objects."""
+        with mock.patch.object(COMMITTER_MODULE, "git") as git:
+            with self.assertRaisesRegex(
+                COMMITTER_MODULE.CommitError, "blocked Vault"
+            ):
+                COMMITTER_MODULE.commit_groups(
+                    "/vault",
+                    "/vault/.git",
+                    "/gitleaks",
+                    {"local_head": "a" * 40, "dirty_digest": "b" * 64},
+                    {"commit_groups": [{"message": "x", "paths": ["x.md"]}]},
+                    "x.md",
+                    "c" * 64,
+                    self.workdir,
+                    publication_mode="blocked",
+                )
+        git.assert_not_called()
 
     def test_local_committer_scans_binary_blobs_and_allows_deletion(self) -> None:
         """Reject a home path in raw bytes without treating deletion as a blob."""
@@ -2750,6 +3446,41 @@ def load_environment(*, checkout_root, environ, require_catalog):
         )
         rejected_commit.assert_not_called()
 
+        output.unlink()
+        unchanged_user = {
+            "commit_status": "not_started",
+            "commit_hashes": [],
+            "pre_local_head": user_before,
+            "local_head": user_before,
+            "pre_dirty_digest": "e" * 64,
+            "post_dirty_digest": "e" * 64,
+            "clean": False,
+        }
+        with mock.patch.object(
+            COMMITTER_MODULE,
+            "current_state",
+            side_effect=[actual_agents, unchanged_user],
+        ):
+            fatal_status = COMMITTER_MODULE.main(
+                [
+                    "commit-reviewed-publication.py",
+                    *(str(path) for path in input_paths),
+                    str(context_path),
+                    str(review_path),
+                    "/unused-installer",
+                    "/unused-capture",
+                    "0" * 64,
+                    str(output),
+                ]
+            )
+        self.assertEqual(fatal_status, 75)
+        fatal_result = json.loads(output.read_text())
+        self.assertEqual(fatal_result["outcome"], "partial_publication")
+        self.assertEqual(fatal_result["agents_vault"]["local_head"], agents_after)
+        self.assertEqual(
+            fatal_result["agents_vault"]["commit_hashes"], [agents_after]
+        )
+
     def test_local_committer_malformed_input_emits_blocked_result(self) -> None:
         """Convert malformed early input into status 75 and structured JSON."""
         invalid = self.workdir / "invalid-committer-runtime.json"
@@ -2912,6 +3643,53 @@ def load_environment(*, checkout_root, environ, require_catalog):
         self.assertEqual(
             resumable["user_vault"]["publication_mode"], "own_only"
         )
+
+    def test_failure_state_timeout_never_fabricates_unchanged_vaults(self) -> None:
+        """Use explicit unknown sentinels when post-failure recapture times out."""
+        before = {
+            "agents_vault": {
+                "local_head": "a" * 40,
+                "dirty_digest": "d" * 64,
+                "dirty_lines": [],
+            },
+            "user_vault": {
+                "local_head": "b" * 40,
+                "dirty_digest": "e" * 64,
+                "dirty_lines": [],
+            },
+        }
+        with mock.patch.object(
+            COMMITTER_MODULE,
+            "current_state",
+            side_effect=subprocess.TimeoutExpired(["git"], 90),
+        ):
+            result = COMMITTER_MODULE.result_after_failure(
+                {
+                    "agents_vault_root": "/agents",
+                    "agents_git_dir": "/agents/.git",
+                    "user_vault_root": "/user",
+                    "user_git_dir": "/user/.git",
+                },
+                before,
+                {"daily_pipeline_status": "complete"},
+                {
+                    "summary_target": "/user/summary.md",
+                    "advisory_target": "/agents/advisory.md",
+                },
+                "state recapture timed out",
+            )
+
+        self.assertEqual(result["outcome"], "partial_publication")
+        for key in ("agents_vault", "user_vault"):
+            vault = result[key]
+            self.assertEqual(vault["commit_status"], "failed")
+            self.assertEqual(vault["local_head"], "0" * 40)
+            self.assertEqual(vault["post_dirty_digest"], "0" * 64)
+            self.assertFalse(vault["clean"])
+            self.assertNotEqual(vault["local_head"], vault["pre_local_head"])
+            self.assertNotEqual(
+                vault["post_dirty_digest"], vault["pre_dirty_digest"]
+            )
 
     def test_local_committer_rejects_staged_only_before_head_changes(self) -> None:
         """Fail before commit when reviewed index bytes differ from the worktree."""
@@ -3089,7 +3867,7 @@ def load_environment(*, checkout_root, environ, require_catalog):
         with mock.patch.dict(os.environ, {"GIT_DIR": "/attacker/git"}), mock.patch.object(
             FETCH_MODULE, "IsolatedGitTransport", return_value=transport
         ) as transport_factory, mock.patch.object(
-            FETCH_MODULE.subprocess, "run", side_effect=local_results
+            FETCH_MODULE, "run_local_command", side_effect=local_results
         ) as local_run:
             FETCH_MODULE.fetch_main(
                 "/vault/worktree", "/local/gitdir", "ssh://git@example.invalid/repo"
@@ -3168,6 +3946,19 @@ def load_environment(*, checkout_root, environ, require_catalog):
         self.assertEqual(result.returncode, 78)
         self.assertIn("invalid publisher Git email", result.stderr)
 
+    def test_resolver_pins_gitleaks_major_and_uses_distinct_deadlines(self) -> None:
+        """Keep scanner compatibility separate from short Git control probes."""
+        self.assertEqual(
+            RESOLVER_MODULE.validated_gitleaks_version("gitleaks version 8.30.1"),
+            "gitleaks version 8.30.1",
+        )
+        with self.assertRaisesRegex(RESOLVER_MODULE.ContextError, "major version 8"):
+            RESOLVER_MODULE.validated_gitleaks_version("gitleaks version 9.0.0")
+        self.assertGreater(
+            RESOLVER_MODULE.EXTERNAL_BINARY_TIMEOUT_SECONDS,
+            RESOLVER_MODULE.CONTROL_COMMAND_TIMEOUT_SECONDS,
+        )
+
     def test_resolver_rejects_git_transport_rewrite_and_include(self) -> None:
         """Reject repository-local config that can redirect fixed Git transport."""
         subprocess.run(
@@ -3222,6 +4013,10 @@ def load_environment(*, checkout_root, environ, require_catalog):
             ("filter.fixture.clean", "sh -c 'exit 1'"),
             ("core.attributesFile", str(self.workdir / "attributes")),
             ("core.fsmonitor", "sh -c 'exit 1'"),
+            ("alias.fixture", "!sh -c 'exit 1'"),
+            ("gpg.ssh.program", "sh -c 'exit 1'"),
+            ("merge.fixture.driver", "sh -c 'exit 1'"),
+            ("uploadpack.packObjectsHook", "sh -c 'exit 1'"),
         )
         for key, value in cases:
             with self.subTest(key=key):
@@ -3250,6 +4045,24 @@ def load_environment(*, checkout_root, environ, require_catalog):
                     ],
                     check=True,
                 )
+
+    def test_resolver_rejects_valueless_local_git_config(self) -> None:
+        """Report a missing value distinctly instead of accepting an empty command key."""
+        config_path = self.agents / ".git" / "config"
+        original = config_path.read_text(encoding="utf-8")
+        config_path.write_text(original + "\n[alias]\n\tfixture\n", encoding="utf-8")
+        result = subprocess.run(
+            [
+                str(SCRIPTS / "resolve-runtime-context.py"),
+                str(self.config),
+                str(self.workdir),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 78)
+        self.assertIn("config value is missing", result.stderr)
 
     def test_resolver_accepts_bound_absolute_gitdir_file(self) -> None:
         """Support the Vault layout while binding its indirection file."""
@@ -3581,6 +4394,10 @@ def load_environment(*, checkout_root, environ, require_catalog):
                     {"path": "safe.md", "materialization_status": "available"}
                 ],
             },
+            "local_commits": {
+                "agents_vault": [],
+                "user_vault": [],
+            },
         }
         guarded = MODE_MODULE.apply_residual_guards(hint, manifest)
         self.assertEqual(guarded["agents_vault"]["required_mode"], "own_only")
@@ -3595,6 +4412,54 @@ def load_environment(*, checkout_root, environ, require_catalog):
         )
         self.assertEqual(guarded["user_vault"]["required_mode"], "sweep")
         self.assertEqual(guarded["user_vault"]["guard_deferred_paths"], [])
+
+    def test_unavailable_local_history_blocks_only_its_vault(self) -> None:
+        """Do not publish an unreviewable local-ahead commit as an ancestor."""
+        hint = {
+            "version": 1,
+            "agents_vault": {
+                "required_mode": "sweep",
+                "retry_disposition": "none",
+                "reasons": ["stable_sweep_candidate"],
+            },
+            "user_vault": {
+                "required_mode": "sweep",
+                "retry_disposition": "none",
+                "reasons": ["stable_sweep_candidate"],
+            },
+        }
+        manifest = {
+            "version": 4,
+            "vaults": {"agents_vault": [], "user_vault": []},
+            "local_commits": {
+                "agents_vault": [
+                    {
+                        "commit": "a" * 40,
+                        "materialization_status": "blocked",
+                    }
+                ],
+                "user_vault": [],
+            },
+        }
+        guarded = MODE_MODULE.apply_residual_guards(hint, manifest)
+        self.assertEqual(guarded["agents_vault"]["required_mode"], "blocked")
+        self.assertEqual(guarded["agents_vault"]["retry_disposition"], "none")
+        self.assertEqual(guarded["agents_vault"]["guard_blocked_commits"], ["a" * 40])
+        self.assertIn(
+            "sealed_local_history_guard_blocked",
+            guarded["agents_vault"]["reasons"],
+        )
+        self.assertEqual(guarded["user_vault"]["required_mode"], "sweep")
+
+    def test_missing_residual_guard_inputs_fail_closed(self) -> None:
+        """Never treat an unscanned dirty entry as reviewable."""
+        content = b"safe-looking bytes\n"
+        self.assertEqual(
+            DIRTY_STAGER_MODULE.residual_guard_reason(
+                {}, {}, "agents_git_dir", "dirty.md", content
+            ),
+            "dirty_entry_residual_guard_unavailable",
+        )
 
     def test_own_only_commit_preserves_unrelated_staged_and_untracked_state(self) -> None:
         """Commit only the artifact while preserving unsafe residual bytes and metadata."""
@@ -4298,12 +5163,36 @@ def load_environment(*, checkout_root, environ, require_catalog):
         )
         agents_only_result = json.loads(agents_only.stdout)
         installed_advisory = Path(agents_only_result["advisory_target"])
+        advisory_receipt = agents_only_result["installed_receipt"]
+        advisory_stat = installed_advisory.lstat()
+        self.assertEqual(advisory_receipt["path"], str(installed_advisory))
+        self.assertEqual(advisory_receipt["sha256"], digest(advisory))
+        self.assertEqual(
+            advisory_receipt["identity"],
+            [advisory_stat.st_dev, advisory_stat.st_ino],
+        )
+        self.assertEqual(advisory_receipt["size"], advisory_stat.st_size)
+        self.assertEqual(advisory_receipt["mode"], advisory_stat.st_mode)
+        normalized_mtime = max(1, advisory_stat.st_mtime_ns - 1_000_000_000)
+        os.utime(installed_advisory, ns=(normalized_mtime, normalized_mtime))
+        validated_receipt = COMMITTER_MODULE.validated_installer_receipt(
+            advisory_receipt, installed_advisory, digest(advisory)
+        )
+        self.assertEqual(validated_receipt["identity"], tuple(advisory_receipt["identity"]))
         self.assertEqual(
             blocked_summary.read_text(encoding="utf-8"),
             "concurrent user target\n",
         )
         self.assertTrue(installed_advisory.is_file())
         blocked_summary.unlink()
+        installed_advisory.unlink()
+        installed_advisory.write_bytes(advisory.read_bytes())
+        with self.assertRaisesRegex(
+            COMMITTER_MODULE.CommitError, "changed before publication"
+        ):
+            COMMITTER_MODULE.validated_installer_receipt(
+                advisory_receipt, installed_advisory, digest(advisory)
+            )
         installed_advisory.unlink()
 
         summary_result = subprocess.run(
@@ -4330,13 +5219,43 @@ def load_environment(*, checkout_root, environ, require_catalog):
             capture_output=True,
             text=True,
         )
+        summary_output = json.loads(summary_result.stdout)
+        advisory_output = json.loads(advisory_result.stdout)
+        self.assertEqual(
+            summary_output["installed_receipt"]["sha256"], digest(summary)
+        )
+        self.assertEqual(
+            advisory_output["installed_receipt"]["sha256"], digest(advisory)
+        )
         installed = {
-            **json.loads(summary_result.stdout),
-            **json.loads(advisory_result.stdout),
+            **summary_output,
+            **advisory_output,
         }
         self.assertTrue(Path(installed["summary_target"]).is_file())
         self.assertTrue(Path(installed["advisory_target"]).is_file())
         self.assertEqual(existing_summary.read_text(encoding="utf-8"), "existing summary\n")
+
+        unrelated_plan = dict(plan)
+        unrelated_plan["summary_target"] = str(
+            Path(plan["summary_target"]).with_name(
+                "SUMMARY-IT-NEWS-2026-07-31junk-2.md"
+            )
+        )
+        plan_path.write_text(json.dumps(unrelated_plan), encoding="utf-8")
+        unrelated = subprocess.run(
+            [
+                str(SCRIPTS / "install-verified-artifacts.py"),
+                str(context_path),
+                str(collection_path),
+                str(plan_path),
+                "user_it_news_summary",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(unrelated.returncode, 75)
+        self.assertIn("artifact plan target is invalid", unrelated.stderr)
 
         context["it_news_archive_relative"] = ""
         context_path.write_text(json.dumps(context), encoding="utf-8")
@@ -4367,6 +5286,142 @@ def load_environment(*, checkout_root, environ, require_catalog):
             text=True,
         )
         self.assertEqual(rejected.returncode, 75)
+
+    def test_installer_failure_cleanup_preserves_replaced_inode(self) -> None:
+        """Never unlink a third-party entry that replaces a failed O_EXCL target."""
+        source = self.workdir / "staged-summary.md"
+        source.write_text("verified artifact\n", encoding="utf-8")
+        digest = hashlib.sha256(source.read_bytes()).hexdigest()
+        relative = PurePosixPath("installed")
+        target = self.user / "installed" / "summary.md"
+
+        def replace_then_fail(_descriptor: int, _content: object) -> int:
+            target.unlink()
+            target.write_text("third-party replacement\n", encoding="utf-8")
+            raise OSError("fixture write failure")
+
+        with mock.patch.object(
+            INSTALLER_MODULE.os, "write", side_effect=replace_then_fail
+        ), self.assertRaisesRegex(
+            INSTALLER_MODULE.InstallError, "replaced during failed cleanup"
+        ):
+            INSTALLER_MODULE.install(
+                source,
+                digest,
+                self.user,
+                relative,
+                target.name,
+                target,
+            )
+        self.assertEqual(
+            target.read_text(encoding="utf-8"), "third-party replacement\n"
+        )
+        self.assertEqual(
+            list(target.parent.glob(".vault-publisher-install-*")), []
+        )
+
+    def test_installer_failure_cleanup_restores_non_hardlinkable_replacements(
+        self,
+    ) -> None:
+        """Restore directory and symlink entries with metadata and index intact."""
+        source = self.workdir / "staged-type-generic-summary.md"
+        source.write_text("verified artifact\n", encoding="utf-8")
+        digest = hashlib.sha256(source.read_bytes()).hexdigest()
+        staged = self.user / "installer-unrelated-staged.md"
+        staged.write_text("staged\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.user), "add", staged.name], check=True)
+        fixed_mtime = 1_700_000_100_000_000_000
+
+        for replacement_type in ("directory", "symlink"):
+            with self.subTest(replacement_type=replacement_type):
+                relative = PurePosixPath(f"installed-{replacement_type}")
+                target = self.user / str(relative) / "summary.md"
+                symlink_source = self.user / f"installer-{replacement_type}-source"
+                if replacement_type == "symlink":
+                    symlink_source.write_text("symlink target\n", encoding="utf-8")
+                replacement_fingerprint: tuple[int, int, int, int, int] | None = None
+                status_before = b""
+                index_before = b""
+
+                def replace_then_fail(_descriptor: int, _content: object) -> int:
+                    nonlocal replacement_fingerprint, status_before, index_before
+                    target.unlink()
+                    if replacement_type == "directory":
+                        target.mkdir(mode=0o750)
+                        (target / "preserved.txt").write_text(
+                            "directory content\n", encoding="utf-8"
+                        )
+                        os.chmod(target, 0o750)
+                    else:
+                        target.symlink_to(symlink_source.name)
+                    os.utime(
+                        target,
+                        ns=(fixed_mtime, fixed_mtime),
+                        follow_symlinks=False,
+                    )
+                    metadata = os.lstat(target)
+                    replacement_fingerprint = (
+                        metadata.st_dev,
+                        metadata.st_ino,
+                        metadata.st_mode,
+                        metadata.st_size,
+                        metadata.st_mtime_ns,
+                    )
+                    status_before = subprocess.check_output(
+                        [
+                            "git", "-C", str(self.user), "status",
+                            "--porcelain=v2", "-z", "--untracked-files=all",
+                        ]
+                    )
+                    index_before = (self.user / ".git" / "index").read_bytes()
+                    raise OSError("fixture write failure")
+
+                with mock.patch.object(
+                    INSTALLER_MODULE.os, "write", side_effect=replace_then_fail
+                ), self.assertRaisesRegex(
+                    INSTALLER_MODULE.InstallError, "replaced during failed cleanup"
+                ):
+                    INSTALLER_MODULE.install(
+                        source,
+                        digest,
+                        self.user,
+                        relative,
+                        target.name,
+                        target,
+                    )
+                metadata = os.lstat(target)
+                self.assertEqual(
+                    (
+                        metadata.st_dev,
+                        metadata.st_ino,
+                        metadata.st_mode,
+                        metadata.st_size,
+                        metadata.st_mtime_ns,
+                    ),
+                    replacement_fingerprint,
+                )
+                if replacement_type == "directory":
+                    self.assertEqual(
+                        (target / "preserved.txt").read_text(encoding="utf-8"),
+                        "directory content\n",
+                    )
+                else:
+                    self.assertEqual(os.readlink(target), symlink_source.name)
+                self.assertEqual(
+                    subprocess.check_output(
+                        [
+                            "git", "-C", str(self.user), "status",
+                            "--porcelain=v2", "-z", "--untracked-files=all",
+                        ]
+                    ),
+                    status_before,
+                )
+                self.assertEqual(
+                    (self.user / ".git" / "index").read_bytes(), index_before
+                )
+                self.assertEqual(
+                    list(target.parent.glob(".vault-publisher-install-*")), []
+                )
 
     def test_evidence_preparer_invalid_utf8_fails_closed(self) -> None:
         """Convert malformed runtime JSON into the status-75 contract."""
@@ -4511,6 +5566,92 @@ def load_environment(*, checkout_root, environ, require_catalog):
                     )
                 self.assertEqual(task.read_text(encoding="utf-8"), original)
 
+        with self.assertRaisesRegex(ValueError, "before evidence heading"):
+            EVIDENCE_MODULE.insert_evidence_block(
+                b"```md\n### Vault Publication Evidence\n",
+                block,
+                b"vault-change-publisher:fixture",
+            )
+
+    def test_evidence_patch_marks_missing_terminal_newlines(self) -> None:
+        """Render a reviewable canonical diff when either side lacks LF."""
+        cases = (
+            (b"before", b"after", b"-before\n", b"+after\n"),
+            (b"before\r", b"after\r", b"-before\r\n", b"+after\r\n"),
+        )
+        for before, after, removed, added in cases:
+            with self.subTest(before=before, after=after):
+                patch = FINALIZER_MODULE.canonical_patch(
+                    "tasks/standing.md", before, after
+                )
+                self.assertEqual(
+                    patch.count(b"\\ No newline at end of file\n"), 2
+                )
+                self.assertIn(removed + b"\\ No newline", patch)
+                self.assertIn(added + b"\\ No newline", patch)
+
+        crlf_patch = FINALIZER_MODULE.canonical_patch(
+            "tasks/standing.md", b"before\r\n", b"after\r\n"
+        )
+        self.assertNotIn(b"\\ No newline at end of file", crlf_patch)
+
+    def test_evidence_target_requires_one_nul_terminated_tree_record(self) -> None:
+        """Reject ambiguous or truncated ls-tree output before evidence mutation."""
+        record = b"100644 blob " + (b"a" * 40) + b"\ttasks/standing.md\0"
+        runtime = {
+            "agents_vault_root": str(self.agents),
+            "agents_git_dir": str(self.agents / ".git"),
+        }
+        baseline = {"agents_vault": {"index_entries": []}}
+        for raw in (record.rstrip(b"\0"), record + record):
+            with self.subTest(raw=raw):
+                with mock.patch.object(EVIDENCE_MODULE, "git_bytes", return_value=raw):
+                    with self.assertRaisesRegex(
+                        EVIDENCE_MODULE.EvidenceError, "missing or ambiguous"
+                    ):
+                        EVIDENCE_MODULE.target_entries(
+                            runtime, baseline, "tasks/standing.md"
+                        )
+
+    def test_evidence_replacement_preserves_mode_under_restrictive_umask(self) -> None:
+        """Preserve the exact reviewed mode during install and rollback."""
+        target = self.agents / "mode-evidence.md"
+        target.write_bytes(b"before\n")
+        target.chmod(0o664)
+        previous_umask = os.umask(0o022)
+        try:
+            receipt = FINALIZER_MODULE.replace_worktree_candidate(
+                str(self.agents),
+                target.name,
+                hashlib.sha256(b"before\n").hexdigest(),
+                b"candidate\n",
+            )
+            self.assertEqual(target.stat().st_mode & 0o777, 0o664)
+            FINALIZER_MODULE.rollback_worktree_candidate(receipt)
+        finally:
+            os.umask(previous_umask)
+        self.assertEqual(target.read_bytes(), b"before\n")
+        self.assertEqual(target.stat().st_mode & 0o777, 0o664)
+
+    def test_evidence_push_retries_transient_remote_verification(self) -> None:
+        """A transient ls-remote failure must not discard a successful fixed push."""
+        commit = "b" * 40
+        completed = subprocess.CompletedProcess([], 0, "", "")
+        with mock.patch.object(
+            FINALIZER_MODULE, "git", return_value=completed
+        ) as git, mock.patch.object(
+            FINALIZER_MODULE,
+            "remote_head",
+            side_effect=[TRANSPORT_MODULE.TransportError("transient"), commit],
+        ):
+            remote = FINALIZER_MODULE.push_evidence_with_retry(
+                "/agents", "remote", "/agents/.git", commit, "a" * 40
+            )
+        self.assertEqual(remote, commit)
+        self.assertEqual(git.call_count, 2)
+        for call in git.call_args_list:
+            self.assertEqual(call.args[-3:], ("push", "remote", f"{commit}:refs/heads/main"))
+
     def test_evidence_target_content_guards_fail_closed(self) -> None:
         """Reject malformed, oversized, growing, and oversized-output targets."""
         task = self.agents / "tasks" / "standing.md"
@@ -4631,6 +5772,24 @@ def load_environment(*, checkout_root, environ, require_catalog):
                 )
         self.assertEqual(task.read_text(encoding="utf-8"), concurrent)
 
+    def test_failed_push_does_not_report_unpublished_preexisting_commits(self) -> None:
+        """Include local-ahead hashes only after remote publication succeeds."""
+        reported = {
+            "commit_status": "not_started",
+            "commit_hashes": [],
+            "local_head": "b" * 40,
+            "clean": True,
+            "publication_mode": "sweep",
+            "deferred_cleanup": [],
+        }
+        pre = {"local_commits": [{"commit": "a" * 40}]}
+        failed = PUSH_MODULE.final_vault(reported, "failed", "0" * 40, pre)
+        self.assertEqual(failed["commit_hashes"], [])
+        self.assertEqual(failed["commit_status"], "not_started")
+        complete = PUSH_MODULE.final_vault(reported, "complete", "b" * 40, pre)
+        self.assertEqual(complete["commit_hashes"], ["a" * 40])
+        self.assertEqual(complete["commit_status"], "complete")
+
     def test_fixed_pusher_validates_and_pushes_exact_heads(self) -> None:
         """Push both validated local main heads outside the Codex process."""
         runtime = {
@@ -4641,7 +5800,7 @@ def load_environment(*, checkout_root, environ, require_catalog):
             "agents_remote_url": str(self.origins["agents"]),
             "user_remote_url": str(self.origins["user"]),
             "gitleaks_bin": str(self.fake_gitleaks),
-            "gitleaks_version": "fixture-gitleaks 1.0",
+            "gitleaks_version": "fixture-gitleaks 8.30.1",
         }
         for repo, key in ((self.agents, "agents"), (self.user, "user")):
             (repo / "initial.md").write_text("initial\n", encoding="utf-8")
@@ -4753,7 +5912,7 @@ def load_environment(*, checkout_root, environ, require_catalog):
                 "file_guard": "passed",
                 "secret_scan": "passed",
                 "secret_scan_tool": "gitleaks",
-                "secret_scan_tool_version": "fixture-gitleaks 1.0",
+                "secret_scan_tool_version": "fixture-gitleaks 8.30.1",
                 "reviewed_snapshot_sha256": hashlib.sha256(b"").hexdigest(),
                 "reviewed_history_sha256": pre[
                     "agents_vault" if root == self.agents else "user_vault"
@@ -4881,7 +6040,7 @@ def load_environment(*, checkout_root, environ, require_catalog):
     def test_pusher_scans_remote_to_final_and_isolates_remote_races(self) -> None:
         """Scan the full range and contain a remote race to the affected Vault."""
         completed = subprocess.CompletedProcess([], 0, "", "")
-        with mock.patch.object(PUSH_MODULE.subprocess, "run", return_value=completed) as run:
+        with mock.patch.object(PUSH_MODULE, "run_local_command", return_value=completed) as run:
             PUSH_MODULE.scan_commits("/tools/gitleaks", "/vault", "a" * 40, "b" * 40)
         self.assertIn(
             f"{'a' * 40}..{'b' * 40}",
@@ -4937,6 +6096,96 @@ def load_environment(*, checkout_root, environ, require_catalog):
                 ),
                 ("complete", "b" * 40),
             )
+
+    def test_pusher_outer_fallback_survives_both_remote_deadlines(self) -> None:
+        """Always emit structured per-Vault unknown remote observations."""
+        root = self.workdir / "pusher-remote-fallback"
+        root.mkdir()
+        runtime = {
+            "agents_vault_root": str(self.agents),
+            "agents_git_dir": str(self.agents / ".git"),
+            "agents_remote_url": "fixture-agents",
+            "user_vault_root": str(self.user),
+            "user_git_dir": str(self.user / ".git"),
+            "user_remote_url": "fixture-user",
+        }
+        pre = {
+            "agents_vault": {"local_head": "a" * 40, "dirty_digest": "d" * 64},
+            "user_vault": {"local_head": "b" * 40, "dirty_digest": "e" * 64},
+        }
+        plan: dict[str, object] = {}
+        context = {"runtime": runtime, "pre_collection_state": pre, "artifact_plan": plan}
+        context_path = root / "context.json"
+        context_path.write_text(json.dumps(context), encoding="utf-8")
+        review = {
+            "publication_context_sha256": hashlib.sha256(
+                context_path.read_bytes()
+            ).hexdigest()
+        }
+        values = {
+            "runtime.json": runtime,
+            "pre.json": pre,
+            "commit.json": {},
+            "review.json": review,
+            "plan.json": plan,
+        }
+        paths: dict[str, Path] = {}
+        for name, value in values.items():
+            path = root / name
+            path.write_text(json.dumps(value), encoding="utf-8")
+            paths[name] = path
+        output = root / "result.json"
+        unchanged = [
+            {
+                "commit_status": "not_started",
+                "commit_hashes": [],
+                "pre_local_head": "a" * 40,
+                "local_head": "a" * 40,
+                "pre_dirty_digest": "d" * 64,
+                "post_dirty_digest": "d" * 64,
+                "clean": False,
+            },
+            {
+                "commit_status": "not_started",
+                "commit_hashes": [],
+                "pre_local_head": "b" * 40,
+                "local_head": "b" * 40,
+                "pre_dirty_digest": "e" * 64,
+                "post_dirty_digest": "e" * 64,
+                "clean": False,
+            },
+        ]
+        with mock.patch.object(
+            PUSH_MODULE, "current_local", side_effect=unchanged
+        ), mock.patch.object(
+            PUSH_MODULE,
+            "remote_head",
+            side_effect=TRANSPORT_MODULE.TransportError("deadline"),
+        ):
+            exit_code = PUSH_MODULE.main(
+                [
+                    "push-committed-heads.py",
+                    str(paths["runtime.json"]),
+                    str(paths["pre.json"]),
+                    str(paths["commit.json"]),
+                    str(output),
+                    "75",
+                    str(context_path),
+                    str(paths["review.json"]),
+                    str(paths["plan.json"]),
+                    hashlib.sha256(paths["review.json"].read_bytes()).hexdigest(),
+                ]
+            )
+        self.assertEqual(exit_code, 75)
+        result = json.loads(output.read_text(encoding="utf-8"))
+        self.assertEqual(result["outcome"], "partial_publication")
+        for key in ("agents_vault", "user_vault"):
+            self.assertIsNone(result[key]["remote_head"])
+            self.assertEqual(result[key]["push_status"], "failed")
+        schema = json.loads(
+            (SKILL_ROOT / "references" / "automation-result.schema.json").read_text()
+        )
+        CANONICAL_MODULE.validate(result, schema, schema)
 
     def test_fixed_push_is_non_force_and_bounded(self) -> None:
         """Retry a fixed refspec at most three times and stop on remote drift."""
@@ -5008,7 +6257,7 @@ def load_environment(*, checkout_root, environ, require_catalog):
                     "target_path": str(self.agents / "advisory.md"),
                 },
                 None,
-                "fixture-gitleaks 1.0",
+                "fixture-gitleaks 8.30.1",
                 {"required_mode": "sweep"},
                 materialized_commits=[{"patch_sha256": "d" * 64}],
             )
@@ -5019,23 +6268,46 @@ def load_environment(*, checkout_root, environ, require_catalog):
         finalization_hash = "2" * 40
         initial = {
             "agents_vault": {
+                "commit_status": "complete",
                 "commit_hashes": [initial_hash],
+                "push_status": "complete",
                 "local_head": initial_hash,
                 "remote_head": initial_hash,
-            }
+                "clean": True,
+                "publication_mode": "own_only",
+                "deferred_cleanup": [],
+            },
+            "user_vault": {
+                "commit_status": "complete",
+                "commit_hashes": ["3" * 40],
+                "push_status": "complete",
+                "local_head": "3" * 40,
+                "remote_head": "3" * 40,
+                "clean": True,
+                "publication_mode": "own_only",
+                "deferred_cleanup": [],
+            },
         }
         git_results = [
             subprocess.CompletedProcess([], 0, finalization_hash + "\n", ""),
             subprocess.CompletedProcess([], 0, finalization_hash + "\n", ""),
+            subprocess.CompletedProcess([], 0, "3" * 40 + "\n", ""),
         ]
         with mock.patch.object(FINALIZER_MODULE, "git", side_effect=git_results), \
              mock.patch.object(FINALIZER_MODULE, "dirty_status", return_value=(True, "")), \
-             mock.patch.object(FINALIZER_MODULE, "remote_head", return_value=initial_hash):
+             mock.patch.object(
+                 FINALIZER_MODULE,
+                 "remote_head",
+                 side_effect=[initial_hash, "3" * 40],
+             ):
             result = FINALIZER_MODULE.partial_result(
                 {
                     "agents_vault_root": str(self.agents),
                     "agents_remote_url": "fixture",
                     "agents_git_dir": str(self.agents / ".git"),
+                    "user_vault_root": str(self.user),
+                    "user_remote_url": "fixture-user",
+                    "user_git_dir": str(self.user / ".git"),
                 },
                 {},
                 initial,
@@ -5045,6 +6317,59 @@ def load_environment(*, checkout_root, environ, require_catalog):
             result["agents_vault"]["commit_hashes"],
             [initial_hash, finalization_hash],
         )
+
+    def test_partial_evidence_uses_unknown_remote_without_losing_json(self) -> None:
+        """Represent per-Vault transport failures as null/failed observations."""
+        initial = {
+            "agents_vault": {
+                "commit_status": "complete",
+                "commit_hashes": ["1" * 40],
+                "push_status": "complete",
+                "local_head": "1" * 40,
+                "remote_head": "1" * 40,
+                "clean": True,
+                "publication_mode": "own_only",
+                "deferred_cleanup": [],
+            },
+            "user_vault": {
+                "commit_status": "complete",
+                "commit_hashes": ["2" * 40],
+                "push_status": "complete",
+                "local_head": "2" * 40,
+                "remote_head": "2" * 40,
+                "clean": True,
+                "publication_mode": "own_only",
+                "deferred_cleanup": [],
+            },
+        }
+        git_results = [
+            subprocess.CompletedProcess([], 0, "1" * 40 + "\n", ""),
+            subprocess.CompletedProcess([], 0, "", ""),
+            subprocess.CompletedProcess([], 0, "2" * 40 + "\n", ""),
+        ]
+        with mock.patch.object(FINALIZER_MODULE, "git", side_effect=git_results), \
+             mock.patch.object(FINALIZER_MODULE, "dirty_status", return_value=(True, "")), \
+             mock.patch.object(
+                 FINALIZER_MODULE,
+                 "remote_head",
+                 side_effect=TRANSPORT_MODULE.TransportError("deadline"),
+             ):
+            result = FINALIZER_MODULE.partial_result(
+                {
+                    "agents_vault_root": str(self.agents),
+                    "agents_remote_url": "fixture-agents",
+                    "agents_git_dir": str(self.agents / ".git"),
+                    "user_vault_root": str(self.user),
+                    "user_remote_url": "fixture-user",
+                    "user_git_dir": str(self.user / ".git"),
+                },
+                {},
+                initial,
+                "fixture transport failure",
+            )
+        for key in ("agents_vault", "user_vault"):
+            self.assertIsNone(result[key]["remote_head"])
+            self.assertEqual(result[key]["push_status"], "failed")
 
     def test_review_rejects_forbidden_obsidian_scope(self) -> None:
         """Reject forbidden Vault metadata before any write-capable phase."""
@@ -5077,7 +6402,7 @@ def load_environment(*, checkout_root, environ, require_catalog):
                     "target_path": str(self.agents / "advisory.md"),
                 },
                 str(self.agents / "tasks" / "standing.md"),
-                "fixture-gitleaks 1.0",
+                "fixture-gitleaks 8.30.1",
                 {"required_mode": "sweep"},
             )
 
@@ -5093,7 +6418,7 @@ def load_environment(*, checkout_root, environ, require_catalog):
                 "TSK-AUTH",
                 {},
                 None,
-                "fixture-gitleaks 1.0",
+                "fixture-gitleaks 8.30.1",
                 {"required_mode": "sweep"},
             )
 
@@ -5332,6 +6657,9 @@ def load_environment(*, checkout_root, environ, require_catalog):
             SCRIPTS / "evidence_hunk.py",
             SCRIPTS / "git_diff_digest.py",
             SCRIPTS / "isolated_git_transport.py",
+            SCRIPTS / "atomic_file_ops.py",
+            SCRIPTS / "trusted_gitleaks.py",
+            SCRIPTS / "gitleaks-default.toml",
             SCRIPTS / "prepare-codex-output-schema.py",
             SCRIPTS / "validate-canonical-result.py",
             SCRIPTS / "stage-standing-task.py",
@@ -5351,6 +6679,11 @@ import json, os, subprocess, sys
 from pathlib import Path
 real=Path(__file__).with_name("install-verified-artifacts.real.py")
 marker=Path(__file__).with_name("artifact-target-conflict-once.marker")
+if os.environ.get("FAKE_INSTALL_TARGET_CONFLICT_ALWAYS") == "user" and len(sys.argv) == 5 and sys.argv[4] == "user_it_news_summary":
+    plan=json.loads(Path(sys.argv[3]).read_text())
+    target=Path(plan["summary_target"])
+    target.parent.mkdir(parents=True,exist_ok=True)
+    target.write_text("persistent third-party target must survive\\n")
 completed=subprocess.run([str(real),*sys.argv[1:]],check=False,capture_output=True,text=True)
 if completed.returncode == 0 and len(sys.argv) > 1 and sys.argv[1] == "--plan" and os.environ.get("FAKE_PLAN_TARGET_CONFLICT_ONCE") == "1" and not marker.exists():
     plan=json.loads(completed.stdout)
@@ -5536,7 +6869,7 @@ elif stage=="review":
         commit_materialization=snapshot_manifest["local_commits"][key]
         assert all(entry["materialization_status"]!="blocked" for entry in commit_materialization)
         if any(entry["materialization_status"]=="deferred" for entry in dirty_materialization):
-            assert mode=="own_only"
+            assert mode in {"own_only","blocked"}
         initial=sorted(set(state["dirty_paths"]+[target_rel]))
         existing_paths=[path for commit in state["local_commits"] for path in commit["changed_paths"]]
         if mode=="sweep":
@@ -5876,6 +7209,88 @@ output.write_text(json.dumps(result))
         subprocess.run(["chmod", "-R", "u+w", str(runtime / "logs")], check=True)
         shutil.rmtree(runtime / "logs")
         (runtime / "last-status.txt").unlink()
+
+        remote_before_persistent = {
+            key: subprocess.check_output(
+                ["git", "-C", str(repo), "ls-remote", "origin", "refs/heads/main"],
+                text=True,
+            ).split()[0]
+            for key, repo in (("agents", self.agents), ("user", self.user))
+        }
+        persistent_collision = subprocess.run(
+            [str(runtime / "run-daily-it-news-vulnerability-check.sh")],
+            check=False,
+            env={
+                **os.environ,
+                "PATH": os.environ["PATH"],
+                "FAKE_INSTALL_TARGET_CONFLICT_ALWAYS": "user",
+            },
+        )
+        self.assertEqual(persistent_collision.returncode, 75)
+        persistent_status = (runtime / "last-status.txt").read_text(encoding="utf-8")
+        persistent_roots = [
+            path
+            for date_root in (runtime / "logs").iterdir()
+            for path in date_root.iterdir()
+            if path.is_dir()
+        ]
+        self.assertEqual(
+            len(persistent_roots),
+            1,
+            msg=persistent_status,
+        )
+        persistent_root = persistent_roots[0]
+        self.assertTrue((persistent_root / "publication-attempt-4").is_dir())
+        exhausted = json.loads(
+            (persistent_root / "exhausted-replan-vaults.json").read_text()
+        )
+        self.assertEqual(exhausted, ["user_vault"])
+        forced_hint = json.loads(
+            (
+                persistent_root
+                / "publication-attempt-4"
+                / "publication-mode-hint.json"
+            ).read_text()
+        )
+        self.assertEqual(forced_hint["user_vault"]["required_mode"], "blocked")
+        self.assertNotEqual(forced_hint["agents_vault"]["required_mode"], "blocked")
+        remote_after_persistent = {
+            key: subprocess.check_output(
+                ["git", "-C", str(repo), "ls-remote", "origin", "refs/heads/main"],
+                text=True,
+            ).split()[0]
+            for key, repo in (("agents", self.agents), ("user", self.user))
+        }
+        self.assertNotEqual(
+            remote_after_persistent["agents"],
+            remote_before_persistent["agents"],
+            msg=persistent_status
+            + "\n"
+            + "\n".join(
+                f"{path.name}: {path.read_text(encoding='utf-8', errors='replace')}"
+                for path in persistent_root.rglob("*result.json")
+            ),
+        )
+        self.assertEqual(
+            remote_after_persistent["user"], remote_before_persistent["user"]
+        )
+        collision_targets = {
+            Path(
+                json.loads(plan.read_text(encoding="utf-8"))["summary_target"]
+            )
+            for plan in persistent_root.glob("publication-attempt-[123]/artifact-plan.json")
+        }
+        self.assertEqual(len(collision_targets), 3)
+        for target in collision_targets:
+            self.assertEqual(
+                target.read_text(encoding="utf-8"),
+                "persistent third-party target must survive\n",
+            )
+            target.unlink()
+        subprocess.run(["chmod", "-R", "u+w", str(runtime / "logs")], check=True)
+        shutil.rmtree(runtime / "logs")
+        (runtime / "last-status.txt").unlink()
+
         invalid_final = subprocess.run(
             [str(runtime / "run-daily-it-news-vulnerability-check.sh")],
             check=False,

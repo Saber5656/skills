@@ -262,11 +262,17 @@ def validate_manifest(
         and not local_commits
     ):
         raise ReviewError("pre-publication local history metadata is inconsistent")
-    materialized_commits = materialized_commits or []
+    if materialized_commits is None:
+        materialized_commits = [
+            {**entry, "materialization_status": "available"}
+            for entry in state.get("local_commits", [])
+        ]
     if len(materialized_commits) != len(local_commits):
         raise ReviewError("local commit materialization count mismatch")
     expected_approved_commits = [
         {**commit, "patch_sha256": materialized.get("patch_sha256")}
+        # Python 3.9 is the deployed macOS runtime. The explicit count check
+        # above provides the same fail-closed guarantee as zip(strict=True).
         for commit, materialized in zip(local_commits, materialized_commits)
     ]
     if manifest["approved_existing_commits"] != expected_approved_commits:
@@ -334,11 +340,6 @@ def validate_manifest(
                 ),
             }
             for entry in state.get("dirty_entries", [])
-        ]
-    if materialized_commits is None:
-        materialized_commits = [
-            {**entry, "materialization_status": "available"}
-            for entry in state.get("local_commits", [])
         ]
     unavailable_dirty = [
         entry for entry in materialized_dirty

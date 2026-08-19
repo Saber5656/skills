@@ -5,10 +5,18 @@ from __future__ import annotations
 
 import json
 import hashlib
+import selectors
 import subprocess
 import sys
 import os
+import time
 from pathlib import Path
+
+from isolated_git_transport import (
+    LOCAL_COMMAND_TIMEOUT_SECONDS,
+    kill_process_group,
+    run_local_command,
+)
 
 
 MAX_GIT_METADATA_BYTES = 1024 * 1024
@@ -41,12 +49,13 @@ def clean_git_environment() -> dict[str, str]:
 
 def git(repo: str, *arguments: str) -> str:
     """Run one read-only Git command and return trimmed stdout."""
-    result = subprocess.run(
+    result = run_local_command(
         ["git", "-C", repo, *arguments],
         check=True,
         capture_output=True,
         text=True,
         env=clean_git_environment(),
+        timeout=LOCAL_COMMAND_TIMEOUT_SECONDS,
     )
     return result.stdout.rstrip("\n")
 
@@ -58,22 +67,42 @@ def git_bounded_bytes(repo: str, arguments: list[str], limit: int) -> bytes:
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
         env=clean_git_environment(),
+        start_new_session=True,
     )
     assert process.stdout is not None
+    selector = selectors.DefaultSelector()
+    selector.register(process.stdout, selectors.EVENT_READ)
+    deadline = time.monotonic() + LOCAL_COMMAND_TIMEOUT_SECONDS
     content = bytearray()
+    finished = False
     try:
-        while chunk := process.stdout.read(min(65536, limit + 1 - len(content))):
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not selector.select(remaining):
+                raise HistoryUnavailable("local history metadata exceeded its deadline")
+            chunk = os.read(
+                process.stdout.fileno(), min(65536, limit + 1 - len(content))
+            )
+            if not chunk:
+                break
             content.extend(chunk)
             if len(content) > limit:
-                process.kill()
-                process.wait()
                 raise HistoryUnavailable("local history metadata exceeds size limit")
-        return_code = process.wait()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise HistoryUnavailable("local history metadata exceeded its deadline")
+        try:
+            return_code = process.wait(timeout=remaining)
+        except subprocess.TimeoutExpired as exc:
+            raise HistoryUnavailable(
+                "local history metadata exceeded its deadline"
+            ) from exc
+        finished = True
     finally:
+        selector.close()
         process.stdout.close()
-        if process.poll() is None:
-            process.kill()
-            process.wait()
+        if not finished:
+            kill_process_group(process)
     if return_code != 0:
         raise HistoryUnavailable("local history metadata is unavailable")
     return bytes(content)
@@ -101,12 +130,13 @@ def file_sha256(path: Path) -> str:
 
 def is_ancestor(repo: str, ancestor: str, descendant: str) -> bool:
     """Return whether one exact commit is an ancestor of another."""
-    result = subprocess.run(
+    result = run_local_command(
         ["git", "-C", repo, "merge-base", "--is-ancestor", ancestor, descendant],
         check=False,
         capture_output=True,
         text=True,
         env=clean_git_environment(),
+        timeout=LOCAL_COMMAND_TIMEOUT_SECONDS,
     )
     if result.returncode not in {0, 1}:
         raise subprocess.CalledProcessError(
@@ -314,12 +344,13 @@ def capture(repo: str, include_local_history: bool = False) -> dict[str, object]
             metadata = path.lstat()
             if path.is_symlink():
                 mode = "120000"
-                blob_oid = subprocess.run(
+                blob_oid = run_local_command(
                     ["git", "-C", repo, "hash-object", "--stdin"],
                     input=os.fsencode(os.readlink(path)),
                     check=True,
                     capture_output=True,
                     env=clean_git_environment(),
+                    timeout=LOCAL_COMMAND_TIMEOUT_SECONDS,
                 ).stdout.decode("ascii").strip()
             elif path.is_file():
                 mode = "100755" if metadata.st_mode & 0o111 else "100644"

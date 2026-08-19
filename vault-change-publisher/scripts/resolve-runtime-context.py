@@ -14,6 +14,9 @@ import tempfile
 from urllib.parse import urlsplit
 from pathlib import Path, PurePosixPath
 
+from isolated_git_transport import run_local_command
+from trusted_gitleaks import EXPECTED_CONFIG_SHA256, validated_config_path
+
 ALLOWED_KEYS = {
     "SAIHAI_CHECKOUT_ROOT",
     "CODEX_BIN",
@@ -29,7 +32,9 @@ ALLOWED_KEYS = {
     "PUBLISHER_GIT_EMAIL",
 }
 REQUIRED_KEYS = ALLOWED_KEYS
-CONTROL_COMMAND_TIMEOUT_SECONDS = 3
+CONTROL_COMMAND_TIMEOUT_SECONDS = 30
+EXTERNAL_BINARY_TIMEOUT_SECONDS = 60
+SUPPORTED_GITLEAKS_MAJOR = 8
 
 
 class ContextError(RuntimeError):
@@ -113,7 +118,7 @@ def validated_git_identity(name: str, email: str) -> tuple[str, str]:
 
 def git_directory(repo_root: Path) -> str:
     """Return a direct or safely detached Git directory for one Vault."""
-    top_level = subprocess.run(
+    top_level = run_local_command(
         [
             "git", "-C", str(repo_root), "-c", "core.fsmonitor=false",
             "rev-parse", "--show-toplevel",
@@ -126,7 +131,7 @@ def git_directory(repo_root: Path) -> str:
     ).stdout.strip()
     if Path(top_level).resolve() != repo_root.resolve():
         raise ContextError("catalog Vault root is not the repository top level")
-    result = subprocess.run(
+    result = run_local_command(
         [
             "git", "-C", str(repo_root), "-c", "core.fsmonitor=false",
             "rev-parse", "--absolute-git-dir",
@@ -168,7 +173,7 @@ def git_directory(repo_root: Path) -> str:
 def validate_git_control_config(repo_root: Path, git_dir: str) -> None:
     """Reject includes and repository config capable of redirecting Git I/O."""
     common_dir = Path(
-        subprocess.run(
+        run_local_command(
             [
                 "git", "-C", str(repo_root), "rev-parse",
                 "--path-format=absolute", "--git-common-dir",
@@ -189,7 +194,7 @@ def validate_git_control_config(repo_root: Path, git_dir: str) -> None:
         or not optional_worktree_config.is_file()
     ):
         raise ContextError("worktree Git config must be a regular file")
-    completed = subprocess.run(
+    completed = run_local_command(
         [
             # Do not dereference repository-controlled include paths merely to
             # discover that includes are forbidden.  The directive itself is
@@ -212,14 +217,20 @@ def validate_git_control_config(repo_root: Path, git_dir: str) -> None:
         optional_worktree_config.resolve(),
     }
     dangerous_exact = {
+        "core.alternaterefscommand",
         "core.attributesfile",
         "core.askpass",
+        "core.editor",
         "core.excludesfile",
         "core.fsmonitor",
         "core.gitproxy",
         "core.hookspath",
+        "core.pager",
         "core.sshcommand",
+        "gpg.program",
+        "sequence.editor",
         "ssh.variant",
+        "uploadpack.packobjectshook",
     }
     for index in range(0, len(fields), 2):
         try:
@@ -234,10 +245,13 @@ def validate_git_control_config(repo_root: Path, git_dir: str) -> None:
         origin_path = Path(origin.removeprefix("file:"))
         if not origin_path.is_absolute():
             origin_path = repo_root / origin_path
-        if not separator or origin_path.resolve() not in allowed_origin_paths:
+        if origin_path.resolve() not in allowed_origin_paths:
             raise ContextError("repository-local Git config include is forbidden")
+        if not separator:
+            raise ContextError("repository-local Git config value is missing")
         if (
             normalized in dangerous_exact
+            or normalized.startswith("alias.")
             or normalized.startswith("include.")
             or normalized.startswith("includeif.")
             or normalized.startswith("url.")
@@ -245,6 +259,14 @@ def validate_git_control_config(repo_root: Path, git_dir: str) -> None:
             or normalized.startswith("filter.")
             or normalized.startswith("http.")
             or normalized.startswith("protocol.")
+            or (
+                normalized.startswith("gpg.")
+                and normalized.endswith(".program")
+            )
+            or (
+                normalized.startswith("merge.")
+                and normalized.rsplit(".", 1)[-1] in {"driver", "recursive"}
+            )
             or (
                 normalized.startswith("diff.")
                 and normalized.rsplit(".", 1)[-1]
@@ -261,7 +283,7 @@ def validate_git_control_config(repo_root: Path, git_dir: str) -> None:
 
 def remote_url(repo_root: Path) -> str:
     """Return a credential-free HTTPS or SSH origin URL."""
-    result = subprocess.run(
+    result = run_local_command(
         [
             "git", "-C", str(repo_root), "config", "--local", "--no-includes",
             "--get", "remote.origin.url",
@@ -294,6 +316,16 @@ def remote_url(repo_root: Path) -> str:
         or not parsed.path.strip("/")
     ):
         raise ContextError("origin URL must be credential-free HTTPS or SSH")
+    return value
+
+
+def validated_gitleaks_version(value: str) -> str:
+    """Require the pinned CLI major whose invocation contract is reviewed."""
+    match = re.search(r"(?<![0-9])(\d+)\.(\d+)\.(\d+)(?![0-9])", value)
+    if match is None or int(match.group(1)) != SUPPORTED_GITLEAKS_MAJOR:
+        raise ContextError(
+            f"Gitleaks major version {SUPPORTED_GITLEAKS_MAJOR} is required"
+        )
     return value
 
 
@@ -355,6 +387,13 @@ def resolve_context(local_config: Path, workdir: Path) -> dict[str, str]:
     validate_git_control_config(agents_root, agents_git_dir)
     validate_git_control_config(user_root, user_git_dir)
 
+    gitleaks_version = run_local_command(
+        [str(Path(values["GITLEAKS_BIN"]).expanduser().resolve()), "version"],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=EXTERNAL_BINARY_TIMEOUT_SECONDS,
+    ).stdout.strip()
     context = {
         "workdir": str(workdir.resolve()),
         "saihai_root": str(saihai_root),
@@ -362,13 +401,9 @@ def resolve_context(local_config: Path, workdir: Path) -> dict[str, str]:
         "gitleaks_bin": str(
             Path(values["GITLEAKS_BIN"]).expanduser().resolve()
         ),
-        "gitleaks_version": subprocess.run(
-            [str(Path(values["GITLEAKS_BIN"]).expanduser().resolve()), "version"],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=CONTROL_COMMAND_TIMEOUT_SECONDS,
-        ).stdout.strip(),
+        "gitleaks_version": validated_gitleaks_version(gitleaks_version),
+        "gitleaks_config": validated_config_path(),
+        "gitleaks_config_sha256": EXPECTED_CONFIG_SHA256,
         "skills_root": str(skills_root),
         "agents_vault_root": str(agents_root),
         "user_vault_root": str(user_root),

@@ -21,6 +21,7 @@ def markdown_evidence_boundary(lines: list[str]) -> int:
     headings: list[int] = []
     fence_character: str | None = None
     fence_length = 0
+    fence_start_index: int | None = None
     for index, line in enumerate(lines):
         text = line.rstrip("\r\n")
         if fence_character is not None:
@@ -30,14 +31,23 @@ def markdown_evidence_boundary(lines: list[str]) -> int:
             ):
                 fence_character = None
                 fence_length = 0
+                fence_start_index = None
             continue
         opening = FENCE_START.match(text)
         if opening:
             fence_character = opening.group(1)[0]
             fence_length = len(opening.group(1))
+            fence_start_index = index
             continue
         if text == EVIDENCE_HEADING:
             headings.append(index)
+    if fence_character is not None:
+        location = (
+            "in evidence section"
+            if headings and fence_start_index is not None and fence_start_index > headings[0]
+            else "before evidence heading"
+        )
+        raise EvidenceHunkError(f"unterminated fenced block {location}")
     if len(headings) != 1:
         raise EvidenceHunkError("canonical evidence heading is missing or duplicated")
 
@@ -97,4 +107,10 @@ def canonical_patch(target: str, before: bytes, after: bytes) -> bytes:
         tofile=f"b/{target}",
         lineterm="\n",
     )
-    return "".join(patch).encode("utf-8")
+    rendered: list[str] = []
+    for line in patch:
+        if line.startswith(("+", "-", " ")) and not line.endswith("\n"):
+            rendered.extend((line, "\n", "\\ No newline at end of file\n"))
+        else:
+            rendered.append(line)
+    return "".join(rendered).encode("utf-8")

@@ -24,12 +24,19 @@ if ! "$JQ_BIN" -e '
     type == "object"
     and (.commit_status | IN("complete", "not_required", "failed", "not_started"))
     and (.commit_hashes | type == "array" and all(.[]; type == "string" and length > 0))
-    and (if .commit_status == "complete" then (.commit_hashes | length > 0) else true end)
+    and (if .commit_status == "complete" then
+      (.commit_hashes | length > 0)
+    else
+      (.commit_hashes | length == 0)
+    end)
     and (.push_status | IN("complete", "not_required", "failed", "not_started"))
     and (.local_head | type == "string" or . == null)
     and (.remote_head | type == "string" or . == null)
     and (.clean | type == "boolean")
     and (.publication_mode | IN("sweep", "own_only", "blocked"))
+    and (if .publication_mode == "blocked" then
+      (.commit_hashes | length == 0)
+    else true end)
     and (.deferred_cleanup | type == "array" and all(.[];
       type == "object"
       and (.path | type == "string" and length > 0)

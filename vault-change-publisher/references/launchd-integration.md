@@ -10,7 +10,7 @@ launchd 04:00
   -> collection Codex process (Web/search, run staging write only)
   -> deterministic artifact validation
   -> deterministic collision-safe artifact target plan
-  -> short cooperative publication lock + bounded stable Vault recapture
+  -> short cooperative publication lock + bounded per-Vault stable recapture
   -> per-Vault mode hint (sweep / own_only / blocked)
   -> target/snapshot conflict on retry-safe boundary: unlock and bounded full replan/review
   -> materialize local-only commit metadata and patches for publication only
@@ -54,6 +54,9 @@ launchd 04:00
 | `scripts/evidence_hunk.py` | same workdir |
 | `scripts/git_diff_digest.py` | same workdir |
 | `scripts/isolated_git_transport.py` | same workdir |
+| `scripts/atomic_file_ops.py` | same workdir |
+| `scripts/trusted_gitleaks.py` | same workdir |
+| `scripts/gitleaks-default.toml` | same workdir |
 | `scripts/prepare-codex-output-schema.py` | same workdir |
 | `scripts/validate-canonical-result.py` | same workdir |
 | `scripts/stage-standing-task.py` | same workdir |
@@ -70,11 +73,11 @@ authorization taskはnetwork-enabled collection終了後に別のreview input di
 
 Codexへ渡すpromptはCLI引数へ展開せずstdinから供給し、macOSのargument-size上限に依存しない。publication/evidence reviewへinlineするcontextは、deterministic helperが使用する完全なcontext fileのSHA-256を保持したまま、review判断に不要な全tracked pathの`index_entries`列だけを除いたbounded projectionとする。reviewは`index_sha256`、staged path、dirty/history metadata、sealed snapshotを使い、完全なindex列をLLM contextへ複製しない。
 
-pre/post-collectionの軽量captureはlocal-only commit patchを生成しない。collection成功後、Vaultが変化していてもcollectionを失敗扱いにせず、HEAD、index、dirty content/mode/mtime、Git control-planeの差をVaultごとの`own_only`制約へ変換する。publication時点がbounded retryで安定した後だけ、dirty fileをcapture済みGit blob OIDからreview inputへ0600・exclusive createし、local-ahead commitのhash、parents、tree、message、changed paths、first-parent patch digestとpatchを同じisolated review inputへ0600・exclusive createする。sealed residual guardはdirty candidateとreview済みHEADのno-index差分だけを検査し、新規machine-home path、`.obsidian/`、pinned gitleaks不合格を`deferred`へ変換してVault単位のmode floorを`own_only`にする。guard不合格entryのbytesはreviewerへ渡さず、既存fileを変更しない。publication reviewはVault上のdirty fileやlocal-only historyを直接読まず、manifestでidentityとSHA-256に結合されたsnapshotだけを検査する。
+pre/post-collectionの軽量captureはlocal-only commit patchを生成しない。collection成功後、Vaultが変化していてもcollectionを失敗扱いにせず、HEAD、index、dirty content/mode/mtime、Git control-planeの差をVaultごとの`own_only`制約へ変換する。publication時点がbounded retryで安定したVaultだけ、dirty fileをcapture済みGit blob OIDからreview inputへ0600・exclusive createし、local-ahead commitのhash、parents、tree、message、changed paths、first-parent patch digestとpatchを同じisolated review inputへ0600・exclusive createする。片方のsnapshotだけが安定しない場合は、そのVaultの最新identityを`vault_state_snapshot_unstable`として封印し、live bytesを再読込せず`blocked`にする。安定したpeer Vaultのreview・publicationは継続する。sealed residual guardはdirty candidateとreview済みHEADのno-index差分だけを検査し、新規machine-home path、`.obsidian/`、pinned Gitleaks v8不合格を`deferred`へ変換してVault単位のmode floorを`own_only`にする。guard不合格entryのbytesはreviewerへ渡さず、既存fileを変更しない。publication reviewはVault上のdirty fileやlocal-only historyを直接読まず、manifestでidentityとSHA-256に結合されたsnapshotだけを検査する。
 
 cooperative publication lockはstable snapshotとmode hintの固定にだけ使い、長時間のreview中は保持しない。解放前にlock fileのPIDが実行中runner自身と一致することを確認し、別processのlockへ置き換わっていた場合は削除しない。lock解放後の競合はexact snapshot、expected parent、CASでfail closedする。
 
-plan後のtarget競合またはcommit前のretry-safeなsnapshot driftを検出した場合は、artifactも既存差分も上書きせずlockを解放し、最新stateからtarget plan、mode hint、reviewをbounded replanする。片側だけ今回commitを作成済みでも未pushであり、peerがmutation前にretry-safe失敗した場合に限り、その今回commitをold OID付きCASで取り消し、共有indexとartifact inodeをexact backupへ復元して再計画する。既存commit、既存dirty/staged差分、push済みcommitはrollbackしない。
+plan後のtarget競合またはcommit前のretry-safeなsnapshot driftを検出した場合は、artifactも既存差分も上書きせずlockを解放し、最新stateからtarget plan、mode hint、reviewをbounded replanする。target競合が上限まで継続した場合は競合したVaultだけを`artifact_target_replan_exhausted`で`blocked`にし、peer Vaultを続行する。review後のinstaller直前競合が3回継続した場合も、committerが報告したroot-cause Vaultだけを固定して4回目の最終peer-only plan/review/publicationを行う。installerは`O_EXCL` target fdからSHA-256、stable device/inode identity、size、modeをreceiptへ封印し、File Providerで揮発する`mtime/ctime`だけの非同期正規化は許容する。別inode、content、size、mode変更はfail closedとし、失敗cleanupもprivate quarantineへのrename後にidentityを検証して同inodeだけを除去する。別inodeならentry typeに依存しないdescriptor-relative no-replace renameで元のpathへ戻し、競合時は上書きや削除をせずquarantineへ保持して停止する。片側だけ今回commitを作成済みでも未pushであり、peerがmutation前にretry-safe失敗した場合に限り、その今回commitをold OID付きCASで取り消し、共有indexと同receiptに一致するartifact inodeをexact backupへ復元して再計画する。別processのpartial resumeではpathnameからreceiptを再生成しない。receipt不一致時は第三者fileを削除しない。既存commit、既存dirty/staged差分、push済みcommitはrollbackしない。
 
 fetch後のhistory relationは収集の可否には使わない。`equal`または安全な`local_ahead`はpublication可能で、既存commit境界を維持したままreview・secret scan・fixed pushへ含める。unsafe local-ahead、`remote_ahead`、`diverged`、active Git operationは自動pull/rebaseで解消せず、該当Vaultだけ`blocked`とする。安定したdirty residualがguard/reviewを通れば`sweep`、失敗すればその内容を触らず`own_only`へdowngradeする。
 
@@ -84,7 +87,7 @@ fetch後のhistory relationは収集の可否には使わない。`equal`また�
 
 personal absolute paths、Vault names、machine layout、publisher account identityはtracked fileへ書かない。`automation.local.env`にはSaihai primary checkout、relative destination、承認taskのSHA-256 pin、GitHubへ紐付くpublisher Git name/emailを置き、runnerは`directory_paths.load_environment(checkout_root=..., environ={}, require_catalog=True)`でcanonical rootsを解決する。resolverがprivate identityを検証してruntime contextへbindし、commit helperはmutation直前に再検証する。承認taskが変わった場合は自動追従せず、内容を人間が再確認してpinを更新する。
 
-File Provider配下のVaultでnetwork Git transportを起動するときは、Vault repoのlocal config、hooks、attributes、fsmonitor、filter、ssh commandを実行経路へ入れない。一時bare Git control planeを作り、Vaultのobject directoryだけをalternateとして共有し、fixed remote URL、object ID、`refs/heads/main`だけでfetch、`ls-remote`、fixed pushを行う。transport subprocessはVaultをcwdにせず、wall-clock deadline超過時はprocess group全体を終了する。non-force制約は変更しない。
+File Provider配下のVaultでnetwork Git transportを起動するときは、Vault repoのlocal config、hooks、attributes、fsmonitor、filter、ssh commandを実行経路へ入れない。一時bare Git control planeを作り、Vaultのobject directoryをtransportのprimary object store（`GIT_OBJECT_DIRECTORY`）として固定し、fixed remote URL、object ID、`refs/heads/main`だけでfetch、`ls-remote`、fixed pushを行う。fetchはVaultのobject storeへimmutable objectを追加し得るが、Vaultのworktree、index、local branch refは変更しない。tracking ref更新は取得OIDとold OIDを照合した別のCASで行う。transportとlocal helper subprocessには用途別wall-clock deadlineを設定し、deadline超過時はprocess groupをbounded cleanupする。Gitleaks v8はdigest固定した`[extend] useDefault = true` config bytesを匿名fdへ複製し、`pass_fds`でscanner childへ渡して`/dev/fd/N`を全scanへ明示する。検証後のpath差替えやVault内`.gitleaks.toml`をconfig sourceにしない。non-force制約は変更しない。
 
 push直前のremote OID照合とfixed pushはVaultごとに独立して行う。片方でremote race、network failure、または`blocked`を検出しても、もう片方の安全なpushは抑止しない。片側だけ公開できた場合は`partial_publication`と非0を返し、forceや履歴書換えは行わない。
 

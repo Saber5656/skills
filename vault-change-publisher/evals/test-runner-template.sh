@@ -30,7 +30,14 @@ if [[ ! -x "$COLLECTOR_SOURCE" ]] || {
 fi
 
 MODE_FIXTURE_ROOT="$(mktemp -d)"
-trap 'rm -rf "$MODE_FIXTURE_ROOT"' EXIT
+FAIL_RUN_ROOT=""
+SNAPSHOT_FIXTURE_ROOT="$(mktemp -d)"
+cleanup() {
+  [[ -z "$MODE_FIXTURE_ROOT" ]] || rm -rf "$MODE_FIXTURE_ROOT"
+  [[ -z "$FAIL_RUN_ROOT" ]] || rm -rf "$FAIL_RUN_ROOT"
+  [[ -z "$SNAPSHOT_FIXTURE_ROOT" ]] || rm -rf "$SNAPSHOT_FIXTURE_ROOT"
+}
+trap cleanup EXIT
 /bin/cp "$RUNNER" "$MODE_FIXTURE_ROOT/run-daily-it-news-vulnerability-check.sh"
 for required_name in \
   automation.local.env resolve-runtime-context.py fetch-vault-main.py \
@@ -40,7 +47,7 @@ for required_name in \
   commit-reviewed-publication.py validate-publication-review.py \
   push-committed-heads.py prepare-publication-evidence.py \
   commit-push-publication-evidence.py evidence_hunk.py git_diff_digest.py \
-  isolated_git_transport.py \
+  isolated_git_transport.py atomic_file_ops.py trusted_gitleaks.py gitleaks-default.toml \
   prepare-codex-output-schema.py validate-canonical-result.py \
   stage-standing-task.py stage-dirty-review-inputs.py \
   daily-it-news.collect.prompt.md daily-it-news.review.prompt.md \
@@ -50,16 +57,21 @@ for required_name in \
   interpret-automation-result.sh; do
   /usr/bin/touch "$MODE_FIXTURE_ROOT/$required_name"
 done
+/bin/chmod 0755 "$MODE_FIXTURE_ROOT"/*.py "$MODE_FIXTURE_ROOT"/*.sh
 /bin/chmod 0644 "$MODE_FIXTURE_ROOT/collect-public-sources.py"
 set +e
 /bin/zsh "$MODE_FIXTURE_ROOT/run-daily-it-news-vulnerability-check.sh" \
   >"$MODE_FIXTURE_ROOT/stdout.log" 2>"$MODE_FIXTURE_ROOT/stderr.log"
 MODE_FIXTURE_STATUS=$?
 set -e
-if [[ "$MODE_FIXTURE_STATUS" -ne 66 ]] \
-  || ! /usr/bin/grep -F -- \
-    'required daily automation asset is not executable:' \
-    "$MODE_FIXTURE_ROOT/stderr.log" >/dev/null \
+if [[ "$MODE_FIXTURE_STATUS" -ne 66 ]]; then
+  echo "non-executable collector must fail preflight with status 66" >&2
+  exit 1
+fi
+if ! /usr/bin/grep -F -- 'required daily automation asset is not executable:' \
+  "$MODE_FIXTURE_ROOT/stderr.log" >/dev/null \
+  || ! /usr/bin/grep -F -- "$MODE_FIXTURE_ROOT/collect-public-sources.py" \
+  "$MODE_FIXTURE_ROOT/stderr.log" >/dev/null \
   || [[ -d "$MODE_FIXTURE_ROOT/logs" ]]; then
   echo "non-executable collector must fail preflight with status 66" >&2
   exit 1
@@ -127,6 +139,9 @@ fi
 /usr/bin/grep -F -- '"$EVIDENCE_FINALIZER"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- 'git_diff_digest.py' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- 'isolated_git_transport.py' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- 'atomic_file_ops.py' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- 'trusted_gitleaks.py' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- 'gitleaks-default.toml' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- 'fail_run 75 artifact_plan' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- '/bin/cp "$INITIAL_PUSH_RESULT" "$PUBLICATION_RESULT"' "$RUNNER" >/dev/null
 EVIDENCE_PREPARATION_BLOCK="$(sed -n '/^if \[\[ "\$EVIDENCE_PREPARE_STATUS" -eq 0 \]\]; then$/,/^fi$/p' "$RUNNER")"
@@ -154,8 +169,149 @@ fi
 /usr/bin/grep -F -- '"$DIRTY_SNAPSHOT_MANIFEST"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- '/usr/bin/shlock -f "$PUBLICATION_LOCK" -p $$' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- '[[ "$observed_owner" == "$$" ]] || return 1' "$RUNNER" >/dev/null
-/usr/bin/grep -F -- 'Vault state did not stabilize during bounded snapshot retries' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- 'vault_state_snapshot_unstable' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- 'artifact_target_replan_exhausted' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- 'AGENTS_SELECTED_STATE=' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- 'USER_SELECTED_STATE=' "$RUNNER" >/dev/null
+if [[ "$(/usr/bin/grep -c -F -- 'AGENTS_STABLE_STATE=0' "$RUNNER")" -ne 1 \
+  || "$(/usr/bin/grep -c -F -- 'USER_STABLE_STATE=0' "$RUNNER")" -ne 1 ]]; then
+  echo "per-Vault stabilization flags must survive later snapshot attempts" >&2
+  exit 1
+fi
+/usr/bin/grep -F -- 'if [[ "$AGENTS_STABLE_STATE" -ne 1 ]]; then' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- 'if [[ "$USER_STABLE_STATE" -ne 1 ]]; then' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- '"$STATE_CAPTURE" --include-local-history' "$RUNNER" >/dev/null
+SNAPSHOT_BLOCK="$(sed -n \
+  '/^AGENTS_STABLE_STATE=0$/,/^if ! "\$MODE_DETERMINER"/p' "$RUNNER" \
+  | sed '$d')"
+FAKE_STATE_CAPTURE="$SNAPSHOT_FIXTURE_ROOT/capture-vault-state.py"
+cat > "$FAKE_STATE_CAPTURE" <<'ZSH'
+#!/bin/zsh
+set -eu
+include_history=0
+if [[ "${1:-}" == "--include-local-history" ]]; then
+  include_history=1
+fi
+attempt="$(<"$SNAPSHOT_COUNTER")"
+if [[ "$include_history" -eq 1 ]]; then
+  attempt=$((attempt + 1))
+  print -r -- "$attempt" > "$SNAPSHOT_COUNTER"
+fi
+case "$SNAPSHOT_SCENARIO:$attempt:$include_history" in
+  cross:1:1) agents=A1; user=U1 ;;
+  cross:1:0) agents=A1; user=U2 ;;
+  cross:2:1) agents=A2; user=U2 ;;
+  cross:2:0) agents=A3; user=U2 ;;
+  unstable_agents:*:1) agents="A$attempt"; user=U1 ;;
+  unstable_agents:*:0) agents="AX$attempt"; user=U1 ;;
+  unstable_user:*:1) agents=A1; user="U$attempt" ;;
+  unstable_user:*:0) agents=A1; user="UX$attempt" ;;
+  both_unstable:*:1) agents="A$attempt"; user="U$attempt" ;;
+  both_unstable:*:0) agents="AX$attempt"; user="UX$attempt" ;;
+  *) exit 65 ;;
+esac
+if [[ "$include_history" -eq 1 ]]; then
+  /usr/bin/jq -n --arg agents "$agents" --arg user "$user" '{
+    agents_vault:{marker:$agents,local_commits:[],history_capture_status:"available",history_capture_reason:null,history_snapshot_sha256:("a"*64)},
+    user_vault:{marker:$user,local_commits:[],history_capture_status:"available",history_capture_reason:null,history_snapshot_sha256:("b"*64)}
+  }'
+else
+  /usr/bin/jq -n --arg agents "$agents" --arg user "$user" \
+    '{agents_vault:{marker:$agents},user_vault:{marker:$user}}'
+fi
+ZSH
+/bin/chmod 0755 "$FAKE_STATE_CAPTURE"
+run_snapshot_case() {
+  local scenario="$1"
+  local case_root="$SNAPSHOT_FIXTURE_ROOT/$scenario"
+  /bin/mkdir "$case_root"
+  print -r -- 0 > "$case_root/counter"
+  (
+    export SNAPSHOT_SCENARIO="$scenario"
+    export SNAPSHOT_COUNTER="$case_root/counter"
+    ATTEMPT_ROOT="$case_root"
+    STATE_CAPTURE="$FAKE_STATE_CAPTURE"
+    RUNTIME_CONTEXT_FILE="$case_root/runtime.json"
+    REVIEWED_PUBLICATION_STATE="$case_root/reviewed.json"
+    fail_run() {
+      exit "$1"
+    }
+    eval "$SNAPSHOT_BLOCK"
+  )
+}
+run_snapshot_case cross
+/usr/bin/jq -e '
+  .agents_vault.marker == "A1"
+  and .user_vault.marker == "U2"
+' "$SNAPSHOT_FIXTURE_ROOT/cross/reviewed.json" >/dev/null || {
+  echo "Vaults that stabilize on different attempts were not preserved independently" >&2
+  exit 1
+}
+run_snapshot_case unstable_agents
+/usr/bin/jq -e '
+  .agents_vault.marker == "A3"
+  and .agents_vault.capture_status == "blocked"
+  and .agents_vault.capture_reason == "vault_state_snapshot_unstable"
+  and .user_vault.marker == "U1"
+  and (.user_vault.capture_status // "available") == "available"
+' "$SNAPSHOT_FIXTURE_ROOT/unstable_agents/reviewed.json" >/dev/null || {
+  echo "persistent instability did not block only the affected Vault" >&2
+  exit 1
+}
+run_snapshot_case unstable_user
+/usr/bin/jq -e '
+  .agents_vault.marker == "A1"
+  and (.agents_vault.capture_status // "available") == "available"
+  and .user_vault.marker == "U3"
+  and .user_vault.capture_status == "blocked"
+  and .user_vault.capture_reason == "vault_state_snapshot_unstable"
+' "$SNAPSHOT_FIXTURE_ROOT/unstable_user/reviewed.json" >/dev/null || {
+  echo "persistent User instability changed its stable peer" >&2
+  exit 1
+}
+run_snapshot_case both_unstable
+/usr/bin/jq -e '
+  .agents_vault.marker == "A3"
+  and .agents_vault.capture_status == "blocked"
+  and .agents_vault.capture_reason == "vault_state_snapshot_unstable"
+  and .user_vault.marker == "U3"
+  and .user_vault.capture_status == "blocked"
+  and .user_vault.capture_reason == "vault_state_snapshot_unstable"
+' "$SNAPSHOT_FIXTURE_ROOT/both_unstable/reviewed.json" >/dev/null || {
+  echo "persistent two-Vault instability did not block both independently" >&2
+  exit 1
+}
+REPLAN_BLOCK="$(sed -n \
+  '/^  EXHAUSTED_MODE_HINT=/,/^    || fail_run 75 artifact_plan "could not seal exhausted artifact target re-plan"$/p' \
+  "$RUNNER")"
+REPLAN_FIXTURE_ROOT="$SNAPSHOT_FIXTURE_ROOT/replan"
+/bin/mkdir "$REPLAN_FIXTURE_ROOT"
+/usr/bin/jq -n '{
+  agents_vault:{required_mode:"own_only",retry_disposition:"replan",reasons:["artifact_target_conflict"]},
+  user_vault:{required_mode:"sweep",retry_disposition:"none",reasons:["stable_sweep_candidate"]}
+}' > "$REPLAN_FIXTURE_ROOT/publication-mode-hint.json"
+USER_MODE_BEFORE="$(/usr/bin/jq -cS '.user_vault' "$REPLAN_FIXTURE_ROOT/publication-mode-hint.json")"
+(
+  ATTEMPT_ROOT="$REPLAN_FIXTURE_ROOT"
+  PUBLICATION_MODE_HINT="$REPLAN_FIXTURE_ROOT/publication-mode-hint.json"
+  fail_run() {
+    exit "$1"
+  }
+  eval "$REPLAN_BLOCK"
+)
+/usr/bin/jq -e '
+  .agents_vault.required_mode == "blocked"
+  and .agents_vault.retry_disposition == "none"
+  and (.agents_vault.reasons | index("artifact_target_replan_exhausted")) != null
+' "$REPLAN_FIXTURE_ROOT/publication-mode-hint.json" >/dev/null || {
+  echo "exhausted target replan did not block the affected Vault" >&2
+  exit 1
+}
+if [[ "$(/usr/bin/jq -cS '.user_vault' "$REPLAN_FIXTURE_ROOT/publication-mode-hint.json")" \
+  != "$USER_MODE_BEFORE" ]]; then
+  echo "exhausted target replan changed the unaffected Vault" >&2
+  exit 1
+fi
 collection_line="$(/usr/bin/grep -n -F -- 'COLLECTION_STATUS=$?' "$RUNNER" | /usr/bin/cut -d: -f1)"
 history_line="$(/usr/bin/grep -n -F -- '"$STATE_CAPTURE" --include-local-history' "$RUNNER" | /usr/bin/head -n 1 | /usr/bin/cut -d: -f1)"
 if [[ -z "$collection_line" || -z "$history_line" || "$history_line" -le "$collection_line" ]]; then
@@ -174,7 +330,7 @@ fi
 /usr/bin/grep -F -- '"$RUNTIME_CONTEXT_FILE" "$REVIEW_INPUT_ROOT" authorization' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- '--arg authorization_task "$AUTHORIZATION_TASK_SNAPSHOT"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- '"$RUNTIME_CONTEXT_FILE" "$REVIEWED_PUBLICATION_STATE" "$SEALED_REVIEW_ROOT"' "$RUNNER" >/dev/null
-/usr/bin/grep -F -- 'while [[ "$PUBLICATION_ATTEMPT" -le 3 ]]' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- 'while [[ "$PUBLICATION_ATTEMPT" -le 4 ]]' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- '.retry_disposition == "replan"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- 'chmod 700 "$SEALED_REVIEW_ROOT"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- '--arg dirty_snapshot_manifest_file "$DIRTY_SNAPSHOT_MANIFEST"' "$RUNNER" >/dev/null
@@ -256,4 +412,4 @@ for forbidden in "/""Users/" "Library/Mobile"" Documents" "Yasu""'s Vault"; do
   fi
 done
 
-echo "runner isolation contract: 39/39 passed"
+echo "runner isolation contract: 44/44 passed"

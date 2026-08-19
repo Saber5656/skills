@@ -24,6 +24,11 @@
     "publication_context_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
     "resumable_state": {"type": ["object", "null"]}
     ,"retry_disposition": {"enum": ["none", "replan"]}
+    ,"replan_vaults": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"enum": ["agents_vault", "user_vault"]}
+    }
   },
   "allOf": [
     {
@@ -136,7 +141,7 @@
         {"$ref": "#/$defs/vaultResult"},
         {
           "properties": {
-            "commit_status": {"enum": ["complete", "not_required"]},
+            "commit_status": {"const": "complete"},
             "publication_mode": {"enum": ["sweep", "own_only"]}
           }
         },

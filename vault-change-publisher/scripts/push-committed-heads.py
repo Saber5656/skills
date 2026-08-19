@@ -12,7 +12,13 @@ import subprocess
 import sys
 from pathlib import Path
 
-from isolated_git_transport import TransportError, run_transport
+from isolated_git_transport import (
+    LOCAL_COMMAND_TIMEOUT_SECONDS,
+    TransportError,
+    run_local_command,
+    run_transport,
+)
+from trusted_gitleaks import trusted_scan_invocation
 
 
 class PushError(RuntimeError):
@@ -81,7 +87,7 @@ def git(
         if git_dir is None:
             raise PushError("network Git operation requires an explicit Git directory")
         return run_transport(git_dir, *arguments, check=check, text=True)
-    return subprocess.run(
+    return run_local_command(
         [
             "git", *repository_arguments,
             "-c", f"core.hooksPath={os.devnull}",
@@ -92,6 +98,7 @@ def git(
         capture_output=True,
         text=True,
         env=environment,
+        timeout=LOCAL_COMMAND_TIMEOUT_SECONDS,
     )
 
 
@@ -233,7 +240,7 @@ def commit_patch_sha256(repo: str, commit: str, parents: list[str]) -> str:
     environment["GIT_NO_LAZY_FETCH"] = "1"
     environment["GIT_NO_REPLACE_OBJECTS"] = "1"
     environment["GIT_OPTIONAL_LOCKS"] = "0"
-    content = subprocess.run(
+    content = run_local_command(
         [
             "git", "-C", repo,
             "-c", f"core.hooksPath={os.devnull}",
@@ -243,6 +250,7 @@ def commit_patch_sha256(repo: str, commit: str, parents: list[str]) -> str:
         check=True,
         capture_output=True,
         env=environment,
+        timeout=LOCAL_COMMAND_TIMEOUT_SECONDS,
     ).stdout
     return hashlib.sha256(content).hexdigest()
 
@@ -281,7 +289,7 @@ def existing_commit_metadata(
 
 def blob_sha256(repo: str, head: str, relative: str) -> str:
     """Hash one committed blob without checking out or following a symlink."""
-    result = subprocess.run(
+    result = run_local_command(
         [
             "git",
             "-C",
@@ -310,6 +318,7 @@ def blob_sha256(repo: str, head: str, relative: str) -> str:
             "GIT_CONFIG_KEY_0": "core.fsmonitor",
             "GIT_CONFIG_VALUE_0": "false",
         },
+        timeout=LOCAL_COMMAND_TIMEOUT_SECONDS,
     )
     return hashlib.sha256(result.stdout).hexdigest()
 
@@ -441,26 +450,24 @@ def scan_commits(gitleaks_bin: str, repo: str, old: str, new: str) -> None:
     environment["GIT_CONFIG_KEY_0"] = "core.fsmonitor"
     environment["GIT_CONFIG_VALUE_0"] = "false"
     try:
-        result = subprocess.run(
-            [
-                gitleaks_bin,
-                "--no-banner",
-                "--redact",
-                "--ignore-gitleaks-allow",
-                "--gitleaks-ignore-path",
-                os.devnull,
-                "git",
-                "--log-opts",
-                f"{old}..{new}",
-                repo,
-            ],
-            cwd="/",
-            check=False,
-            capture_output=True,
-            text=True,
-            env=environment,
-            timeout=SCAN_TIMEOUT_SECONDS,
-        )
+        with trusted_scan_invocation() as (scan_prefix, pass_fds):
+            result = run_local_command(
+                [
+                    gitleaks_bin,
+                    *scan_prefix,
+                    "git",
+                    "--log-opts",
+                    f"{old}..{new}",
+                    repo,
+                ],
+                cwd="/",
+                check=False,
+                capture_output=True,
+                text=True,
+                env=environment,
+                timeout=SCAN_TIMEOUT_SECONDS,
+                pass_fds=pass_fds,
+            )
     except subprocess.TimeoutExpired as exc:
         raise PushError("gitleaks history scan exceeded its deadline") from exc
     if result.returncode != 0:
@@ -549,7 +556,7 @@ def validate_local(
 def capture_complete(runtime_file: str) -> dict[str, object]:
     """Reuse the canonical state helper immediately before fixed pushes."""
     helper = Path(__file__).with_name("capture-vault-state.py")
-    result = subprocess.run(
+    result = run_local_command(
         [str(helper), "--include-local-history", runtime_file],
         check=True,
         capture_output=True,
@@ -562,6 +569,7 @@ def capture_complete(runtime_file: str) -> dict[str, object]:
             "GIT_NO_REPLACE_OBJECTS": "1",
             "GIT_OPTIONAL_LOCKS": "0",
         },
+        timeout=LOCAL_COMMAND_TIMEOUT_SECONDS,
     )
     return json.loads(result.stdout)
 
@@ -737,12 +745,12 @@ def push_one_independently(
 def final_vault(
     reported: dict[str, object],
     push_status: str,
-    remote: str,
+    remote: str | None,
     pre_state: dict[str, object] | None = None,
 ) -> dict[str, object]:
     """Convert one local commit result into the final publication shape."""
     commit_hashes = list(reported["commit_hashes"])
-    if pre_state is not None:
+    if pre_state is not None and push_status in {"complete", "not_required"}:
         commit_hashes = [
             str(commit["commit"])
             for commit in pre_state.get("local_commits", [])
@@ -868,11 +876,19 @@ def main(argv: list[str]) -> int:
             "notification_result": committed["notification_result"],
             "agents_vault": final_vault(
                 actual_agents, agents_push, agents_remote,
-                pre["agents_vault"],
+                (
+                    pre["agents_vault"]
+                    if agents_push in {"complete", "not_required"}
+                    else None
+                ),
             ),
             "user_vault": final_vault(
                 actual_user, user_push, user_remote,
-                pre["user_vault"],
+                (
+                    pre["user_vault"]
+                    if user_push in {"complete", "not_required"}
+                    else None
+                ),
             ),
             "publication_mode": committed["publication_mode"],
             "deferred_cleanup": committed["deferred_cleanup"],
@@ -904,14 +920,55 @@ def main(argv: list[str]) -> int:
         print(f"fixed push blocked:{exc}", file=sys.stderr)
         if runtime and pre:
             try:
-                actual_agents = current_local(
-                    str(runtime["agents_vault_root"]), pre["agents_vault"]
-                )
-                actual_user = current_local(
-                    str(runtime["user_vault_root"]), pre["user_vault"]
-                )
+                unknown_local = False
+
+                def fallback_local(key: str, prefix: str) -> dict[str, object]:
+                    nonlocal unknown_local
+                    try:
+                        return current_local(
+                            str(runtime[f"{prefix}_vault_root"]), pre[key]
+                        )
+                    except (
+                        KeyError,
+                        OSError,
+                        TypeError,
+                        subprocess.SubprocessError,
+                        TransportError,
+                        PushError,
+                    ):
+                        unknown_local = True
+                        return {
+                            "commit_status": "failed",
+                            "commit_hashes": [],
+                            "pre_local_head": pre[key]["local_head"],
+                            "local_head": None,
+                            "pre_dirty_digest": pre[key]["dirty_digest"],
+                            "post_dirty_digest": "0" * 64,
+                            "clean": False,
+                        }
+
+                def fallback_remote(prefix: str) -> str | None:
+                    try:
+                        return remote_head(
+                            str(runtime[f"{prefix}_vault_root"]),
+                            str(runtime[f"{prefix}_remote_url"]),
+                            str(runtime[f"{prefix}_git_dir"]),
+                        )
+                    except (
+                        KeyError,
+                        OSError,
+                        TypeError,
+                        subprocess.SubprocessError,
+                        TransportError,
+                        PushError,
+                    ):
+                        return None
+
+                actual_agents = fallback_local("agents_vault", "agents")
+                actual_user = fallback_local("user_vault", "user")
                 for key, actual in (
-                    ("agents_vault", actual_agents), ("user_vault", actual_user)
+                    ("agents_vault", actual_agents),
+                    ("user_vault", actual_user),
                 ):
                     actual["publication_mode"] = committed.get(key, {}).get(
                         "publication_mode", "blocked"
@@ -919,22 +976,23 @@ def main(argv: list[str]) -> int:
                     actual["deferred_cleanup"] = committed.get(key, {}).get(
                         "deferred_cleanup", []
                     )
-                agents_remote = remote_head(
-                    str(runtime["agents_vault_root"]),
-                    str(runtime["agents_remote_url"]),
-                    str(runtime["agents_git_dir"]),
-                )
-                user_remote = remote_head(
-                    str(runtime["user_vault_root"]),
-                    str(runtime["user_remote_url"]),
-                    str(runtime["user_git_dir"]),
-                )
-                progressed = any(
+                agents_remote = fallback_remote("agents")
+                user_remote = fallback_remote("user")
+                progressed = (
+                    unknown_local
+                    or agents_remote is None
+                    or user_remote is None
+                    or any(
+                        actual["publication_mode"] != "blocked"
+                        for actual in (actual_agents, actual_user)
+                    )
+                    or any(
                     actual["local_head"] != before["local_head"]
                     or actual["post_dirty_digest"] != before["dirty_digest"]
                     for actual, before in (
                         (actual_agents, pre["agents_vault"]),
                         (actual_user, pre["user_vault"]),
+                    )
                     )
                 )
                 fallback = {
@@ -952,11 +1010,13 @@ def main(argv: list[str]) -> int:
                         actual_agents,
                         (
                             "complete"
-                            if agents_remote == actual_agents["local_head"]
+                            if agents_remote is not None
+                            and agents_remote == actual_agents["local_head"]
                             and actual_agents["commit_hashes"]
                             else "not_required"
-                            if agents_remote == actual_agents["local_head"]
-                            else "not_started"
+                            if agents_remote is not None
+                            and agents_remote == actual_agents["local_head"]
+                            else "failed"
                         ),
                         agents_remote,
                     ),
@@ -964,11 +1024,13 @@ def main(argv: list[str]) -> int:
                         actual_user,
                         (
                             "complete"
-                            if user_remote == actual_user["local_head"]
+                            if user_remote is not None
+                            and user_remote == actual_user["local_head"]
                             and actual_user["commit_hashes"]
                             else "not_required"
-                            if user_remote == actual_user["local_head"]
-                            else "not_started"
+                            if user_remote is not None
+                            and user_remote == actual_user["local_head"]
+                            else "failed"
                         ),
                         user_remote,
                     ),

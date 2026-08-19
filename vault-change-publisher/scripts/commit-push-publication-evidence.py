@@ -15,7 +15,13 @@ from pathlib import Path
 
 from evidence_hunk import canonical_patch
 from git_diff_digest import git_diff_digest
-from isolated_git_transport import TransportError, run_transport
+from isolated_git_transport import (
+    LOCAL_COMMAND_TIMEOUT_SECONDS,
+    TransportError,
+    run_local_command,
+    run_transport,
+)
+from trusted_gitleaks import trusted_scan_invocation
 
 
 class FinalizationError(RuntimeError):
@@ -111,7 +117,7 @@ def git(
                 "network Git operation requires an explicit Git directory"
             )
         return run_transport(git_dir, *arguments, check=check, text=True)
-    return subprocess.run(
+    return run_local_command(
         [
             "git", *repository_arguments,
             "-c", f"core.hooksPath={os.devnull}",
@@ -124,6 +130,7 @@ def git(
         text=True,
         env=environment,
         input=input_text,
+        timeout=LOCAL_COMMAND_TIMEOUT_SECONDS,
     )
 
 
@@ -215,31 +222,63 @@ def remote_head(repo: str, remote_url: str, git_dir: str | None = None) -> str:
     return result[0]
 
 
+def push_evidence_with_retry(
+    repo: str,
+    remote_url: str,
+    git_dir: str,
+    evidence_commit: str,
+    before_remote: str,
+) -> str:
+    """Retry a fixed non-force push across transient remote verification errors."""
+    remote = before_remote
+    for _ in range(3):
+        git(
+            repo,
+            "push",
+            remote_url,
+            f"{evidence_commit}:refs/heads/main",
+            check=False,
+            git_dir=git_dir,
+        )
+        try:
+            remote = remote_head(repo, remote_url, git_dir)
+        except (
+            FinalizationError,
+            OSError,
+            subprocess.SubprocessError,
+            TransportError,
+        ):
+            continue
+        if remote == evidence_commit:
+            return remote
+        if remote != before_remote:
+            break
+    raise FinalizationError("final evidence push failed")
+
+
 def scan_staged(gitleaks_bin: str, repo: str, index_file: str | None = None) -> None:
     """Run pinned gitleaks against the exact staged evidence hunk."""
     environment = clean_environment()
     if index_file is not None:
         environment["GIT_INDEX_FILE"] = index_file
     try:
-        result = subprocess.run(
-            [
-                gitleaks_bin,
-                "--no-banner",
-                "--redact",
-                "--ignore-gitleaks-allow",
-                "--gitleaks-ignore-path",
-                os.devnull,
-                "git",
-                "--staged",
-                repo,
-            ],
-            cwd="/",
-            check=False,
-            capture_output=True,
-            text=True,
-            env=environment,
-            timeout=SCAN_TIMEOUT_SECONDS,
-        )
+        with trusted_scan_invocation() as (scan_prefix, pass_fds):
+            result = run_local_command(
+                [
+                    gitleaks_bin,
+                    *scan_prefix,
+                    "git",
+                    "--staged",
+                    repo,
+                ],
+                cwd="/",
+                check=False,
+                capture_output=True,
+                text=True,
+                env=environment,
+                timeout=SCAN_TIMEOUT_SECONDS,
+                pass_fds=pass_fds,
+            )
     except subprocess.TimeoutExpired as exc:
         raise FinalizationError("gitleaks evidence scan exceeded its deadline") from exc
     if result.returncode != 0:
@@ -249,12 +288,13 @@ def scan_staged(gitleaks_bin: str, repo: str, index_file: str | None = None) -> 
 def capture_complete(runtime_file: str) -> dict[str, object]:
     """Capture both Vaults through the canonical publication state helper."""
     helper = Path(__file__).with_name("capture-vault-state.py")
-    completed = subprocess.run(
+    completed = run_local_command(
         [str(helper), "--include-local-history", runtime_file],
         check=True,
         capture_output=True,
         text=True,
         env=clean_environment(),
+        timeout=LOCAL_COMMAND_TIMEOUT_SECONDS,
     )
     return json.loads(completed.stdout)
 
@@ -352,37 +392,22 @@ def git_object_bytes(repo: str, git_dir: str, object_spec: str) -> bytes:
         raise FinalizationError("evidence Git object size is invalid") from exc
     if object_size < 0 or object_size > MAX_TASK_BYTES:
         raise FinalizationError("evidence Git object exceeds the allowed size")
-    process = subprocess.Popen(
+    completed = run_local_command(
         [
             "git", f"--git-dir={git_dir}", f"--work-tree={repo}",
             "-c", f"core.hooksPath={os.devnull}",
             "-c", "core.fsmonitor=false",
             "cat-file", "blob", object_spec,
         ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
+        check=False,
+        capture_output=True,
         env=clean_environment(),
+        timeout=LOCAL_COMMAND_TIMEOUT_SECONDS,
     )
-    assert process.stdout is not None
-    content = bytearray()
-    try:
-        while chunk := process.stdout.read(
-            min(65536, MAX_TASK_BYTES + 1 - len(content))
-        ):
-            content.extend(chunk)
-            if len(content) > MAX_TASK_BYTES:
-                process.kill()
-                process.wait()
-                raise FinalizationError("evidence Git object exceeds the allowed size")
-        return_code = process.wait()
-    finally:
-        process.stdout.close()
-        if process.poll() is None:
-            process.kill()
-            process.wait()
-    if return_code != 0 or len(content) != object_size:
+    content = completed.stdout
+    if completed.returncode != 0 or len(content) != object_size:
         raise FinalizationError("evidence Git object is unavailable or unstable")
-    return bytes(content)
+    return content
 
 
 def private_candidate(plan: dict[str, object], prefix: str) -> bytes:
@@ -428,6 +453,7 @@ def replace_worktree_candidate(
             stat.S_IMODE(before.st_mode),
             dir_fd=parent_fd,
         )
+        os.fchmod(temporary_fd, stat.S_IMODE(before.st_mode))
         write_all(temporary_fd, candidate)
         os.fsync(temporary_fd)
         current = path.lstat()
@@ -488,6 +514,7 @@ def rollback_worktree_candidate(receipt: dict[str, object]) -> None:
             int(receipt["original_mode"]),
             dir_fd=parent_fd,
         )
+        os.fchmod(temporary_fd, int(receipt["original_mode"]))
         write_all(temporary_fd, bytes(receipt["original"]))
         os.fsync(temporary_fd)
         os.replace(temporary_name, path.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
@@ -535,19 +562,21 @@ def isolated_evidence_commit(
         raise FinalizationError("evidence HEAD source differs from review")
     if canonical_patch(target, current_head_blob, head_candidate) != review_patch:
         raise FinalizationError("evidence candidate differs from reviewed hunk")
-    head_blob = subprocess.run(
+    head_blob = run_local_command(
         ["git", f"--git-dir={git_dir}", f"--work-tree={repo}", "hash-object", "-w", "--stdin"],
         input=head_candidate,
         check=True,
         capture_output=True,
         env=clean_environment(),
+        timeout=LOCAL_COMMAND_TIMEOUT_SECONDS,
     ).stdout.decode("ascii").strip()
-    index_blob = subprocess.run(
+    index_blob = run_local_command(
         ["git", f"--git-dir={git_dir}", f"--work-tree={repo}", "hash-object", "-w", "--stdin"],
         input=index_candidate,
         check=True,
         capture_output=True,
         env=clean_environment(),
+        timeout=LOCAL_COMMAND_TIMEOUT_SECONDS,
     ).stdout.decode("ascii").strip()
     descriptor, index_path = tempfile.mkstemp(prefix="evidence-index-", dir=str(directory))
     os.close(descriptor)
@@ -597,45 +626,78 @@ def partial_result(
     reason: str,
 ) -> dict[str, object]:
     """Capture actual local/remote evidence state after any failure."""
-    repo = runtime["agents_vault_root"]
-    head = git(repo, "rev-parse", "HEAD").stdout.strip()
-    clean, _ = dirty_status(repo)
-    finalization_commits = git(
-        repo,
-        "rev-list",
-        "--reverse",
-        f"{initial['agents_vault']['local_head']}..{head}",
-    ).stdout.splitlines()
-    try:
-        remote = remote_head(
-            repo, runtime["agents_remote_url"], runtime["agents_git_dir"]
+    finalization_commits: list[str] = []
+
+    def observed_vault(key: str, prefix: str) -> dict[str, object]:
+        nonlocal finalization_commits
+        repo = runtime[f"{prefix}_vault_root"]
+        local_known = True
+        try:
+            head: str | None = git(repo, "rev-parse", "HEAD").stdout.strip()
+            clean, _ = dirty_status(repo)
+            if key == "agents_vault":
+                finalization_commits = git(
+                    repo,
+                    "rev-list",
+                    "--reverse",
+                    f"{initial[key]['local_head']}..{head}",
+                ).stdout.splitlines()
+        except (
+            FinalizationError,
+            OSError,
+            subprocess.SubprocessError,
+            TransportError,
+        ):
+            head = None
+            clean = False
+            local_known = False
+            if key == "agents_vault":
+                finalization_commits = []
+        try:
+            remote: str | None = remote_head(
+                repo,
+                runtime[f"{prefix}_remote_url"],
+                runtime[f"{prefix}_git_dir"],
+            )
+        except (
+            FinalizationError,
+            OSError,
+            subprocess.SubprocessError,
+            TransportError,
+        ):
+            remote = None
+        hashes = [
+            *initial[key].get("commit_hashes", []),
+            *(finalization_commits if key == "agents_vault" else []),
+        ]
+        observed = dict(initial[key])
+        observed.update(
+            {
+                "commit_status": (
+                    "complete" if hashes else ("not_started" if local_known else "failed")
+                ),
+                "commit_hashes": hashes,
+                "push_status": (
+                    "complete"
+                    if head is not None and remote is not None and remote == head
+                    else "failed"
+                ),
+                "local_head": head,
+                "remote_head": remote,
+                "clean": clean,
+            }
         )
-    except (FinalizationError, subprocess.SubprocessError):
-        remote = initial["agents_vault"]["remote_head"]
-    agents = dict(initial["agents_vault"])
-    agents.update(
-        {
-            "commit_status": (
-                "complete"
-                if initial["agents_vault"]["commit_hashes"] or finalization_commits
-                else "not_started"
-            ),
-            "commit_hashes": [
-                *initial["agents_vault"]["commit_hashes"],
-                *finalization_commits,
-            ],
-            "push_status": "complete" if remote == head else "failed",
-            "local_head": head,
-            "remote_head": remote,
-            "clean": clean,
-        }
-    )
+        return observed
+
+    agents = observed_vault("agents_vault", "agents")
+    user = observed_vault("user_vault", "user")
     result = dict(initial)
     result.update(
         {
             "outcome": "partial_publication",
             "phase": "evidence_finalization",
             "agents_vault": agents,
+            "user_vault": user,
             "evidence_finalization_commit": (
                 finalization_commits[-1]
                 if finalization_commits
@@ -752,25 +814,12 @@ def main(argv: list[str]) -> int:
         )
         if before_remote != initial["agents_vault"]["remote_head"]:
             raise FinalizationError("remote main raced before evidence push")
-        pushed = False
-        for _ in range(3):
-            result = git(
-                repo, "push", runtime["agents_remote_url"],
-                f"{evidence_commit}:refs/heads/main", check=False,
-                git_dir=runtime["agents_git_dir"],
-            )
-            remote = remote_head(
-                repo, runtime["agents_remote_url"], runtime["agents_git_dir"]
-            )
-            if remote == evidence_commit:
-                pushed = True
-                break
-            if remote != before_remote:
-                break
-        if not pushed:
-            raise FinalizationError("final evidence push failed")
-        remote = remote_head(
-            repo, runtime["agents_remote_url"], runtime["agents_git_dir"]
+        remote = push_evidence_with_retry(
+            repo,
+            str(runtime["agents_remote_url"]),
+            str(runtime["agents_git_dir"]),
+            evidence_commit,
+            before_remote,
         )
         clean, _ = dirty_status(repo)
         if remote != evidence_commit:

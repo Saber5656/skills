@@ -7,13 +7,21 @@ import hashlib
 import json
 import os
 import re
+import selectors
 import stat
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path, PurePosixPath
 
 from git_diff_digest import unified_diff_added_content
+from isolated_git_transport import (
+    LOCAL_COMMAND_TIMEOUT_SECONDS,
+    kill_process_group,
+    run_local_command,
+)
+from trusted_gitleaks import trusted_scan_invocation
 
 
 MAX_BLOB_BYTES = 8 * 1024 * 1024
@@ -28,31 +36,49 @@ class DirtySnapshotError(RuntimeError):
 
 
 def run_bounded(arguments: list[str], limit: int) -> bytes:
-    """Read subprocess stdout up to an explicit bound without buffering beyond it."""
+    """Read bounded stdout under one wall deadline and reap the process group."""
     process = subprocess.Popen(
         arguments,
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
         cwd="/",
         env=clean_git_environment(),
+        start_new_session=True,
     )
     assert process.stdout is not None
+    selector = selectors.DefaultSelector()
+    selector.register(process.stdout, selectors.EVENT_READ)
+    deadline = time.monotonic() + LOCAL_COMMAND_TIMEOUT_SECONDS
     chunks: list[bytes] = []
     total = 0
+    finished = False
     try:
-        while chunk := process.stdout.read(min(65536, limit + 1 - total)):
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not selector.select(remaining):
+                raise DirtySnapshotError("Git review input exceeded its deadline")
+            chunk = os.read(
+                process.stdout.fileno(), min(65536, limit + 1 - total)
+            )
+            if not chunk:
+                break
             total += len(chunk)
             if total > limit:
-                process.kill()
-                process.wait()
                 raise DirtySnapshotError("review input exceeds per-file size limit")
             chunks.append(chunk)
-        return_code = process.wait()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise DirtySnapshotError("Git review input exceeded its deadline")
+        try:
+            return_code = process.wait(timeout=remaining)
+        except subprocess.TimeoutExpired as exc:
+            raise DirtySnapshotError("Git review input exceeded its deadline") from exc
+        finished = True
     finally:
+        selector.close()
         process.stdout.close()
-        if process.poll() is None:
-            process.kill()
-            process.wait()
+        if not finished:
+            kill_process_group(process)
     if return_code != 0:
         raise DirtySnapshotError("Git review input is unavailable")
     return b"".join(chunks)
@@ -129,13 +155,14 @@ def read_regular_beneath(root: Path, relative: PurePosixPath) -> bytes:
 def read_blob(git_dir: str, worktree: str, relative: str, oid: str) -> bytes:
     if OID_PATTERN.fullmatch(oid) is None:
         raise DirtySnapshotError("dirty entry has an invalid Git object ID")
-    size = subprocess.run(
+    size = run_local_command(
         ["git", f"--git-dir={git_dir}", "cat-file", "-s", oid],
         check=False,
         capture_output=True,
         text=True,
         cwd="/",
         env=clean_git_environment(),
+        timeout=LOCAL_COMMAND_TIMEOUT_SECONDS,
     )
     if size.returncode == 0:
         try:
@@ -150,13 +177,14 @@ def read_blob(git_dir: str, worktree: str, relative: str, oid: str) -> bytes:
         )
     else:
         content = read_regular_beneath(Path(worktree), PurePosixPath(relative))
-    hashed = subprocess.run(
+    hashed = run_local_command(
         ["git", f"--git-dir={git_dir}", "hash-object", "--stdin"],
         input=content,
         check=True,
         capture_output=True,
         cwd="/",
         env=clean_git_environment(),
+        timeout=LOCAL_COMMAND_TIMEOUT_SECONDS,
     )
     if hashed.stdout.decode("ascii").strip() != oid:
         raise DirtySnapshotError("dirty blob bytes do not match captured object ID")
@@ -185,13 +213,14 @@ def read_head_blob(git_dir: str, head: object, relative: str) -> bytes:
     if fields[1] != b"blob":
         return b""
     oid = fields[2].decode("ascii")
-    size = subprocess.run(
+    size = run_local_command(
         ["git", f"--git-dir={git_dir}", "cat-file", "-s", oid],
         check=False,
         capture_output=True,
         text=True,
         cwd="/",
         env=clean_git_environment(),
+        timeout=LOCAL_COMMAND_TIMEOUT_SECONDS,
     )
     try:
         object_size = int(size.stdout.strip()) if size.returncode == 0 else -1
@@ -214,7 +243,7 @@ def diff_added_bytes(baseline: bytes, candidate: bytes) -> tuple[bytes, bool]:
         before.write_bytes(baseline)
         after.write_bytes(candidate)
         try:
-            completed = subprocess.run(
+            completed = run_local_command(
                 [
                     "git", "diff", "--no-index", "--no-color", "--unified=0",
                     "--binary", "--no-ext-diff", "--no-textconv", "--",
@@ -246,23 +275,21 @@ def gitleaks_rejects(gitleaks_bin: str, content: bytes) -> bool:
     if not content:
         return False
     try:
-        completed = subprocess.run(
-            [
-                gitleaks_bin,
-                "--no-banner",
-                "--redact",
-                "--ignore-gitleaks-allow",
-                "--gitleaks-ignore-path",
-                os.devnull,
-                "stdin",
-            ],
-            input=content,
-            cwd="/",
-            check=False,
-            capture_output=True,
-            env=clean_scan_environment(),
-            timeout=SCAN_TIMEOUT_SECONDS,
-        )
+        with trusted_scan_invocation() as (scan_prefix, pass_fds):
+            completed = run_local_command(
+                [
+                    gitleaks_bin,
+                    *scan_prefix,
+                    "stdin",
+                ],
+                input=content,
+                cwd="/",
+                check=False,
+                capture_output=True,
+                env=clean_scan_environment(),
+                timeout=SCAN_TIMEOUT_SECONDS,
+                pass_fds=pass_fds,
+            )
     except (OSError, subprocess.TimeoutExpired):
         return True
     return completed.returncode != 0
@@ -280,10 +307,8 @@ def residual_guard_reason(
         return "dirty_entry_forbidden_obsidian_path"
     head = state.get("local_head")
     gitleaks_bin = runtime.get("gitleaks_bin")
-    # Legacy unit fixtures without production capture/scanner fields exercise
-    # materialization only. Production runtime always supplies both fields.
     if not isinstance(head, str) or not isinstance(gitleaks_bin, str):
-        return None
+        return "dirty_entry_residual_guard_unavailable"
     try:
         baseline = read_head_blob(str(runtime[git_key]), head, relative)
         added, binary = diff_added_bytes(baseline, content)
@@ -371,9 +396,13 @@ def materialize(
             ):
                 vault_descriptor = mkdir_exclusive(snapshots_descriptor, label)
                 try:
-                    entries = pre_state[state_key]["dirty_entries"]
+                    state = pre_state[state_key]
+                    entries = state["dirty_entries"]
                     if not isinstance(entries, list):
                         raise DirtySnapshotError("dirty entries are not a list")
+                    unstable_snapshot = (
+                        state.get("capture_reason") == "vault_state_snapshot_unstable"
+                    )
                     seen: set[str] = set()
                     output_entries: list[dict[str, object]] = []
                     for index, entry in enumerate(entries):
@@ -383,6 +412,21 @@ def materialize(
                         seen.add(relative)
                         mode = entry["mode"]
                         oid = entry["git_blob_oid"]
+                        if unstable_snapshot:
+                            output_entries.append(
+                                {
+                                    "path": relative,
+                                    "git_blob_oid": oid,
+                                    "mode": mode,
+                                    "snapshot": None,
+                                    "sha256": None,
+                                    "materialization_status": "deferred",
+                                    "materialization_reason": (
+                                        "vault_state_snapshot_unstable"
+                                    ),
+                                }
+                            )
+                            continue
                         if relative == ".obsidian" or relative.startswith(
                             ".obsidian/"
                         ):
@@ -481,11 +525,29 @@ def materialize(
             ):
                 vault_descriptor = mkdir_exclusive(commits_descriptor, label)
                 try:
-                    commits = pre_state[state_key].get("local_commits", [])
+                    state = pre_state[state_key]
+                    commits = state.get("local_commits", [])
                     if not isinstance(commits, list):
                         raise DirtySnapshotError("local commits are not a list")
+                    unstable_snapshot = (
+                        state.get("capture_reason") == "vault_state_snapshot_unstable"
+                    )
                     output_commits: list[dict[str, object]] = []
                     for index, commit in enumerate(commits):
+                        if unstable_snapshot:
+                            output_commits.append(
+                                {
+                                    **commit,
+                                    "patch_sha256": None,
+                                    "snapshot": None,
+                                    "sha256": None,
+                                    "materialization_status": "blocked",
+                                    "materialization_reason": (
+                                        "vault_state_snapshot_unstable"
+                                    ),
+                                }
+                            )
+                            continue
                         parents = commit.get("parents")
                         if not isinstance(parents, list):
                             raise DirtySnapshotError("local commit metadata is invalid")
@@ -505,6 +567,7 @@ def materialize(
                             output_commits.append(
                                 {
                                     **commit,
+                                    "patch_sha256": None,
                                     "snapshot": None,
                                     "sha256": None,
                                     "materialization_status": "blocked",

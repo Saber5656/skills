@@ -7,9 +7,12 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import stat
 import sys
 from pathlib import Path, PurePosixPath
+
+from atomic_file_ops import rename_no_replace, verify_rename_no_replace
 
 SUMMARY_PATTERN = re.compile(r"^SUMMARY-IT-NEWS-(\d{4})-(\d{2})-(\d{2})(?:-\d+)?\.md$")
 ADVISORY_PATTERN = re.compile(r"^Personal-Vulnerability-Advisory-\d{4}-\d{2}-\d{2}(?:-\d+)?\.md$")
@@ -17,6 +20,58 @@ ADVISORY_PATTERN = re.compile(r"^Personal-Vulnerability-Advisory-\d{4}-\d{2}-\d{
 
 class InstallError(RuntimeError):
     """Represent a fail-closed artifact installation error."""
+
+
+def cleanup_failed_install(
+    directory_fd: int,
+    candidate: str,
+    owned_identity: tuple[int, int],
+) -> None:
+    """Remove only the installer inode and restore a replaced entry unchanged."""
+    quarantine_name = f".vault-publisher-install-{secrets.token_hex(16)}"
+    os.mkdir(quarantine_name, 0o700, dir_fd=directory_fd)
+    quarantine_fd = os.open(
+        quarantine_name,
+        os.O_RDONLY
+        | os.O_DIRECTORY
+        | getattr(os, "O_NOFOLLOW", 0),
+        dir_fd=directory_fd,
+    )
+    quarantined = False
+    try:
+        verify_rename_no_replace(quarantine_fd)
+        try:
+            os.rename(
+                candidate,
+                "artifact",
+                src_dir_fd=directory_fd,
+                dst_dir_fd=quarantine_fd,
+            )
+        except FileNotFoundError:
+            return
+        quarantined = True
+        metadata = os.stat("artifact", dir_fd=quarantine_fd, follow_symlinks=False)
+        if (metadata.st_dev, metadata.st_ino) == owned_identity:
+            os.unlink("artifact", dir_fd=quarantine_fd)
+            quarantined = False
+            return
+        try:
+            rename_no_replace(
+                quarantine_fd,
+                "artifact",
+                directory_fd,
+                candidate,
+            )
+        except FileExistsError as exc:
+            raise InstallError(
+                "replacement artifact was preserved in failed-install quarantine"
+            ) from exc
+        quarantined = False
+        raise InstallError("destination artifact was replaced during failed cleanup")
+    finally:
+        os.close(quarantine_fd)
+        if not quarantined:
+            os.rmdir(quarantine_name, dir_fd=directory_fd)
 
 
 def sha256_fd(descriptor: int) -> str:
@@ -67,8 +122,8 @@ def install(
     relative_directory: PurePosixPath,
     filename: str,
     expected_target: Path,
-) -> Path:
-    """Copy one verified artifact with O_NOFOLLOW and O_EXCL."""
+) -> tuple[Path, dict[str, object]]:
+    """Copy one verified artifact and return its installer-owned identity."""
     source_flags = os.O_RDONLY
     if hasattr(os, "O_NOFOLLOW"):
         source_flags |= os.O_NOFOLLOW
@@ -101,6 +156,8 @@ def install(
             target_fd = os.open(candidate, flags, 0o644, dir_fd=directory_fd)
         except OSError as exc:
             raise InstallError("planned destination is no longer available") from exc
+        created_stat = os.fstat(target_fd)
+        created_identity = (created_stat.st_dev, created_stat.st_ino)
         try:
             while chunk := os.read(source_fd, 1024 * 1024):
                 view = memoryview(chunk)
@@ -110,13 +167,31 @@ def install(
                         raise InstallError("could not write destination artifact")
                     view = view[count:]
             os.fsync(target_fd)
+            target_stat = os.fstat(target_fd)
+            if (
+                not stat.S_ISREG(target_stat.st_mode)
+                or target_stat.st_size != source_stat.st_size
+            ):
+                raise InstallError("destination artifact identity is invalid")
+            receipt = {
+                "path": str(expected_target),
+                "sha256": expected_hash,
+                "identity": [
+                    target_stat.st_dev,
+                    target_stat.st_ino,
+                ],
+                "size": target_stat.st_size,
+                "mode": target_stat.st_mode,
+            }
         except Exception:
-            os.close(target_fd)
-            os.unlink(candidate, dir_fd=directory_fd)
+            try:
+                cleanup_failed_install(directory_fd, candidate, created_identity)
+            finally:
+                os.close(target_fd)
             raise
         else:
             os.close(target_fd)
-        return expected_target
+        return expected_target, receipt
     finally:
         os.close(source_fd)
         for descriptor in reversed(opened):
@@ -177,7 +252,12 @@ def target_from_bound_plan(
     expected_parent = vault_root.joinpath(*relative_directory.parts)
     stem, suffix = os.path.splitext(filename)
     candidate_stem, candidate_suffix = os.path.splitext(target.name)
-    suffix_number = candidate_stem.removeprefix(f"{stem}-")
+    expected_prefix = f"{stem}-"
+    suffix_number = (
+        candidate_stem[len(expected_prefix) :]
+        if candidate_stem.startswith(expected_prefix)
+        else ""
+    )
     if (
         not target.is_absolute()
         or target.parent != expected_parent
@@ -254,7 +334,7 @@ def main(argv: list[str]) -> int:
                     raise InstallError(
                         "selected summary target no longer matches the artifact plan"
                     )
-                summary_target = install(
+                summary_target, installed_receipt = install(
                     summary_source,
                     collection["summary_sha256"],
                     user_root,
@@ -269,7 +349,7 @@ def main(argv: list[str]) -> int:
                     raise InstallError(
                         "selected advisory target no longer matches the artifact plan"
                     )
-                advisory_target = install(
+                advisory_target, installed_receipt = install(
                     advisory_source,
                     collection["advisory_sha256"],
                     agents_root,
@@ -281,6 +361,8 @@ def main(argv: list[str]) -> int:
             "summary_target": str(summary_target),
             "advisory_target": str(advisory_target),
         }
+        if not plan_only:
+            result["installed_receipt"] = installed_receipt
     except (InstallError, KeyError, OSError, TypeError, ValueError) as exc:
         print(f"artifact installation failed:{exc}", file=sys.stderr)
         return 75

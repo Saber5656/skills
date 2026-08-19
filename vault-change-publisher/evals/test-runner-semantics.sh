@@ -64,6 +64,19 @@ assert_result $'invalid_result\t65'
 write_result partial_publication '["a"]' '["b"]' failed failed false
 assert_result $'partial_publication\t75'
 
+write_result partial_publication '["a"]' '["preexisting"]' failed not_started false
+/usr/bin/jq '
+  .user_vault.publication_mode="blocked"
+  | .publication_mode.user_vault="blocked"
+' "$FIXTURE_ROOT/result.json" > "$FIXTURE_ROOT/blocked-peer.json"
+mv "$FIXTURE_ROOT/blocked-peer.json" "$FIXTURE_ROOT/result.json"
+assert_result $'invalid_result\t65'
+
+write_result partial_publication '["a"]' '["b"]' failed failed false
+/usr/bin/jq '.user_vault.commit_status="failed"' "$FIXTURE_ROOT/result.json" > "$FIXTURE_ROOT/failed-hashes.json"
+mv "$FIXTURE_ROOT/failed-hashes.json" "$FIXTURE_ROOT/result.json"
+assert_result $'invalid_result\t65'
+
 write_result partial_publication '[]' '[]' failed failed true
 assert_result $'invalid_result\t65'
 
@@ -96,4 +109,4 @@ printf '{"outcome":"partial_publication"}\n' > "$FIXTURE_ROOT/result.json"
 assert_result $'invalid_result\t65'
 assert_result $'process_error\t42' 42
 
-echo "runner semantic interpretation: 12/12 passed"
+echo "runner semantic interpretation: 14/14 passed"

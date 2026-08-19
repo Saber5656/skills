@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import stat
 import subprocess
 import sys
@@ -14,7 +15,10 @@ import tempfile
 from pathlib import Path, PurePosixPath
 from typing import Callable, Optional
 
+from atomic_file_ops import rename_no_replace, verify_rename_no_replace
 from git_diff_digest import unified_diff_added_content
+from isolated_git_transport import LOCAL_COMMAND_TIMEOUT_SECONDS, run_local_command
+from trusted_gitleaks import trusted_scan_invocation
 
 
 CLEAN_DIGEST = hashlib.sha256(b"").hexdigest()
@@ -92,7 +96,7 @@ def git(
     environment = clean_environment(publisher_identity)
     if index_file is not None:
         environment["GIT_INDEX_FILE"] = index_file
-    return subprocess.run(
+    return run_local_command(
         [
             "git",
             f"--git-dir={git_dir}",
@@ -111,6 +115,7 @@ def git(
         text=True,
         input=input_text,
         env=environment,
+        timeout=LOCAL_COMMAND_TIMEOUT_SECONDS,
     )
 
 
@@ -124,7 +129,7 @@ def git_bytes(
     environment = clean_environment()
     if index_file is not None:
         environment["GIT_INDEX_FILE"] = index_file
-    return subprocess.run(
+    return run_local_command(
         [
             "git",
             f"--git-dir={git_dir}",
@@ -141,6 +146,7 @@ def git_bytes(
         check=True,
         capture_output=True,
         env=environment,
+        timeout=LOCAL_COMMAND_TIMEOUT_SECONDS,
     )
 
 
@@ -187,13 +193,14 @@ def current_state(repo: str, git_dir: str, pre: dict[str, object]) -> dict[str, 
 
 def capture_exact(capture: str, runtime_file: str, expected: dict[str, object]) -> None:
     """Require the current two-Vault state to equal the immutable pre-state."""
-    completed = subprocess.run(
+    completed = run_local_command(
         [capture, "--include-local-history", runtime_file],
         cwd="/",
         check=True,
         capture_output=True,
         text=True,
         env=clean_environment(),
+        timeout=LOCAL_COMMAND_TIMEOUT_SECONDS,
     )
     if json.loads(completed.stdout) != expected:
         raise CommitError("Vault state changed after the approved review")
@@ -201,13 +208,14 @@ def capture_exact(capture: str, runtime_file: str, expected: dict[str, object]) 
 
 def capture_state(capture: str, runtime_file: str) -> dict[str, object]:
     """Capture the complete current state for both Vaults."""
-    completed = subprocess.run(
+    completed = run_local_command(
         [capture, "--include-local-history", runtime_file],
         cwd="/",
         check=True,
         capture_output=True,
         text=True,
         env=clean_environment(),
+        timeout=LOCAL_COMMAND_TIMEOUT_SECONDS,
     )
     return json.loads(completed.stdout)
 
@@ -373,24 +381,22 @@ def scan_staged(
     environment = clean_environment()
     environment["GIT_INDEX_FILE"] = index_file
     try:
-        completed = subprocess.run(
-            [
-                gitleaks_bin,
-                "--no-banner",
-                "--redact",
-                "--ignore-gitleaks-allow",
-                "--gitleaks-ignore-path",
-                os.devnull,
-                "git",
-                "--staged",
-                repo,
-            ],
-            cwd="/",
-            check=False,
-            capture_output=True,
-            env=environment,
-            timeout=SCAN_TIMEOUT_SECONDS,
-        )
+        with trusted_scan_invocation() as (scan_prefix, pass_fds):
+            completed = run_local_command(
+                [
+                    gitleaks_bin,
+                    *scan_prefix,
+                    "git",
+                    "--staged",
+                    repo,
+                ],
+                cwd="/",
+                check=False,
+                capture_output=True,
+                env=environment,
+                timeout=SCAN_TIMEOUT_SECONDS,
+                pass_fds=pass_fds,
+            )
     except subprocess.TimeoutExpired as exc:
         raise CommitError("gitleaks staged scan exceeded its deadline") from exc
     if completed.returncode != 0:
@@ -423,7 +429,7 @@ def scan_staged(
             ).stdout
             if not listed:
                 continue
-            candidate = subprocess.run(
+            candidate = run_local_command(
                 [
                     "git",
                     f"--git-dir={git_dir}",
@@ -435,6 +441,7 @@ def scan_staged(
                 check=True,
                 capture_output=True,
                 env=environment,
+                timeout=LOCAL_COMMAND_TIMEOUT_SECONDS,
             ).stdout
             numstat = git(
                 repo,
@@ -482,64 +489,197 @@ def stable_regular_bytes(path: Path) -> bytes:
 
 
 def installed_artifact_receipt(path: Path, expected_sha256: str) -> dict[str, object]:
-    """Bind one newly installed artifact so a pre-commit failure can undo only it."""
-    content = stable_regular_bytes(path)
-    metadata = path.lstat()
-    if hashlib.sha256(content).hexdigest() != expected_sha256:
+    """Bind bytes and stable inode identity through one descriptor."""
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise CommitError("newly installed artifact is not a regular file")
+        chunks: list[bytes] = []
+        while chunk := os.read(descriptor, 1024 * 1024):
+            chunks.append(chunk)
+        after = os.fstat(descriptor)
+        identity = (before.st_dev, before.st_ino)
+        content_contract = (before.st_size, before.st_mode)
+        if identity != (after.st_dev, after.st_ino) or content_contract != (
+            after.st_size,
+            after.st_mode,
+        ):
+            raise CommitError("newly installed artifact changed while being read")
+    finally:
+        os.close(descriptor)
+    if hashlib.sha256(b"".join(chunks)).hexdigest() != expected_sha256:
         raise CommitError("newly installed artifact differs from verified staging bytes")
     return {
         "path": str(path),
         "sha256": expected_sha256,
-        "identity": (
-            metadata.st_dev,
-            metadata.st_ino,
-            metadata.st_size,
-            metadata.st_mtime_ns,
-            metadata.st_ctime_ns,
-            metadata.st_mode,
-        ),
+        "identity": identity,
+        "size": content_contract[0],
+        "mode": content_contract[1],
     }
 
 
-def rollback_owned_artifact(receipt: dict[str, object]) -> None:
-    """Remove only the exact O_EXCL artifact created by this failed invocation."""
+def validated_installer_receipt(
+    value: object, expected_path: Path, expected_sha256: str
+) -> dict[str, object]:
+    """Accept only the identity sealed by the installer's O_EXCL descriptor."""
+    if not isinstance(value, dict) or set(value) != {
+        "path",
+        "sha256",
+        "identity",
+        "size",
+        "mode",
+    }:
+        raise CommitError("installer artifact receipt is malformed")
+    identity = value.get("identity")
+    if (
+        value.get("path") != str(expected_path)
+        or value.get("sha256") != expected_sha256
+        or not isinstance(identity, list)
+        or len(identity) != 2
+        or any(not isinstance(field, int) or isinstance(field, bool) for field in identity)
+        or not isinstance(value.get("size"), int)
+        or isinstance(value.get("size"), bool)
+        or int(value["size"]) < 0
+        or not isinstance(value.get("mode"), int)
+        or isinstance(value.get("mode"), bool)
+    ):
+        raise CommitError("installer artifact receipt differs from the approved artifact")
+    receipt = {
+        "path": str(expected_path),
+        "sha256": expected_sha256,
+        "identity": tuple(identity),
+        "size": int(value["size"]),
+        "mode": int(value["mode"]),
+    }
+    require_owned_artifact(receipt)
+    return receipt
+
+
+def descriptor_matches_owned_artifact(
+    descriptor: int, receipt: dict[str, object]
+) -> bool:
+    """Check stable inode/content fields without treating timestamps as identity."""
+    before = os.fstat(descriptor)
+    identity = (before.st_dev, before.st_ino)
+    content_contract = (before.st_size, before.st_mode)
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or identity != tuple(receipt["identity"])
+        or content_contract != (receipt["size"], receipt["mode"])
+    ):
+        return False
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    hasher = hashlib.sha256()
+    while chunk := os.read(descriptor, 1024 * 1024):
+        hasher.update(chunk)
+    after = os.fstat(descriptor)
+    return (
+        identity == (after.st_dev, after.st_ino)
+        and content_contract == (after.st_size, after.st_mode)
+        and hasher.hexdigest() == receipt["sha256"]
+    )
+
+
+def require_owned_artifact(receipt: dict[str, object]) -> None:
+    """Verify bytes through the installer inode while ignoring timestamp churn."""
     path = Path(str(receipt["path"]))
     descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     try:
-        before = os.fstat(descriptor)
-        identity = (
-            before.st_dev,
-            before.st_ino,
-            before.st_size,
-            before.st_mtime_ns,
-            before.st_ctime_ns,
-            before.st_mode,
-        )
-        if identity != tuple(receipt["identity"]):
-            raise CommitError("newly installed artifact changed; rollback refused")
-        content = b""
-        while chunk := os.read(descriptor, 1024 * 1024):
-            content += chunk
-        after = os.fstat(descriptor)
-        if (
-            identity
-            != (
-                after.st_dev,
-                after.st_ino,
-                after.st_size,
-                after.st_mtime_ns,
-                after.st_ctime_ns,
-                after.st_mode,
-            )
-            or hashlib.sha256(content).hexdigest() != receipt["sha256"]
-        ):
-            raise CommitError("newly installed artifact changed; rollback refused")
-        path_identity = path.lstat()
-        if (path_identity.st_dev, path_identity.st_ino) != (before.st_dev, before.st_ino):
-            raise CommitError("newly installed artifact was replaced; rollback refused")
-        path.unlink()
+        if not descriptor_matches_owned_artifact(descriptor, receipt):
+            raise CommitError("installer-owned artifact changed before publication")
     finally:
         os.close(descriptor)
+
+
+def rollback_owned_artifact(receipt: dict[str, object]) -> None:
+    """Atomically quarantine, verify, and remove only this run's artifact."""
+    path = Path(str(receipt["path"]))
+    parent_descriptor = os.open(
+        path.parent,
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+    )
+    descriptor = -1
+    quarantine_descriptor = -1
+    quarantine_name = f".vault-publisher-rollback-{secrets.token_hex(16)}"
+    quarantined = False
+    try:
+        descriptor = os.open(
+            path.name,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=parent_descriptor,
+        )
+        before = os.fstat(descriptor)
+        if not descriptor_matches_owned_artifact(descriptor, receipt):
+            raise CommitError("newly installed artifact changed; rollback refused")
+        os.mkdir(quarantine_name, 0o700, dir_fd=parent_descriptor)
+        quarantine_descriptor = os.open(
+            quarantine_name,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=parent_descriptor,
+        )
+        verify_rename_no_replace(quarantine_descriptor)
+        os.rename(
+            path.name,
+            "artifact",
+            src_dir_fd=parent_descriptor,
+            dst_dir_fd=quarantine_descriptor,
+        )
+        quarantined = True
+        quarantined_identity = os.stat(
+            "artifact", dir_fd=quarantine_descriptor, follow_symlinks=False
+        )
+        if (quarantined_identity.st_dev, quarantined_identity.st_ino) != (
+            before.st_dev,
+            before.st_ino,
+        ):
+            try:
+                rename_no_replace(
+                    quarantine_descriptor,
+                    "artifact",
+                    parent_descriptor,
+                    path.name,
+                )
+                quarantined = False
+            except FileExistsError:
+                pass
+            raise CommitError(
+                "newly installed artifact was replaced; rollback quarantined it"
+            )
+        if not descriptor_matches_owned_artifact(descriptor, receipt):
+            try:
+                rename_no_replace(
+                    quarantine_descriptor,
+                    "artifact",
+                    parent_descriptor,
+                    path.name,
+                )
+                quarantined = False
+                raise CommitError(
+                    "newly installed artifact changed during rollback; rollback refused"
+                )
+            except FileExistsError:
+                raise CommitError(
+                    "newly installed artifact changed during rollback; "
+                    "rollback quarantined it"
+                )
+        os.unlink("artifact", dir_fd=quarantine_descriptor)
+        quarantined = False
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if quarantine_descriptor >= 0:
+            os.close(quarantine_descriptor)
+        if not quarantined:
+            try:
+                os.rmdir(quarantine_name, dir_fd=parent_descriptor)
+            except FileNotFoundError:
+                pass
+        os.close(parent_descriptor)
 
 
 def write_blob(
@@ -549,7 +689,7 @@ def write_blob(
     expected_oid: str | None = None,
 ) -> str:
     """Write one already-verified blob without filters or a shell."""
-    completed = subprocess.run(
+    completed = run_local_command(
         [
             "git",
             f"--git-dir={git_dir}",
@@ -563,6 +703,7 @@ def write_blob(
         input=content,
         capture_output=True,
         env=clean_environment(),
+        timeout=LOCAL_COMMAND_TIMEOUT_SECONDS,
     )
     oid = completed.stdout.decode("ascii").strip()
     if not oid or (expected_oid is not None and oid != expected_oid):
@@ -687,6 +828,8 @@ def commit_groups(
     mutation_tracker: dict[str, object] | None = None,
 ) -> dict[str, object]:
     """Create the ordered, minimal commits declared by the approved manifest."""
+    if publication_mode not in {"sweep", "own_only"}:
+        raise CommitError("blocked Vault cannot create publication commits")
     if git(repo, git_dir, "branch", "--show-current").stdout.strip() != "main":
         raise CommitError("Vault is not on main")
     if git(repo, git_dir, "rev-parse", "HEAD").stdout.strip() != pre["local_head"]:
@@ -830,8 +973,6 @@ def commit_groups(
         "dirty_digest"
     ]:
         raise CommitError("own_only changed the residual porcelain state")
-    if publication_mode not in {"sweep", "own_only"}:
-        raise CommitError("blocked Vault cannot create publication commits")
     result["commit_status"] = "complete"
     result["publication_mode"] = publication_mode
     result["deferred_cleanup"] = list(manifest.get("deferred_cleanup", []))
@@ -932,13 +1073,13 @@ def result_after_failure(
         except (KeyError, TypeError, OSError, subprocess.SubprocessError):
             before = pre.get(key, {}) if isinstance(pre, dict) else {}
             state = {
-                "commit_status": "not_started",
+                "commit_status": "failed",
                 "commit_hashes": [],
                 "pre_local_head": before.get("local_head", zero_head),
-                "local_head": before.get("local_head", zero_head),
+                "local_head": zero_head,
                 "pre_dirty_digest": before.get("dirty_digest", zero_digest),
-                "post_dirty_digest": before.get("dirty_digest", zero_digest),
-                "clean": not before.get("dirty_lines", []),
+                "post_dirty_digest": zero_digest,
+                "clean": False,
             }
         if state["commit_hashes"]:
             state["commit_status"] = "failed"
@@ -1143,9 +1284,14 @@ def restore_completed_publication(
         raise CommitError("completed Vault changed before compensating rollback")
     artifact = str(handle["artifact"])
     artifact_absolute = Path(str(handle["artifact_absolute"]))
-    receipt = installed_artifact_receipt(
-        artifact_absolute, str(handle["artifact_sha256"])
-    )
+    receipt = handle.get("artifact_receipt")
+    if (
+        not isinstance(receipt, dict)
+        or receipt.get("path") != str(artifact_absolute)
+        or receipt.get("sha256") != str(handle["artifact_sha256"])
+    ):
+        raise CommitError("publication rollback receipt is malformed")
+    require_owned_artifact(receipt)
     backup = handle["index_backup"]
     if not isinstance(backup, dict):
         raise CommitError("publication index backup is malformed")
@@ -1265,29 +1411,36 @@ def publish_one_vault(
             capture_one_exact(capture, runtime_file, key, resume_state)
             installed_state = resume_state
             validate_installed_vault(before, installed_state, artifact)
-            receipt = installed_artifact_receipt(
-                Path(artifact_absolute), str(collection[collection_sha_key])
-            )
+            # A prior process's installer receipt is not persisted.  Exact bytes
+            # may be committed after the reviewed resume-state check, but path
+            # metadata must never be rebound into rollback ownership here.
+            receipt = None
         else:
             capture_one_exact(capture, runtime_file, key, before)
             index_backup = snapshot_shared_index(git_dir, output_directory, key)
             installed = json.loads(
-                subprocess.run(
+                run_local_command(
                     [installer, runtime_file, collection_file, plan_file, role],
                     cwd="/",
                     check=True,
                     capture_output=True,
                     text=True,
                     env=clean_environment(),
+                    timeout=LOCAL_COMMAND_TIMEOUT_SECONDS,
                 ).stdout
             )
-            if installed != {
-                "summary_target": plan["summary_target"],
-                "advisory_target": plan["advisory_target"],
-            }:
+            if (
+                not isinstance(installed, dict)
+                or installed.get("summary_target") != plan["summary_target"]
+                or installed.get("advisory_target") != plan["advisory_target"]
+                or set(installed)
+                != {"summary_target", "advisory_target", "installed_receipt"}
+            ):
                 raise CommitError("installed artifact differs from the approved plan")
-            receipt = installed_artifact_receipt(
-                Path(artifact_absolute), str(collection[collection_sha_key])
+            receipt = validated_installer_receipt(
+                installed["installed_receipt"],
+                Path(artifact_absolute),
+                str(collection[collection_sha_key]),
             )
             installed_state = capture_one(capture, runtime_file, key)
             validate_installed_vault(before, installed_state, artifact)
@@ -1314,6 +1467,7 @@ def publish_one_vault(
             publication_mode=mode,
             mutation_tracker=tracker,
         )
+        completed_receipt = receipt
         receipt = None
         after = capture_one(capture, runtime_file, key)
         if after["local_head"] != result["local_head"]:
@@ -1327,6 +1481,7 @@ def publish_one_vault(
                 "artifact": artifact,
                 "artifact_absolute": artifact_absolute,
                 "artifact_sha256": str(collection[collection_sha_key]),
+                "artifact_receipt": completed_receipt,
                 "before": before,
                 "after": after,
                 "index_backup": index_backup,
@@ -1479,7 +1634,7 @@ def legacy_main(argv: list[str]) -> int:
         if modes["agents_vault"] != "blocked":
             if previous is None:
                 installed_agents = json.loads(
-                    subprocess.run(
+                    run_local_command(
                         [
                             argv[7], str(bound_runtime), str(bound_collection),
                             str(bound_plan), "agents_security_advisory",
@@ -1489,12 +1644,21 @@ def legacy_main(argv: list[str]) -> int:
                         capture_output=True,
                         text=True,
                         env=clean_environment(),
+                        timeout=LOCAL_COMMAND_TIMEOUT_SECONDS,
                     ).stdout
                 )
-                if installed_agents != installed:
+                if (
+                    not isinstance(installed_agents, dict)
+                    or installed_agents.get("summary_target")
+                    != installed["summary_target"]
+                    or installed_agents.get("advisory_target")
+                    != installed["advisory_target"]
+                ):
                     raise CommitError("installed Agents artifact differs from the approved plan")
-                rollback_receipts["agents_vault"] = installed_artifact_receipt(
-                    Path(plan["advisory_target"]), str(collection["advisory_sha256"])
+                rollback_receipts["agents_vault"] = validated_installer_receipt(
+                    installed_agents.get("installed_receipt"),
+                    Path(plan["advisory_target"]),
+                    str(collection["advisory_sha256"]),
                 )
                 agents_installed_state = capture_installed_scope(
                     argv[8], str(bound_runtime), pre,
@@ -1572,7 +1736,7 @@ def legacy_main(argv: list[str]) -> int:
         if modes["user_vault"] != "blocked":
             if previous is None or user_artifact not in after_agents["user_vault"]["dirty_paths"]:
                 installed_user = json.loads(
-                    subprocess.run(
+                    run_local_command(
                         [
                             argv[7], str(bound_runtime), str(bound_collection),
                             str(bound_plan), "user_it_news_summary",
@@ -1582,12 +1746,21 @@ def legacy_main(argv: list[str]) -> int:
                         capture_output=True,
                         text=True,
                         env=clean_environment(),
+                        timeout=LOCAL_COMMAND_TIMEOUT_SECONDS,
                     ).stdout
                 )
-                if installed_user != installed:
+                if (
+                    not isinstance(installed_user, dict)
+                    or installed_user.get("summary_target")
+                    != installed["summary_target"]
+                    or installed_user.get("advisory_target")
+                    != installed["advisory_target"]
+                ):
                     raise CommitError("installed User artifact differs from the approved plan")
-                rollback_receipts["user_vault"] = installed_artifact_receipt(
-                    Path(plan["summary_target"]), str(collection["summary_sha256"])
+                rollback_receipts["user_vault"] = validated_installer_receipt(
+                    installed_user.get("installed_receipt"),
+                    Path(plan["summary_target"]),
+                    str(collection["summary_sha256"]),
                 )
                 user_installed_state = capture_installed_scope(
                     argv[8], str(bound_runtime), after_agents,
@@ -1733,6 +1906,14 @@ def main(argv: list[str]) -> int:
         )
         return 64
     output = Path(argv[10])
+    runtime: dict[str, object] = {}
+    pre: dict[str, object] = {}
+    collection: dict[str, object] = {}
+    plan: dict[str, object] = {}
+    context_digest: str | None = None
+    bound_runtime: Path | None = None
+    modes: dict[str, str] | None = None
+    deferred: dict[str, list[dict[str, str]]] | None = None
     try:
         runtime_input = json.loads(Path(argv[1]).read_text(encoding="utf-8"))
         pre_input = json.loads(Path(argv[2]).read_text(encoding="utf-8"))
@@ -1754,6 +1935,14 @@ def main(argv: list[str]) -> int:
             or review.get("publication_context_sha256") != context_digest
         ):
             raise CommitError("publication review is not approved and context-bound")
+        modes = {
+            "agents_vault": str(review["agents_vault"]["publication_mode"]),
+            "user_vault": str(review["user_vault"]["publication_mode"]),
+        }
+        deferred = {
+            "agents_vault": list(review["agents_vault"].get("deferred_cleanup", [])),
+            "user_vault": list(review["user_vault"].get("deferred_cleanup", [])),
+        }
         bound_runtime, _ = write_bound_json(output.parent, "bound-runtime.json", runtime)
         bound_collection, _ = write_bound_json(
             output.parent, "bound-collection.json", collection
@@ -1901,6 +2090,8 @@ def main(argv: list[str]) -> int:
             "advisory_target",
             "advisory_sha256",
         )
+        user_compensated_for_peer = False
+        agents_compensated_for_peer = False
         # Cross-repository CAS cannot be atomic. If exactly one candidate was
         # committed and its peer failed without mutation, compensate the owned,
         # unpushed commit back to the reviewed state. The next bounded outer
@@ -1923,6 +2114,7 @@ def main(argv: list[str]) -> int:
             )
             user_ok = False
             user_retry_safe = True
+            user_compensated_for_peer = True
             user_reason = "owned unpushed commit was compensated for peer re-plan"
         elif (
             agents_ok
@@ -1948,14 +2140,20 @@ def main(argv: list[str]) -> int:
             )
             agents_ok = False
             agents_retry_safe = True
+            agents_compensated_for_peer = True
             agents_reason = "owned unpushed commit was compensated for peer re-plan"
         progressed = bool(user["commit_hashes"] or agents["commit_hashes"])
         publishable = user_ok or agents_ok or progressed
         attempted_retry_safety = []
+        attempted_retry_vaults = []
         if review["user_vault"]["publication_mode"] != "blocked" and not user_ok:
             attempted_retry_safety.append(user_retry_safe)
+            if user_retry_safe and not user_compensated_for_peer:
+                attempted_retry_vaults.append("user_vault")
         if review["agents_vault"]["publication_mode"] != "blocked" and not agents_ok:
             attempted_retry_safety.append(agents_retry_safe)
+            if agents_retry_safe and not agents_compensated_for_peer:
+                attempted_retry_vaults.append("agents_vault")
         retry_disposition = (
             "replan"
             if not publishable
@@ -1995,6 +2193,9 @@ def main(argv: list[str]) -> int:
             },
             "evidence_finalization_commit": None,
             "retry_disposition": retry_disposition,
+            "replan_vaults": (
+                attempted_retry_vaults if retry_disposition == "replan" else []
+            ),
             "next_action": "; ".join(reasons) if reasons else None,
         }
         if not publishable and result["next_action"] is None:
@@ -2014,47 +2215,20 @@ def main(argv: list[str]) -> int:
         subprocess.SubprocessError,
     ) as exc:
         print(f"Local publication failed closed: {exc}", file=sys.stderr)
-        zero_head = "0" * 40
-        zero_digest = "0" * 64
-        blocked_vault = {
-            "commit_status": "not_started",
-            "commit_hashes": [],
-            "pre_local_head": zero_head,
-            "local_head": zero_head,
-            "pre_dirty_digest": zero_digest,
-            "post_dirty_digest": zero_digest,
-            "clean": False,
-            "publication_mode": "blocked",
-            "deferred_cleanup": [],
-        }
+        result = result_after_failure(
+            runtime,
+            pre,
+            collection,
+            plan,
+            f"Local publication failed closed: {exc}",
+            context_digest,
+            argv[8] if bound_runtime is not None else None,
+            str(bound_runtime) if bound_runtime is not None else None,
+            modes,
+            deferred,
+        )
         try:
-            output.write_text(
-                json.dumps(
-                    {
-                        "outcome": "blocked",
-                        "phase": "local_commit",
-                        "daily_pipeline_status": "blocked",
-                        "summary_path": None,
-                        "advisory_path": None,
-                        "notification_result": None,
-                        "agents_vault": blocked_vault,
-                        "user_vault": blocked_vault,
-                        "publication_mode": {
-                            "agents_vault": "blocked",
-                            "user_vault": "blocked",
-                        },
-                        "deferred_cleanup": {
-                            "agents_vault": [],
-                            "user_vault": [],
-                        },
-                        "evidence_finalization_commit": None,
-                        "retry_disposition": "none",
-                        "next_action": f"Local publication failed closed: {exc}",
-                    },
-                    ensure_ascii=False,
-                ),
-                encoding="utf-8",
-            )
+            output.write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
         except OSError:
             pass
         return 75

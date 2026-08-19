@@ -304,6 +304,38 @@
       "expected_output": "artifactは非actionable identityとして保持し、commit scopeを空にする。captured dirty pathsだけをdeferred arraysへ列挙し、local-ahead identityはapproved_existing_commits、復旧方法はroot next_actionへ記録する。",
       "files": [],
       "expectations": ["sets commit_required false and commit_groups empty", "does not add local-ahead changed paths to dirty residual arrays", "keeps the artifact binding without authorizing mutation", "records local-ahead identity only in approved_existing_commits", "uses a concrete root next_action for the blocked Vault"]
+    },
+    {
+      "id": 43,
+      "name": "snapshot_instability_blocks_only_affected_vault",
+      "prompt": "publication snapshotの再取得中、Agents Vaultだけが3回とも変化し、User Vaultは途中で安定しました。collection済みartifactをpublicationしてください。",
+      "expected_output": "Agentsのlatest identityをsealed blocked snapshotとして保持し、live residualを読まずAgentsだけblockedにする。安定したUser summaryのreview、commit、fixed pushは継続する。",
+      "files": [],
+      "expectations": ["tracks stabilization independently per Vault", "does not overwrite a peer snapshot after it stabilizes", "does not materialize live residual bytes from the unstable Vault", "continues publication for the stable Vault", "returns nonzero partial publication when only one artifact is published"]
+    },
+    {
+      "id": 44,
+      "name": "target_replan_exhaustion_blocks_only_affected_vault",
+      "prompt": "Agents advisory targetだけがplan時またはreview後のinstaller直前に各bounded replanで競合し続け、User summary targetは空いています。3回目の判定を処理してください。",
+      "expected_output": "root-causeのAgentsだけをartifact_target_replan_exhaustedでblockedへ確定し、必要なら最終peer-only attemptでUserのreview、artifact-only commit、fixed pushを継続する。既存targetを上書きしない。",
+      "files": [],
+      "expectations": ["retries the deterministic plan only up to the bound", "attributes a post-review collision to its root-cause Vault rather than a compensated peer", "changes only the replan-requesting Vault to blocked", "preserves the unaffected Vault mode hint", "never overwrites a conflicting target", "does not force or rewrite history"]
+    },
+    {
+      "id": 45,
+      "name": "fatal_committer_result_reports_actual_progress",
+      "prompt": "片方のVaultでlocal commitがCAS済みになった後、peer captureが失敗してfatal handlerへ移りました。failure resultを作成してください。",
+      "expected_output": "両Vaultのactual HEAD、dirty digest、commit hashを再取得し、進行済みlocal commitをpartial_publicationとして保持する。取得不能なVaultだけzero fallbackを使う。",
+      "files": [],
+      "expectations": ["re-derives per-Vault state after a fatal exception", "does not report a created commit as not_started", "preserves resumable binding only when both context digest and state exist", "keeps unpublished pre-existing commits out of published hash lists"]
+    },
+    {
+      "id": 46,
+      "name": "publication_helpers_fail_closed_with_bounded_controls",
+      "prompt": "File Provider上のlocal Gitが停止し、residual guard inputが欠落し、repository-local Git configにcommand実行key、Vault rootに弱い.gitleaks.tomlがあります。さらにscan開始直前のtrusted config path、installer失敗cleanup中のtarget path（regular file、directory、symlink）、partial resumeのartifact pathが差し替えられます。安全に停止してください。",
+      "expected_output": "local helperと子孫processをbounded kill/reapし、missing guardをdeferred、command-capable Git configをpreflight拒否する。全scanはdigest固定default-rule bytesを継承fdから読み、installer fdが封印したdevice/inodeとSHA-256/size/modeだけをcleanup/rollback対象にする。File Providerのtimestamp-only driftは許容するが、別inode・content・mode変更は拒否する。第三者entryはtypeに依存しないatomic no-replace restoreでidentity、mode、mtime、dirty/staged stateを保ち、partial resumeではpathから所有receiptを再生成しない。",
+      "files": [],
+      "expectations": ["bounds local Git and helper subprocesses", "kills descendant process groups even when the leader exits", "fails closed when residual guard inputs are missing", "rejects command-capable repository-local Git config", "binds a trusted default-rule config snapshot to Gitleaks through an inherited descriptor", "cleans up or rolls back only the artifact inode sealed by the installer descriptor", "allows timestamp-only drift on the same installer inode while rejecting inode content size or mode drift", "never rebinds rollback ownership from a pathname during partial resume", "preserves existing dirty staged mode and mtime state"]
     }
   ]
 }

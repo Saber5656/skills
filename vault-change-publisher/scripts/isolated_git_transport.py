@@ -9,10 +9,12 @@ import stat
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 
 TRANSPORT_TIMEOUT_SECONDS = 90
+LOCAL_COMMAND_TIMEOUT_SECONDS = 90
+PROCESS_CLEANUP_TIMEOUT_SECONDS = 5
 GIT_BIN = "/usr/bin/git"
 SSH_COMMAND = (
     "/usr/bin/ssh -oBatchMode=yes -oConnectTimeout=20 "
@@ -22,6 +24,90 @@ SSH_COMMAND = (
 
 class TransportError(RuntimeError):
     """Represent an isolated Git transport setup, timeout, or command failure."""
+
+
+class ProcessCleanupError(subprocess.SubprocessError):
+    """Represent a local subprocess group that could not be reaped safely."""
+
+
+def kill_process_group(
+    process: subprocess.Popen[Any],
+    *,
+    cleanup_timeout: int = PROCESS_CLEANUP_TIMEOUT_SECONDS,
+) -> None:
+    """Kill one private process group and reap its direct child within a bound."""
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+    try:
+        process.wait(timeout=cleanup_timeout)
+    except subprocess.TimeoutExpired as first_exc:
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+        try:
+            process.wait(timeout=cleanup_timeout)
+        except subprocess.TimeoutExpired as final_exc:
+            raise ProcessCleanupError(
+                "local subprocess could not be reaped after bounded cleanup"
+            ) from final_exc
+        raise ProcessCleanupError(
+            "local subprocess required a second bounded kill"
+        ) from first_exc
+
+
+def run_local_command(
+    arguments: Sequence[str],
+    *,
+    timeout: int = LOCAL_COMMAND_TIMEOUT_SECONDS,
+    check: bool = False,
+    capture_output: bool = False,
+    text: bool = False,
+    input: str | bytes | None = None,
+    cwd: str | None = None,
+    env: dict[str, str] | None = None,
+    stdout: int | None = None,
+    stderr: int | None = None,
+    pass_fds: Sequence[int] = (),
+) -> subprocess.CompletedProcess[Any]:
+    """Run a local helper with a wall deadline and process-group cleanup."""
+    if capture_output and (stdout is not None or stderr is not None):
+        raise ValueError("stdout and stderr may not be used with capture_output")
+    command = list(arguments)
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.PIPE if input is not None else subprocess.DEVNULL,
+        stdout=subprocess.PIPE if capture_output else stdout,
+        stderr=subprocess.PIPE if capture_output else stderr,
+        cwd=cwd,
+        env=env,
+        text=text,
+        start_new_session=True,
+        pass_fds=tuple(pass_fds),
+    )
+    try:
+        output, errors = process.communicate(input=input, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        try:
+            kill_process_group(process)
+        finally:
+            for stream in (process.stdin, process.stdout, process.stderr):
+                if stream is not None:
+                    stream.close()
+        raise subprocess.TimeoutExpired(
+            command, timeout, output=exc.output, stderr=exc.stderr
+        ) from exc
+    completed = subprocess.CompletedProcess(
+        command, process.returncode, output, errors
+    )
+    if check:
+        completed.check_returncode()
+    return completed
 
 
 def clean_transport_environment(object_directory: Path) -> dict[str, str]:
@@ -164,7 +250,25 @@ class IsolatedGitTransport:
                 os.killpg(process.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
-            stdout, stderr = process.communicate()
+            try:
+                process.wait(timeout=PROCESS_CLEANUP_TIMEOUT_SECONDS)
+            except subprocess.TimeoutExpired as cleanup_exc:
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
+                try:
+                    process.wait(timeout=PROCESS_CLEANUP_TIMEOUT_SECONDS)
+                except subprocess.TimeoutExpired as final_exc:
+                    raise TransportError(
+                        "Git transport process could not be reaped after timeout"
+                    ) from final_exc
+                raise TransportError(
+                    "Git transport required a second bounded kill after timeout"
+                ) from cleanup_exc
+            for stream in (process.stdin, process.stdout, process.stderr):
+                if stream is not None:
+                    stream.close()
             raise TransportError(
                 f"Git transport exceeded {self.timeout} second deadline"
             ) from exc
