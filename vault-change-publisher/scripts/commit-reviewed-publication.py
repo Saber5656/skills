@@ -11,11 +11,23 @@ import secrets
 import stat
 import subprocess
 import sys
-import tempfile
 from pathlib import Path, PurePosixPath
 from typing import Callable, Optional
 
-from atomic_file_ops import rename_no_replace, verify_rename_no_replace
+from atomic_file_ops import (
+    AtomicTransactionError,
+    allocate_private_entry_path,
+    fsync_after_rename,
+    link_no_replace_durable,
+    mkdir_durable,
+    open_absolute_directory_chain,
+    publish_head_index_transaction,
+    read_named_entry_contract,
+    recover_head_index_transaction,
+    rename_no_replace,
+    retain_path_no_replace,
+    verify_rename_no_replace,
+)
 from git_diff_digest import unified_diff_added_content
 from isolated_git_transport import LOCAL_COMMAND_TIMEOUT_SECONDS, run_local_command
 from trusted_gitleaks import trusted_scan_invocation
@@ -27,6 +39,30 @@ SCAN_TIMEOUT_SECONDS = 120
 
 class CommitError(RuntimeError):
     """Represent a publication mutation that must fail closed."""
+
+
+VOLATILE_INDEX_FIELDS = frozenset({"index_sha256", "index_identity"})
+
+
+def same_semantic_vault_state(left: object, right: object) -> bool:
+    """Compare Git/Vault meaning while ignoring index stat-cache serialization."""
+    if not isinstance(left, dict) or not isinstance(right, dict):
+        return False
+    return {
+        key: value for key, value in left.items() if key not in VOLATILE_INDEX_FIELDS
+    } == {
+        key: value for key, value in right.items() if key not in VOLATILE_INDEX_FIELDS
+    }
+
+
+def same_semantic_state_pair(left: object, right: object) -> bool:
+    """Require the same two Vaults and semantic state for each Vault."""
+    if not isinstance(left, dict) or not isinstance(right, dict):
+        return False
+    keys = {"agents_vault", "user_vault"}
+    return set(left) == keys and set(right) == keys and all(
+        same_semantic_vault_state(left[key], right[key]) for key in keys
+    )
 
 
 def validated_publisher_identity(runtime: dict[str, object]) -> tuple[str, str]:
@@ -234,6 +270,7 @@ def validate_installed_scope(
         "staged_paths",
         "index_sha256",
         "index_entries",
+        "index_identity",
         "dirty_worktree_sha256",
         "dirty_digest",
         "diff_snapshot_sha256",
@@ -279,7 +316,6 @@ def validate_installed_scope(
         if (
             current_state_value["staged_paths"] != expected_state["staged_paths"]
             or current_state_value["index_entries"] != expected_state["index_entries"]
-            or current_state_value["index_sha256"] != expected_state["index_sha256"]
         ):
             raise CommitError("existing staged state changed during artifact installation")
         if artifact is not None:
@@ -488,8 +524,13 @@ def stable_regular_bytes(path: Path) -> bytes:
         os.close(descriptor)
 
 
-def installed_artifact_receipt(path: Path, expected_sha256: str) -> dict[str, object]:
-    """Bind bytes and stable inode identity through one descriptor."""
+def installed_artifact_receipt(
+    path: Path,
+    expected_sha256: str,
+    vault_root: Path,
+    quarantine_root: Path,
+) -> dict[str, object]:
+    """Build a fully directory-bound receipt for focused transaction tests."""
     descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     try:
         before = os.fstat(descriptor)
@@ -510,21 +551,89 @@ def installed_artifact_receipt(path: Path, expected_sha256: str) -> dict[str, ob
         os.close(descriptor)
     if hashlib.sha256(b"".join(chunks)).hexdigest() != expected_sha256:
         raise CommitError("newly installed artifact differs from verified staging bytes")
-    return {
+    try:
+        relative = path.relative_to(vault_root)
+    except ValueError as exc:
+        raise CommitError("newly installed artifact escaped the Vault") from exc
+    flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+    opened: list[int] = []
+    quarantine_fd = -1
+    reservation_fd = -1
+    reservation_name = f".vault-publisher-install-{secrets.token_hex(16)}"
+    try:
+        opened.append(os.open(vault_root, flags))
+        parent_chain = []
+        metadata = os.fstat(opened[-1])
+        parent_chain.append((metadata.st_dev, metadata.st_ino))
+        for component in relative.parts[:-1]:
+            opened.append(os.open(component, flags, dir_fd=opened[-1]))
+            metadata = os.fstat(opened[-1])
+            parent_chain.append((metadata.st_dev, metadata.st_ino))
+        quarantine_fd, quarantine_chain = open_absolute_directory_chain(
+            quarantine_root
+        )
+        quarantine_metadata = os.fstat(quarantine_fd)
+        mkdir_durable(reservation_name, 0o700, parent_fd=quarantine_fd)
+        reservation_fd = os.open(
+            reservation_name, flags, dir_fd=quarantine_fd
+        )
+        reservation_metadata = os.fstat(reservation_fd)
+        link_no_replace_durable(
+            opened[-1], relative.name, reservation_fd, "artifact"
+        )
+        reserved = os.stat("artifact", dir_fd=reservation_fd, follow_symlinks=False)
+        if (reserved.st_dev, reserved.st_ino) != identity:
+            raise CommitError("installed artifact changed before publication")
+    finally:
+        if reservation_fd >= 0:
+            os.close(reservation_fd)
+        if quarantine_fd >= 0:
+            os.close(quarantine_fd)
+        for opened_fd in reversed(opened):
+            os.close(opened_fd)
+    receipt = {
         "path": str(path),
+        "vault_root": str(vault_root),
+        "vault_root_identity": parent_chain[0],
+        "target_parent_chain": tuple(parent_chain),
+        "quarantine_root": str(quarantine_root),
+        "quarantine_root_identity": (
+            quarantine_metadata.st_dev,
+            quarantine_metadata.st_ino,
+        ),
+        "quarantine_root_chain": tuple(quarantine_chain),
+        "reservation_name": reservation_name,
+        "reservation_identity": (
+            reservation_metadata.st_dev,
+            reservation_metadata.st_ino,
+        ),
         "sha256": expected_sha256,
         "identity": identity,
         "size": content_contract[0],
         "mode": content_contract[1],
     }
+    require_owned_artifact(receipt)
+    return receipt
 
 
 def validated_installer_receipt(
-    value: object, expected_path: Path, expected_sha256: str
+    value: object,
+    expected_path: Path,
+    expected_sha256: str,
+    expected_vault_root: str,
+    expected_quarantine_root: str,
 ) -> dict[str, object]:
     """Accept only the identity sealed by the installer's O_EXCL descriptor."""
     if not isinstance(value, dict) or set(value) != {
         "path",
+        "vault_root",
+        "vault_root_identity",
+        "target_parent_chain",
+        "quarantine_root",
+        "quarantine_root_identity",
+        "quarantine_root_chain",
+        "reservation_name",
+        "reservation_identity",
         "sha256",
         "identity",
         "size",
@@ -532,12 +641,40 @@ def validated_installer_receipt(
     }:
         raise CommitError("installer artifact receipt is malformed")
     identity = value.get("identity")
+    vault_identity = value.get("vault_root_identity")
+    parent_chain = value.get("target_parent_chain")
+    quarantine_identity = value.get("quarantine_root_identity")
+    quarantine_chain = value.get("quarantine_root_chain")
+    reservation_identity = value.get("reservation_identity")
+    reservation_name = value.get("reservation_name")
+    valid_pair = lambda pair: (
+        isinstance(pair, list)
+        and len(pair) == 2
+        and all(
+            isinstance(field, int) and not isinstance(field, bool) and field >= 0
+            for field in pair
+        )
+    )
     if (
         value.get("path") != str(expected_path)
+        or value.get("vault_root") != expected_vault_root
+        or value.get("quarantine_root") != expected_quarantine_root
         or value.get("sha256") != expected_sha256
-        or not isinstance(identity, list)
-        or len(identity) != 2
-        or any(not isinstance(field, int) or isinstance(field, bool) for field in identity)
+        or not valid_pair(identity)
+        or not valid_pair(vault_identity)
+        or not valid_pair(quarantine_identity)
+        or not isinstance(quarantine_chain, list)
+        or not quarantine_chain
+        or not all(valid_pair(pair) for pair in quarantine_chain)
+        or quarantine_chain[-1] != quarantine_identity
+        or not valid_pair(reservation_identity)
+        or not isinstance(reservation_name, str)
+        or not reservation_name.startswith(".vault-publisher-install-")
+        or "/" in reservation_name
+        or not isinstance(parent_chain, list)
+        or not parent_chain
+        or not all(valid_pair(pair) for pair in parent_chain)
+        or parent_chain[0] != vault_identity
         or not isinstance(value.get("size"), int)
         or isinstance(value.get("size"), bool)
         or int(value["size"]) < 0
@@ -547,6 +684,14 @@ def validated_installer_receipt(
         raise CommitError("installer artifact receipt differs from the approved artifact")
     receipt = {
         "path": str(expected_path),
+        "vault_root": expected_vault_root,
+        "vault_root_identity": tuple(vault_identity),
+        "target_parent_chain": tuple(tuple(pair) for pair in parent_chain),
+        "quarantine_root": expected_quarantine_root,
+        "quarantine_root_identity": tuple(quarantine_identity),
+        "quarantine_root_chain": tuple(tuple(pair) for pair in quarantine_chain),
+        "reservation_name": reservation_name,
+        "reservation_identity": tuple(reservation_identity),
         "sha256": expected_sha256,
         "identity": tuple(identity),
         "size": int(value["size"]),
@@ -554,6 +699,78 @@ def validated_installer_receipt(
     }
     require_owned_artifact(receipt)
     return receipt
+
+
+def open_receipt_directories(
+    receipt: dict[str, object],
+) -> tuple[int, str, int]:
+    """Reopen and bind the Vault root, every target parent, and Git-private root."""
+    path = Path(str(receipt["path"]))
+    vault_root = Path(str(receipt["vault_root"]))
+    try:
+        relative = path.relative_to(vault_root)
+    except ValueError as exc:
+        raise CommitError("installer receipt target escaped the Vault") from exc
+    if not relative.parts or any(part in {"", ".", ".."} for part in relative.parts):
+        raise CommitError("installer receipt target is invalid")
+    flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+    opened: list[int] = []
+    quarantine_fd = -1
+    reservation_fd = -1
+    try:
+        opened.append(os.open(vault_root, flags))
+        identities = []
+        metadata = os.fstat(opened[-1])
+        identities.append((metadata.st_dev, metadata.st_ino))
+        for component in relative.parts[:-1]:
+            opened.append(os.open(component, flags, dir_fd=opened[-1]))
+            metadata = os.fstat(opened[-1])
+            identities.append((metadata.st_dev, metadata.st_ino))
+        if tuple(identities) != tuple(receipt["target_parent_chain"]):
+            raise CommitError("installer receipt parent chain changed")
+        quarantine_fd, quarantine_chain = open_absolute_directory_chain(
+            str(receipt["quarantine_root"])
+        )
+        quarantine_metadata = os.fstat(quarantine_fd)
+        if (
+            (quarantine_metadata.st_dev, quarantine_metadata.st_ino)
+            != tuple(receipt["quarantine_root_identity"])
+            or quarantine_metadata.st_dev != os.fstat(opened[-1]).st_dev
+            or quarantine_chain != tuple(receipt["quarantine_root_chain"])
+        ):
+            raise CommitError("installer receipt quarantine root changed")
+        reservation_fd = os.open(
+            str(receipt["reservation_name"]),
+            flags,
+            dir_fd=quarantine_fd,
+        )
+        reservation_metadata = os.fstat(reservation_fd)
+        named_reservation = os.stat(
+            str(receipt["reservation_name"]),
+            dir_fd=quarantine_fd,
+            follow_symlinks=False,
+        )
+        if (
+            (reservation_metadata.st_dev, reservation_metadata.st_ino)
+            != tuple(receipt["reservation_identity"])
+            or (named_reservation.st_dev, named_reservation.st_ino)
+            != tuple(receipt["reservation_identity"])
+        ):
+            raise CommitError("installer receipt reservation changed")
+        parent_fd = opened.pop()
+        for descriptor in reversed(opened):
+            os.close(descriptor)
+        os.close(quarantine_fd)
+        quarantine_fd = -1
+        return parent_fd, relative.name, reservation_fd
+    except Exception:
+        for descriptor in reversed(opened):
+            os.close(descriptor)
+        if quarantine_fd >= 0:
+            os.close(quarantine_fd)
+        if reservation_fd >= 0:
+            os.close(reservation_fd)
+        raise
 
 
 def descriptor_matches_owned_artifact(
@@ -582,56 +799,100 @@ def descriptor_matches_owned_artifact(
 
 
 def require_owned_artifact(receipt: dict[str, object]) -> None:
-    """Verify bytes through the installer inode while ignoring timestamp churn."""
-    path = Path(str(receipt["path"]))
-    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    """Verify target bytes and all directory identities from the installer."""
+    parent_fd, target_name, reservation_fd = open_receipt_directories(receipt)
+    descriptor = os.open(
+        target_name,
+        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+        dir_fd=parent_fd,
+    )
     try:
-        if not descriptor_matches_owned_artifact(descriptor, receipt):
+        named = os.stat(target_name, dir_fd=parent_fd, follow_symlinks=False)
+        reserved = os.stat("artifact", dir_fd=reservation_fd, follow_symlinks=False)
+        if (
+            (named.st_dev, named.st_ino) != tuple(receipt["identity"])
+            or (reserved.st_dev, reserved.st_ino) != tuple(receipt["identity"])
+            or not descriptor_matches_owned_artifact(descriptor, receipt)
+        ):
             raise CommitError("installer-owned artifact changed before publication")
     finally:
         os.close(descriptor)
+        os.close(parent_fd)
+        os.close(reservation_fd)
+
+
+def owned_artifact_bytes(receipt: dict[str, object]) -> bytes:
+    """Read only the installer-reserved inode while binding its worktree name."""
+    parent_fd, target_name, reservation_fd = open_receipt_directories(receipt)
+    target_fd = -1
+    reserved_fd = -1
+    try:
+        target_fd = os.open(
+            target_name,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=parent_fd,
+        )
+        reserved_fd = os.open(
+            "artifact",
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=reservation_fd,
+        )
+        named = os.stat(target_name, dir_fd=parent_fd, follow_symlinks=False)
+        reserved_named = os.stat(
+            "artifact", dir_fd=reservation_fd, follow_symlinks=False
+        )
+        if (
+            (named.st_dev, named.st_ino) != tuple(receipt["identity"])
+            or (reserved_named.st_dev, reserved_named.st_ino)
+            != tuple(receipt["identity"])
+            or not descriptor_matches_owned_artifact(target_fd, receipt)
+            or not descriptor_matches_owned_artifact(reserved_fd, receipt)
+        ):
+            raise CommitError("installer-owned artifact changed before publication")
+        os.lseek(reserved_fd, 0, os.SEEK_SET)
+        content = b""
+        while chunk := os.read(reserved_fd, 1024 * 1024):
+            content += chunk
+        if not descriptor_matches_owned_artifact(reserved_fd, receipt):
+            raise CommitError("installer-owned artifact changed while being read")
+        return content
+    finally:
+        if target_fd >= 0:
+            os.close(target_fd)
+        if reserved_fd >= 0:
+            os.close(reserved_fd)
+        os.close(parent_fd)
+        os.close(reservation_fd)
 
 
 def rollback_owned_artifact(receipt: dict[str, object]) -> None:
-    """Atomically quarantine, verify, and remove only this run's artifact."""
-    path = Path(str(receipt["path"]))
-    parent_descriptor = os.open(
-        path.parent,
-        os.O_RDONLY
-        | getattr(os, "O_DIRECTORY", 0)
-        | getattr(os, "O_NOFOLLOW", 0),
+    """Move the exact own artifact to a retained Git-private tombstone."""
+    parent_descriptor, target_name, reservation_descriptor = (
+        open_receipt_directories(receipt)
     )
     descriptor = -1
-    quarantine_descriptor = -1
-    quarantine_name = f".vault-publisher-rollback-{secrets.token_hex(16)}"
+    quarantine_name = "rollback-worktree"
     quarantined = False
     try:
         descriptor = os.open(
-            path.name,
+            target_name,
             os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
             dir_fd=parent_descriptor,
         )
         before = os.fstat(descriptor)
         if not descriptor_matches_owned_artifact(descriptor, receipt):
             raise CommitError("newly installed artifact changed; rollback refused")
-        os.mkdir(quarantine_name, 0o700, dir_fd=parent_descriptor)
-        quarantine_descriptor = os.open(
+        verify_rename_no_replace(reservation_descriptor)
+        rename_no_replace(
+            parent_descriptor,
+            target_name,
+            reservation_descriptor,
             quarantine_name,
-            os.O_RDONLY
-            | getattr(os, "O_DIRECTORY", 0)
-            | getattr(os, "O_NOFOLLOW", 0),
-            dir_fd=parent_descriptor,
-        )
-        verify_rename_no_replace(quarantine_descriptor)
-        os.rename(
-            path.name,
-            "artifact",
-            src_dir_fd=parent_descriptor,
-            dst_dir_fd=quarantine_descriptor,
         )
         quarantined = True
+        fsync_after_rename(parent_descriptor, reservation_descriptor)
         quarantined_identity = os.stat(
-            "artifact", dir_fd=quarantine_descriptor, follow_symlinks=False
+            quarantine_name, dir_fd=reservation_descriptor, follow_symlinks=False
         )
         if (quarantined_identity.st_dev, quarantined_identity.st_ino) != (
             before.st_dev,
@@ -639,47 +900,81 @@ def rollback_owned_artifact(receipt: dict[str, object]) -> None:
         ):
             try:
                 rename_no_replace(
-                    quarantine_descriptor,
-                    "artifact",
+                    reservation_descriptor,
+                    quarantine_name,
                     parent_descriptor,
-                    path.name,
+                    target_name,
                 )
                 quarantined = False
+                fsync_after_rename(reservation_descriptor, parent_descriptor)
             except FileExistsError:
                 pass
+            if not quarantined:
+                raise CommitError(
+                    "newly installed artifact was replaced; "
+                    "the replacement was restored and rollback was refused"
+                )
             raise CommitError(
                 "newly installed artifact was replaced; rollback quarantined it"
             )
-        if not descriptor_matches_owned_artifact(descriptor, receipt):
+        try:
+            retained_content, retained_identity = read_named_entry_contract(
+                reservation_descriptor,
+                quarantine_name,
+                max_bytes=int(receipt["size"]),
+            )
+            retained_matches = (
+                retained_identity[:4]
+                == [
+                    int(receipt["identity"][0]),
+                    int(receipt["identity"][1]),
+                    int(receipt["size"]),
+                    int(receipt["mode"]),
+                ]
+                and hashlib.sha256(retained_content).hexdigest() == receipt["sha256"]
+            )
+        except (AtomicTransactionError, KeyError, TypeError, ValueError):
+            retained_matches = False
+        if not retained_matches:
             try:
                 rename_no_replace(
-                    quarantine_descriptor,
-                    "artifact",
+                    reservation_descriptor,
+                    quarantine_name,
                     parent_descriptor,
-                    path.name,
+                    target_name,
                 )
                 quarantined = False
+                fsync_after_rename(reservation_descriptor, parent_descriptor)
                 raise CommitError(
                     "newly installed artifact changed during rollback; rollback refused"
                 )
-            except FileExistsError:
+            except FileExistsError as exc:
                 raise CommitError(
                     "newly installed artifact changed during rollback; "
                     "rollback quarantined it"
-                )
-        os.unlink("artifact", dir_fd=quarantine_descriptor)
-        quarantined = False
+                ) from exc
+        # Reopen the full chain after the move. The exact failed artifact is
+        # intentionally retained below the Git-private quarantine root.
+        rebound_parent, rebound_name, rebound_reservation = open_receipt_directories(
+            receipt
+        )
+        try:
+            if rebound_name != target_name:
+                raise CommitError("rollback target binding changed")
+        finally:
+            os.close(rebound_parent)
+            os.close(rebound_reservation)
+        receipt["rollback_quarantine_name"] = quarantine_name
+        receipt["rollback_quarantine_identity"] = (
+            quarantined_identity.st_dev,
+            quarantined_identity.st_ino,
+        )
+        os.fsync(reservation_descriptor)
     finally:
         if descriptor >= 0:
             os.close(descriptor)
-        if quarantine_descriptor >= 0:
-            os.close(quarantine_descriptor)
-        if not quarantined:
-            try:
-                os.rmdir(quarantine_name, dir_fd=parent_descriptor)
-            except FileNotFoundError:
-                pass
         os.close(parent_descriptor)
+        os.close(reservation_descriptor)
 
 
 def write_blob(
@@ -760,12 +1055,147 @@ def update_index_entry(
     )
 
 
+def index_file_contract(path: Path) -> tuple[bytes, list[int]]:
+    """Read one stable no-follow Git index and return its exact inode contract."""
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise CommitError("Git index is not a regular file")
+        content = bytearray()
+        while chunk := os.read(descriptor, 1024 * 1024):
+            content.extend(chunk)
+        after = os.fstat(descriptor)
+        contract = [
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mode,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        ]
+        if contract != [
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mode,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        ]:
+            raise CommitError("Git index changed while it was read")
+        return bytes(content), contract
+    finally:
+        os.close(descriptor)
+
+
+def prepare_shared_index_candidate(
+    repo: str,
+    git_dir: str,
+    entries: dict[str, tuple[str, str] | None],
+    pre: dict[str, object],
+    temporary_directory: Path,
+) -> tuple[str, dict[str, object]]:
+    """Build the final shared index from the exact reviewed index bytes."""
+    index_path = Path(git_dir) / "index"
+    content, identity = index_file_contract(index_path)
+    if (
+        hashlib.sha256(content).hexdigest() != pre.get("index_sha256")
+        or identity != pre.get("index_identity")
+    ):
+        raise CommitError("shared Git index differs from review")
+    candidate_path = allocate_private_entry_path(
+        temporary_directory,
+        prefix=".publication-shared-index-work-",
+        entry_name="index",
+    )
+    descriptor = os.open(
+        candidate_path,
+        os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+        stat.S_IMODE(identity[3]),
+    )
+    try:
+        view = memoryview(content)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise CommitError("could not prepare shared Git index")
+            view = view[written:]
+        os.fchmod(descriptor, stat.S_IMODE(identity[3]))
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    try:
+        for path, entry in entries.items():
+            update_index_entry(
+                repo,
+                git_dir,
+                path,
+                entry,
+                index_file=candidate_path,
+            )
+        candidate_content, candidate_identity = index_file_contract(
+            Path(candidate_path)
+        )
+        return candidate_path, {
+            "sha256": hashlib.sha256(candidate_content).hexdigest(),
+            "identity": candidate_identity,
+        }
+    except Exception as original:
+        try:
+            retain_path_no_replace(
+                candidate_path,
+                label="failed publication shared-index candidate",
+                prefix=".publication-shared-index-retained-",
+                allow_missing=True,
+            )
+        except AtomicTransactionError as cleanup_error:
+            raise CommitError(
+                f"publication shared-index cleanup failed closed: {cleanup_error}"
+            ) from original
+        raise
+
+
+def publish_head_and_shared_index(
+    repo: str,
+    git_dir: str,
+    pre: dict[str, object],
+    candidate_head: str,
+    candidate_index: str,
+    candidate_index_contract: dict[str, object],
+    mutation_tracker: dict[str, object] | None,
+) -> None:
+    """Publish the reviewed HEAD/index pair through the shared durable helper."""
+    expected_digest = pre.get("index_sha256")
+    expected_identity = pre.get("index_identity")
+    if not isinstance(expected_digest, str) or not isinstance(expected_identity, list):
+        raise CommitError("reviewed Git index contract is malformed")
+    try:
+        publish_head_index_transaction(
+            git_dir,
+            base_head=str(pre["local_head"]),
+            candidate_head=candidate_head,
+            expected_index_sha256=expected_digest,
+            expected_index_identity=expected_identity,
+            candidate_index_path=candidate_index,
+            candidate_index_sha256=str(candidate_index_contract.get("sha256")),
+            candidate_index_identity=candidate_index_contract.get("identity"),
+            read_head=lambda: git(repo, git_dir, "rev-parse", "HEAD").stdout.strip(),
+            update_head=lambda new, old: git(
+                repo, git_dir, "update-ref", "HEAD", new, old
+            ),
+            mutation_tracker=mutation_tracker,
+        )
+    except AtomicTransactionError as exc:
+        raise CommitError(str(exc)) from exc
+
+
 def validate_final_worktree(
     repo: str,
     git_dir: str,
     manifest: dict[str, object],
     artifact_path: str,
     artifact_source_sha256: str,
+    artifact_receipt: dict[str, object] | None = None,
 ) -> None:
     """Prove every final approved entry matches the worktree before any commit."""
     entries = {
@@ -780,7 +1210,11 @@ def validate_final_worktree(
         if entry is not None:
             ensure_reviewed_blob(repo, git_dir, path, entry[1])
     artifact_path = safe_path(artifact_path)
-    artifact_content = stable_regular_bytes(Path(repo) / artifact_path)
+    artifact_content = (
+        owned_artifact_bytes(artifact_receipt)
+        if artifact_receipt is not None
+        else stable_regular_bytes(Path(repo) / artifact_path)
+    )
     if hashlib.sha256(artifact_content).hexdigest() != artifact_source_sha256:
         raise CommitError("installed artifact digest differs from review")
     entries[artifact_path] = ("100644", write_blob(repo, git_dir, artifact_content))
@@ -805,10 +1239,15 @@ def validate_final_worktree(
         actual_mode = "100755" if metadata.st_mode & 0o111 else "100644"
         if actual_mode != entry[0]:
             raise CommitError("worktree mode differs from the approved final mode")
+        content = (
+            owned_artifact_bytes(artifact_receipt)
+            if path == artifact_path and artifact_receipt is not None
+            else stable_regular_bytes(worktree_path)
+        )
         write_blob(
             repo,
             git_dir,
-            stable_regular_bytes(worktree_path),
+            content,
             entry[1],
         )
 
@@ -826,6 +1265,7 @@ def commit_groups(
     before_update: Callable[[], None] | None = None,
     publication_mode: str = "sweep",
     mutation_tracker: dict[str, object] | None = None,
+    artifact_receipt: dict[str, object] | None = None,
 ) -> dict[str, object]:
     """Create the ordered, minimal commits declared by the approved manifest."""
     if publication_mode not in {"sweep", "own_only"}:
@@ -849,7 +1289,11 @@ def commit_groups(
         if entry is not None:
             ensure_reviewed_blob(repo, git_dir, path, entry[1])
     artifact_path = safe_path(artifact_path)
-    artifact_content = stable_regular_bytes(Path(repo) / artifact_path)
+    artifact_content = (
+        owned_artifact_bytes(artifact_receipt)
+        if artifact_receipt is not None
+        else stable_regular_bytes(Path(repo) / artifact_path)
+    )
     if hashlib.sha256(artifact_content).hexdigest() != artifact_source_sha256:
         raise CommitError("installed artifact digest differs from review")
     artifact_oid = write_blob(
@@ -871,11 +1315,12 @@ def commit_groups(
         ):
             raise CommitError("approved commit group is invalid")
         require_filter_free(repo, git_dir, paths)
-        descriptor, temporary_index = tempfile.mkstemp(
-            prefix="publication-index-", dir=str(temporary_directory)
+        temporary_index = allocate_private_entry_path(
+            temporary_directory,
+            prefix=".publication-index-work-",
+            entry_name="index",
         )
-        os.close(descriptor)
-        os.unlink(temporary_index)
+        temporary_index_contract = None
         try:
             git(
                 repo,
@@ -918,11 +1363,26 @@ def commit_groups(
                 input_text=message + "\n",
                 publisher_identity=publisher_identity,
             ).stdout.strip()
+            temporary_content, temporary_identity = index_file_contract(
+                Path(temporary_index)
+            )
+            temporary_index_contract = {
+                "sha256": hashlib.sha256(temporary_content).hexdigest(),
+                "identity": temporary_identity,
+            }
         finally:
             try:
-                os.unlink(temporary_index)
-            except FileNotFoundError:
-                pass
+                retain_path_no_replace(
+                    temporary_index,
+                    expected=temporary_index_contract,
+                    label="publication commit temporary index",
+                    prefix=".publication-index-retained-",
+                    allow_missing=temporary_index_contract is None,
+                )
+            except AtomicTransactionError as cleanup_error:
+                raise CommitError(
+                    f"publication temporary-index cleanup failed closed: {cleanup_error}"
+                )
         actual = sorted(
             value
             for value in git(
@@ -957,13 +1417,41 @@ def commit_groups(
             ).stdout.splitlines()
             if value
         ]
-    if before_update is not None:
-        before_update()
-    git(repo, git_dir, "update-ref", "HEAD", current_head, str(pre["local_head"]))
-    if mutation_tracker is not None:
-        mutation_tracker["head_updated"] = True
-    for path, entry in entries.items():
-        update_index_entry(repo, git_dir, path, entry)
+    shared_index_candidate = prepare_shared_index_candidate(
+        repo,
+        git_dir,
+        entries,
+        pre,
+        temporary_directory,
+    )
+    try:
+        if before_update is not None:
+            before_update()
+        if artifact_receipt is not None:
+            require_owned_artifact(artifact_receipt)
+        publish_head_and_shared_index(
+            repo,
+            git_dir,
+            pre,
+            current_head,
+            shared_index_candidate[0],
+            shared_index_candidate[1],
+            mutation_tracker,
+        )
+        if artifact_receipt is not None:
+            require_owned_artifact(artifact_receipt)
+    finally:
+        try:
+            retain_path_no_replace(
+                shared_index_candidate[0],
+                expected=shared_index_candidate[1],
+                label="publication shared-index candidate",
+                prefix=".publication-shared-index-retained-",
+            )
+        except AtomicTransactionError as cleanup_error:
+            raise CommitError(
+                f"publication shared-index cleanup failed closed: {cleanup_error}"
+            )
     result = current_state(repo, git_dir, pre)
     if len(result["commit_hashes"]) != len(groups):
         raise CommitError("approved local commit count differs from review")
@@ -1126,20 +1614,39 @@ def capture_one_exact(
     key: str,
     expected: dict[str, object],
 ) -> None:
-    """Bind one Vault without allowing its peer to suppress publication."""
+    """Bind one normal publication Vault to the complete reviewed snapshot."""
     if capture_one(capture, runtime_file, key) != expected:
         raise CommitError(f"{key} state changed after approved review")
 
 
+def capture_one_semantic(
+    capture: str,
+    runtime_file: str,
+    key: str,
+    expected: dict[str, object],
+) -> None:
+    """Ignore raw stat-cache serialization only while resuming owned progress."""
+    if not same_semantic_vault_state(
+        capture_one(capture, runtime_file, key), expected
+    ):
+        raise CommitError(f"{key} semantic state changed after resumable progress")
+
+
 def validate_installed_vault(
-    before: dict[str, object], current: dict[str, object], artifact: str
+    before: dict[str, object],
+    current: dict[str, object],
+    artifact: str,
+    *,
+    allow_volatile_index: bool = False,
 ) -> None:
     """Allow one newly installed artifact while preserving one Vault residual."""
     mutable_fields = {
         "dirty_lines", "dirty_paths", "dirty_entries", "dirty_metadata",
-        "staged_paths", "index_sha256", "index_entries",
+        "staged_paths", "index_entries",
         "dirty_worktree_sha256", "dirty_digest", "diff_snapshot_sha256",
     }
+    if allow_volatile_index:
+        mutable_fields.update(VOLATILE_INDEX_FIELDS)
     if {
         field: value for field, value in current.items() if field not in mutable_fields
     } != {
@@ -1159,7 +1666,6 @@ def validate_installed_vault(
     if (
         current["staged_paths"] != before["staged_paths"]
         or current["index_entries"] != before["index_entries"]
-        or current["index_sha256"] != before["index_sha256"]
     ):
         raise CommitError("existing staged state changed during artifact installation")
     artifact_entry = current_entries.get(artifact)
@@ -1206,154 +1712,6 @@ def rollback_uncommitted_artifact(
     if git(repo, git_dir, "ls-files", "--stage", "-z", "--", artifact).stdout:
         raise CommitError("artifact entered the shared index; rollback refused")
     rollback_owned_artifact(receipt)
-
-
-def snapshot_shared_index(
-    git_dir: str, temporary_directory: Path, label: str
-) -> dict[str, object]:
-    """Seal the exact shared index bytes before publication mutation."""
-    index_path = Path(git_dir) / "index"
-    descriptor = os.open(index_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-    destination_fd, destination_name = tempfile.mkstemp(
-        prefix=f"{label}-index-backup-", dir=str(temporary_directory)
-    )
-    try:
-        before = os.fstat(descriptor)
-        if not stat.S_ISREG(before.st_mode):
-            raise CommitError("Git index is not a regular file")
-        hasher = hashlib.sha256()
-        while chunk := os.read(descriptor, 1024 * 1024):
-            hasher.update(chunk)
-            view = memoryview(chunk)
-            while view:
-                written = os.write(destination_fd, view)
-                if written <= 0:
-                    raise CommitError("could not seal Git index backup")
-                view = view[written:]
-        after = os.fstat(descriptor)
-        if (
-            before.st_dev,
-            before.st_ino,
-            before.st_size,
-            before.st_mtime_ns,
-            before.st_ctime_ns,
-        ) != (
-            after.st_dev,
-            after.st_ino,
-            after.st_size,
-            after.st_mtime_ns,
-            after.st_ctime_ns,
-        ):
-            raise CommitError("Git index changed while backup was sealed")
-        os.fchmod(destination_fd, stat.S_IMODE(before.st_mode))
-        os.fsync(destination_fd)
-        return {
-            "index_path": str(index_path),
-            "backup_path": destination_name,
-            "sha256": hasher.hexdigest(),
-            "mode": stat.S_IMODE(before.st_mode),
-            "atime_ns": before.st_atime_ns,
-            "mtime_ns": before.st_mtime_ns,
-        }
-    except Exception:
-        try:
-            os.unlink(destination_name)
-        except FileNotFoundError:
-            pass
-        raise
-    finally:
-        os.close(descriptor)
-        os.close(destination_fd)
-
-
-def restore_completed_publication(
-    *,
-    handle: dict[str, object],
-    capture: str,
-    runtime_file: str,
-    key: str,
-) -> dict[str, object]:
-    """Compensate one unpushed owned commit so the pair can be re-reviewed."""
-    repo = str(handle["repo"])
-    git_dir = str(handle["git_dir"])
-    before = handle["before"]
-    after = handle["after"]
-    if not isinstance(before, dict) or not isinstance(after, dict):
-        raise CommitError("publication rollback state is malformed")
-    if capture_one(capture, runtime_file, key) != after:
-        raise CommitError("completed Vault changed before compensating rollback")
-    artifact = str(handle["artifact"])
-    artifact_absolute = Path(str(handle["artifact_absolute"]))
-    receipt = handle.get("artifact_receipt")
-    if (
-        not isinstance(receipt, dict)
-        or receipt.get("path") != str(artifact_absolute)
-        or receipt.get("sha256") != str(handle["artifact_sha256"])
-    ):
-        raise CommitError("publication rollback receipt is malformed")
-    require_owned_artifact(receipt)
-    backup = handle["index_backup"]
-    if not isinstance(backup, dict):
-        raise CommitError("publication index backup is malformed")
-    index_path = Path(str(backup["index_path"]))
-    backup_path = Path(str(backup["backup_path"]))
-    if hashlib.sha256(stable_regular_bytes(backup_path)).hexdigest() != backup["sha256"]:
-        raise CommitError("publication index backup changed")
-    lock_path = index_path.with_name(index_path.name + ".lock")
-    lock_fd = os.open(
-        lock_path,
-        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
-        int(backup["mode"]),
-    )
-    rollback_head = str(before["local_head"])
-    committed_head = str(after["local_head"])
-    head_restored = False
-    try:
-        source_fd = os.open(
-            backup_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-        )
-        try:
-            while chunk := os.read(source_fd, 1024 * 1024):
-                view = memoryview(chunk)
-                while view:
-                    written = os.write(lock_fd, view)
-                    if written <= 0:
-                        raise CommitError("could not prepare index rollback")
-                    view = view[written:]
-        finally:
-            os.close(source_fd)
-        os.fsync(lock_fd)
-        if capture_one(capture, runtime_file, key) != after:
-            raise CommitError("completed Vault changed while rollback was prepared")
-        git(repo, git_dir, "update-ref", "HEAD", rollback_head, committed_head)
-        head_restored = True
-        os.close(lock_fd)
-        lock_fd = -1
-        os.replace(lock_path, index_path)
-        os.chmod(index_path, int(backup["mode"]), follow_symlinks=False)
-        os.utime(
-            index_path,
-            ns=(int(backup["atime_ns"]), int(backup["mtime_ns"])),
-            follow_symlinks=False,
-        )
-        rollback_owned_artifact(receipt)
-    finally:
-        if lock_fd >= 0:
-            os.close(lock_fd)
-        try:
-            os.unlink(lock_path)
-        except FileNotFoundError:
-            pass
-    final = capture_one(capture, runtime_file, key)
-    if final != before:
-        if head_restored:
-            raise CommitError(
-                "compensating rollback restored HEAD but not the exact Vault state"
-            )
-        raise CommitError("compensating rollback did not restore the Vault")
-    if git(repo, git_dir, "ls-tree", "-z", "HEAD", "--", artifact).stdout:
-        raise CommitError("rolled-back artifact still exists in HEAD")
-    return final
 
 
 def publish_one_vault(
@@ -1405,19 +1763,22 @@ def publish_one_vault(
         )
     receipt: dict[str, object] | None = None
     tracker: dict[str, object] = {"head_updated": False}
-    index_backup: dict[str, object] | None = None
     try:
         if resume_state is not None:
-            capture_one_exact(capture, runtime_file, key, resume_state)
+            capture_one_semantic(capture, runtime_file, key, resume_state)
             installed_state = resume_state
-            validate_installed_vault(before, installed_state, artifact)
+            validate_installed_vault(
+                before,
+                installed_state,
+                artifact,
+                allow_volatile_index=True,
+            )
             # A prior process's installer receipt is not persisted.  Exact bytes
             # may be committed after the reviewed resume-state check, but path
             # metadata must never be rebound into rollback ownership here.
             receipt = None
         else:
             capture_one_exact(capture, runtime_file, key, before)
-            index_backup = snapshot_shared_index(git_dir, output_directory, key)
             installed = json.loads(
                 run_local_command(
                     [installer, runtime_file, collection_file, plan_file, role],
@@ -1441,6 +1802,8 @@ def publish_one_vault(
                 installed["installed_receipt"],
                 Path(artifact_absolute),
                 str(collection[collection_sha_key]),
+                repo,
+                git_dir,
             )
             installed_state = capture_one(capture, runtime_file, key)
             validate_installed_vault(before, installed_state, artifact)
@@ -1450,6 +1813,7 @@ def publish_one_vault(
             manifest,
             artifact,
             str(collection[collection_sha_key]),
+            receipt,
         )
         result = commit_groups(
             repo,
@@ -1466,32 +1830,19 @@ def publish_one_vault(
             ),
             publication_mode=mode,
             mutation_tracker=tracker,
+            artifact_receipt=receipt,
         )
-        completed_receipt = receipt
         receipt = None
         after = capture_one(capture, runtime_file, key)
         if after["local_head"] != result["local_head"]:
             raise CommitError("Vault HEAD differs from created commit")
         validate_post_commit_state(before, after, artifact, mode)
-        rollback_handle = None
-        if index_backup is not None:
-            rollback_handle = {
-                "repo": repo,
-                "git_dir": git_dir,
-                "artifact": artifact,
-                "artifact_absolute": artifact_absolute,
-                "artifact_sha256": str(collection[collection_sha_key]),
-                "artifact_receipt": completed_receipt,
-                "before": before,
-                "after": after,
-                "index_backup": index_backup,
-            }
         return (
             result,
             True,
             False,
             None,
-            rollback_handle,
+            None,
         )
     except (
         CommitError,
@@ -1526,382 +1877,81 @@ def publish_one_vault(
         return result, False, retry_safe, str(exc), None
 
 
-def legacy_main(argv: list[str]) -> int:
-    """Validate inputs, install artifacts, commit approved groups, and emit JSON."""
-    if len(argv) != 11:
-        print(
-            "usage: commit-reviewed-publication.py RUNTIME PRE COLLECTION PLAN "
-            "CONTEXT REVIEW INSTALLER CAPTURE REVIEW_SHA OUTPUT",
-            file=sys.stderr,
-        )
-        return 64
-    output = Path(argv[10])
-    runtime: dict[str, object] = {}
-    pre: dict[str, object] = {}
-    collection: dict[str, object] = {}
-    plan: dict[str, object] = {}
-    context_digest: Optional[str] = None
-    bound_runtime: Optional[Path] = None
-    modes: Optional[dict[str, str]] = None
-    deferred: Optional[dict[str, list[dict[str, str]]]] = None
-    rollback_receipts: dict[str, dict[str, object]] = {}
-    try:
-        runtime = json.loads(Path(argv[1]).read_text(encoding="utf-8"))
-        pre = json.loads(Path(argv[2]).read_text(encoding="utf-8"))
-        collection = json.loads(Path(argv[3]).read_text(encoding="utf-8"))
-        plan = json.loads(Path(argv[4]).read_text(encoding="utf-8"))
-        context_path = Path(argv[5])
-        context_bytes = stable_regular_bytes(context_path)
-        context_digest = hashlib.sha256(context_bytes).hexdigest()
-        context = json.loads(context_bytes)
-        runtime, pre, collection, plan = reviewed_inputs(
-            context, runtime, pre, collection, plan
-        )
-        publisher_identity = validated_publisher_identity(runtime)
-        bound_runtime, bound_runtime_bytes = write_bound_json(
-            output.parent, "bound-runtime.json", runtime
-        )
-        bound_collection, bound_collection_bytes = write_bound_json(
-            output.parent, "bound-collection.json", collection
-        )
-        bound_plan, bound_plan_bytes = write_bound_json(
-            output.parent, "bound-artifact-plan.json", plan
-        )
-        review_path = Path(argv[6])
-        review_bytes = stable_regular_bytes(review_path)
-        if hashlib.sha256(review_bytes).hexdigest() != argv[9]:
-            raise CommitError("publication review changed after validation")
-        review = json.loads(review_bytes)
-        if review.get("outcome") != "approved" or review.get(
-            "publication_context_sha256"
-        ) != context_digest:
-            raise CommitError("publication review is not approved and context-bound")
-        modes = {
-            "agents_vault": review["agents_vault"]["publication_mode"],
-            "user_vault": review["user_vault"]["publication_mode"],
-        }
-        deferred = {
-            "agents_vault": review["agents_vault"]["deferred_cleanup"],
-            "user_vault": review["user_vault"]["deferred_cleanup"],
-        }
-        if modes["agents_vault"] == "blocked" and modes["user_vault"] == "blocked":
-            raise CommitError("review blocked both Vault artifacts")
-        previous = None
-        current_resume_state = None
-        if output.exists():
-            candidate = json.loads(stable_regular_bytes(output))
-            if (
-                candidate.get("outcome") == "partial_publication"
-                and candidate.get("phase") == "local_commit"
-                and candidate.get("publication_context_sha256") == context_digest
-                and isinstance(candidate.get("resumable_state"), dict)
-                and candidate.get("agents_vault", {}).get("commit_status")
-                in {"complete", "failed"}
-                and candidate.get("user_vault", {}).get("commit_status")
-                == "not_started"
-                and candidate.get("publication_mode") == modes
-                and candidate.get("evidence_finalization_commit") is None
-                and modes["agents_vault"] != "blocked"
-                and modes["user_vault"] != "blocked"
-            ):
-                previous = candidate
-            else:
-                raise CommitError("existing commit result is not a resumable partial publication")
-        if previous is None:
-            capture_exact(argv[8], str(bound_runtime), pre)
-        else:
-            current_resume_state = capture_state(argv[8], str(bound_runtime))
-            if current_resume_state != previous["resumable_state"]:
-                raise CommitError("Vaults no longer match the resumable result")
-        installed = {
-            "summary_target": plan["summary_target"],
-            "advisory_target": plan["advisory_target"],
-        }
-        require_bound_bytes(bound_runtime, bound_runtime_bytes)
-        require_bound_bytes(bound_collection, bound_collection_bytes)
-        require_bound_bytes(bound_plan, bound_plan_bytes)
-        if installed != {
-            "summary_target": plan["summary_target"],
-            "advisory_target": plan["advisory_target"],
-        }:
-            raise CommitError("installed artifacts differ from the approved plan")
-        agents_artifact = str(
-            Path(plan["advisory_target"]).relative_to(runtime["agents_vault_root"])
-        )
-        user_artifact = str(
-            Path(plan["summary_target"]).relative_to(runtime["user_vault_root"])
-        )
-        if modes["agents_vault"] != "blocked":
-            if previous is None:
-                installed_agents = json.loads(
-                    run_local_command(
-                        [
-                            argv[7], str(bound_runtime), str(bound_collection),
-                            str(bound_plan), "agents_security_advisory",
-                        ],
-                        cwd="/",
-                        check=True,
-                        capture_output=True,
-                        text=True,
-                        env=clean_environment(),
-                        timeout=LOCAL_COMMAND_TIMEOUT_SECONDS,
-                    ).stdout
-                )
-                if (
-                    not isinstance(installed_agents, dict)
-                    or installed_agents.get("summary_target")
-                    != installed["summary_target"]
-                    or installed_agents.get("advisory_target")
-                    != installed["advisory_target"]
-                ):
-                    raise CommitError("installed Agents artifact differs from the approved plan")
-                rollback_receipts["agents_vault"] = validated_installer_receipt(
-                    installed_agents.get("installed_receipt"),
-                    Path(plan["advisory_target"]),
-                    str(collection["advisory_sha256"]),
-                )
-                agents_installed_state = capture_installed_scope(
-                    argv[8], str(bound_runtime), pre,
-                    {"agents_vault": agents_artifact},
-                )
-            else:
-                agents_installed_state = current_resume_state
-            validate_final_worktree(
-                str(runtime["agents_vault_root"]),
-                str(runtime["agents_git_dir"]),
-                review["agents_vault"],
-                agents_artifact,
-                str(collection["advisory_sha256"]),
-            )
-            if previous is None:
-                agents = commit_groups(
-                    str(runtime["agents_vault_root"]),
-                    str(runtime["agents_git_dir"]),
-                    str(runtime["gitleaks_bin"]),
-                    pre["agents_vault"],
-                    review["agents_vault"],
-                    agents_artifact,
-                    str(collection["advisory_sha256"]),
-                    output.parent,
-                    publisher_identity,
-                    before_update=lambda: capture_exact(
-                        argv[8], str(bound_runtime), agents_installed_state
-                    ),
-                    publication_mode=modes["agents_vault"],
-                )
-                rollback_receipts.pop("agents_vault", None)
-            else:
-                agents = current_state(
-                    str(runtime["agents_vault_root"]),
-                    str(runtime["agents_git_dir"]),
-                    pre["agents_vault"],
-                )
-                claimed = previous["agents_vault"]
-                if any(
-                    agents[field] != claimed.get(field)
-                    for field in ("commit_hashes", "local_head", "clean", "post_dirty_digest")
-                ):
-                    raise CommitError("Agents Vault no longer matches the resumable result")
-                agents["commit_status"] = "complete"
-                agents["publication_mode"] = modes["agents_vault"]
-                agents["deferred_cleanup"] = review["agents_vault"]["deferred_cleanup"]
-        else:
-            agents_installed_state = pre
-            agents = unchanged_vault_result(
-                str(runtime["agents_vault_root"]),
-                str(runtime["agents_git_dir"]),
-                pre["agents_vault"],
-                review["agents_vault"],
-            )
-        after_agents = capture_state(argv[8], str(bound_runtime))
-        expected_user_before_install = (
-            current_resume_state["user_vault"]
-            if previous is not None
-            else pre["user_vault"]
-        )
-        if after_agents["user_vault"] != expected_user_before_install:
-            raise CommitError("User Vault changed during Agents publication")
-        if modes["agents_vault"] == "blocked":
-            if after_agents["agents_vault"] != pre["agents_vault"]:
-                raise CommitError("blocked Agents Vault changed")
-        else:
-            if after_agents["agents_vault"]["local_head"] != agents["local_head"]:
-                raise CommitError("Agents Vault HEAD differs from created commit")
-            validate_post_commit_state(
-                pre["agents_vault"],
-                after_agents["agents_vault"],
-                agents_artifact,
-                modes["agents_vault"],
-            )
-        if modes["user_vault"] != "blocked":
-            if previous is None or user_artifact not in after_agents["user_vault"]["dirty_paths"]:
-                installed_user = json.loads(
-                    run_local_command(
-                        [
-                            argv[7], str(bound_runtime), str(bound_collection),
-                            str(bound_plan), "user_it_news_summary",
-                        ],
-                        cwd="/",
-                        check=True,
-                        capture_output=True,
-                        text=True,
-                        env=clean_environment(),
-                        timeout=LOCAL_COMMAND_TIMEOUT_SECONDS,
-                    ).stdout
-                )
-                if (
-                    not isinstance(installed_user, dict)
-                    or installed_user.get("summary_target")
-                    != installed["summary_target"]
-                    or installed_user.get("advisory_target")
-                    != installed["advisory_target"]
-                ):
-                    raise CommitError("installed User artifact differs from the approved plan")
-                rollback_receipts["user_vault"] = validated_installer_receipt(
-                    installed_user.get("installed_receipt"),
-                    Path(plan["summary_target"]),
-                    str(collection["summary_sha256"]),
-                )
-                user_installed_state = capture_installed_scope(
-                    argv[8], str(bound_runtime), after_agents,
-                    {"user_vault": user_artifact},
-                )
-            else:
-                resume_baseline = {
-                    "agents_vault": after_agents["agents_vault"],
-                    "user_vault": pre["user_vault"],
-                }
-                validate_installed_scope(
-                    resume_baseline,
-                    after_agents,
-                    {"user_vault": user_artifact},
-                )
-                user_installed_state = after_agents
-            validate_final_worktree(
-                str(runtime["user_vault_root"]),
-                str(runtime["user_git_dir"]),
-                review["user_vault"],
-                user_artifact,
-                str(collection["summary_sha256"]),
-            )
-            user = commit_groups(
-                str(runtime["user_vault_root"]),
-                str(runtime["user_git_dir"]),
-                str(runtime["gitleaks_bin"]),
-                pre["user_vault"],
-                review["user_vault"],
-                user_artifact,
-                str(collection["summary_sha256"]),
-                output.parent,
-                publisher_identity,
-                before_update=lambda: capture_exact(
-                    argv[8], str(bound_runtime), user_installed_state
+def recover_interrupted_publications(runtime_path: str) -> dict[str, str]:
+    """Recover durable per-Vault transactions before collection observes Git state."""
+    runtime = json.loads(stable_regular_bytes(Path(runtime_path)))
+    if not isinstance(runtime, dict):
+        raise CommitError("runtime context is malformed during transaction recovery")
+    recovered: dict[str, str] = {}
+    for key, prefix in (("agents_vault", "agents"), ("user_vault", "user")):
+        repo = runtime.get(f"{prefix}_vault_root")
+        git_dir = runtime.get(f"{prefix}_git_dir")
+        if not isinstance(repo, str) or not isinstance(git_dir, str):
+            raise CommitError(f"{key} runtime paths are malformed during recovery")
+        try:
+            recovered[key] = recover_head_index_transaction(
+                git_dir,
+                read_head=lambda repo=repo, git_dir=git_dir: git(
+                    repo, git_dir, "rev-parse", "HEAD"
+                ).stdout.strip(),
+                update_head=lambda new, old, repo=repo, git_dir=git_dir: git(
+                    repo, git_dir, "update-ref", "HEAD", new, old
                 ),
-                publication_mode=modes["user_vault"],
             )
-            rollback_receipts.pop("user_vault", None)
-        else:
-            user = unchanged_vault_result(
-                str(runtime["user_vault_root"]),
-                str(runtime["user_git_dir"]),
-                pre["user_vault"],
-                review["user_vault"],
-            )
-        after_all = capture_state(argv[8], str(bound_runtime))
-        expected_agents_after_user = (
-            user_installed_state["agents_vault"]
-            if modes["user_vault"] != "blocked"
-            else after_agents["agents_vault"]
-        )
-        if after_all["agents_vault"] != expected_agents_after_user:
-            raise CommitError("Agents Vault changed during User publication")
-        if modes["user_vault"] == "blocked":
-            if after_all["user_vault"] != pre["user_vault"]:
-                raise CommitError("blocked User Vault changed")
-        else:
-            if after_all["user_vault"]["local_head"] != user["local_head"]:
-                raise CommitError("User Vault HEAD differs from created commit")
-            validate_post_commit_state(
-                pre["user_vault"],
-                after_all["user_vault"],
-                user_artifact,
-                modes["user_vault"],
-            )
-        result = {
-            "outcome": "ready_to_push",
-            "phase": "local_commit",
-            "daily_pipeline_status": "complete",
-            "summary_path": (
-                installed["summary_target"]
-                if modes["user_vault"] != "blocked"
-                else None
-            ),
-            "advisory_path": (
-                installed["advisory_target"]
-                if modes["agents_vault"] != "blocked"
-                else None
-            ),
-            "notification_result": collection.get("notification_result"),
-            "agents_vault": agents,
-            "user_vault": user,
-            "publication_mode": modes,
-            "deferred_cleanup": {
-                "agents_vault": review["agents_vault"]["deferred_cleanup"],
-                "user_vault": review["user_vault"]["deferred_cleanup"],
-            },
-            "evidence_finalization_commit": None,
-            "next_action": review.get("next_action"),
-        }
-    except (
-        CommitError,
-        KeyError,
-        OSError,
-        TypeError,
-        ValueError,
-        json.JSONDecodeError,
-        subprocess.SubprocessError,
-    ) as exc:
-        rollback_failures = []
-        for key, receipt in list(rollback_receipts.items()):
-            try:
-                prefix = "agents" if key == "agents_vault" else "user"
-                if runtime and pre and git(
-                    str(runtime[f"{prefix}_vault_root"]),
-                    str(runtime[f"{prefix}_git_dir"]),
-                    "rev-parse", "HEAD",
-                ).stdout.strip() == pre[key]["local_head"]:
-                    rollback_owned_artifact(receipt)
-            except Exception as rollback_exc:
-                rollback_failures.append(f"{key}:{rollback_exc}")
-        if rollback_failures:
-            exc = CommitError(
-                f"{exc}; owned artifact rollback failed: {'; '.join(rollback_failures)}"
-            )
-        result = result_after_failure(
-            runtime,
-            pre,
-            collection,
-            plan,
-            f"Local publication failed closed: {exc}",
-            context_digest,
-            argv[8] if bound_runtime is not None else None,
-            str(bound_runtime) if bound_runtime is not None else None,
-            modes,
-            deferred,
-        )
-        output.write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
-        print(str(exc), file=sys.stderr)
-        return 75
-    output.write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
-    return 0
+        except AtomicTransactionError as exc:
+            raise CommitError(f"{key} transaction recovery failed: {exc}") from exc
+    return recovered
+
+
+def verify_carried_artifact(
+    repo: str,
+    git_dir: str,
+    head: str,
+    artifact: str,
+    expected_sha256: str,
+) -> None:
+    """Bind a retained same-run commit to its exact regular artifact blob."""
+    path = safe_path(artifact)
+    tree_entry = git(repo, git_dir, "ls-tree", "-z", head, "--", path).stdout
+    records = [record for record in tree_entry.split("\0") if record]
+    if len(records) != 1 or "\t" not in records[0]:
+        raise CommitError("carried artifact is absent from the retained commit")
+    metadata, actual_path = records[0].split("\t", 1)
+    fields = metadata.split()
+    if len(fields) != 3 or fields[0] != "100644" or fields[1] != "blob" or actual_path != path:
+        raise CommitError("carried artifact is not a regular reviewed blob")
+    content = git_bytes(repo, git_dir, "cat-file", "blob", fields[2]).stdout
+    if hashlib.sha256(content).hexdigest() != expected_sha256:
+        raise CommitError("carried artifact blob differs from the current collection")
 
 
 def main(argv: list[str]) -> int:
     """Publish User then Agents independently from one reviewed context."""
-    if len(argv) != 11:
+    if len(argv) == 3 and argv[1] == "--recover":
+        try:
+            print(
+                json.dumps(
+                    recover_interrupted_publications(argv[2]),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
+            return 0
+        except (
+            CommitError,
+            OSError,
+            TypeError,
+            ValueError,
+            json.JSONDecodeError,
+            subprocess.SubprocessError,
+        ) as exc:
+            print(f"publication transaction recovery failed closed: {exc}", file=sys.stderr)
+            return 75
+    if len(argv) not in {11, 12}:
         print(
-            "usage: commit-reviewed-publication.py RUNTIME PRE COLLECTION PLAN "
-            "CONTEXT REVIEW INSTALLER CAPTURE REVIEW_SHA OUTPUT",
+            "usage: commit-reviewed-publication.py --recover RUNTIME | "
+            "RUNTIME PRE COLLECTION PLAN CONTEXT REVIEW INSTALLER CAPTURE "
+            "REVIEW_SHA OUTPUT [CARRIED_COMMIT_RESULT]",
             file=sys.stderr,
         )
         return 64
@@ -1952,6 +2002,8 @@ def main(argv: list[str]) -> int:
         )
         previous: dict[str, object] | None = None
         resume_pair: dict[str, object] | None = None
+        same_context_resume = False
+        carried_keys: set[str] = set()
         if output.exists():
             candidate = json.loads(stable_regular_bytes(output))
             if (
@@ -1965,16 +2017,85 @@ def main(argv: list[str]) -> int:
             for resume_key, label in (
                 ("agents_vault", "Agents"), ("user_vault", "User")
             ):
-                if resume_pair.get(resume_key) != candidate["resumable_state"].get(
-                    resume_key
+                if not same_semantic_vault_state(
+                    resume_pair.get(resume_key),
+                    candidate["resumable_state"].get(resume_key),
                 ):
                     raise CommitError(
                         "Vaults no longer match the resumable result: "
                         f"{label} Vault no longer matches"
                     )
             previous = candidate
+            same_context_resume = True
+        elif len(argv) == 12:
+            carried_bytes = stable_regular_bytes(Path(argv[11]))
+            candidate = json.loads(carried_bytes)
+            context_carried = context.get("carried_commit_result")
+            context_carried_digest = context.get("carried_commit_result_sha256")
+            if candidate is None:
+                if context_carried is not None or context_carried_digest is not None:
+                    raise CommitError("empty carried result differs from reviewed context")
+            else:
+                if (
+                    not isinstance(candidate, dict)
+                    or candidate != context_carried
+                    or hashlib.sha256(carried_bytes).hexdigest()
+                    != context_carried_digest
+                    or candidate.get("outcome") != "partial_publication"
+                    or candidate.get("phase") != "local_commit"
+                    or not isinstance(candidate.get("resumable_state"), dict)
+                ):
+                    raise CommitError("carried commit result is not context-bound progress")
+                current_pair = capture_state(argv[8], str(bound_runtime))
+                if not same_semantic_state_pair(current_pair, pre):
+                    raise CommitError("Vaults no longer match the carried commit result")
+                for carry_key, carry_prefix, result_path_key, plan_key, sha_key in (
+                    (
+                        "agents_vault", "agents", "advisory_path",
+                        "advisory_target", "advisory_sha256",
+                    ),
+                    (
+                        "user_vault", "user", "summary_path",
+                        "summary_target", "summary_sha256",
+                    ),
+                ):
+                    carried_path = candidate.get(result_path_key)
+                    if carried_path is None:
+                        continue
+                    claimed = candidate.get(carry_key)
+                    if (
+                        not isinstance(carried_path, str)
+                        or carried_path != plan[plan_key]
+                        or not isinstance(claimed, dict)
+                        or claimed.get("commit_status") != "complete"
+                        or not claimed.get("commit_hashes")
+                        or claimed.get("local_head") != pre[carry_key]["local_head"]
+                        or claimed.get("post_dirty_digest")
+                        != pre[carry_key]["dirty_digest"]
+                        or not same_semantic_vault_state(
+                            candidate["resumable_state"].get(carry_key),
+                            pre[carry_key],
+                        )
+                        or review[carry_key].get("publication_mode") != "own_only"
+                        or review[carry_key].get("commit_required") is not False
+                        or review[carry_key].get("commit_groups")
+                    ):
+                        raise CommitError("carried Vault publication contract is invalid")
+                    repo = str(runtime[f"{carry_prefix}_vault_root"])
+                    artifact = str(Path(carried_path).relative_to(repo))
+                    verify_carried_artifact(
+                        repo,
+                        str(runtime[f"{carry_prefix}_git_dir"]),
+                        str(claimed["local_head"]),
+                        artifact,
+                        str(collection[sha_key]),
+                    )
+                    carried_keys.add(carry_key)
+                if not carried_keys:
+                    raise CommitError("carried result contains no completed Vault")
+                previous = candidate
 
-        if previous is not None:
+        if same_context_resume and previous is not None:
             for completed_key, completed_prefix, completed_label in (
                 ("agents_vault", "agents", "Agents"),
                 ("user_vault", "user", "User"),
@@ -2013,7 +2134,19 @@ def main(argv: list[str]) -> int:
             str | None,
             dict[str, object] | None,
         ]:
-            if previous is not None and previous[key].get("commit_hashes"):
+            if key in carried_keys:
+                current = capture_one(argv[8], str(bound_runtime), key)
+                if not same_semantic_vault_state(current, pre[key]):
+                    label = "Agents" if key == "agents_vault" else "User"
+                    raise CommitError(f"{label} Vault changed after carried review")
+                assert previous is not None
+                claimed = dict(previous[key])
+                claimed["publication_mode"] = review[key]["publication_mode"]
+                claimed["deferred_cleanup"] = list(review[key]["deferred_cleanup"])
+                claimed["post_dirty_digest"] = current["dirty_digest"]
+                claimed["clean"] = not current["dirty_lines"]
+                return claimed, True, False, None, None
+            if same_context_resume and previous is not None and previous[key].get("commit_hashes"):
                 actual = current_state(
                     str(runtime[f"{prefix}_vault_root"]),
                     str(runtime[f"{prefix}_git_dir"]),
@@ -2064,101 +2197,58 @@ def main(argv: list[str]) -> int:
                     plan_file=str(bound_plan),
                     output_directory=output.parent,
                     publisher_identity=publisher_identity,
-                    resume_state=(resume_pair[key] if resume_pair is not None else None),
+                    resume_state=(
+                        resume_pair[key]
+                        if same_context_resume and resume_pair is not None
+                        else None
+                    ),
                 )
                 result, succeeded, retry_safe, _reason, _rollback_handle = last
                 if succeeded or result["commit_hashes"] or not retry_safe:
                     break
-                if capture_one(argv[8], str(bound_runtime), key) != pre[key]:
+                if not same_semantic_vault_state(
+                    capture_one(argv[8], str(bound_runtime), key), pre[key]
+                ):
                     break
             assert last is not None
             return last
 
         # The daily summary is the primary availability objective. A failure in
         # Agents publication must not suppress the independently safe User commit.
-        user, user_ok, user_retry_safe, user_reason, user_rollback = run_vault(
+        user, user_ok, user_retry_safe, user_reason, _user_rollback = run_vault(
             "user_vault",
             "user",
             "user_it_news_summary",
             "summary_target",
             "summary_sha256",
         )
-        agents, agents_ok, agents_retry_safe, agents_reason, agents_rollback = run_vault(
+        agents, agents_ok, agents_retry_safe, agents_reason, _agents_rollback = run_vault(
             "agents_vault",
             "agents",
             "agents_security_advisory",
             "advisory_target",
             "advisory_sha256",
         )
-        user_compensated_for_peer = False
-        agents_compensated_for_peer = False
-        # Cross-repository CAS cannot be atomic. If exactly one candidate was
-        # committed and its peer failed without mutation, compensate the owned,
-        # unpushed commit back to the reviewed state. The next bounded outer
-        # attempt can then take a fresh snapshot and review without duplicating
-        # the already-created daily artifact.
-        if user_ok and not agents_ok and agents_retry_safe and user_rollback is not None:
-            restored = restore_completed_publication(
-                handle=user_rollback,
-                capture=argv[8],
-                runtime_file=str(bound_runtime),
-                key="user_vault",
-            )
-            user = vault_result_from_snapshot(
-                restored,
-                pre["user_vault"],
-                commit_status="not_started",
-                commit_hashes=[],
-                publication_mode="blocked",
-                deferred_cleanup=list(review["user_vault"].get("deferred_cleanup", [])),
-            )
-            user_ok = False
-            user_retry_safe = True
-            user_compensated_for_peer = True
-            user_reason = "owned unpushed commit was compensated for peer re-plan"
-        elif (
-            agents_ok
-            and not user_ok
-            and user_retry_safe
-            and agents_rollback is not None
-        ):
-            restored = restore_completed_publication(
-                handle=agents_rollback,
-                capture=argv[8],
-                runtime_file=str(bound_runtime),
-                key="agents_vault",
-            )
-            agents = vault_result_from_snapshot(
-                restored,
-                pre["agents_vault"],
-                commit_status="not_started",
-                commit_hashes=[],
-                publication_mode="blocked",
-                deferred_cleanup=list(
-                    review["agents_vault"].get("deferred_cleanup", [])
-                ),
-            )
-            agents_ok = False
-            agents_retry_safe = True
-            agents_compensated_for_peer = True
-            agents_reason = "owned unpushed commit was compensated for peer re-plan"
+        # Keep every independently safe commit.  A peer failure is represented
+        # as partial publication and must not roll back the primary daily
+        # summary (or the independently safe advisory) before fixed push.
         progressed = bool(user["commit_hashes"] or agents["commit_hashes"])
         publishable = user_ok or agents_ok or progressed
         attempted_retry_safety = []
         attempted_retry_vaults = []
         if review["user_vault"]["publication_mode"] != "blocked" and not user_ok:
             attempted_retry_safety.append(user_retry_safe)
-            if user_retry_safe and not user_compensated_for_peer:
+            if user_retry_safe:
                 attempted_retry_vaults.append("user_vault")
         if review["agents_vault"]["publication_mode"] != "blocked" and not agents_ok:
             attempted_retry_safety.append(agents_retry_safe)
-            if agents_retry_safe and not agents_compensated_for_peer:
+            if agents_retry_safe:
                 attempted_retry_vaults.append("agents_vault")
         retry_disposition = (
             "replan"
-            if not publishable
-            and attempted_retry_safety
+            if attempted_retry_safety
             and all(attempted_retry_safety)
+            and attempted_retry_vaults
             else "none"
         )
         reasons = [

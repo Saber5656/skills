@@ -49,6 +49,15 @@ artifact installation, staging, commit, or push.
    - `blocked` is required when the hint is `blocked`, core review fails, a
      local-ahead commit is unsafe, or the artifact cannot be committed safely.
    Never upgrade a restrictive hint to a less restrictive mode.
+   When `artifact_already_committed` is true, this same run already committed
+   that Vault's reviewed artifact during an earlier bounded attempt and only
+   its peer Vault is being re-planned. The context-bound
+   `carried_commit_result` identifies the retained target and commit. Keep that
+   Vault in `own_only`; review the local-ahead commit normally, but do not plan,
+   install, or commit the artifact a second time. The deterministic validator
+   binds the completed Vault's semantic state and artifact blob. Raw index
+   stat-cache serialization is not a staged-content change, and the failed peer
+   intentionally uses its newly sealed re-plan snapshot.
 4. Bind both manifests to `publication_context.authorization_task_id`, the
    exact repo root, diff/history snapshot digests, artifact role/hash/target,
    and pinned gitleaks version. Copy every supplied local-only commit exactly
@@ -80,6 +89,20 @@ artifact installation, staging, commit, or push.
      exactly equal all captured dirty paths; `deferred_cleanup` has one entry
      per captured dirty path with a concrete reason; `residual_review_status`
      is `deferred`.
+     The runner preserves this raw response for audit and then deterministically
+     completes only these three residual arrays from the sealed dirty snapshot.
+     This structural projection exists so a large path set is not a copying
+     reliability boundary. It never changes core status, publication mode,
+     owned paths, commit groups, artifact/history binding, or any supplied
+     reason. A duplicate or foreign supplied residual path fails closed. Still
+     return every residual you reviewed; do not rely on projection to make a
+     residual-quality decision for you.
+     The sole exception is a hint with `artifact_already_committed=true`: set
+     `commit_required=false` and `commit_groups=[]`. Keep the exact artifact in
+     `reviewed_artifacts` and `owned_paths`, copy all local-ahead identities to
+     `approved_existing_commits`, and otherwise use the same `own_only`
+     excluded/deferred/evidence-finalization contract. The fixed pusher will
+     verify the retained commit and artifact blob against this new review.
    - `blocked`: `commit_required` is false, `commit_groups` and
      `approved_dirty_entries` are empty, `evidence_finalization` is null, and
      `owned_paths` contains only the current artifact target as a non-actionable

@@ -102,6 +102,10 @@ if ! print -r -- "$COLLECTION_BLOCK" | /usr/bin/grep -F -- '<<< "$COLLECTION_PRO
   echo "collection prompt must use stdin instead of argv" >&2
   exit 1
 fi
+if ! print -r -- "$COLLECTION_BLOCK" | /usr/bin/grep -F -- '--output-last-message "$COLLECTION_AGENT_RESULT"' >/dev/null; then
+  echo "collection must preserve the raw agent result" >&2
+  exit 1
+fi
 if print -r -- "$COLLECTION_BLOCK" | /usr/bin/grep -F -- '-C "$WORKDIR"' >/dev/null; then
   echo "collection must not make the automation root writable" >&2
   exit 1
@@ -112,6 +116,10 @@ if ! print -r -- "$REVIEW_BLOCK" | /usr/bin/grep -F -- '--sandbox read-only' >/d
 fi
 if ! print -r -- "$REVIEW_BLOCK" | /usr/bin/grep -F -- '<<< "$REVIEW_PROMPT_CONTENT"' >/dev/null; then
   echo "publication review prompt must use stdin instead of argv" >&2
+  exit 1
+fi
+if ! print -r -- "$REVIEW_BLOCK" | /usr/bin/grep -F -- '--output-last-message "$REVIEW_AGENT_RESULT"' >/dev/null; then
+  echo "publication review must preserve the raw agent result" >&2
   exit 1
 fi
 if print -r -- "$PUBLICATION_BLOCK" | /usr/bin/grep -F -- 'CODEX_BIN' >/dev/null; then
@@ -132,6 +140,10 @@ if ! print -r -- "$EVIDENCE_REVIEW_BLOCK" | /usr/bin/grep -F -- '<<< "$EVIDENCE_
 fi
 /usr/bin/grep -F -- '"$REVIEW_RESULT"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- '"$REVIEW_RESULT_SHA256"' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- '"$REVIEW_AGENT_RESULT"' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- '"$REVIEW_NORMALIZATION_RECEIPT"' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- '"$REVIEW_VALIDATOR" --canonicalize-own-only' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- '"$COLLECTION_VALIDATOR" --canonicalize-constraints' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- '"$PUBLICATION_CONTEXT_FILE"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- '"$ARTIFACT_PLAN"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- 'mkdir "$RUN_ROOT"' "$RUNNER" >/dev/null
@@ -159,6 +171,14 @@ fi
 /usr/bin/grep -F -- 'local exit_code="$1"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- 'FIXED_FETCHER="$WORKDIR/fetch-vault-main.py"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- '"$FIXED_FETCHER" "$RUNTIME_CONTEXT_FILE"' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- '"$LOCAL_COMMITTER" --recover "$RUNTIME_CONTEXT_FILE"' "$RUNNER" >/dev/null
+RECOVERY_LINE="$(/usr/bin/grep -n -F -- '"$LOCAL_COMMITTER" --recover "$RUNTIME_CONTEXT_FILE"' "$RUNNER" | /usr/bin/cut -d: -f1)"
+FETCH_LINE="$(/usr/bin/grep -n -F -- '"$FIXED_FETCHER" "$RUNTIME_CONTEXT_FILE"' "$RUNNER" | /usr/bin/cut -d: -f1)"
+CAPTURE_LINE="$(/usr/bin/grep -n -F -- '"$STATE_CAPTURE" "$RUNTIME_CONTEXT_FILE" > "$COLLECTION_START_STATE"' "$RUNNER" | /usr/bin/cut -d: -f1)"
+if [[ "$RECOVERY_LINE" -ge "$FETCH_LINE" || "$RECOVERY_LINE" -ge "$CAPTURE_LINE" ]]; then
+  echo "durable transaction recovery must precede fetch and collection-state capture" >&2
+  exit 1
+fi
 /usr/bin/grep -F -- 'SCHEMA_PROJECTOR="$WORKDIR/prepare-codex-output-schema.py"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- 'CANONICAL_VALIDATOR="$WORKDIR/validate-canonical-result.py"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- 'STANDING_TASK_STAGER="$WORKDIR/stage-standing-task.py"' "$RUNNER" >/dev/null
@@ -181,9 +201,56 @@ fi
 /usr/bin/grep -F -- 'if [[ "$AGENTS_STABLE_STATE" -ne 1 ]]; then' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- 'if [[ "$USER_STABLE_STATE" -ne 1 ]]; then' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- '"$STATE_CAPTURE" --include-local-history' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- 'The interpreter performs one stable descriptor read' "$RUNNER" >/dev/null
+NORMALIZATION_FAILURE_BLOCK="$(sed -n \
+  '/^if ! "\$REVIEW_VALIDATOR" --canonicalize-own-only/,/^fi$/p' "$RUNNER")"
+for audit_pointer in \
+  'review_agent_result=$REVIEW_AGENT_RESULT' \
+  'review_result=$REVIEW_RESULT' \
+  'review_normalization_receipt=$REVIEW_NORMALIZATION_RECEIPT'; do
+  if ! print -r -- "$NORMALIZATION_FAILURE_BLOCK" \
+    | /usr/bin/grep -F -- "$audit_pointer" >/dev/null; then
+    echo "normalization failure status must identify all review audit files" >&2
+    exit 1
+  fi
+done
+COLLECTION_NORMALIZATION_FAILURE_BLOCK="$(sed -n \
+  '/^if ! "\$COLLECTION_VALIDATOR" --canonicalize-constraints/,/^fi$/p' "$RUNNER")"
+for audit_pointer in \
+  'collection_agent_result=$COLLECTION_AGENT_RESULT' \
+  'collection_result=$COLLECTION_RESULT' \
+  'collection_normalization_receipt=$COLLECTION_NORMALIZATION_RECEIPT'; do
+  if ! print -r -- "$COLLECTION_NORMALIZATION_FAILURE_BLOCK" \
+    | /usr/bin/grep -F -- "$audit_pointer" >/dev/null; then
+    echo "normalization failure status must identify all collection audit files" >&2
+    exit 1
+  fi
+done
+TERMINAL_STATUS_BLOCK="$(sed -n '/^{$/,/^} > "\$STATUS_FILE"$/p' "$RUNNER" | tail -n 20)"
+for audit_pointer in \
+  'collection_agent_result=$COLLECTION_AGENT_RESULT' \
+  'collection_result=$COLLECTION_RESULT' \
+  'collection_normalization_receipt=$COLLECTION_NORMALIZATION_RECEIPT' \
+  'review_agent_result=$REVIEW_AGENT_RESULT' \
+  'review_result=$REVIEW_RESULT' \
+  'review_normalization_receipt=$REVIEW_NORMALIZATION_RECEIPT'; do
+  if ! print -r -- "$TERMINAL_STATUS_BLOCK" \
+    | /usr/bin/grep -F -- "$audit_pointer" >/dev/null; then
+    echo "terminal status must identify all review audit files" >&2
+    exit 1
+  fi
+done
 SNAPSHOT_BLOCK="$(sed -n \
   '/^AGENTS_STABLE_STATE=0$/,/^if ! "\$MODE_DETERMINER"/p' "$RUNNER" \
   | sed '$d')"
+[[ -n "$SNAPSHOT_BLOCK" ]] || {
+  echo "snapshot stabilization block extraction was empty" >&2
+  exit 1
+}
+/usr/bin/grep -F -- 'vault_state_snapshot_unstable' <<<"$SNAPSHOT_BLOCK" >/dev/null || {
+  echo "snapshot stabilization block extraction missed its failure marker" >&2
+  exit 1
+}
 FAKE_STATE_CAPTURE="$SNAPSHOT_FIXTURE_ROOT/capture-vault-state.py"
 cat > "$FAKE_STATE_CAPTURE" <<'ZSH'
 #!/bin/zsh
@@ -284,6 +351,14 @@ run_snapshot_case both_unstable
 REPLAN_BLOCK="$(sed -n \
   '/^  EXHAUSTED_MODE_HINT=/,/^    || fail_run 75 artifact_plan "could not seal exhausted artifact target re-plan"$/p' \
   "$RUNNER")"
+[[ -n "$REPLAN_BLOCK" ]] || {
+  echo "artifact target replan block extraction was empty" >&2
+  exit 1
+}
+/usr/bin/grep -F -- 'artifact_target_replan_exhausted' <<<"$REPLAN_BLOCK" >/dev/null || {
+  echo "artifact target replan block extraction missed its failure marker" >&2
+  exit 1
+}
 REPLAN_FIXTURE_ROOT="$SNAPSHOT_FIXTURE_ROOT/replan"
 /bin/mkdir "$REPLAN_FIXTURE_ROOT"
 /usr/bin/jq -n '{
@@ -312,6 +387,32 @@ if [[ "$(/usr/bin/jq -cS '.user_vault' "$REPLAN_FIXTURE_ROOT/publication-mode-hi
   echo "exhausted target replan changed the unaffected Vault" >&2
   exit 1
 fi
+CARRY_SELECTOR="$(sed -n '/^select_carried_commit_result() {$/,/^}$/p' "$RUNNER")"
+[[ -n "$CARRY_SELECTOR" ]] || {
+  echo "carried-result selector extraction was empty" >&2
+  exit 1
+}
+CARRY_FIXTURE_ROOT="$SNAPSHOT_FIXTURE_ROOT/carried-result"
+/bin/mkdir "$CARRY_FIXTURE_ROOT"
+print -r -- 'null' > "$CARRY_FIXTURE_ROOT/none.json"
+print -r -- '{"outcome":"blocked"}' > "$CARRY_FIXTURE_ROOT/blocked.json"
+print -r -- '{"outcome":"partial_publication"}' \
+  > "$CARRY_FIXTURE_ROOT/partial.json"
+(
+  NO_CARRIED_COMMIT_RESULT="$CARRY_FIXTURE_ROOT/none.json"
+  CARRIED_COMMIT_RESULT="$NO_CARRIED_COMMIT_RESULT"
+  eval "$CARRY_SELECTOR"
+  select_carried_commit_result "$CARRY_FIXTURE_ROOT/blocked.json"
+  [[ "$CARRIED_COMMIT_RESULT" == "$NO_CARRIED_COMMIT_RESULT" ]] || {
+    echo "no-progress blocked result was promoted to carried progress" >&2
+    exit 1
+  }
+  select_carried_commit_result "$CARRY_FIXTURE_ROOT/partial.json"
+  [[ "$CARRIED_COMMIT_RESULT" == "$CARRY_FIXTURE_ROOT/partial.json" ]] || {
+    echo "partial same-run progress was not retained for re-plan" >&2
+    exit 1
+  }
+)
 collection_line="$(/usr/bin/grep -n -F -- 'COLLECTION_STATUS=$?' "$RUNNER" | /usr/bin/cut -d: -f1)"
 history_line="$(/usr/bin/grep -n -F -- '"$STATE_CAPTURE" --include-local-history' "$RUNNER" | /usr/bin/head -n 1 | /usr/bin/cut -d: -f1)"
 if [[ -z "$collection_line" || -z "$history_line" || "$history_line" -le "$collection_line" ]]; then
@@ -323,9 +424,27 @@ fi
 /usr/bin/grep -F -- 'COLLECTION_OUTPUT_ROOT="$RUN_ROOT"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- '"$COLLECTION_FETCHER" "$SOURCE_CATALOG" "$SOURCE_INPUT_ROOT"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- '--arg source_manifest "$SOURCE_MANIFEST"' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- '--arg resolution_verifier "$COLLECTION_FETCHER"' "$RUNNER" >/dev/null
+if /usr/bin/grep -F -- 'resolution_verification_root' "$RUNNER" >/dev/null; then
+  echo "agent-visible context must not select the verifier run root" >&2
+  exit 1
+fi
 /usr/bin/grep -F -- 'chmod -R a-w "$SOURCE_INPUT_ROOT"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- '"$COLLECTION_FETCHER" --verify-resolutions' "$RUNNER" >/dev/null
-/usr/bin/grep -F -- '"$SOURCE_MANIFEST" "$RESOLUTION_REQUEST" "$VERIFIED_RESOLUTIONS"' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- '"$RESOLUTION_REQUEST" "$VERIFIED_RESOLUTIONS"' "$RUNNER" >/dev/null
+RAW_SCHEMA_LINE="$(/usr/bin/grep -n -F -- '"$CANONICAL_VALIDATOR" "$COLLECTION_SCHEMA" "$COLLECTION_AGENT_RESULT"' "$RUNNER" | /usr/bin/head -n 1 | /usr/bin/cut -d: -f1)"
+RESOLUTION_VERIFY_LINE="$(/usr/bin/grep -n -F -- '"$COLLECTION_FETCHER" --verify-resolutions' "$RUNNER" | /usr/bin/head -n 1 | /usr/bin/cut -d: -f1)"
+COLLECTION_PROJECTION_LINE="$(/usr/bin/grep -n -F -- '"$COLLECTION_VALIDATOR" --canonicalize-constraints' "$RUNNER" | /usr/bin/head -n 1 | /usr/bin/cut -d: -f1)"
+if [[ -z "$RAW_SCHEMA_LINE" || -z "$RESOLUTION_VERIFY_LINE" || -z "$COLLECTION_PROJECTION_LINE" ]] \
+  || [[ "$RAW_SCHEMA_LINE" -ge "$RESOLUTION_VERIFY_LINE" ]] \
+  || [[ "$RESOLUTION_VERIFY_LINE" -ge "$COLLECTION_PROJECTION_LINE" ]]; then
+  echo "collection authority order must be raw schema, resolution verification, projection" >&2
+  exit 1
+fi
+if /usr/bin/grep -F -- '"$SOURCE_CATALOG" "$SOURCE_MANIFEST" "$RESOLUTION_REQUEST"' "$RUNNER" >/dev/null; then
+  echo "runner must not expose arbitrary verifier catalog or manifest arguments" >&2
+  exit 1
+fi
 /usr/bin/grep -F -- 'AUTHORIZATION_TASK_SNAPSHOT="$REVIEW_INPUT_ROOT/authorization-task.md"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- '"$RUNTIME_CONTEXT_FILE" "$REVIEW_INPUT_ROOT" authorization' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- '--arg authorization_task "$AUTHORIZATION_TASK_SNAPSHOT"' "$RUNNER" >/dev/null
@@ -335,7 +454,11 @@ fi
 /usr/bin/grep -F -- 'chmod 700 "$SEALED_REVIEW_ROOT"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- '--arg dirty_snapshot_manifest_file "$DIRTY_SNAPSHOT_MANIFEST"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- '--output-schema "$CODEX_COLLECTION_SCHEMA"' "$RUNNER" >/dev/null
-/usr/bin/grep -F -- 'INTERPRETER_PROCESS_STATUS=75' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- 'INTERPRETER_PROCESS_STATUS="$FINALIZATION_STATUS"' "$RUNNER" >/dev/null
+if /usr/bin/grep -F -- 'INTERPRETER_PROCESS_STATUS=0' "$RUNNER" >/dev/null; then
+  echo "runner must not erase a nonzero finalizer status when a result file exists" >&2
+  exit 1
+fi
 if /usr/bin/grep -F -- 'fetch origin main' "$RUNNER" >/dev/null; then
   echo "runner must not trust a mutable remote name or ambiguous refspec" >&2
   exit 1
@@ -346,6 +469,15 @@ if /usr/bin/grep -F -- 'local status="$1"' "$RUNNER" >/dev/null; then
 fi
 FAIL_RUN_FUNCTION="$(sed -n '/^fail_run() {/,/^}/p' "$RUNNER")"
 LOCK_RELEASE_FUNCTION="$(sed -n '/^release_publication_lock() {/,/^}/p' "$RUNNER")"
+for audit_pointer in \
+  'collection_agent_result=' \
+  'collection_result=' \
+  'collection_normalization_receipt='; do
+  if ! print -r -- "$FAIL_RUN_FUNCTION" | /usr/bin/grep -F -- "$audit_pointer" >/dev/null; then
+    echo "every common failure status must retain collection audit pointers" >&2
+    exit 1
+  fi
+done
 FAIL_RUN_ROOT="$(mktemp -d)"
 if /bin/zsh -c '
   set -u
@@ -412,4 +544,4 @@ for forbidden in "/""Users/" "Library/Mobile"" Documents" "Yasu""'s Vault"; do
   fi
 done
 
-echo "runner isolation contract: 44/44 passed"
+echo "runner isolation contract: 53/53 passed"

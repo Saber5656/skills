@@ -10,6 +10,7 @@ Runtime context supplies:
 - collection result schema
 - skills root
 - reviewed source catalog and sealed deterministic public-source manifest
+- read-only trusted resolution verifier bound to this canonical run layout
 
 ## Pipeline
 
@@ -41,8 +42,18 @@ Runtime context supplies:
    publication date is visible, or an official feed/page where every sealed
    `article`/JSON-LD candidate has a publication date. Do not submit a home,
    category, archive, or listing URL that repeats the undated direct-page failure.
+   A search result or opened listing that visibly displays dates is still not a
+   valid resolution URL: click/open one individual official article and submit
+   that article's canonical URL. Prefer a verified individual article even when
+   its date falls outside the collection window; that case is a valid fallback
+   with count `0` and is safer than submitting a category/listing page.
    If no verifiable dated official URL can be found, return blocked. The summary
    row's `期間内件数` must equal the dated candidates from that verified fallback.
+   The one `resolutions` entry is the sole candidate set for an unresolved source:
+   do not add or count separate search results. When the selected resolution is a
+   specific article page, its row count is `1` only when that article's verified
+   publication date falls in the inclusive window, otherwise `0`. A fallback
+   source name must not also appear in `date_evidence`.
    Add entries to `source-resolutions.json.resolutions` only for source names whose
    sealed manifest status is exactly `needs_search_fallback`. Never add a
    redundant resolution for a source already sealed as `fetched` or
@@ -67,7 +78,8 @@ Runtime context supplies:
    `login` or `ログイン`, `paywall` must say `paywall`/`購読`/`有料`, and `captcha`
    must say `captcha`. Never describe a sealed `robots` constraint as `購読`.
    `期間内件数` must exactly equal the sealed dated entries in the inclusive JST
-   window defined in step 4; `対象期間記事なし` requires
+   window defined in step 4. Use `取得済み` if and only if that count is at
+   least `1`; use `対象期間記事なし` if and only if that count is `0`, with
    evidence that the dated candidates checked do not fall in the window.
    For every direct manifest entry whose status is `fetched`, copy the trusted
    `jst_window_item_count` exactly into `期間内件数`; do not independently recount
@@ -85,23 +97,47 @@ Runtime context supplies:
    verification agrees. A robots restriction must match a recorded failed attempt.
    For every successful site-search or official-alternate fallback, write one
    entry to `<collection_output_root>/source-resolutions.json` using exactly this
-   shape: `{"version":1,"resolutions":[{"name":"catalog name","method":"site_search|official_alternate","url":"bare HTTPS URL"}],"date_evidence":[{"name":"catalog name","url":"official article URL"}]}`.
+   shape: `{"version":1,"resolutions":[{"name":"catalog name","method":"site_search|official_alternate","url":"bare HTTPS URL"}],"date_evidence":[]}`.
    For a login/paywall/CAPTCHA page discovered only during fallback, use
    `{"name":"catalog name","method":"access_constraint","url":"bare HTTPS URL","constraint":"login|paywall|captcha"}` instead. Use `公開ページ` in its audit row and include the matching constraint term in `理由`.
    A direct manifest `access_constraint` (including robots) is not a fallback
    resolution and must not be copied into this array.
-   Put every official article URL used to supplement a missing HTML `published`
-   value in `date_evidence`; do not repeat entries already carrying a date in the
-   sealed extract. Always write this file, using empty arrays when no fallback URL
+   `date_evidence` is only for an exact undated entry of a direct manifest source
+   whose sealed status is `fetched`. Put every official article URL used for that
+   purpose there; do not repeat entries already carrying a date in the sealed
+   extract, and never put a `needs_search_fallback` or `access_constraint` source
+   in `date_evidence`. Always write this file, using empty arrays when no fallback URL
    or supplemental date is needed. The runner-created
    `verified-source-resolutions.json` does not exist and is not readable during
-   this collection response. Once you have found a dated official URL, recorded
-   it in `source-resolutions.json`, and used the corresponding evidence in the
-   audit row, treat that source as provisionally resolved for your output. Do not
-   return blocked only because post-response runner verification has not happened
-   yet. After this response, the trusted runner independently fetches every
-   submitted URL and fails closed before publication if the candidate or date
-   evidence cannot be verified.
+   this collection response. Before returning a `complete` result, you must run
+   the supplied trusted verifier against the exact request you wrote. Substitute
+   the absolute values from Runtime context JSON into this command (the angle
+   bracket labels below are not literal shell arguments):
+
+   ```sh
+   "<resolution_verifier>" --check-resolutions \
+     "<collection_output_root>/source-resolutions.json"
+   ```
+
+   Do not pass or substitute another catalog, manifest, or run root. The
+   executable is bound to the OS account's canonical production runtime and
+   derives the reviewed catalog and sealed manifest from that fixed root and
+   the direct canonical request path; executable copies, alternate
+   staging catalogs/manifests, and symlink aliases are rejected before any
+   fetch. The check is read-only and
+   creates no trusted output. If it exits nonzero,
+   replace the rejected fallback with another official individual article URL,
+   open that article to confirm its visible publication date, and rerun the
+   check. Try at most three distinct candidates for a source; if none passes,
+   return blocked. A category/listing candidate that fails this check must never
+   be reused. A `complete` result is forbidden unless the final exact request
+   exits `0`. After this response, the trusted runner independently repeats the
+   same verification and writes `verified-source-resolutions.json`; the agent's
+   preflight does not replace that authority boundary and the runner still fails
+   closed before publication. Once the exact request
+   passes preflight, treat that source as provisionally resolved for this
+   response. Do not return blocked only because post-response runner verification
+   has not created its separate evidence file yet.
    If any catalog source remains unresolved, return the daily
    pipeline as blocked instead of creating a misleading complete summary.
 7. Validate the same-run staged summary.

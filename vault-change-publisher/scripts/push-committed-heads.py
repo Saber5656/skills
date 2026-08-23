@@ -28,6 +28,28 @@ class PushError(RuntimeError):
 SCAN_TIMEOUT_SECONDS = 120
 
 
+def clean_git_environment() -> dict[str, str]:
+    """Disable ambient Git controls and repository-local fsmonitor commands."""
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("GIT_")
+    }
+    environment.update(
+        {
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_NO_LAZY_FETCH": "1",
+            "GIT_NO_REPLACE_OBJECTS": "1",
+            "GIT_OPTIONAL_LOCKS": "0",
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "core.fsmonitor",
+            "GIT_CONFIG_VALUE_0": "false",
+        }
+    )
+    return environment
+
+
 def read_regular_nofollow(path: Path) -> bytes:
     """Read one stable regular control file without following a symlink."""
     descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
@@ -65,19 +87,7 @@ def git(
     git_dir: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run Git without a shell and capture sanitized text output."""
-    environment = {
-        key: value
-        for key, value in os.environ.items()
-        if not key.startswith("GIT_")
-    }
-    environment["GIT_CONFIG_NOSYSTEM"] = "1"
-    environment["GIT_CONFIG_GLOBAL"] = os.devnull
-    environment["GIT_NO_LAZY_FETCH"] = "1"
-    environment["GIT_NO_REPLACE_OBJECTS"] = "1"
-    environment["GIT_OPTIONAL_LOCKS"] = "0"
-    environment["GIT_CONFIG_COUNT"] = "1"
-    environment["GIT_CONFIG_KEY_0"] = "core.fsmonitor"
-    environment["GIT_CONFIG_VALUE_0"] = "false"
+    environment = clean_git_environment()
     repository_arguments = (
         [f"--git-dir={git_dir}", f"--work-tree={repo}"]
         if git_dir is not None
@@ -170,22 +180,60 @@ def git_control_digest(repo: str) -> str:
             control.update(config_path.read_bytes())
         control.update(b"\0")
     hooks = common_dir / "hooks"
-    if hooks.exists():
-        for root, directories, files in os.walk(hooks, followlinks=False):
-            directories.sort()
-            files.sort()
-            for filename in files:
-                path = Path(root) / filename
-                control.update(str(path.relative_to(common_dir)).encode("utf-8"))
+    if os.path.lexists(hooks):
+        control.update(b"hooks\0")
+        control.update(f"{hooks.lstat().st_mode:o}".encode("ascii"))
+        control.update(b"\0")
+        walk_hooks = False
+        if hooks.is_symlink():
+            control.update(b"symlink\0")
+            control.update(os.fsencode(os.readlink(hooks)))
+            control.update(b"\0")
+            try:
+                target_mode = hooks.stat().st_mode
+            except FileNotFoundError:
+                control.update(b"dangling\0")
+            else:
+                control.update(f"{target_mode:o}".encode("ascii"))
                 control.update(b"\0")
-                control.update(f"{path.lstat().st_mode:o}".encode("ascii"))
-                control.update(b"\0")
-                if path.is_symlink():
-                    control.update(b"symlink\0")
-                    control.update(os.readlink(path).encode("utf-8"))
+                if hooks.is_dir():
+                    control.update(b"target-directory\0")
+                    walk_hooks = True
                 else:
-                    control.update(path.read_bytes())
-                control.update(b"\0")
+                    control.update(b"target-unsupported\0")
+        elif not hooks.is_dir():
+            control.update(b"unsupported\0")
+        else:
+            control.update(b"directory\0")
+            walk_hooks = True
+        if walk_hooks:
+            for root, directories, files in os.walk(hooks, followlinks=False):
+                directories.sort()
+                files.sort()
+                for name in directories:
+                    path = Path(root) / name
+                    control.update(str(path.relative_to(common_dir)).encode("utf-8"))
+                    control.update(b"\0")
+                    control.update(f"{path.lstat().st_mode:o}".encode("ascii"))
+                    control.update(b"\0")
+                    if path.is_symlink():
+                        control.update(b"symlink\0")
+                        control.update(os.fsencode(os.readlink(path)))
+                    else:
+                        control.update(b"directory\0")
+                    control.update(b"\0")
+                for filename in files:
+                    path = Path(root) / filename
+                    control.update(str(path.relative_to(common_dir)).encode("utf-8"))
+                    control.update(b"\0")
+                    control.update(f"{path.lstat().st_mode:o}".encode("ascii"))
+                    control.update(b"\0")
+                    if path.is_symlink():
+                        control.update(b"symlink\0")
+                        control.update(os.fsencode(os.readlink(path)))
+                    else:
+                        control.update(path.read_bytes())
+                    control.update(b"\0")
     return control.hexdigest()
 
 
@@ -371,6 +419,7 @@ def validate_scope(
     pre_state: dict[str, object],
     reported: dict[str, object],
     manifest: dict[str, object],
+    carried: bool = False,
 ) -> None:
     """Bind actual commits and artifact blobs to an approved review manifest."""
     existing_commits = existing_commit_metadata(repo, pre_state)
@@ -407,16 +456,39 @@ def validate_scope(
         validate_dirty_entry(
             repo, str(reported["local_head"]), entry
         )
-    if len(reported["commit_hashes"]) != len(approved_groups):
-        raise PushError("commit count differs from approved commit groups")
-    for commit, group in zip(reported["commit_hashes"], approved_groups):
-        paths = set(commit_paths(repo, commit))
+    if carried:
+        approved_existing_ids = [
+            commit["commit"] for commit in manifest["approved_existing_commits"]
+        ]
+        artifact_targets = [
+            artifact["target_path"] for artifact in manifest["reviewed_artifacts"]
+        ]
         if (
-            paths != set(group["paths"])
-            or git(repo, "show", "-s", "--format=%s", commit).stdout.strip()
-            != group["message"]
+            manifest.get("commit_required") is not False
+            or approved_groups
+            or not reported["commit_hashes"]
+            or any(
+                commit not in approved_existing_ids
+                for commit in reported["commit_hashes"]
+            )
+            or len(artifact_targets) != 1
+            or not any(
+                artifact_targets[0] in commit_paths(repo, commit)
+                for commit in reported["commit_hashes"]
+            )
         ):
-            raise PushError("commit does not exactly match its ordered approved group")
+            raise PushError("carried commit does not match approved local-only history")
+    else:
+        if len(reported["commit_hashes"]) != len(approved_groups):
+            raise PushError("commit count differs from approved commit groups")
+        for commit, group in zip(reported["commit_hashes"], approved_groups):
+            paths = set(commit_paths(repo, commit))
+            if (
+                paths != set(group["paths"])
+                or git(repo, "show", "-s", "--format=%s", commit).stdout.strip()
+                != group["message"]
+            ):
+                raise PushError("commit does not exactly match its ordered approved group")
     for artifact in manifest["reviewed_artifacts"]:
         validate_blob_mode(
             repo,
@@ -480,6 +552,7 @@ def validate_local(
     reported: dict[str, object],
     current_state: dict[str, object] | None = None,
     artifact_path: str | None = None,
+    carried: bool = False,
 ) -> str:
     """Bind a reported commit sequence to its mode-specific checkout state."""
     branch = git(repo, "branch", "--show-current").stdout.strip()
@@ -492,6 +565,7 @@ def validate_local(
             or reported.get("local_head") != local_head
             or reported.get("pre_local_head") != pre_state["local_head"]
             or reported.get("commit_hashes")
+            or reported.get("commit_status") not in {"not_started", "not_required"}
             or actual_dirty != pre_state["dirty_digest"]
             or reported.get("post_dirty_digest") != actual_dirty
             or current_state is None
@@ -504,6 +578,33 @@ def validate_local(
         raise PushError("publication checkout is not main tracking origin/main")
     if local_head != reported["local_head"]:
         raise PushError("reported local head does not match repository")
+    if carried:
+        if (
+            pre_state["local_head"] != local_head
+            or reported.get("commit_status") != "complete"
+            or not reported.get("commit_hashes")
+            or reported.get("post_dirty_digest") != dirty_digest(repo)
+            or current_state is None
+        ):
+            raise PushError("carried publication state is inconsistent")
+        commits = git(
+            repo,
+            "rev-list",
+            "--reverse",
+            f"{reported['pre_local_head']}..{local_head}",
+        ).stdout.splitlines()
+        if commits != reported["commit_hashes"]:
+            raise PushError("carried commit sequence no longer matches local history")
+        for field in (
+            "dirty_lines", "dirty_paths", "dirty_entries", "dirty_metadata",
+            "staged_paths", "index_entries",
+            "dirty_worktree_sha256", "dirty_digest", "diff_snapshot_sha256",
+            "git_control_sha256", "branch", "upstream", "operation_in_progress",
+            "remote_head",
+        ):
+            if current_state.get(field) != pre_state.get(field):
+                raise PushError(f"carried publication state changed before push: {field}")
+        return local_head
     if reported["pre_local_head"] != pre_state["local_head"]:
         raise PushError("reported pre-publication head does not match captured state")
     if reported["pre_dirty_digest"] != pre_state["dirty_digest"]:
@@ -561,14 +662,7 @@ def capture_complete(runtime_file: str) -> dict[str, object]:
         check=True,
         capture_output=True,
         text=True,
-        env={
-            **{key: value for key, value in os.environ.items() if not key.startswith("GIT_")},
-            "GIT_CONFIG_NOSYSTEM": "1",
-            "GIT_CONFIG_GLOBAL": os.devnull,
-            "GIT_NO_LAZY_FETCH": "1",
-            "GIT_NO_REPLACE_OBJECTS": "1",
-            "GIT_OPTIONAL_LOCKS": "0",
-        },
+        env=clean_git_environment(),
         timeout=LOCAL_COMMAND_TIMEOUT_SECONDS,
     )
     return json.loads(result.stdout)
@@ -599,17 +693,18 @@ def validate_and_push_one(
     expected_remote = str(pre_state["remote_head"])
     observed_remote = expected_remote
     mode = reported.get("publication_mode")
+    carried = mode != "blocked" and manifest.get("commit_required") is False
     try:
         if mode != manifest.get("publication_mode"):
             raise PushError("commit result mode differs from the approved review")
         state = capture_one(repo)
         local_head = validate_local(
-            repo, pre_state, reported, state, artifact_path
+            repo, pre_state, reported, state, artifact_path, carried
         )
         if git_control_digest(repo) != pre_state["git_control_sha256"]:
             raise PushError("Git config or hooks changed during local publication")
         if mode != "blocked":
-            validate_scope(repo, pre_state, reported, manifest)
+            validate_scope(repo, pre_state, reported, manifest, carried)
             scan_commits(
                 str(runtime["gitleaks_bin"]), repo,
                 str(pre_state["remote_head"]), local_head,
@@ -661,6 +756,26 @@ def remote_head(repo: str, remote_url: str, git_dir: str | None = None) -> str:
     return fields[0]
 
 
+def require_fast_forward_target(
+    repo: str,
+    expected_remote: str,
+    local_head: str,
+    git_dir: str | None = None,
+) -> None:
+    """Prove the fixed non-force update cannot rewrite reviewed history."""
+    result = git(
+        repo,
+        "merge-base",
+        "--is-ancestor",
+        expected_remote,
+        local_head,
+        check=False,
+        git_dir=git_dir,
+    )
+    if result.returncode != 0:
+        raise PushError("fixed push target is not a descendant of expected remote")
+
+
 def push_one(
     repo: str,
     remote_url: str,
@@ -674,6 +789,7 @@ def push_one(
         return ("not_required", before)
     if not required:
         raise PushError("not_required publication unexpectedly needs a push")
+    require_fast_forward_target(repo, before, local_head, git_dir)
     observed = before
     for _ in range(3):
         try:
@@ -751,10 +867,13 @@ def final_vault(
     """Convert one local commit result into the final publication shape."""
     commit_hashes = list(reported["commit_hashes"])
     if pre_state is not None and push_status in {"complete", "not_required"}:
-        commit_hashes = [
+        existing_hashes = [
             str(commit["commit"])
             for commit in pre_state.get("local_commits", [])
-        ] + commit_hashes
+        ]
+        commit_hashes = existing_hashes + [
+            commit for commit in commit_hashes if commit not in existing_hashes
+        ]
     return {
         "commit_status": "complete" if commit_hashes else reported["commit_status"],
         "commit_hashes": commit_hashes,

@@ -5,11 +5,13 @@ from __future__ import annotations
 
 import importlib.util
 import gzip
+import hashlib
 import io
 import json
 import os
 import tempfile
 import unittest
+from datetime import date
 from pathlib import Path
 from unittest import mock
 
@@ -30,6 +32,67 @@ VALIDATOR_SPEC = importlib.util.spec_from_file_location(
 assert VALIDATOR_SPEC and VALIDATOR_SPEC.loader
 VALIDATOR = importlib.util.module_from_spec(VALIDATOR_SPEC)
 VALIDATOR_SPEC.loader.exec_module(VALIDATOR)
+
+
+def write_bound_manifest(
+    path: Path,
+    statuses: dict[str, str],
+    catalog: Path = CATALOG,
+) -> None:
+    """Write the complete catalog-bound manifest shape used by the collector."""
+    sources = MODULE.load_catalog(catalog)
+    rows = [
+        {
+            "name": source["name"],
+            "status": statuses.get(source["name"], "access_constraint"),
+        }
+        for source in sources
+    ]
+    path.write_text(
+        json.dumps(
+            {
+                "catalog_sha256": hashlib.sha256(catalog.read_bytes()).hexdigest(),
+                "source_count": len(rows),
+                "fetched_count": sum(row["status"] == "fetched" for row in rows),
+                "needs_search_fallback_count": sum(
+                    row["status"] == "needs_search_fallback" for row in rows
+                ),
+                "access_constraint_count": sum(
+                    row["status"] == "access_constraint" for row in rows
+                ),
+                "sources": rows,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def create_check_runtime(
+    root: Path,
+    statuses: dict[str, str],
+) -> tuple[Path, Path, Path, Path]:
+    """Create the flattened immutable layout required by resolution preflight."""
+    root = root.resolve(strict=True)
+    runtime = root / "runtime"
+    runtime.mkdir()
+    executable = runtime / "collect-public-sources.py"
+    executable.write_text("# fixture runtime executable\n", encoding="utf-8")
+    catalog = runtime / "it-news-sources.json"
+    catalog.write_bytes(CATALOG.read_bytes())
+    run_root = (
+        runtime
+        / "logs"
+        / "2026-08-23"
+        / "20260823T050000+0900-123-456"
+    )
+    staging = run_root / "staging"
+    source_inputs = run_root / "source-inputs"
+    staging.mkdir(parents=True)
+    source_inputs.mkdir()
+    manifest = source_inputs / "source-manifest.json"
+    write_bound_manifest(manifest, statuses, catalog)
+    request = staging / "source-resolutions.json"
+    return executable, catalog, manifest, request
 
 
 class FakeHeaders:
@@ -88,6 +151,42 @@ class PublicSourceCollectorTests(unittest.TestCase):
         self.assertEqual(len({source["name"] for source in sources}), 26)
         self.assertEqual(sum(source["tier"] == 1 for source in sources), 11)
         self.assertEqual(sum(source["tier"] == 2 for source in sources), 15)
+        by_name = {source["name"]: source for source in sources}
+        self.assertEqual(
+            by_name["The New Stack"]["feed_url"],
+            "https://thenewstack.io/feed/",
+        )
+
+    def test_the_new_stack_official_feed_precedes_html_fallback(self) -> None:
+        """Resolve the publisher from its reviewed feed without touching HTML."""
+        source = next(
+            source
+            for source in MODULE.load_catalog(CATALOG)
+            if source["name"] == "The New Stack"
+        )
+        hosts = MODULE.source_hosts(source)
+        feed = (
+            b"<rss><channel><item><title>Official feed story</title>"
+            b"<link>https://thenewstack.io/official-feed-story/</link>"
+            b"<pubDate>Sat, 22 Aug 2026 17:00:00 +0000</pubDate>"
+            b"</item></channel></rss>"
+        )
+        fetch = mock.Mock(return_value={
+            "content": feed,
+            "content_type": "application/rss+xml",
+            "final_url": source["feed_url"],
+            "http_status": 200,
+        })
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.object(
+            MODULE, "fetch_url", fetch
+        ):
+            result = MODULE.collect_source(
+                16, source, hosts, Path(temporary), MODULE.date(2026, 8, 23)
+            )
+        fetch.assert_called_once_with("https://thenewstack.io/feed/", hosts)
+        self.assertEqual(result["status"], "fetched")
+        self.assertEqual(result["method"], "rss")
+        self.assertEqual(result["jst_window_item_count"], 1)
 
     def test_url_allowlist_rejects_unsafe_targets(self) -> None:
         """Do not turn the collector into an arbitrary URL or credential client."""
@@ -202,9 +301,1223 @@ class PublicSourceCollectorTests(unittest.TestCase):
         self.assertEqual(extracted["entry_count"], 1)
         self.assertEqual(extracted["entries"][0]["title"], "Release")
 
+    def test_feed_extract_drops_invalid_urls_without_losing_valid_peers(self) -> None:
+        """Apply the public URL gate to every RSS item independently."""
+        items = (
+            ("bad-port", "https://example.test:bad/a"),
+            ("out-of-range-port", "https://example.test:65536/b"),
+            ("credentials", "https://user:pass@example.test/c"),
+            ("invalid-host", "https://bad_host.test/d"),
+            ("foreign-host", "https://other.test/e"),
+            ("valid", "https://example.test/release#details"),
+        )
+        content = (
+            "<rss><channel>"
+            + "".join(
+                "<item><title>"
+                + title
+                + "</title><link>"
+                + url
+                + "</link><pubDate>2026-08-05</pubDate></item>"
+                for title, url in items
+            )
+            + "</channel></rss>"
+        ).encode()
+        extracted = MODULE.extract_content(
+            content,
+            "application/rss+xml",
+            "https://example.test/feed",
+            {"example.test", "www.example.test"},
+        )
+        self.assertEqual(extracted["format"], "feed")
+        self.assertEqual(extracted["entry_count"], 1)
+        self.assertEqual(extracted["entries"][0]["title"], "valid")
+        self.assertEqual(
+            extracted["entries"][0]["url"], "https://example.test/release"
+        )
+
+    def test_source_bound_extract_drops_foreign_html_navigation(self) -> None:
+        """Do not seal cross-host navigation from an otherwise valid source page."""
+        content = (
+            b'<a href="https://other.test/about">Foreign navigation</a>'
+            b'<article><time datetime="2026-08-18"></time>'
+            b'<h2><a href="/story">Local story</a></h2></article>'
+        )
+        extracted = MODULE.extract_content(
+            content,
+            "text/html",
+            "https://example.test/news",
+            {"example.test", "www.example.test"},
+        )
+        self.assertEqual(extracted["entry_count"], 1)
+        self.assertEqual(extracted["candidate_entry_count"], 1)
+        self.assertEqual(
+            extracted["entries"][0]["url"], "https://example.test/story"
+        )
+
+    def test_source_bound_foreign_records_do_not_consume_html_caps(self) -> None:
+        """Count accepted source-local records, not earlier foreign records."""
+        foreign_anchors = "".join(
+            f'<a href="https://other.test/nav/{index}">Foreign {index}</a>'
+            for index in range(400)
+        )
+        local_article = (
+            '<article><time datetime="2026-08-18"></time>'
+            '<h2><a href="/story">Local story</a></h2></article>'
+        )
+        extracted = MODULE.extract_content(
+            (foreign_anchors + local_article).encode(),
+            "text/html",
+            "https://example.test/news",
+            {"example.test", "www.example.test"},
+        )
+        self.assertEqual(extracted["candidate_entry_count"], 1)
+        self.assertEqual(extracted["date_evidence_count"], 1)
+        self.assertEqual(extracted["entries"][0]["title"], "Local story")
+
+        foreign_records = [
+            {
+                "@context": "https://schema.org",
+                "@type": "NewsArticle",
+                "headline": f"Foreign {index}",
+                "url": f"https://other.test/story/{index}",
+                "datePublished": "2026-08-17",
+            }
+            for index in range(200)
+        ]
+        local_record = {
+            "@context": "https://schema.org",
+            "@type": "NewsArticle",
+            "headline": "Local JSON story",
+            "url": "/json-story",
+            "datePublished": "2026-08-18",
+        }
+        graph = json.dumps({"@graph": [*foreign_records, local_record]}).encode()
+        content = (
+            b'<script type="application/ld+json">'
+            + graph
+            + b"</script>"
+        )
+        extracted = MODULE.extract_content(
+            content,
+            "text/html",
+            "https://example.test/news",
+            {"example.test", "www.example.test"},
+        )
+        self.assertEqual(extracted["candidate_entry_count"], 1)
+        self.assertEqual(extracted["date_evidence_count"], 1)
+        self.assertEqual(extracted["entries"][0]["title"], "Local JSON story")
+
+        foreign_blocks = b"".join(
+            b'<script type="application/ld+json">'
+            + json.dumps(record).encode()
+            + b"</script>"
+            for record in foreign_records[:50]
+        )
+        local_block = (
+            b'<script type="application/ld+json">'
+            + json.dumps(local_record).encode()
+            + b"</script>"
+        )
+        extracted = MODULE.extract_content(
+            foreign_blocks + local_block,
+            "text/html",
+            "https://example.test/news",
+            {"example.test", "www.example.test"},
+        )
+        self.assertEqual(extracted["candidate_entry_count"], 1)
+        self.assertEqual(extracted["entries"][0]["title"], "Local JSON story")
+
+    def test_rss_text_url_is_validated_before_any_length_transform(self) -> None:
+        """Preserve bounded raw RSS URL identity and reject overlong input."""
+        prefix = "https://example.test/"
+        for length in (1000, 1001, 4096, 4097):
+            url = prefix + "a" * (length - len(prefix))
+            content = (
+                "<rss><channel><item><title>Length probe</title><link>\n  "
+                + url
+                + "  \n</link><pubDate>2026-08-05</pubDate></item>"
+                "</channel></rss>"
+            ).encode()
+            extracted = MODULE.extract_content(
+                content,
+                "application/rss+xml",
+                "https://example.test/feed",
+                {"example.test", "www.example.test"},
+            )
+            with self.subTest(length=length):
+                if length <= 4096:
+                    self.assertEqual(extracted["entry_count"], 1)
+                    self.assertEqual(extracted["entries"][0]["url"], url)
+                else:
+                    self.assertEqual(extracted["entry_count"], 0)
+
+    def test_duplicate_records_do_not_consume_unique_entry_caps(self) -> None:
+        """Deduplicate accepted identities before applying per-channel caps."""
+        duplicate_items = "".join(
+            "<item><title>Duplicate</title>"
+            "<link>https://example.test/duplicate</link>"
+            "<pubDate>2026-08-17</pubDate></item>"
+            for _ in range(200)
+        )
+        unique_item = (
+            "<item><title>Unique</title>"
+            "<link>https://example.test/unique</link>"
+            "<pubDate>2026-08-18</pubDate></item>"
+        )
+        extracted = MODULE.extract_content(
+            ("<rss><channel>" + duplicate_items + unique_item + "</channel></rss>").encode(),
+            "application/rss+xml",
+            "https://example.test/feed",
+            {"example.test", "www.example.test"},
+        )
+        self.assertEqual(extracted["entry_count"], 2)
+        self.assertEqual(
+            [entry["url"] for entry in extracted["entries"]],
+            ["https://example.test/duplicate", "https://example.test/unique"],
+        )
+
+        duplicate_json = {
+            "@context": "https://schema.org",
+            "@type": "NewsArticle",
+            "headline": "Duplicate JSON",
+            "url": "/duplicate",
+            "datePublished": "2026-08-17",
+        }
+        unique_json = {
+            "@context": "https://schema.org",
+            "@type": "NewsArticle",
+            "headline": "Unique JSON",
+            "url": "/unique",
+            "datePublished": "2026-08-18",
+        }
+        content = (
+            b'<script type="application/ld+json">'
+            + json.dumps({"@graph": [duplicate_json] * 200 + [unique_json]}).encode()
+            + b"</script>"
+        )
+        extracted = MODULE.extract_content(
+            content,
+            "text/html",
+            "https://example.test/news",
+            {"example.test", "www.example.test"},
+        )
+        self.assertEqual(extracted["candidate_entry_count"], 2)
+        self.assertEqual(
+            [entry["url"] for entry in extracted["entries"]],
+            ["https://example.test/duplicate", "https://example.test/unique"],
+        )
+
+        duplicate_embedded = "".join(
+            '<p class="title"><a href="/duplicate">Duplicate embedded</a></p>'
+            '<p class="date">(2026/8/17)</p>'
+            for _ in range(200)
+        )
+        unique_embedded = (
+            '<p class="title"><a href="/unique">Unique embedded</a></p>'
+            '<p class="date">(2026/8/18)</p>'
+        )
+        entries = MODULE.extract_embedded_article_metadata(
+            (duplicate_embedded + unique_embedded).encode(),
+            "https://example.test/news",
+            {"example.test", "www.example.test"},
+        )
+        self.assertEqual(len(entries), 2)
+        self.assertEqual(
+            [entry["url"] for entry in entries],
+            ["https://example.test/duplicate", "https://example.test/unique"],
+        )
+
+    def test_json_ld_titleless_duplicates_complete_existing_metadata(self) -> None:
+        """Merge validated metadata by identity before title admission or caps."""
+        first_block = json.dumps(
+            {
+                "@context": "https://schema.org",
+                "@graph": [
+                {
+                    "@type": "NewsArticle",
+                    "headline": "Target",
+                    "url": "/target",
+                },
+                *[
+                    {
+                        "@type": "NewsArticle",
+                        "headline": f"Filler {index}",
+                        "url": f"/filler/{index}",
+                    }
+                    for index in range(199)
+                ],
+                ],
+            }
+        )
+        titleless_complement = json.dumps(
+            {
+                "@context": "https://schema.org",
+                "@type": "NewsArticle",
+                "url": "https://example.test:443/target/",
+                "datePublished": "2026-08-18",
+                "description": "Validated later metadata",
+            }
+        )
+        non_article = json.dumps(
+            {
+                "@context": "https://schema.org",
+                "@type": "WebPage",
+                "url": "/target",
+                "datePublished": "2026-08-19",
+                "description": "Must not replace article metadata",
+            }
+        )
+        content = (
+            f'<script type="application/ld+json">{first_block}</script>'
+            f'<script type="application/ld+json">{titleless_complement}</script>'
+            f'<script type="application/ld+json">{non_article}</script>'
+        ).encode()
+        entries = MODULE.extract_json_ld(
+            content,
+            "https://example.test/news",
+            {"example.test", "www.example.test"},
+        )
+        self.assertEqual(len(entries), 200)
+        self.assertEqual(entries[0]["title"], "Target")
+        self.assertEqual(entries[0]["published"], "2026-08-18")
+        self.assertEqual(entries[0]["summary"], "Validated later metadata")
+
+        before_cap = MODULE.extract_json_ld(
+            (
+                '<script type="application/ld+json">'
+                '{"@context":"https://schema.org","@type":"NewsArticle",'
+                '"headline":"Before cap","url":"/before"}'
+                '</script><script type="application/ld+json">'
+                '{"@context":"https://schema.org","@type":"NewsArticle",'
+                '"url":"/before/",'
+                '"datePublished":"2026-08-17","description":"Completed"}'
+                "</script>"
+            ).encode(),
+            "https://example.test/news",
+            {"example.test", "www.example.test"},
+        )
+        self.assertEqual(before_cap[0]["published"], "2026-08-17")
+        self.assertEqual(before_cap[0]["summary"], "Completed")
+
+    def test_json_ld_budgets_isolate_bad_blocks_and_keep_valid_peers(self) -> None:
+        """Reject one abnormal block transactionally and continue later peers."""
+        decode_too_deep = "[" * 1200 + "0" + "]" * 1200
+        depth_too_deep = json.dumps(
+            {"child": {"child": {"child": "seed"}}}
+        )
+        for _ in range(MODULE.JSON_LD_MAX_DEPTH + 1):
+            depth_too_deep = '{"child":' + depth_too_deep + "}"
+        node_too_large = {
+            "@context": "https://schema.org",
+            "@type": "NewsArticle",
+            "headline": "Must roll back",
+            "url": "/partial",
+            "@graph": [0] * MODULE.JSON_LD_MAX_NODES,
+        }
+        node_too_large = json.dumps(node_too_large)
+        valid_json = json.dumps(
+            {
+                "@context": "https://schema.org",
+                "@type": "NewsArticle",
+                "headline": "Valid JSON peer",
+                "url": "/valid-json",
+                "datePublished": "2026-08-18",
+            }
+        )
+        content = (
+            f'<script type="application/ld+json">{decode_too_deep}</script>'
+            f'<script type="application/ld+json">{depth_too_deep}</script>'
+            f'<script type="application/ld+json">{node_too_large}</script>'
+            f'<script type="application/ld+json">{valid_json}</script>'
+            '<article><time datetime="2026-08-17"></time>'
+            '<h2><a href="/valid-html">Valid HTML peer</a></h2></article>'
+        ).encode()
+        extracted = MODULE.extract_content(
+            content,
+            "text/html",
+            "https://example.test/news",
+            {"example.test", "www.example.test"},
+        )
+        by_url = {entry["url"]: entry for entry in extracted["entries"]}
+        self.assertNotIn("https://example.test/partial", by_url)
+        self.assertIn("https://example.test/valid-json", by_url)
+        self.assertIn("https://example.test/valid-html", by_url)
+        self.assertEqual(extracted["candidate_entry_count"], 2)
+        self.assertEqual(extracted["date_evidence_count"], 2)
+
+    def test_json_ld_accepts_only_canonical_schema_article_types(self) -> None:
+        """Use exact Schema.org Article identities, never arbitrary suffixes."""
+        allowed_records = [
+            {
+                "@type": article_type,
+                "headline": article_type,
+                "url": f"/allowed/{index}",
+                "datePublished": "2026-08-18",
+            }
+            for index, article_type in enumerate(
+                sorted(MODULE.JSON_LD_ARTICLE_TYPES)
+            )
+        ]
+        allowed_records.extend(
+            [
+                {
+                    "@type": "https://schema.org/NewsArticle",
+                    "headline": "HTTPS canonical IRI",
+                    "url": "/allowed/https",
+                    "datePublished": "2026-08-18",
+                },
+                {
+                    "@type": "http://schema.org:80/BlogPosting",
+                    "headline": "HTTP canonical IRI",
+                    "url": "/allowed/http",
+                    "datePublished": "2026-08-18",
+                },
+                {
+                    "@type": ["WebPage", "TechArticle"],
+                    "headline": "Multiple canonical types",
+                    "url": "/allowed/multiple",
+                    "datePublished": "2026-08-18",
+                },
+            ]
+        )
+        allowed = MODULE.extract_json_ld(
+            (
+                '<script type="application/ld+json">'
+                + json.dumps(
+                    {
+                        "@context": "https://schema.org",
+                        "@graph": allowed_records,
+                    }
+                )
+                + "</script>"
+            ).encode(),
+            "https://example.test/news",
+            {"example.test", "www.example.test"},
+        )
+        self.assertEqual(len(allowed), len(allowed_records))
+        self.assertTrue(all(entry["published"] for entry in allowed))
+
+        context_list = MODULE.extract_json_ld(
+            (
+                '<script type="application/ld+json">'
+                + json.dumps(
+                    {
+                        "@context": [
+                            "https://schema.org",
+                            {"@vocab": "http://schema.org/"},
+                        ],
+                        "@type": "NewsArticle",
+                        "headline": "Context list",
+                        "url": "/allowed/context-list",
+                        "datePublished": "2026-08-18",
+                    }
+                )
+                + "</script>"
+            ).encode(),
+            "https://example.test/news",
+            {"example.test", "www.example.test"},
+        )
+        self.assertEqual(len(context_list), 1)
+
+        absolute_without_trusted_context = MODULE.extract_json_ld(
+            (
+                '<script type="application/ld+json">'
+                + json.dumps(
+                    {
+                        "@graph": [
+                            {
+                                "@type": "https://schema.org/NewsArticle",
+                                "headline": "Absolute without context",
+                                "url": "/allowed/absolute-no-context",
+                            },
+                            {
+                                "@context": "https://other.test/context",
+                                "@type": "http://schema.org:80/BlogPosting",
+                                "headline": "Absolute under foreign context",
+                                "url": "/allowed/absolute-foreign-context",
+                            },
+                        ]
+                    }
+                )
+                + "</script>"
+            ).encode(),
+            "https://example.test/news",
+            {"example.test", "www.example.test"},
+        )
+        self.assertEqual(len(absolute_without_trusted_context), 2)
+
+        invalid_types = [
+            "NotAnArticle",
+            "SyntheticPosting",
+            "schema:NewsArticle",
+            "https://schema.org/NewsArticle?variant=Article",
+            "https://schema.org/NewsArticle?",
+            "https://schema.org/NewsArticle#Article",
+            "https://schema.org/NewsArticle#",
+            "https://schema.org/path/NewsArticle",
+            "https://schema.org/NewsArticle/",
+            "https://www.schema.org/NewsArticle",
+            "https://pending.schema.org/NewsArticle",
+            "https://other.test/NewsArticle",
+            "https://schema.org:444/NewsArticle",
+            "https://schema.org/WebPage?kind=Article",
+            ["WebPage", 42],
+        ]
+        for invalid_type in invalid_types:
+            initial = {
+                "@type": "NewsArticle",
+                "headline": "Existing",
+                "url": "/existing",
+            }
+            invalid_complement = {
+                "@type": invalid_type,
+                "url": "/existing/",
+                "datePublished": "2026-08-19",
+                "description": "Must not merge",
+            }
+            entries = MODULE.extract_json_ld(
+                (
+                    '<script type="application/ld+json">'
+                    + json.dumps(
+                        {
+                            "@context": "https://schema.org",
+                            "@graph": [initial, invalid_complement],
+                        }
+                    )
+                    + "</script>"
+                ).encode(),
+                "https://example.test/news",
+                {"example.test", "www.example.test"},
+            )
+            with self.subTest(invalid_type=invalid_type):
+                self.assertEqual(len(entries), 1)
+                self.assertIsNone(entries[0]["published"])
+                self.assertIsNone(entries[0]["summary"])
+
+        for untrusted_context in (
+            None,
+            "https://other.test/context",
+            {"@vocab": "https://other.test/"},
+            {"NewsArticle": "https://other.test/Type"},
+            {
+                "@vocab": "https://schema.org/",
+                "NewsArticle": "https://other.test/Type",
+            },
+            {
+                "@vocab": "https://schema.org/",
+                "@language": "en",
+            },
+            {
+                "@vocab": "https://schema.org/",
+                "@import": "https://other.test/context",
+            },
+            {
+                "@vocab": "https://schema.org/",
+                "@propagate": False,
+            },
+            ["https://schema.org", {"unrelated": "https://example.test/"}],
+            ["https://schema.org", "https://other.test/context"],
+            ["https://other.test/context", "https://schema.org"],
+            [
+                {
+                    "@vocab": "https://schema.org/",
+                    "NewsArticle": "https://other.test/NotArticle",
+                },
+                "https://schema.org",
+            ],
+            [
+                "https://schema.org",
+                {
+                    "@vocab": "https://schema.org/",
+                    "NewsArticle": "https://other.test/NotArticle",
+                },
+                "https://schema.org",
+            ],
+            ["https://schema.org", ["https://schema.org"]],
+            ["https://schema.org"] * (MODULE.JSON_LD_MAX_CONTEXT_ITEMS + 1),
+        ):
+            context_override = {
+                "@context": "https://schema.org",
+                "@graph": [
+                    {
+                        "@type": "NewsArticle",
+                        "headline": "Existing",
+                        "url": "/existing",
+                    },
+                    {
+                        "@context": untrusted_context,
+                        "@type": "NewsArticle",
+                        "url": "/existing/",
+                        "datePublished": "2026-08-19",
+                        "description": "Must not merge",
+                    },
+                ],
+            }
+            entries = MODULE.extract_json_ld(
+                (
+                    '<script type="application/ld+json">'
+                    + json.dumps(context_override)
+                    + "</script>"
+                ).encode(),
+                "https://example.test/news",
+                {"example.test", "www.example.test"},
+            )
+            with self.subTest(untrusted_context=untrusted_context):
+                self.assertEqual(len(entries), 1)
+                self.assertIsNone(entries[0]["published"])
+                self.assertIsNone(entries[0]["summary"])
+
+        no_context_short_name = MODULE.extract_json_ld(
+            (
+                '<script type="application/ld+json">'
+                + json.dumps(
+                    {
+                        "@graph": [
+                            {
+                                "@type": "https://schema.org/NewsArticle",
+                                "headline": "Existing",
+                                "url": "/existing",
+                            },
+                            {
+                                "@type": "NewsArticle",
+                                "url": "/existing/",
+                                "datePublished": "2026-08-19",
+                                "description": "Must not merge",
+                            },
+                        ]
+                    }
+                )
+                + "</script>"
+            ).encode(),
+            "https://example.test/news",
+            {"example.test", "www.example.test"},
+        )
+        self.assertEqual(len(no_context_short_name), 1)
+        self.assertIsNone(no_context_short_name[0]["published"])
+        self.assertIsNone(no_context_short_name[0]["summary"])
+
+        context_declaration_is_not_a_record = MODULE.extract_json_ld(
+            (
+                '<script type="application/ld+json">'
+                + json.dumps(
+                    {
+                        "@context": {
+                            "@vocab": "https://schema.org/",
+                            "payload": {
+                                "@id": "https://example.test/payload",
+                                "@type": "NewsArticle",
+                                "headline": "Context injection",
+                                "url": "/context-injection",
+                            },
+                        },
+                        "@type": "WebPage",
+                        "url": "/listing",
+                    }
+                )
+                + "</script>"
+            ).encode(),
+            "https://example.test/news",
+            {"example.test", "www.example.test"},
+        )
+        self.assertEqual(context_declaration_is_not_a_record, [])
+
+        canonical_complement = [
+            {
+                "@type": "NewsArticle",
+                "headline": "Existing",
+                "url": "/existing",
+            },
+            {
+                "@type": "https://schema.org/NewsArticle",
+                "url": "/existing/",
+                "datePublished": "2026-08-18",
+                "description": "Canonical complement",
+            },
+        ]
+        entries = MODULE.extract_json_ld(
+            (
+                '<script type="application/ld+json">'
+                + json.dumps(
+                    {
+                        "@context": {"@vocab": "https://schema.org/"},
+                        "@graph": canonical_complement,
+                    }
+                )
+                + "</script>"
+            ).encode(),
+            "https://example.test/news",
+            {"example.test", "www.example.test"},
+        )
+        self.assertEqual(entries[0]["published"], "2026-08-18")
+        self.assertEqual(entries[0]["summary"], "Canonical complement")
+
+    def test_json_ld_context_taint_is_sticky_across_arrays_and_scopes(self) -> None:
+        """Never let partially understood contexts authorize short article types."""
+        base = "https://example.test/news"
+        hosts = {"example.test", "www.example.test"}
+        initial = {
+            "@type": "https://schema.org/NewsArticle",
+            "headline": "Existing",
+            "url": "/existing",
+        }
+        tainted_contexts = [
+            [
+                {
+                    "@vocab": "https://schema.org/",
+                    "NewsArticle": "https://other.test/NotArticle",
+                },
+                "https://schema.org",
+            ],
+            [
+                "https://schema.org",
+                {
+                    "@vocab": "https://schema.org/",
+                    "NewsArticle": "https://other.test/NotArticle",
+                },
+                "https://schema.org",
+            ],
+            ["https://other.test/context", "https://schema.org"],
+        ]
+        for tainted_context in tainted_contexts:
+            entries = MODULE.extract_json_ld(
+                (
+                    '<script type="application/ld+json">'
+                    + json.dumps(
+                        {
+                            "@graph": [
+                                initial,
+                                {
+                                    "@context": tainted_context,
+                                    "@type": "NewsArticle",
+                                    "url": "/existing/",
+                                    "datePublished": "2026-08-19",
+                                    "description": "Must not merge",
+                                },
+                            ]
+                        }
+                    )
+                    + "</script>"
+                ).encode(),
+                base,
+                hosts,
+            )
+            with self.subTest(tainted_context=tainted_context):
+                self.assertEqual(len(entries), 1)
+                self.assertIsNone(entries[0]["published"])
+                self.assertIsNone(entries[0]["summary"])
+
+        sibling_isolation = MODULE.extract_json_ld(
+            (
+                '<script type="application/ld+json">'
+                + json.dumps(
+                    {
+                        "@context": "https://schema.org",
+                        "@graph": [
+                            {
+                                "@context": [
+                                    "https://other.test/context",
+                                    "https://schema.org",
+                                ],
+                                "@type": "NewsArticle",
+                                "headline": "Tainted child",
+                                "url": "/tainted-child",
+                            },
+                            {
+                                "@type": "TechArticle",
+                                "headline": "Trusted sibling",
+                                "url": "/trusted-sibling",
+                            },
+                        ],
+                    }
+                )
+                + "</script>"
+            ).encode(),
+            base,
+            hosts,
+        )
+        self.assertEqual(
+            [entry["url"] for entry in sibling_isolation],
+            ["https://example.test/trusted-sibling"],
+        )
+
+        scoped = {
+            "@context": {
+                "@vocab": "https://schema.org/",
+                "payload": {
+                    "@id": "https://example.test/payload",
+                    "@context": {"@vocab": "https://other.test/"},
+                },
+            },
+            "@graph": [
+                initial,
+                {
+                    "payload": {
+                        "@context": "https://schema.org",
+                        "@type": "NewsArticle",
+                        "url": "/existing/",
+                        "datePublished": "2026-08-20",
+                        "description": "Must remain tainted",
+                    }
+                },
+                {
+                    "payload": {
+                        "@type": "https://schema.org/NewsArticle",
+                        "headline": "Absolute peer",
+                        "url": "/absolute-peer",
+                        "datePublished": "2026-08-20",
+                    }
+                },
+            ],
+        }
+        scoped_entries = MODULE.extract_json_ld(
+            (
+                '<script type="application/ld+json">'
+                + json.dumps(scoped)
+                + "</script>"
+            ).encode(),
+            base,
+            hosts,
+        )
+        scoped_by_url = {entry["url"]: entry for entry in scoped_entries}
+        self.assertEqual(len(scoped_entries), 2)
+        self.assertIsNone(scoped_by_url["https://example.test/existing"]["published"])
+        self.assertIsNone(scoped_by_url["https://example.test/existing"]["summary"])
+        self.assertEqual(
+            scoped_by_url["https://example.test/absolute-peer"]["published"],
+            "2026-08-20",
+        )
+
+        accepted = [
+            {
+                "@context": "https://schema.org",
+                "@type": "NewsArticle",
+                "headline": "Short target",
+                "url": "/cap-short",
+            },
+            {
+                "@context": "https://schema.org",
+                "@type": "NewsArticle",
+                "headline": "Absolute target",
+                "url": "/cap-absolute",
+            },
+            *[
+                {
+                    "@context": "https://schema.org",
+                    "@type": "NewsArticle",
+                    "headline": f"Filler {index}",
+                    "url": f"/cap-filler/{index}",
+                }
+                for index in range(198)
+            ],
+        ]
+        cap_content = (
+            '<script type="application/ld+json">'
+            + json.dumps(accepted)
+            + "</script>"
+            + '<script type="application/ld+json">'
+            + json.dumps(
+                {
+                    "@context": {
+                        "@vocab": "https://schema.org/",
+                        "payload": {
+                            "@id": "https://example.test/payload",
+                            "@context": {"@vocab": "https://other.test/"},
+                        },
+                    },
+                    "payload": [
+                        {
+                            "@type": "NewsArticle",
+                            "url": "/cap-short/",
+                            "datePublished": "2026-08-21",
+                            "description": "Must not merge after cap",
+                        },
+                        {
+                            "@type": "https://schema.org/NewsArticle",
+                            "url": "/cap-absolute/",
+                            "datePublished": "2026-08-21",
+                            "description": "Absolute complement",
+                        },
+                    ],
+                }
+            )
+            + "</script>"
+        ).encode()
+        cap_entries = MODULE.extract_json_ld(cap_content, base, hosts)
+        cap_by_url = {entry["url"]: entry for entry in cap_entries}
+        self.assertEqual(len(cap_entries), 200)
+        self.assertIsNone(cap_by_url["https://example.test/cap-short"]["published"])
+        self.assertIsNone(cap_by_url["https://example.test/cap-short"]["summary"])
+        self.assertEqual(
+            cap_by_url["https://example.test/cap-absolute"]["published"],
+            "2026-08-21",
+        )
+        self.assertEqual(
+            cap_by_url["https://example.test/cap-absolute"]["summary"],
+            "Absolute complement",
+        )
+
+    def test_json_ld_raw_text_does_not_decode_html_character_references(self) -> None:
+        """Keep HTML entities literal inside script raw text before JSON parsing."""
+        base = "https://example.test/news"
+        hosts = {"example.test", "www.example.test"}
+        initial = {
+            "@type": "https://schema.org/NewsArticle",
+            "headline": "Existing",
+            "url": "/existing",
+        }
+        encoded_type_forms = [
+            {
+                "@context": "https://schema.org&#47;",
+                "@type": "NewsArticle",
+            },
+            {
+                "@context": "https://schema.org",
+                "@type": "News&#65;rticle",
+            },
+            {
+                "@type": "https://schema.org/News&#65;rticle",
+            },
+        ]
+        for encoded_type_form in encoded_type_forms:
+            complement = {
+                **encoded_type_form,
+                "url": "/existing/",
+                "datePublished": "2026-08-22",
+                "description": "Must not merge",
+            }
+            entries = MODULE.extract_json_ld(
+                (
+                    '<script type="application/ld+json">'
+                    + json.dumps({"@graph": [initial, complement]})
+                    + "</script>"
+                ).encode(),
+                base,
+                hosts,
+            )
+            with self.subTest(encoded_type_form=encoded_type_form):
+                self.assertEqual(len(entries), 1)
+                self.assertIsNone(entries[0]["published"])
+                self.assertIsNone(entries[0]["summary"])
+
+        encoded_date = MODULE.extract_json_ld(
+            (
+                '<script type="application/ld+json">'
+                + json.dumps(
+                    {
+                        "@context": "https://schema.org",
+                        "@type": "NewsArticle",
+                        "headline": "Encoded date",
+                        "url": "/encoded-date",
+                        "datePublished": "2026-08-&#50;2",
+                    }
+                )
+                + "</script>"
+            ).encode(),
+            base,
+            hosts,
+        )
+        self.assertEqual(len(encoded_date), 1)
+        self.assertIsNone(encoded_date[0]["published"])
+
+        accepted = [
+            {
+                "@context": "https://schema.org",
+                "@type": "NewsArticle",
+                "headline": f"Target {index}",
+                "url": f"/cap-target/{index}",
+            }
+            for index in range(4)
+        ] + [
+            {
+                "@context": "https://schema.org",
+                "@type": "NewsArticle",
+                "headline": f"Filler {index}",
+                "url": f"/cap-entity-filler/{index}",
+            }
+            for index in range(196)
+        ]
+        complements = [
+            {
+                **encoded_type_form,
+                "url": f"/cap-target/{index}/",
+                "datePublished": "2026-08-22",
+                "description": "Must not merge after cap",
+            }
+            for index, encoded_type_form in enumerate(encoded_type_forms)
+        ]
+        complements.append(
+            {
+                "@context": "https://schema.org",
+                "@type": "NewsArticle",
+                "url": "/cap-target/3/",
+                "datePublished": "2026-08-&#50;2",
+                "description": "Encoded date must not merge after cap",
+            }
+        )
+        cap_entries = MODULE.extract_json_ld(
+            (
+                '<script type="application/ld+json">'
+                + json.dumps(accepted)
+                + "</script>"
+                + '<script type="application/ld+json">'
+                + json.dumps(complements)
+                + "</script>"
+            ).encode(),
+            base,
+            hosts,
+        )
+        cap_by_url = {entry["url"]: entry for entry in cap_entries}
+        self.assertEqual(len(cap_entries), 200)
+        for index in range(4):
+            target = cap_by_url[f"https://example.test/cap-target/{index}"]
+            self.assertIsNone(target["published"])
+            if index < 3:
+                self.assertIsNone(target["summary"])
+        self.assertEqual(
+            cap_by_url["https://example.test/cap-target/3"]["summary"],
+            "Encoded date must not merge after cap",
+        )
+
+        json_escape = (
+            '<script type="application/ld+json">'
+            '{"@context":"https://schema.org","@type":"News\\u0041rticle",'
+            '"headline":"JSON escape","url":"/json-escape",'
+            '"datePublished":"2026-08-\\u0032\\u0032"}'
+            "</script>"
+        )
+        encoded_syntax = (
+            '<script type="application/ld+json">'
+            '{&quot;@context&quot;:&quot;https://schema.org&quot;,'
+            '&quot;@type&quot;:&quot;NewsArticle&quot;,'
+            '&quot;headline&quot;:&quot;Encoded syntax&quot;,'
+            '&quot;url&quot;:&quot;/encoded-syntax&quot;}'
+            "</script>"
+        )
+        valid_peer = (
+            '<script type="application/ld+json">'
+            '{"@context":"https://schema.org","@type":"NewsArticle",'
+            '"headline":"Valid peer","url":"/valid-peer"}'
+            "</script>"
+        )
+        peers = MODULE.extract_json_ld(
+            (encoded_syntax + json_escape + valid_peer).encode(), base, hosts
+        )
+        self.assertEqual(
+            [entry["url"] for entry in peers],
+            [
+                "https://example.test/json-escape",
+                "https://example.test/valid-peer",
+            ],
+        )
+        self.assertEqual(peers[0]["published"], "2026-08-22")
+
+    def test_json_ld_requires_actual_inline_script_type_attribute(self) -> None:
+        """Ignore lookalike attributes, duplicate types, and external scripts."""
+        base = "https://example.test/news"
+        hosts = {"example.test", "www.example.test"}
+
+        def payload(path: str) -> str:
+            return json.dumps(
+                {
+                    "@context": "https://schema.org",
+                    "@type": "NewsArticle",
+                    "headline": path,
+                    "url": f"/{path}",
+                    "datePublished": "2026-08-23",
+                }
+            )
+
+        rejected = [
+            f'<script data-type="application/ld+json">{payload("data-type")}</script>',
+            f'<script notatype="application/ld+json">{payload("notatype")}</script>',
+            (
+                "<script data-note='type=\"application/ld+json\"'>"
+                f'{payload("embedded-type")}</script>'
+            ),
+            (
+                '<script type="application/ld+json" '
+                f'type="text/plain">{payload("duplicate-type")}</script>'
+            ),
+            (
+                '<script type="application/ld+json" src="/metadata.json">'
+                f'{payload("external-script")}</script>'
+            ),
+            (
+                '<script type="application/ld&#43;json">'
+                f'{payload("attribute-entity")}</script>'
+            ),
+            (
+                '<script type="application/ld+json"/>'
+                f'{payload("self-closing")}</script>'
+            ),
+            f'<script type="application/ld+json">{payload("unfinished")}',
+        ]
+        for markup in rejected:
+            with self.subTest(markup=markup):
+                self.assertEqual(
+                    MODULE.extract_json_ld(markup.encode(), base, hosts), []
+                )
+
+        accepted = (
+            "<SCRIPT TYPE=APPLICATION/LD+JSON data-purpose=jsonld>"
+            f'{payload("uppercase-unquoted")}</SCRIPT>'
+            '<script type="application/ld+json" '
+            "data-note='type=\"application/ld+json\"'>"
+            f'{payload("quoted-peer")}</script>'
+        )
+        entries = MODULE.extract_json_ld(accepted.encode(), base, hosts)
+        self.assertEqual(
+            [entry["url"] for entry in entries],
+            [
+                "https://example.test/uppercase-unquoted",
+                "https://example.test/quoted-peer",
+            ],
+        )
+
+        lookalike_then_valid = (
+            f'<script data-type="application/ld+json">{payload("lookalike")}</script>'
+            '<script type="text/plain">not JSON-LD</script>'
+            '<script type="application/ld+json">'
+            f'{payload("valid-peer")}</script>'
+        )
+        peers = MODULE.extract_json_ld(
+            lookalike_then_valid.encode(), base, hosts
+        )
+        self.assertEqual(
+            [entry["url"] for entry in peers],
+            ["https://example.test/valid-peer"],
+        )
+
+    def test_json_ld_uses_html5_safe_script_token_boundaries(self) -> None:
+        """Fail closed on HTMLParser/HTML5 whitespace and closer divergence."""
+        base = "https://example.test/news"
+        hosts = {"example.test", "www.example.test"}
+
+        def payload(path: str) -> str:
+            return json.dumps(
+                {
+                    "@context": "https://schema.org",
+                    "@type": "NewsArticle",
+                    "headline": path,
+                    "url": f"/{path}",
+                    "datePublished": "2026-08-23",
+                }
+            )
+
+        for closer in ("</ script>", "</\tscript>", "</\nscript>"):
+            markup = (
+                '<script type="application/ld+json">'
+                f'{payload("bad-closer")}{closer}'
+            )
+            with self.subTest(closer=closer):
+                self.assertEqual(
+                    MODULE.extract_json_ld(markup.encode(), base, hosts), []
+                )
+
+        unicode_separators = ("\v", "\u0085", "\u00a0", "\u1680", "\u2003", "\u202f")
+        for separator in unicode_separators:
+            markup = (
+                f'<script x{separator}type="application/ld+json">'
+                f'{payload("unicode-separator")}</script>'
+            )
+            with self.subTest(separator=repr(separator)):
+                self.assertEqual(
+                    MODULE.extract_json_ld(markup.encode(), base, hosts), []
+                )
+
+        for index, separator in enumerate((" ", "\t", "\n", "\f", "\r")):
+            markup = (
+                f'<script data-id={index}{separator}type=application/ld+json>'
+                f'{payload(f"ascii-separator-{index}")}</script>'
+            )
+            entries = MODULE.extract_json_ld(markup.encode(), base, hosts)
+            with self.subTest(separator=repr(separator)):
+                self.assertEqual(len(entries), 1)
+                self.assertEqual(entries[0]["published"], "2026-08-23")
+
+        for index, closer in enumerate(("</script>", "</SCRIPT >", "</script\t>")):
+            markup = (
+                '<script type="application/ld+json">'
+                f'{payload(f"safe-closer-{index}")}{closer}'
+            )
+            entries = MODULE.extract_json_ld(markup.encode(), base, hosts)
+            with self.subTest(closer=closer):
+                self.assertEqual(len(entries), 1)
+
+        valid_before = (
+            '<script type="application/ld+json">'
+            f'{payload("valid-before")}</script>'
+        )
+        malformed = (
+            '<script type="application/ld+json">'
+            f'{payload("malformed")}</ script>'
+        )
+        valid_after = (
+            '<script type="application/ld+json">'
+            f'{payload("valid-after")}</script>'
+        )
+        self.assertEqual(
+            MODULE.extract_json_ld(
+                (valid_before + malformed + valid_after).encode(), base, hosts
+            ),
+            [],
+        )
+
+        opaque_containers = (
+            "iframe",
+            "noembed",
+            "noframes",
+            "noscript",
+            "style",
+            "textarea",
+            "title",
+            "xmp",
+            "math",
+            "svg",
+            "template",
+        )
+        for container in opaque_containers:
+            markup = (
+                f'<{container}><script type="application/ld+json">'
+                f'{payload("hidden")}</script></{container}>'
+                '<script type="application/ld+json">'
+                f'{payload("visible-peer")}</script>'
+            )
+            entries = MODULE.extract_json_ld(markup.encode(), base, hosts)
+            with self.subTest(container=container):
+                self.assertEqual(
+                    [entry["url"] for entry in entries],
+                    ["https://example.test/visible-peer"],
+                )
+
+        plaintext = (
+            '<plaintext><script type="application/ld+json">'
+            f'{payload("plaintext-hidden")}</script>'
+        )
+        self.assertEqual(
+            MODULE.extract_json_ld(plaintext.encode(), base, hosts), []
+        )
+
+        frameset_documents = (
+            '<frameset><script type="application/ld+json">'
+            f'{payload("in-frameset")}</script></frameset>',
+            '<frameset></frameset><script type="application/ld+json">'
+            f'{payload("after-frameset")}</script>',
+            '<frameset></frameset></html><script type="application/ld+json">'
+            f'{payload("after-after-frameset")}</script>',
+            '<script type="application/ld+json">'
+            f'{payload("valid-before-frameset")}</script><frameset></frameset>',
+        )
+        for markup in frameset_documents:
+            with self.subTest(frameset_markup=markup):
+                self.assertEqual(
+                    MODULE.extract_json_ld(markup.encode(), base, hosts), []
+                )
+
     def test_html_extract_preserves_article_date_evidence(self) -> None:
         """Associate article-card and JSON-LD publication dates with official URLs."""
-        content = b'''<html><article><a href="/card">Card story</a><time datetime="2026-08-05">Today</time></article><script type="application/ld+json">{"@type":"NewsArticle","headline":"JSON story","url":"/json","datePublished":"2026-08-04"}</script></html>'''
+        content = b'''<html><article><a href="/card">Card story</a><time datetime="2026-08-05">Today</time></article><script type="application/ld+json">{"@context":"https://schema.org","@type":"NewsArticle","headline":"JSON story","url":"/json","datePublished":"2026-08-04"}</script></html>'''
         extracted = MODULE.extract_content(content, "text/html", "https://example.test/news")
         by_url = {entry["url"]: entry for entry in extracted["entries"]}
         self.assertEqual(by_url["https://example.test/card"]["published"], "2026-08-05")
@@ -222,6 +1535,137 @@ class PublicSourceCollectorTests(unittest.TestCase):
         )
         self.assertEqual(extracted["entries"][0]["published"], "2026-08-04")
         self.assertEqual(extracted["date_evidence_count"], 1)
+
+    def test_html_extract_binds_semantically_labeled_english_date(self) -> None:
+        """Bind a publisher's explicit publication label without guessing body dates."""
+        content = (
+            b'<article><span alt="Date of publication">Aug 18, 2026</span>'
+            b'<h2><a href="/card">Card story</a></h2></article>'
+        )
+        extracted = MODULE.extract_content(
+            content, "text/html", "https://example.test/news"
+        )
+        self.assertEqual(extracted["entries"][0]["published"], "2026-08-18")
+        self.assertEqual(extracted["date_evidence_count"], 1)
+
+    def test_html_extract_prefers_same_url_article_headline_over_share_label(self) -> None:
+        """Keep the real card headline when copy/share controls reuse its URL."""
+        content = (
+            b'<article><span alt="Date of publication">Aug 18, 2026</span>'
+            b'<a href="/story">Copy the url to clipboard</a>'
+            b'<a href="/story">Share this article</a>'
+            b'<h2><a href="/story">New benchmark ranks search APIs</a></h2>'
+            b'<a href="/story">Read full article</a></article>'
+        )
+        extracted = MODULE.extract_content(
+            content, "text/html", "https://example.test/news"
+        )
+        candidates = [
+            entry for entry in extracted["entries"]
+            if entry.get("candidate_provenance") == "article"
+        ]
+        self.assertEqual(extracted["candidate_entry_count"], 1)
+        self.assertEqual(extracted["date_evidence_count"], 1)
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0]["title"], "New benchmark ranks search APIs")
+        self.assertEqual(candidates[0]["published"], "2026-08-18")
+
+        heading_first = (
+            b'<article><h2><a href="/story">Actual headline</a></h2>'
+            b'<a href="/story">Copy link</a>'
+            b'<time datetime="2026-08-18"></time></article>'
+        )
+        extracted = MODULE.extract_content(
+            heading_first, "text/html", "https://example.test/news"
+        )
+        self.assertEqual(extracted["entries"][0]["title"], "Actual headline")
+
+        canonical_variants = (
+            b'<article><a href="/story/?ref=home#copy">Copy the url to clipboard</a>'
+            b'<h2><a href="https://example.test:443/story?ref=home#headline">'
+            b'Canonical headline</a></h2>'
+            b'<time datetime="2026-08-18"></time></article>'
+        )
+        extracted = MODULE.extract_content(
+            canonical_variants, "text/html", "https://example.test/news"
+        )
+        self.assertEqual(extracted["entry_count"], 1)
+        self.assertEqual(extracted["candidate_entry_count"], 1)
+        self.assertEqual(extracted["entries"][0]["title"], "Canonical headline")
+        self.assertEqual(extracted["entries"][0]["published"], "2026-08-18")
+
+    def test_html_extract_upgrades_existing_headline_at_entry_cap(self) -> None:
+        """Keep title arbitration active when the bounded entry set reaches 400."""
+        navigation = "".join(
+            f'<a href="/nav/{index}">Navigation {index}</a>'
+            for index in range(399)
+        )
+        article = (
+            '<article><a href="/story">Copy link</a>'
+            '<h2><a href="/story">Boundary headline</a></h2>'
+            '<time datetime="2026-08-18"></time></article>'
+        )
+        extracted = MODULE.extract_content(
+            (navigation + article).encode(),
+            "text/html",
+            "https://example.test/news",
+        )
+        candidates = [
+            entry for entry in extracted["entries"]
+            if entry.get("candidate_provenance") == "article"
+        ]
+        self.assertEqual(extracted["entry_count"], 400)
+        self.assertEqual(extracted["candidate_entry_count"], 1)
+        self.assertEqual(extracted["date_evidence_count"], 1)
+        self.assertEqual(candidates[0]["title"], "Boundary headline")
+        self.assertEqual(candidates[0]["published"], "2026-08-18")
+
+        full_navigation = navigation + '<a href="/nav/399">Navigation 399</a>'
+        extracted = MODULE.extract_content(
+            (full_navigation + article).encode(),
+            "text/html",
+            "https://example.test/news",
+        )
+        self.assertEqual(extracted["entry_count"], 400)
+        self.assertEqual(extracted["candidate_entry_count"], 0)
+
+    def test_html_extract_disables_single_link_fallback_when_article_is_capped(self) -> None:
+        """Do not promote a control when the real article URL was cap-rejected."""
+        navigation = '<a href="/story?view=share">Global share</a>' + "".join(
+            f'<a href="/nav/{index}">Navigation {index}</a>'
+            for index in range(399)
+        )
+        truncated_article = (
+            '<article><a href="/story?view=share">Copy link</a>'
+            '<h2><a href="/story?view=article">Actual headline</a></h2>'
+            '<time datetime="2026-08-18"></time></article>'
+        )
+        extracted = MODULE.extract_content(
+            (navigation + truncated_article).encode(),
+            "text/html",
+            "https://example.test/news",
+        )
+        self.assertEqual(extracted["entry_count"], 400)
+        self.assertEqual(extracted["candidate_entry_count"], 0)
+        self.assertEqual(extracted["date_evidence_count"], 0)
+
+        known_headline = (
+            '<article><h2><a href="/story?view=share">Known headline</a></h2>'
+            '<a href="/new-ancillary">Rejected ancillary</a>'
+            '<time datetime="2026-08-18"></time></article>'
+        )
+        extracted = MODULE.extract_content(
+            (navigation + known_headline).encode(),
+            "text/html",
+            "https://example.test/news",
+        )
+        candidates = [
+            entry for entry in extracted["entries"]
+            if entry.get("candidate_provenance") == "article"
+        ]
+        self.assertEqual(extracted["candidate_entry_count"], 1)
+        self.assertEqual(extracted["date_evidence_count"], 1)
+        self.assertEqual(candidates[0]["title"], "Known headline")
 
     def test_html_date_capture_ignores_void_depth_and_resets_between_articles(self) -> None:
         """Do not let void or malformed nested tags poison later card dates."""
@@ -243,9 +1687,379 @@ class PublicSourceCollectorTests(unittest.TestCase):
         self.assertEqual(by_url["https://example.test/two"]["published"], "2026-08-05")
         self.assertEqual(by_url["https://example.test/three"]["published"], "2026-08-06")
 
+    def test_html_heading_scope_resets_between_articles(self) -> None:
+        """Do not let an unclosed heading turn a later article link into a headline."""
+        content = (
+            b'<article><h2><a href="/first">First headline</a>'
+            b'<time datetime="2026-08-17"></time></article>'
+            b'<article><a href="/author">Alice</a>'
+            b'<a href="/story">Actual story</a>'
+            b'<time datetime="2026-08-18"></time></article>'
+        )
+        extracted = MODULE.extract_content(
+            content, "text/html", "https://example.test/news"
+        )
+        candidates = [
+            entry for entry in extracted["entries"]
+            if entry.get("candidate_provenance") == "article"
+        ]
+        self.assertEqual(extracted["candidate_entry_count"], 1)
+        self.assertEqual(extracted["date_evidence_count"], 1)
+        self.assertEqual(candidates[0]["url"], "https://example.test/first")
+        self.assertEqual(candidates[0]["title"], "First headline")
+
+    def test_unclosed_anchor_is_discarded_at_article_boundary(self) -> None:
+        """Do not complete one article's unfinished anchor inside a later article."""
+        content = (
+            b'<article><a href="/leaked">Leaked anchor'
+            b'<time datetime="2026-08-16"></time></article>'
+            b'<article>Later text</a>'
+            b'<time datetime="2026-08-17"></time></article>'
+            b'<article><h2><a href="/valid">Valid headline</a></h2>'
+            b'<time datetime="2026-08-18"></time></article>'
+        )
+        extracted = MODULE.extract_content(
+            content, "text/html", "https://example.test/news"
+        )
+        candidates = [
+            entry for entry in extracted["entries"]
+            if entry.get("candidate_provenance") == "article"
+        ]
+        self.assertEqual(extracted["candidate_entry_count"], 1)
+        self.assertEqual(extracted["date_evidence_count"], 1)
+        self.assertEqual(candidates[0]["url"], "https://example.test/valid")
+        self.assertEqual(candidates[0]["title"], "Valid headline")
+        self.assertEqual(candidates[0]["published"], "2026-08-18")
+
+    def test_nested_article_heading_and_date_do_not_replace_outer_candidate(self) -> None:
+        """Keep nested article metadata out of the enclosing listing candidate."""
+        content = (
+            b'<article><article><h2><a href="/nested">Nested headline</a></h2>'
+            b'<time datetime="2026-08-17"></time></article>'
+            b'<h2><a href="/outer">Outer headline</a></h2>'
+            b'<time datetime="2026-08-18"></time></article>'
+        )
+        extracted = MODULE.extract_content(
+            content, "text/html", "https://example.test/news"
+        )
+        candidates = [
+            entry for entry in extracted["entries"]
+            if entry.get("candidate_provenance") == "article"
+        ]
+        self.assertEqual(extracted["candidate_entry_count"], 1)
+        self.assertEqual(extracted["date_evidence_count"], 1)
+        self.assertEqual(candidates[0]["url"], "https://example.test/outer")
+        self.assertEqual(candidates[0]["title"], "Outer headline")
+        self.assertEqual(candidates[0]["published"], "2026-08-18")
+
+        malformed_nested = (
+            b'<article><article><h2><a href="/nested">Nested</a></article>'
+            b'<a href="/author">Alice</a><a href="/story">Story</a>'
+            b'<time datetime="2026-08-18"></time></article>'
+        )
+        extracted = MODULE.extract_content(
+            malformed_nested, "text/html", "https://example.test/news"
+        )
+        self.assertEqual(extracted["candidate_entry_count"], 0)
+        self.assertEqual(extracted["date_evidence_count"], 0)
+
+        for nested_start in (
+            b'<article><a href="/nested">Nested text',
+            b'<article><h2><a href="/nested">Nested headline',
+        ):
+            with self.subTest(nested_start=nested_start):
+                nested_anchor_closed_by_outer = (
+                    b'<article>' + nested_start + b'</article>'
+                    b'Outer tail</a><time datetime="2026-08-18"></time></article>'
+                )
+                extracted = MODULE.extract_content(
+                    nested_anchor_closed_by_outer,
+                    "text/html",
+                    "https://example.test/news",
+                )
+                self.assertEqual(extracted["candidate_entry_count"], 0)
+                self.assertEqual(extracted["date_evidence_count"], 0)
+
+        for malformed_outer_date in (
+            b'<time><article>Aug 17, 2026</article></time>',
+            b'<time datetime="2026-08-17"><article>Nested</article></time>',
+            b'<span alt="Date of publication"><article>Aug 17, 2026</article></span>',
+        ):
+            with self.subTest(malformed_outer_date=malformed_outer_date):
+                nested_text_inside_outer_date_capture = (
+                    b'<article>' + malformed_outer_date
+                    + b'<h2><a href="/outer">Outer headline</a></h2></article>'
+                )
+                extracted = MODULE.extract_content(
+                    nested_text_inside_outer_date_capture,
+                    "text/html",
+                    "https://example.test/news",
+                )
+                self.assertEqual(extracted["candidate_entry_count"], 1)
+                self.assertEqual(extracted["date_evidence_count"], 0)
+                candidate = next(
+                    entry for entry in extracted["entries"]
+                    if entry.get("candidate_provenance") == "article"
+                )
+                self.assertIsNone(candidate["published"])
+
+        outer_heading_crosses_nested_boundary = (
+            b'<article><h2>Outer prefix'
+            b'<article><a href="/nested">Nested</a></article>'
+            b'<a href="/author">Alice</a><a href="/story">Actual story</a>'
+            b'<time datetime="2026-08-18"></time></article>'
+        )
+        extracted = MODULE.extract_content(
+            outer_heading_crosses_nested_boundary,
+            "text/html",
+            "https://example.test/news",
+        )
+        self.assertEqual(extracted["candidate_entry_count"], 0)
+        self.assertEqual(extracted["date_evidence_count"], 0)
+
+        completed_outer_metadata_before_nested = (
+            b'<article><h2><a href="/outer">Outer headline</a></h2>'
+            b'<time datetime="2026-08-18"></time>'
+            b'<article><h2><a href="/nested">Nested headline</a></h2>'
+            b'<time datetime="2026-08-17"></time></article></article>'
+        )
+        extracted = MODULE.extract_content(
+            completed_outer_metadata_before_nested,
+            "text/html",
+            "https://example.test/news",
+        )
+        candidates = [
+            entry for entry in extracted["entries"]
+            if entry.get("candidate_provenance") == "article"
+        ]
+        self.assertEqual(extracted["candidate_entry_count"], 1)
+        self.assertEqual(extracted["date_evidence_count"], 1)
+        self.assertEqual(candidates[0]["url"], "https://example.test/outer")
+        self.assertEqual(candidates[0]["title"], "Outer headline")
+        self.assertEqual(candidates[0]["published"], "2026-08-18")
+
+    def test_completed_outer_date_survives_later_unfinished_capture(self) -> None:
+        """Discard only pending date state while retaining completed evidence."""
+        completed_dates = (
+            b'<time datetime="2026-08-18"></time>',
+            b'<span alt="Date of publication">Aug 18, 2026</span>',
+        )
+        unfinished_dates = (
+            b'<time datetime="2026-08-17">discard me',
+            b'<span alt="Date of publication">Aug 17, 2026',
+        )
+        for completed_date in completed_dates:
+            for unfinished_date in unfinished_dates:
+                with self.subTest(
+                    completed_date=completed_date,
+                    unfinished_date=unfinished_date,
+                ):
+                    content = (
+                        b'<article>' + completed_date + unfinished_date
+                        + b'<article><a href="http://[bad">Nested</a></article>'
+                        + b'<h2><a href="/outer">Outer headline</a></h2>'
+                        + b'</article>'
+                    )
+                    extracted = MODULE.extract_content(
+                        content, "text/html", "https://example.test/news"
+                    )
+                    candidates = [
+                        entry for entry in extracted["entries"]
+                        if entry.get("candidate_provenance") == "article"
+                    ]
+                    self.assertEqual(extracted["candidate_entry_count"], 1)
+                    self.assertEqual(extracted["date_evidence_count"], 1)
+                    self.assertEqual(candidates[0]["url"], "https://example.test/outer")
+                    self.assertEqual(candidates[0]["published"], "2026-08-18")
+
+        completed_then_nested_then_unfinished = (
+            b'<article><time datetime="2026-08-18"></time>'
+            b'<article><a href="/nested">Nested</a></article>'
+            b'<time datetime="2026-08-17">discard me'
+            b'<h2><a href="/outer">Outer headline</a></h2></article>'
+        )
+        extracted = MODULE.extract_content(
+            completed_then_nested_then_unfinished,
+            "text/html",
+            "https://example.test/news",
+        )
+        candidates = [
+            entry for entry in extracted["entries"]
+            if entry.get("candidate_provenance") == "article"
+        ]
+        self.assertEqual(extracted["candidate_entry_count"], 1)
+        self.assertEqual(extracted["date_evidence_count"], 1)
+        self.assertEqual(candidates[0]["published"], "2026-08-18")
+
+    def test_malformed_href_does_not_discard_valid_article_candidate(self) -> None:
+        """Skip one invalid URL, including nested metadata, without aborting HTML."""
+        for malformed_anchor in (
+            b'<a href="http://[bad">Global malformed</a>',
+            b'<article><a href="http://[bad">Nested malformed</a></article>',
+        ):
+            with self.subTest(malformed_anchor=malformed_anchor):
+                content = (
+                    malformed_anchor
+                    + b'<article><time datetime="2026-08-18"></time>'
+                    + b'<h2><a href="/valid">Valid headline</a></h2></article>'
+                )
+                extracted = MODULE.extract_content(
+                    content, "text/html", "https://example.test/news"
+                )
+                candidates = [
+                    entry for entry in extracted["entries"]
+                    if entry.get("candidate_provenance") == "article"
+                ]
+                self.assertEqual(extracted["candidate_entry_count"], 1)
+                self.assertEqual(extracted["date_evidence_count"], 1)
+                self.assertEqual(candidates[0]["url"], "https://example.test/valid")
+                self.assertEqual(candidates[0]["published"], "2026-08-18")
+
+        malformed_after_unfinished_anchor = (
+            b'<article><a href="/discarded">Discarded unfinished anchor'
+            b'<a href="http://[bad">Malformed replacement</a>'
+            b'<time datetime="2026-08-18"></time>'
+            b'<h2><a href="/valid">Valid headline</a></h2></article>'
+        )
+        extracted = MODULE.extract_content(
+            malformed_after_unfinished_anchor,
+            "text/html",
+            "https://example.test/news",
+        )
+        candidates = [
+            entry for entry in extracted["entries"]
+            if entry.get("candidate_provenance") == "article"
+        ]
+        self.assertEqual(extracted["candidate_entry_count"], 1)
+        self.assertEqual(extracted["date_evidence_count"], 1)
+        self.assertEqual(candidates[0]["url"], "https://example.test/valid")
+        self.assertEqual(candidates[0]["published"], "2026-08-18")
+
+    def test_candidate_url_grammar_rejects_unusable_authorities(self) -> None:
+        """Validate the complete URL authority before sealing a candidate."""
+        accepted = (
+            "/story",
+            "https://example.test/story",
+            "https://example.test:443/story",
+            "https://example.test:65535/story",
+            "//EXAMPLE.TEST/story",
+            "HTTPS://EXAMPLE.TEST/story",
+        )
+        rejected = (
+            "http://[bad",
+            "https://example.test:bad/story",
+            "https://example.test:%20/story",
+            "https://example.test:-1/story",
+            "https://example.test:/story",
+            "https://example.test:0/story",
+            "https://example.test:65536/story",
+            "https://user@example.test/story",
+            "https://user:pass@example.test/story",
+            "https://@example.test/story",
+            "https://exa mple.test/story",
+            "https://%zz/story",
+            "https://[fe80::1%25eth0]/story",
+            "https://./story",
+            "https://bad_host.test/story",
+            "https://-bad.example/story",
+            "https://bad-.example/story",
+            "https://bad..example/story",
+            " https://example.test/story",
+            "https://example.test/story ",
+            "https://user\\@example.test/story",
+            "javascript:alert(1)",
+        )
+        for value in accepted:
+            with self.subTest(value=value, expected="accepted"):
+                self.assertIsNotNone(
+                    MODULE.parsed_public_candidate_url(
+                        "https://example.test/news", value
+                    )
+                )
+        for value in rejected:
+            with self.subTest(value=value, expected="rejected"):
+                self.assertIsNone(
+                    MODULE.parsed_public_candidate_url(
+                        "https://example.test/news", value
+                    )
+                )
+                content = (
+                    f'<article><time datetime="2026-08-18"></time>'
+                    f'<h2><a href="{value}">Invalid headline</a></h2></article>'
+                ).encode()
+                extracted = MODULE.extract_content(
+                    content, "text/html", "https://example.test/news"
+                )
+                self.assertEqual(extracted["candidate_entry_count"], 0)
+                self.assertEqual(extracted["date_evidence_count"], 0)
+
+    def test_malformed_structured_url_isolated_from_valid_peer(self) -> None:
+        """Skip malformed JSON-LD or embedded records without aborting peers."""
+        json_ld = (
+            b'<script type="application/ld+json">'
+            b'{"@type":"NewsArticle","headline":"Bad","url":"http://[bad",'
+            b'"datePublished":"2026-08-17"}</script>'
+            b'<article><time datetime="2026-08-18"></time>'
+            b'<h2><a href="/valid">Valid headline</a></h2></article>'
+        )
+        extracted = MODULE.extract_content(
+            json_ld, "text/html", "https://example.test/news"
+        )
+        candidates = [
+            entry for entry in extracted["entries"]
+            if entry.get("candidate_provenance") in {"article", "json_ld"}
+        ]
+        self.assertEqual(extracted["candidate_entry_count"], 1)
+        self.assertEqual(extracted["date_evidence_count"], 1)
+        self.assertEqual(candidates[0]["url"], "https://example.test/valid")
+
+        embedded = (
+            b'<p class="title"><a href="http://[bad">Bad</a></p>'
+            b'<p class="date">(2026/8/17)</p>'
+            b'<p class="title"><a href="/valid">Valid</a></p>'
+            b'<p class="date">(2026/8/18)</p>'
+        )
+        entries = MODULE.extract_embedded_article_metadata(
+            embedded, "https://example.test/news"
+        )
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["url"], "https://example.test/valid")
+        self.assertEqual(entries[0]["published"], "2026-08-18")
+
+    def test_nested_article_cap_rejection_does_not_truncate_outer_candidate(self) -> None:
+        """Keep nested anchors out of enclosing state and its bounded entry set."""
+        nav = b"".join(
+            f'<a href="/nav-{index}">Nav {index}</a>'.encode()
+            for index in range(399)
+        )
+        for article_body in (
+            b'<a href="/outer">Outer story</a>'
+            b'<article><a href="/nested-over-cap">Nested story</a></article>',
+            b'<article><a href="/nested-at-cap">Nested story</a></article>'
+            b'<a href="/outer">Outer story</a>',
+        ):
+            with self.subTest(article_body=article_body):
+                content = (
+                    nav + b'<article>' + article_body
+                    + b'<time datetime="2026-08-18"></time></article>'
+                )
+                extracted = MODULE.extract_content(
+                    content, "text/html", "https://example.test/news"
+                )
+                candidates = [
+                    entry for entry in extracted["entries"]
+                    if entry.get("candidate_provenance") == "article"
+                ]
+                self.assertEqual(extracted["entry_count"], 400)
+                self.assertEqual(extracted["candidate_entry_count"], 1)
+                self.assertEqual(extracted["date_evidence_count"], 1)
+                self.assertEqual(candidates[0]["url"], "https://example.test/outer")
+                self.assertEqual(candidates[0]["title"], "Outer story")
+                self.assertEqual(candidates[0]["published"], "2026-08-18")
+
     def test_html_extract_rejects_arbitrary_visible_and_malformed_dates(self) -> None:
         """Do not promote body dates or malformed metadata to publication evidence."""
-        content = b'''<article><h2><a href="/card">Support ends 2026-08-04</a></h2></article><script type="application/ld+json">{"@type":"NewsArticle","headline":"Broken","url":"/broken","datePublished":"not-a-date"}</script>'''
+        content = b'''<article><span alt="Date of publication">Aug 32, 2026</span><h2><a href="/card">Support ends 2026-08-04</a></h2></article><script type="application/ld+json">{"@context":"https://schema.org","@type":"NewsArticle","headline":"Broken","url":"/broken","datePublished":"not-a-date"}</script>'''
         extracted = MODULE.extract_content(
             content, "text/html", "https://example.test/news"
         )
@@ -266,6 +2080,14 @@ class PublicSourceCollectorTests(unittest.TestCase):
         self.assertEqual(extracted["candidate_entry_count"], 0)
         self.assertEqual(extracted["date_evidence_count"], 0)
 
+    def test_lowercase_z_uses_the_shared_jst_timestamp_semantics(self) -> None:
+        """Treat lowercase and uppercase UTC suffixes identically end to end."""
+        value = "2026-08-22T16:34:56z"
+        expected = MODULE.date(2026, 8, 23)
+        self.assertEqual(MODULE.validated_publication_date(value), value)
+        self.assertEqual(MODULE.publication_date_in_jst(value), expected)
+        self.assertEqual(VALIDATOR.parse_publication_date(value), expected)
+
     def test_collector_and_validator_share_jst_timestamp_semantics(self) -> None:
         """Keep RFC, offset, Z, and naive timestamps identical at window edges."""
         fixtures = {
@@ -278,8 +2100,26 @@ class PublicSourceCollectorTests(unittest.TestCase):
         }
         for value, expected in fixtures.items():
             with self.subTest(value=value):
+                self.assertEqual(MODULE.validated_publication_date(value), value)
                 self.assertEqual(MODULE.publication_date_in_jst(value), expected)
                 self.assertEqual(VALIDATOR.parse_publication_date(value), expected)
+        rejected = (
+            "Sun, 23 Aug 2026 12:00:00 +0900 trailing prose",
+            " Sun, 23 Aug 2026 12:00:00 +0900",
+            "Sun, 23 Aug 2026 12:00:00 +0900 ",
+            " 2026-08-22T16:34:56z",
+            "2026-08-22T16:34:56z\n",
+            "<time>2026-08-22T16:34:56Z</time>",
+            "2026-08-22T16:34:56&#90;",
+        )
+        for value in rejected:
+            with self.subTest(rejected=value):
+                self.assertIsNone(MODULE.validated_publication_date(value))
+                self.assertIsNone(MODULE.publication_date_in_jst(value))
+                self.assertIsNone(VALIDATOR.parse_publication_date(value))
+        for wrapped in ("( 2026/8/21)", "(2026/8/21 )"):
+            with self.subTest(wrapped=wrapped):
+                self.assertIsNone(MODULE.validated_publication_date(wrapped))
         extract = {
             "format": "feed",
             "entries": [
@@ -303,16 +2143,18 @@ class PublicSourceCollectorTests(unittest.TestCase):
                 "https://forest.watch.impress.co.jp/docs/1.html",
             ),
             (
-                b"{'url':'/ait/articles/2608/07/news008.html','title':'AIT story',"
-                b"'subtitle':'x','date':'2026/08/07',}",
+                b"<script>{'url':'/ait/articles/2608/07/news008.html',"
+                b"'title':'AIT story','subtitle':'x','date':'2026/08/07',}"
+                b"</script>",
                 "https://atmarkit.itmedia.co.jp/",
                 "https://atmarkit.itmedia.co.jp/ait/articles/2608/07/news008.html",
             ),
             (
-                b'{\\"datePublished\\":\\"2026-08-07T16:00:00.000Z\\",'
-                b'\\"articleMetadata\\":{\\"title\\":\\"Cyber story\\"},'
-                b'\\"issueId\\":\\"daily-briefing\\",\\"issueVolume\\":15,'
-                b'\\"issueNumber\\":150}',
+                b'<script id="__NEXT_DATA__" type="application/json">'
+                b'{"metadata":{"datePublished":"2026-08-07T16:00:00.000Z"},'
+                b'"articleMetadata":{"title":"Cyber story"},'
+                b'"data":{"issueId":"daily-briefing","issueVolume":15,'
+                b'"issueNumber":150}}</script>',
                 "https://thecyberwire.com/newsletters/daily-briefing",
                 "https://thecyberwire.com/newsletters/daily-briefing/15/150",
             ),
@@ -335,6 +2177,195 @@ class PublicSourceCollectorTests(unittest.TestCase):
             content, "https://example.test/news"
         )
         self.assertEqual([entry["url"] for entry in entries], ["https://example.test/second"])
+
+    def test_embedded_list_date_requires_a_complete_calendar_field(self) -> None:
+        """Reject prose containing a calendar substring while keeping exact wrappers."""
+        content = (
+            b'<p class="title"><a href="/bad">Bad</a></p>'
+            b'<p class="date">Updated on 2026/8/22</p>'
+            b'<p class="title"><a href="/good">Good</a></p>'
+            b'<p class="date">(2026/8/21)</p>'
+        )
+        entries = MODULE.extract_embedded_article_metadata(
+            content, "https://example.test/news"
+        )
+        self.assertEqual(
+            [(entry["url"], entry["published"]) for entry in entries],
+            [("https://example.test/good", "2026-08-21")],
+        )
+        extracted = MODULE.extract_content(
+            content, "text/html", "https://example.test/news"
+        )
+        self.assertEqual(extracted["date_evidence_count"], 1)
+
+    def test_embedded_and_end_to_end_paths_fail_closed_on_bad_script_boundary(self) -> None:
+        """Discard completed peers when a later trusted script never closes safely."""
+        valid = (
+            b'<p class="title"><a href="/valid">Valid</a></p>'
+            b'<p class="date">(2026/8/22)</p>'
+        )
+        malformed_scripts = (
+            b"<script>{'url':'/bad','title':'Bad','date':'2026/08/22'}",
+            b"<script>{'url':'/bad','title':'Bad','date':'2026/08/22'}</ script>",
+            b"<script>{'url':'/bad','title':'Bad','date':'2026/08/22'}</\tscript>",
+            b"<script>{'url':'/bad','title':'Bad','date':'2026/08/22'}</\nscript>",
+        )
+        for malformed in malformed_scripts:
+            content = valid + malformed
+            with self.subTest(malformed=malformed):
+                self.assertEqual(
+                    MODULE.extract_embedded_article_metadata(
+                        content, "https://example.test/news"
+                    ),
+                    [],
+                )
+                extracted = MODULE.extract_content(
+                    content, "text/html", "https://example.test/news"
+                )
+                self.assertEqual(extracted["entries"], [])
+                self.assertEqual(extracted["date_evidence_count"], 0)
+
+    def test_primary_date_evidence_fails_closed_on_unfinished_trust_containers(self) -> None:
+        """Apply the same document-wide terminal gate to the primary-meta path."""
+        base = "https://example.test/article"
+        meta = b'<meta property="article:published_time" content="2026-08-22">'
+        malformed = (
+            b"<script>{}",
+            b"<script>{}</ script>",
+            b"<script>{}</\tscript></script>",
+            b"<select>",
+            b"<template>",
+            b"<style>",
+        )
+        for suffix in malformed:
+            with self.subTest(suffix=suffix):
+                self.assertEqual(
+                    MODULE.extract_primary_publication_evidence(
+                        meta + suffix, base, {"example.test"}
+                    ),
+                    (None, None),
+                )
+
+    def test_verified_date_request_rejects_primary_meta_before_bad_script(self) -> None:
+        """Exercise the actual supplemental date-evidence path, not just its parser."""
+        source = MODULE.load_catalog(CATALOG)[0]
+        article_url = source["page_url"]
+        content = (
+            b'<meta property="article:published_time" content="2026-08-22">'
+            b"<script>{'date':'2026-08-22'}</ script>"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manifest = root / "source-manifest.json"
+            request = root / "source-resolutions.json"
+            output = root / "verified-source-resolutions.json"
+            write_bound_manifest(manifest, {source["name"]: "fetched"})
+            request.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "resolutions": [],
+                        "date_evidence": [
+                            {"name": source["name"], "url": article_url}
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with mock.patch.dict(
+                os.environ, {"COLLECTION_OUTPUT_ROOT": str(root)}
+            ), mock.patch.object(
+                MODULE,
+                "fetch_url",
+                return_value={
+                    "content": content,
+                    "content_type": "text/html",
+                    "final_url": article_url,
+                    "http_status": 200,
+                },
+            ):
+                with self.assertRaisesRegex(
+                    MODULE.CollectionError,
+                    "lacks publication-date evidence",
+                ):
+                    MODULE.verify_resolutions(
+                        CATALOG, manifest, request, output
+                    )
+            self.assertFalse(output.exists())
+
+    def test_extracts_legacy_list_items_beneath_one_outer_article(self) -> None:
+        """Match the public Forest listing without crossing list-item bounds."""
+        content = (
+            b'<article><ul><li><div><p class="title">'
+            b'<a href="/docs/first.html">First</a></p>'
+            b'<p class="outline">Summary</p>'
+            b'<p class="date">(2026/8/22)</p></div></li>'
+            b'<li><p class="title"><a href="/docs/undated.html">'
+            b'Undated</a></p></li>'
+            b'<li><p class="date">(2026/8/21)</p></li></ul></article>'
+        )
+        entries = MODULE.extract_embedded_article_metadata(
+            content,
+            "https://forest.watch.impress.co.jp/category/genai/",
+        )
+        self.assertEqual(
+            [(entry["url"], entry["published"]) for entry in entries],
+            [("https://forest.watch.impress.co.jp/docs/first.html", "2026-08-22")],
+        )
+
+    def test_all_article_channels_share_the_html_trust_boundary(self) -> None:
+        """Reject fake cards and publisher data from every suppressed context."""
+        base = "https://example.test/news"
+        article = (
+            '<article><time datetime="2026-08-22"></time>'
+            '<h2><a href="/fake">Fake story</a></h2></article>'
+        )
+        legacy = (
+            '<p class="title"><a href="/fake">Fake legacy</a></p>'
+            '<p class="date">(2026/8/22)</p>'
+        )
+        javascript = (
+            "<script>{'url':'/fake','title':'Fake JS',"
+            "'date':'2026/08/22'}</script>"
+        )
+        next_data = (
+            '<script id="__NEXT_DATA__" type="application/json">'
+            '{"metadata":{"datePublished":"2026-08-22"},'
+            '"articleMetadata":{"title":"Fake Next"},'
+            '"data":{"issueId":"daily","issueVolume":1,"issueNumber":2}}'
+            '</script>'
+        )
+        wrappers = (
+            lambda payload: f"<!--{payload}-->",
+            lambda payload: f'<script type="text/plain">{payload}</script>',
+            lambda payload: f"<template>{payload}</template>",
+            lambda payload: f"<select>{payload}</select>",
+            lambda payload: f"<svg>{payload}</svg>",
+            lambda payload: f"<math>{payload}</math>",
+            lambda payload: f"<frameset>{payload}</frameset>",
+        )
+        for payload in (article, legacy, javascript, next_data):
+            for wrapper in wrappers:
+                markup = wrapper(payload)
+                with self.subTest(payload=payload[:20], markup=markup[:40]):
+                    extracted = MODULE.extract_content(
+                        markup.encode(), "text/html", base
+                    )
+                    self.assertEqual(extracted["candidate_entry_count"], 0)
+                    self.assertEqual(extracted["date_evidence_count"], 0)
+                    self.assertEqual(
+                        MODULE.extract_embedded_article_metadata(
+                            markup.encode(), base
+                        ),
+                        [],
+                    )
+
+        frameset_after = article + "<frameset></frameset>"
+        extracted = MODULE.extract_content(
+            frameset_after.encode(), "text/html", base
+        )
+        self.assertEqual(extracted["candidate_entry_count"], 0)
+        self.assertEqual(extracted["entries"], [])
 
     def test_rejects_gzip_expansion_over_limit(self) -> None:
         """Bound decompressed bytes as well as compressed transport bytes."""
@@ -391,9 +2422,9 @@ class PublicSourceCollectorTests(unittest.TestCase):
             request = root / "request.json"
             output = root / "verified.json"
             candidate = source["page_url"]
-            manifest.write_text(json.dumps({"sources": [{
-                "name": source["name"], "status": "needs_search_fallback"
-            }]}), encoding="utf-8")
+            write_bound_manifest(
+                manifest, {source["name"]: "needs_search_fallback"}
+            )
             request.write_text(json.dumps({"version": 1, "resolutions": [{
                 "name": source["name"], "method": "site_search", "url": candidate
             }], "date_evidence": []}), encoding="utf-8")
@@ -424,6 +2455,406 @@ class PublicSourceCollectorTests(unittest.TestCase):
                 MODULE.urllib.parse.urljoin(candidate, "/article"),
             )
 
+    def test_check_resolutions_cli_is_read_only(self) -> None:
+        """Let the collection agent preflight the exact request without evidence writes."""
+        source = MODULE.load_catalog(CATALOG)[0]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            executable, _catalog, _manifest, request = create_check_runtime(
+                root, {source["name"]: "needs_search_fallback"}
+            )
+            candidate = MODULE.urllib.parse.urljoin(
+                source["page_url"], "/dated-article"
+            )
+            request.write_text(
+                json.dumps({
+                    "version": 1,
+                    "resolutions": [{
+                        "name": source["name"],
+                        "method": "site_search",
+                        "url": candidate,
+                    }],
+                    "date_evidence": [],
+                }),
+                encoding="utf-8",
+            )
+            before = {
+                path.relative_to(root): path.read_bytes()
+                for path in root.rglob("*")
+                if path.is_file()
+            }
+            with mock.patch.object(
+                MODULE, "__file__", str(executable)
+            ), mock.patch.object(
+                MODULE, "canonical_runtime_root", return_value=executable.parent
+            ), mock.patch.object(MODULE, "fetch_url", return_value={
+                "final_url": candidate,
+                "http_status": 200,
+                "content_type": "text/html",
+                "content": (
+                    b'<meta property="article:published_time" '
+                    b'content="2026-08-22">'
+                    b'<article><h2><a href="/dated-article">'
+                    b'Dated article</a></h2></article>'
+                ),
+            }):
+                status = MODULE.main([
+                    str(SCRIPT),
+                    "--check-resolutions",
+                    str(request),
+                ])
+            self.assertEqual(status, 0)
+            self.assertEqual(
+                {
+                    path.relative_to(root): path.read_bytes()
+                    for path in root.rglob("*")
+                    if path.is_file()
+                },
+                before,
+            )
+
+    def test_check_resolutions_requires_every_unresolved_source(self) -> None:
+        """Do not let an empty request pass preflight while a fallback is unresolved."""
+        source = MODULE.load_catalog(CATALOG)[0]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            executable, _catalog, _manifest, request = create_check_runtime(
+                root, {source["name"]: "needs_search_fallback"}
+            )
+            request.write_text(
+                json.dumps({"version": 1, "resolutions": [], "date_evidence": []}),
+                encoding="utf-8",
+            )
+            before = {
+                path.relative_to(root): path.read_bytes()
+                for path in root.rglob("*")
+                if path.is_file()
+            }
+            with mock.patch.object(
+                MODULE, "__file__", str(executable)
+            ), mock.patch.object(
+                MODULE, "canonical_runtime_root", return_value=executable.parent
+            ), mock.patch.object(MODULE, "fetch_url") as fetch, mock.patch(
+                "sys.stderr", new=io.StringIO()
+            ):
+                status = MODULE.main([
+                    str(SCRIPT),
+                    "--check-resolutions",
+                    str(request),
+                ])
+            self.assertEqual(status, 75)
+            fetch.assert_not_called()
+            self.assertEqual(
+                {
+                    path.relative_to(root): path.read_bytes()
+                    for path in root.rglob("*")
+                    if path.is_file()
+                },
+                before,
+            )
+
+    def test_check_resolutions_rejects_agent_supplied_catalog_arguments(self) -> None:
+        """Never let staging content replace the executable-bound host allowlist."""
+        source = MODULE.load_catalog(CATALOG)[0]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            executable, _catalog, manifest, request = create_check_runtime(
+                root, {source["name"]: "needs_search_fallback"}
+            )
+            alternate_catalog = request.parent / "alternate-catalog.json"
+            alternate_catalog.write_text(
+                json.dumps({
+                    "version": 1,
+                    "sources": [{
+                        "name": source["name"],
+                        "tier": 1,
+                        "feed_url": None,
+                        "page_url": "https://agent-controlled.example/news",
+                    }],
+                }),
+                encoding="utf-8",
+            )
+            request.write_text(
+                json.dumps({"version": 1, "resolutions": [], "date_evidence": []}),
+                encoding="utf-8",
+            )
+            with mock.patch.object(
+                MODULE, "__file__", str(executable)
+            ), mock.patch.object(
+                MODULE, "canonical_runtime_root", return_value=executable.parent
+            ), mock.patch.object(MODULE, "fetch_url") as fetch, mock.patch(
+                "sys.stderr", new=io.StringIO()
+            ):
+                status = MODULE.main([
+                    str(SCRIPT),
+                    "--check-resolutions",
+                    str(alternate_catalog),
+                    str(manifest),
+                    str(request),
+                ])
+            self.assertEqual(status, 64)
+            fetch.assert_not_called()
+
+    def test_check_resolutions_rejects_manifest_catalog_digest_mismatch(self) -> None:
+        """Fail before fetch when the canonical manifest is not catalog-bound."""
+        source = MODULE.load_catalog(CATALOG)[0]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            executable, _catalog, manifest, request = create_check_runtime(
+                root, {source["name"]: "needs_search_fallback"}
+            )
+            payload = json.loads(manifest.read_text(encoding="utf-8"))
+            payload["catalog_sha256"] = "0" * 64
+            manifest.write_text(json.dumps(payload), encoding="utf-8")
+            request.write_text(
+                json.dumps({"version": 1, "resolutions": [], "date_evidence": []}),
+                encoding="utf-8",
+            )
+            with mock.patch.object(
+                MODULE, "__file__", str(executable)
+            ), mock.patch.object(
+                MODULE, "canonical_runtime_root", return_value=executable.parent
+            ), mock.patch.object(MODULE, "fetch_url") as fetch, mock.patch(
+                "sys.stderr", new=io.StringIO()
+            ):
+                status = MODULE.main([
+                    str(SCRIPT),
+                    "--check-resolutions",
+                    str(request),
+                ])
+            self.assertEqual(status, 75)
+            fetch.assert_not_called()
+
+    def test_check_resolutions_rejects_staging_verifier_copy_and_fake_runtime(
+        self,
+    ) -> None:
+        """Do not let a copied verifier redefine the externally fixed runtime root."""
+        source = MODULE.load_catalog(CATALOG)[0]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            executable, _catalog, _manifest, request = create_check_runtime(
+                root, {source["name"]: "needs_search_fallback"}
+            )
+            copied_runtime = request.parent / "copied-runtime"
+            copied_executable = copied_runtime / "collect-public-sources.py"
+            copied_executable.parent.mkdir()
+            copied_executable.write_bytes(executable.read_bytes())
+            copied_catalog = copied_runtime / "it-news-sources.json"
+            copied_catalog.write_text(
+                json.dumps({
+                    "version": 1,
+                    "sources": [{
+                        "name": source["name"],
+                        "tier": 1,
+                        "feed_url": None,
+                        "page_url": "https://agent-controlled.example/news",
+                    }],
+                }),
+                encoding="utf-8",
+            )
+            fake_run = (
+                copied_runtime
+                / "logs"
+                / "2026-08-23"
+                / "20260823T050000+0900-999-888"
+            )
+            fake_request = fake_run / "staging/source-resolutions.json"
+            fake_manifest = fake_run / "source-inputs/source-manifest.json"
+            fake_request.parent.mkdir(parents=True)
+            fake_manifest.parent.mkdir()
+            write_bound_manifest(
+                fake_manifest,
+                {source["name"]: "needs_search_fallback"},
+                copied_catalog,
+            )
+            fake_request.write_text(
+                json.dumps({"version": 1, "resolutions": [], "date_evidence": []}),
+                encoding="utf-8",
+            )
+            with mock.patch.object(
+                MODULE, "__file__", str(copied_executable)
+            ), mock.patch.object(
+                MODULE, "canonical_runtime_root", return_value=executable.parent
+            ), mock.patch.object(MODULE, "fetch_url") as fetch, mock.patch(
+                "sys.stderr", new=io.StringIO()
+            ):
+                status = MODULE.main([
+                    str(copied_executable),
+                    "--check-resolutions",
+                    str(fake_request),
+                ])
+            self.assertEqual(status, 75)
+            fetch.assert_not_called()
+
+    def test_check_resolutions_rejects_intermediate_symlink_alias(self) -> None:
+        """Require the lexical direct staging path, not a resolved alias of it."""
+        source = MODULE.load_catalog(CATALOG)[0]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            executable, _catalog, _manifest, request = create_check_runtime(
+                root, {source["name"]: "needs_search_fallback"}
+            )
+            request.write_text(
+                json.dumps({"version": 1, "resolutions": [], "date_evidence": []}),
+                encoding="utf-8",
+            )
+            alias = request.parent / "alias"
+            alias.symlink_to(".", target_is_directory=True)
+            with mock.patch.object(
+                MODULE, "__file__", str(executable)
+            ), mock.patch.object(
+                MODULE, "canonical_runtime_root", return_value=executable.parent
+            ), mock.patch.object(MODULE, "fetch_url") as fetch, mock.patch(
+                "sys.stderr", new=io.StringIO()
+            ):
+                status = MODULE.main([
+                    str(executable),
+                    "--check-resolutions",
+                    str(alias / request.name),
+                ])
+            self.assertEqual(status, 75)
+            fetch.assert_not_called()
+
+    def test_verify_resolutions_rejects_legacy_arbitrary_path_arguments(self) -> None:
+        """Do not expose a second agent-callable catalog or manifest selector."""
+        with mock.patch.object(MODULE, "fetch_url") as fetch, mock.patch(
+            "sys.stderr", new=io.StringIO()
+        ):
+            status = MODULE.main([
+                str(SCRIPT),
+                "--verify-resolutions",
+                "/alternate/catalog.json",
+                "/alternate/manifest.json",
+                "/alternate/request.json",
+                "/alternate/output.json",
+            ])
+        self.assertEqual(status, 64)
+        fetch.assert_not_called()
+
+    def test_verify_resolutions_cli_uses_canonical_request_and_output(self) -> None:
+        """Let only the runner's exact run-local evidence path receive output."""
+        source = MODULE.load_catalog(CATALOG)[0]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            executable, _catalog, _manifest, request = create_check_runtime(
+                root, {source["name"]: "needs_search_fallback"}
+            )
+            candidate = MODULE.urllib.parse.urljoin(
+                source["page_url"], "/dated-article"
+            )
+            request.write_text(
+                json.dumps({
+                    "version": 1,
+                    "resolutions": [{
+                        "name": source["name"],
+                        "method": "site_search",
+                        "url": candidate,
+                    }],
+                    "date_evidence": [],
+                }),
+                encoding="utf-8",
+            )
+            output = request.parent.parent / "verified-source-resolutions.json"
+            with mock.patch.object(
+                MODULE, "__file__", str(executable)
+            ), mock.patch.object(
+                MODULE, "canonical_runtime_root", return_value=executable.parent
+            ), mock.patch.object(MODULE, "fetch_url", return_value={
+                "final_url": candidate,
+                "http_status": 200,
+                "content_type": "text/html",
+                "content": (
+                    b'<meta property="article:published_time" content="2026-08-22">'
+                    b'<article><h2><a href="/dated-article">Dated</a></h2></article>'
+                ),
+            }):
+                status = MODULE.main([
+                    str(executable),
+                    "--verify-resolutions",
+                    str(request),
+                    str(output),
+                ])
+            self.assertEqual(status, 0)
+            self.assertTrue(output.is_file())
+
+    def test_verify_resolutions_cli_rejects_noncanonical_output_before_fetch(
+        self,
+    ) -> None:
+        """Prevent the collection agent from selecting a writable evidence target."""
+        source = MODULE.load_catalog(CATALOG)[0]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            executable, _catalog, _manifest, request = create_check_runtime(
+                root, {source["name"]: "needs_search_fallback"}
+            )
+            request.write_text(
+                json.dumps({"version": 1, "resolutions": [], "date_evidence": []}),
+                encoding="utf-8",
+            )
+            output = request.parent / "agent-selected-output.json"
+            with mock.patch.object(
+                MODULE, "__file__", str(executable)
+            ), mock.patch.object(
+                MODULE, "canonical_runtime_root", return_value=executable.parent
+            ), mock.patch.object(MODULE, "fetch_url") as fetch, mock.patch(
+                "sys.stderr", new=io.StringIO()
+            ):
+                status = MODULE.main([
+                    str(executable),
+                    "--verify-resolutions",
+                    str(request),
+                    str(output),
+                ])
+            self.assertEqual(status, 75)
+            fetch.assert_not_called()
+            self.assertFalse(output.exists())
+
+    def test_fallback_source_cannot_also_submit_supplemental_date_evidence(
+        self,
+    ) -> None:
+        """Keep a fallback row bound to its one independently sealed resolution."""
+        source = MODULE.load_catalog(CATALOG)[0]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manifest = root / "manifest.json"
+            request = root / "request.json"
+            output = root / "verified.json"
+            candidate = source["page_url"]
+            write_bound_manifest(
+                manifest, {source["name"]: "needs_search_fallback"}
+            )
+            request.write_text(
+                json.dumps({
+                    "version": 1,
+                    "resolutions": [{
+                        "name": source["name"],
+                        "method": "site_search",
+                        "url": candidate,
+                    }],
+                    "date_evidence": [{
+                        "name": source["name"],
+                        "url": MODULE.urllib.parse.urljoin(candidate, "/second"),
+                    }],
+                }),
+                encoding="utf-8",
+            )
+            with mock.patch.dict(
+                os.environ, {"COLLECTION_OUTPUT_ROOT": str(root)}
+            ), mock.patch.object(MODULE, "fetch_url", return_value={
+                "final_url": candidate,
+                "http_status": 200,
+                "content_type": "text/html",
+                "content": (
+                    b'<article><time datetime="2026-08-08"></time>'
+                    b'<h2><a href="/article">Public article</a></h2></article>'
+                ),
+            }):
+                with self.assertRaisesRegex(
+                    MODULE.CollectionError, "outside catalog scope"
+                ):
+                    MODULE.verify_resolutions(CATALOG, manifest, request, output)
+            self.assertFalse(output.exists())
+
     def test_fallback_rejects_partially_dated_article_candidates(self) -> None:
         """Require dates for every sealed article candidate while ignoring navigation."""
         source = MODULE.load_catalog(CATALOG)[0]
@@ -433,9 +2864,9 @@ class PublicSourceCollectorTests(unittest.TestCase):
             request = root / "request.json"
             output = root / "verified.json"
             candidate = source["page_url"]
-            manifest.write_text(json.dumps({"sources": [{
-                "name": source["name"], "status": "needs_search_fallback"
-            }]}), encoding="utf-8")
+            write_bound_manifest(
+                manifest, {source["name"]: "needs_search_fallback"}
+            )
             request.write_text(json.dumps({"version": 1, "resolutions": [{
                 "name": source["name"], "method": "site_search", "url": candidate
             }], "date_evidence": []}), encoding="utf-8")
@@ -465,9 +2896,9 @@ class PublicSourceCollectorTests(unittest.TestCase):
             request = root / "request.json"
             output = root / "verified.json"
             candidate = MODULE.urllib.parse.urljoin(source["page_url"], "/article")
-            manifest.write_text(json.dumps({"sources": [{
-                "name": source["name"], "status": "needs_search_fallback"
-            }]}), encoding="utf-8")
+            write_bound_manifest(
+                manifest, {source["name"]: "needs_search_fallback"}
+            )
             request.write_text(json.dumps({"version": 1, "resolutions": [{
                 "name": source["name"], "method": "site_search", "url": candidate
             }], "date_evidence": []}), encoding="utf-8")
@@ -487,7 +2918,327 @@ class PublicSourceCollectorTests(unittest.TestCase):
             verified = json.loads(output.read_text())["resolutions"][0]
             self.assertEqual(verified["candidate_entry_count"], 1)
             self.assertEqual(verified["candidate_evidence"][0]["url"], candidate)
+            self.assertEqual(
+                verified["candidate_evidence"][0]["provenance"], "html_meta"
+            )
             self.assertEqual(verified["published_dates"], ["2026-08-08"])
+
+    def test_html_meta_fallback_passes_the_release_validator(self) -> None:
+        """Keep the trusted producer and downstream provenance contract aligned."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            catalog = root / "catalog.json"
+            source_manifest = root / "source-manifest.json"
+            request = root / "request.json"
+            verified = root / "verified.json"
+            candidate = "https://example.test/article"
+            source = {
+                "name": "Fixture News",
+                "tier": 1,
+                "feed_url": None,
+                "page_url": candidate,
+            }
+            catalog.write_text(
+                json.dumps({"version": 1, "sources": [source]}),
+                encoding="utf-8",
+            )
+            source_manifest.write_text(
+                json.dumps({
+                    "catalog_sha256": hashlib.sha256(
+                        catalog.read_bytes()
+                    ).hexdigest(),
+                    "source_count": 1,
+                    "fetched_count": 0,
+                    "needs_search_fallback_count": 1,
+                    "access_constraint_count": 0,
+                    "sources": [{
+                        "name": source["name"],
+                        "tier": source["tier"],
+                        "status": "needs_search_fallback",
+                        "method": None,
+                        "requested_url": None,
+                        "final_url": None,
+                        "content_file": None,
+                        "extract_file": None,
+                        "extracted_entry_count": 0,
+                        "attempts": [{
+                            "method": "public_page",
+                            "url": candidate,
+                            "status": "failed",
+                            "reason": "fixture",
+                        }],
+                    }],
+                }),
+                encoding="utf-8",
+            )
+            request.write_text(
+                json.dumps({
+                    "version": 1,
+                    "resolutions": [{
+                        "name": source["name"],
+                        "method": "site_search",
+                        "url": candidate,
+                    }],
+                    "date_evidence": [],
+                }),
+                encoding="utf-8",
+            )
+            content = (
+                b'<meta property="article:published_time" content="2026-08-22">'
+                b'<nav><a href="/about">About</a></nav>'
+            )
+            with mock.patch.dict(
+                os.environ, {"COLLECTION_OUTPUT_ROOT": str(root)}
+            ), mock.patch.object(MODULE, "fetch_url", return_value={
+                "final_url": candidate,
+                "http_status": 200,
+                "content_type": "text/html",
+                "content": content,
+            }):
+                MODULE.verify_resolutions(
+                    catalog, source_manifest, request, verified
+                )
+            resolution = json.loads(
+                verified.read_text(encoding="utf-8")
+            )["resolutions"][0]
+            self.assertEqual(
+                resolution["candidate_evidence"][0]["provenance"],
+                "html_meta",
+            )
+            summary = (
+                "## 確認済みサイト一覧\n\n"
+                "| サイト | Tier | 状態 | 取得方法 | 確認URL | 期間内件数 | 理由 |\n"
+                "|---|---:|---|---|---|---:|---|\n"
+                f"| {source['name']} | 1 | 取得済み | サイト限定検索 | "
+                f"{candidate} | 1 | - |\n"
+            )
+            VALIDATOR.validate_source_coverage(
+                summary,
+                catalog,
+                source_manifest,
+                verified,
+                date(2026, 8, 22),
+            )
+            payload = json.loads(verified.read_text(encoding="utf-8"))
+            payload["resolutions"][0]["candidate_evidence"][0][
+                "provenance"
+            ] = "lookalike_meta"
+            verified.write_text(json.dumps(payload), encoding="utf-8")
+            with self.assertRaisesRegex(
+                VALIDATOR.ValidationError,
+                "candidate evidence is invalid",
+            ):
+                VALIDATOR.validate_source_coverage(
+                    summary,
+                    catalog,
+                    source_manifest,
+                    verified,
+                    date(2026, 8, 22),
+                )
+
+    def test_primary_publication_meta_uses_structural_safe_subset(self) -> None:
+        """Accept only unambiguous actual meta outside ignored HTML contexts."""
+        base = "https://example.test/article"
+        hosts = {"example.test"}
+        positives = (
+            '<meta property="article:published_time" content="2026-08-22">',
+            '<META CONTENT=2026-08-22 NAME=datePublished>',
+            '<meta data-purpose=date content="2026-08-22" '
+            'property="ARTICLE:PUBLISHED_TIME">',
+        )
+        for markup in positives:
+            with self.subTest(positive=markup):
+                self.assertEqual(
+                    MODULE.extract_primary_publication_evidence(
+                        markup.encode(), base, hosts
+                    ),
+                    ("2026-08-22", "html_meta"),
+                )
+
+        meta = '<meta property="article:published_time" content="2026-08-22">'
+        negatives = (
+            f'<!--{meta}-->',
+            f'<script type="text/plain">{meta}</script>',
+            f'<style>{meta}</style>',
+            f'<textarea>{meta}</textarea>',
+            f'<title>{meta}</title>',
+            f'<iframe>{meta}</iframe>',
+            f'<noembed>{meta}</noembed>',
+            f'<noframes>{meta}</noframes>',
+            f'<noscript>{meta}</noscript>',
+            f'<xmp>{meta}</xmp>',
+            f'<plaintext>{meta}',
+            f'<template>{meta}</template>',
+            f'<svg>{meta}</svg>',
+            f'<math>{meta}</math>',
+            f'<select>{meta}</select>',
+            f'<frameset>{meta}</frameset>',
+            f'<frameset></frameset>{meta}',
+            '<div data-note=\'<meta property="article:published_time" '
+            'content="2026-08-22">\'></div>',
+            '<meta data-property="article:published_time" '
+            'data-content="2026-08-22">',
+            '<meta notname="datePublished" data-content="2026-08-22">',
+            '<meta property="article:published_time"\u00a0content="2026-08-22">',
+            '<meta property="not-a-date" property="article:published_time" '
+            'content="2026-08-22">',
+            '<meta property="article:published_time" content="not-a-date" '
+            'content="2026-08-22">',
+            '<meta property="article:published_time" name="datePublished" '
+            'content="2026-08-22">',
+            '<meta property="article:published_time" '
+            'content="2026-08-&#50;2">',
+            '<meta property="article:published_time" content="2026-08-21">'
+            '<meta name="datePublished" content="2026-08-22">',
+        )
+        for markup in negatives:
+            with self.subTest(negative=markup):
+                self.assertEqual(
+                    MODULE.extract_primary_publication_evidence(
+                        markup.encode(), base, hosts
+                    ),
+                    (None, None),
+                )
+
+    def test_select_shortcuts_cannot_expose_primary_meta(self) -> None:
+        """Reject Python-only select self-close and malformed end callbacks."""
+        base = "https://example.test/article"
+        hosts = {"example.test"}
+        meta = '<meta property="article:published_time" content="2026-08-22">'
+        malformed = (
+            f"<select/>{meta}",
+            f"<select />{meta}",
+            f"<select name=x />{meta}",
+            f"<select></ select>{meta}</select>",
+            *(
+                f"<select></{separator}select>{meta}</select>"
+                for separator in ("\t", "\n", "\f", "\r")
+            ),
+        )
+        for markup in malformed:
+            with self.subTest(markup=markup):
+                self.assertEqual(
+                    MODULE.extract_primary_publication_evidence(
+                        markup.encode(), base, hosts
+                    ),
+                    (None, None),
+                )
+        self.assertEqual(
+            MODULE.extract_primary_publication_evidence(
+                f"<select></select>{meta}".encode(), base, hosts
+            ),
+            ("2026-08-22", "html_meta"),
+        )
+
+    def test_nonvoid_self_closing_flag_does_not_end_trust_suppression(self) -> None:
+        """Treat XHTML-style flags on every non-void trust container as open."""
+        base = "https://example.test/article"
+        hosts = {"example.test"}
+        meta = '<meta property="article:published_time" content="2026-08-22">'
+        for tag in sorted(MODULE.JSON_LD_NONVOID_TRUST_CONTAINERS):
+            with self.subTest(tag=tag):
+                self.assertEqual(
+                    MODULE.extract_primary_publication_evidence(
+                        f"<{tag}/>{meta}".encode(), base, hosts
+                    ),
+                    (None, None),
+                )
+        self.assertEqual(
+            MODULE.extract_primary_publication_evidence(
+                f"<br/>{meta}".encode(), base, hosts
+            ),
+            ("2026-08-22", "html_meta"),
+        )
+
+    def test_untrusted_primary_metadata_cannot_seal_resolution_evidence(self) -> None:
+        """Reject fake meta/frameset dates in fallback and supplemental paths."""
+        source = MODULE.load_catalog(CATALOG)[0]
+        candidate = MODULE.urllib.parse.urljoin(source["page_url"], "/article")
+        json_ld = json.dumps({
+            "@context": "https://schema.org",
+            "@type": "NewsArticle",
+            "headline": "Ignored",
+            "url": candidate,
+            "datePublished": "2026-08-22",
+        })
+        fixtures = (
+            b'<nav><a href="/about">About</a></nav><!--<meta '
+            b'property="article:published_time" content="2026-08-22">-->',
+            b'<nav><a href="/about">About</a></nav><meta '
+            b'data-property="article:published_time" data-content="2026-08-22">',
+            (
+                '<nav><a href="/about">About</a></nav><frameset>'
+                '<script type="application/ld+json">'
+                f'{json_ld}</script></frameset>'
+            ).encode(),
+            (
+                '<template><article><time datetime="2026-08-22"></time>'
+                f'<h2><a href="{candidate}">Fake card</a></h2></article>'
+                '</template>'
+            ).encode(),
+            (
+                '<script type="text/plain">'
+                f"{{'url':'{candidate}','title':'Fake JS',"
+                "'date':'2026/08/22'}</script>"
+            ).encode(),
+            (
+                '<select><script id="__NEXT_DATA__" type="application/json">'
+                '{"metadata":{"datePublished":"2026-08-22"},'
+                '"articleMetadata":{"title":"Fake Next"},'
+                '"data":{"issueId":"daily","issueVolume":1,'
+                '"issueNumber":2}}</script></select>'
+            ).encode(),
+        )
+        for index, content in enumerate(fixtures):
+            with self.subTest(path="fallback", index=index), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                manifest = root / "manifest.json"
+                request = root / "request.json"
+                output = root / "verified.json"
+                write_bound_manifest(
+                    manifest, {source["name"]: "needs_search_fallback"}
+                )
+                request.write_text(json.dumps({
+                    "version": 1,
+                    "resolutions": [{
+                        "name": source["name"],
+                        "method": "site_search",
+                        "url": candidate,
+                    }],
+                    "date_evidence": [],
+                }), encoding="utf-8")
+                with mock.patch.dict(
+                    os.environ, {"COLLECTION_OUTPUT_ROOT": str(root)}
+                ), mock.patch.object(MODULE, "fetch_url", return_value={
+                    "final_url": candidate,
+                    "http_status": 200,
+                    "content_type": "text/html",
+                    "content": content,
+                }), self.assertRaisesRegex(MODULE.CollectionError, "complete|empty"):
+                    MODULE.verify_resolutions(CATALOG, manifest, request, output)
+
+            with self.subTest(path="date_evidence", index=index), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                manifest = root / "manifest.json"
+                request = root / "request.json"
+                output = root / "verified.json"
+                write_bound_manifest(manifest, {source["name"]: "fetched"})
+                request.write_text(json.dumps({
+                    "version": 1,
+                    "resolutions": [],
+                    "date_evidence": [{
+                        "name": source["name"], "url": candidate
+                    }],
+                }), encoding="utf-8")
+                with mock.patch.dict(
+                    os.environ, {"COLLECTION_OUTPUT_ROOT": str(root)}
+                ), mock.patch.object(MODULE, "fetch_url", return_value={
+                    "final_url": candidate,
+                    "http_status": 200,
+                    "content_type": "text/html",
+                    "content": content,
+                }), self.assertRaisesRegex(MODULE.CollectionError, "lacks"):
+                    MODULE.verify_resolutions(CATALOG, manifest, request, output)
 
     def test_generic_page_date_does_not_collapse_listing_candidates(self) -> None:
         """Do not treat generic category metadata as the listing's publication date."""
@@ -504,17 +3255,17 @@ class PublicSourceCollectorTests(unittest.TestCase):
     def test_json_ld_seals_undated_article_and_merges_same_url_date(self) -> None:
         """Keep undated article-like JSON-LD and merge matching card evidence."""
         base = "https://example.test/"
-        undated = b'''<script type="application/ld+json">{"@type":"NewsArticle","headline":"A","url":"/a"}</script>'''
+        undated = b'''<script type="application/ld+json">{"@context":"https://schema.org","@type":"NewsArticle","headline":"A","url":"/a"}</script>'''
         extracted = MODULE.extract_content(undated, "text/html", base)
         self.assertEqual(extracted["entries"][0]["candidate_provenance"], "json_ld")
         self.assertIsNone(extracted["entries"][0]["published"])
 
-        merged = b'''<script type="application/ld+json">{"@type":"NewsArticle","headline":"A","url":"https://example.test:443/a/"}</script><article><time datetime="2026-08-08"></time><h2><a href="/a">A</a></h2></article>'''
+        merged = b'''<script type="application/ld+json">{"@context":"https://schema.org","@type":"NewsArticle","headline":"A","url":"https://example.test:443/a/"}</script><article><time datetime="2026-08-08"></time><h2><a href="/a">A</a></h2></article>'''
         extracted = MODULE.extract_content(merged, "text/html", base)
         self.assertEqual(len(extracted["entries"]), 1)
         self.assertEqual(extracted["entries"][0]["published"], "2026-08-08")
 
-        distinct_queries = b'''<script type="application/ld+json">[{"@type":"NewsArticle","headline":"A1","url":"/a?id=1","datePublished":"2026-08-08"},{"@type":"NewsArticle","headline":"A2","url":"/a?id=2","datePublished":"2026-08-08"}]</script>'''
+        distinct_queries = b'''<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"NewsArticle","headline":"A1","url":"/a?id=1","datePublished":"2026-08-08"},{"@type":"NewsArticle","headline":"A2","url":"/a?id=2","datePublished":"2026-08-08"}]}</script>'''
         extracted = MODULE.extract_content(distinct_queries, "text/html", base)
         self.assertEqual(len(extracted["entries"]), 2)
 
@@ -534,6 +3285,24 @@ class PublicSourceCollectorTests(unittest.TestCase):
         )
         extracted = MODULE.extract_content(single, "text/html", base)
         self.assertEqual(extracted["entries"][0]["candidate_provenance"], "article")
+
+        preseen = (
+            b'<nav><a href="/story">Navigation label</a></nav>'
+            b'<article><time datetime="2026-08-08"></time>'
+            b'<a href="/story">Article-local title</a></article>'
+        )
+        extracted = MODULE.extract_content(preseen, "text/html", base)
+        self.assertEqual(extracted["candidate_entry_count"], 1)
+        self.assertEqual(extracted["entries"][0]["title"], "Article-local title")
+
+        repeated_controls = (
+            b'<article><time datetime="2026-08-08"></time>'
+            b'<a href="/story">Copy link</a>'
+            b'<a href="/story">Share link</a></article>'
+        )
+        extracted = MODULE.extract_content(repeated_controls, "text/html", base)
+        self.assertEqual(extracted["candidate_entry_count"], 0)
+        self.assertEqual(extracted["date_evidence_count"], 0)
 
     def test_detects_explicit_login_gate_but_not_generic_forbidden_text(self) -> None:
         """Resolve login exceptions from gate markup, not a bare status/error word."""
@@ -630,7 +3399,7 @@ class PublicSourceCollectorTests(unittest.TestCase):
             manifest = root / "manifest.json"
             request = root / "request.json"
             output = root / "verified.json"
-            manifest.write_text(json.dumps({"sources": []}), encoding="utf-8")
+            write_bound_manifest(manifest, {source["name"]: "fetched"})
             request.write_text(json.dumps({
                 "version": 1,
                 "resolutions": [],
@@ -674,7 +3443,9 @@ class PublicSourceCollectorTests(unittest.TestCase):
             target = root / "target.json"
             request = root / "request.json"
             output = root / "verified.json"
-            manifest.write_text(json.dumps({"sources": [{"name": source["name"], "status": "needs_search_fallback"}]}))
+            write_bound_manifest(
+                manifest, {source["name"]: "needs_search_fallback"}
+            )
             target.write_text(json.dumps({"version": 1, "resolutions": [], "date_evidence": []}))
             request.symlink_to(target)
             with mock.patch.dict(os.environ, {"COLLECTION_OUTPUT_ROOT": str(root)}), self.assertRaises((MODULE.CollectionError, OSError)):
@@ -686,7 +3457,9 @@ class PublicSourceCollectorTests(unittest.TestCase):
         article = source["page_url"]
         html = (
             '<script type="application/ld+json">'
-            f'{{"@type":"NewsArticle","headline":"Story","url":"{article}","datePublished":"2026-08-05"}}'
+            f'{{"@context":"https://schema.org","@type":"NewsArticle",'
+            f'"headline":"Story","url":"{article}",'
+            '"datePublished":"2026-08-05"}'
             '</script>'
         ).encode()
         with tempfile.TemporaryDirectory() as temporary:
@@ -694,7 +3467,7 @@ class PublicSourceCollectorTests(unittest.TestCase):
             manifest = root / "manifest.json"
             request = root / "request.json"
             output = root / "verified.json"
-            manifest.write_text(json.dumps({"sources": [{"name": source["name"], "status": "fetched"}]}))
+            write_bound_manifest(manifest, {source["name"]: "fetched"})
             request.write_text(json.dumps({
                 "version": 1, "resolutions": [],
                 "date_evidence": [{"name": source["name"], "url": article}],
@@ -708,6 +3481,63 @@ class PublicSourceCollectorTests(unittest.TestCase):
                 MODULE.verify_resolutions(CATALOG, manifest, request, output)
             verified = json.loads(output.read_text())["date_evidence"][0]
             self.assertEqual(verified["published_date"], "2026-08-05")
+
+    def test_article_channels_reject_ambiguous_raw_attributes(self) -> None:
+        """Never trust HTMLParser-normalized duplicate or non-HTML5 attributes."""
+        malformed_anchors = (
+            b'<a href="/wrong" href="/duplicate">Duplicate href</a>',
+            b'<a\x0bhref="/vertical-tab">Vertical tab href</a>',
+            b'<a href="&#x2f;entity">Entity-built href</a>',
+        )
+        for malformed in malformed_anchors:
+            with self.subTest(malformed=malformed):
+                extracted = MODULE.extract_content(
+                    b'<article><time datetime="2026-08-22"></time>'
+                    + malformed
+                    + b'<h2><a href="/valid">Valid peer</a></h2></article>',
+                    "text/html",
+                    "https://example.test/news",
+                )
+                candidates = [
+                    entry
+                    for entry in extracted["entries"]
+                    if entry.get("candidate_provenance") == "article"
+                ]
+                self.assertEqual(
+                    [entry["url"] for entry in candidates],
+                    ["https://example.test/valid"],
+                )
+                self.assertEqual(candidates[0]["published"], "2026-08-22")
+
+        legacy = MODULE.extract_content(
+            b'<p class="title" class="date"><a href="/ambiguous">Bad</a></p>'
+            b'<p class="date">(2026/8/21)</p>'
+            b'<p class="title"><a href="/legacy-valid">Valid</a></p>'
+            b'<p class="date">(2026/8/22)</p>',
+            "text/html",
+            "https://example.test/news",
+        )
+        embedded = [
+            entry
+            for entry in legacy["entries"]
+            if entry.get("candidate_provenance") == "article"
+        ]
+        self.assertEqual(
+            [entry["url"] for entry in embedded],
+            ["https://example.test/legacy-valid"],
+        )
+
+    def test_suppression_container_control_separator_invalidates_document(self) -> None:
+        """Reject callback tags whose raw container name used a control separator."""
+        extracted = MODULE.extract_content(
+            b'<select\x0b><meta property="article:published_time" '
+            b'content="2026-08-22"></select>'
+            b'<article><time datetime="2026-08-22"></time>'
+            b'<h2><a href="/must-not-survive">Invalid peer</a></h2></article>',
+            "text/html",
+            "https://example.test/news",
+        )
+        self.assertEqual(extracted["entries"], [])
 
 
 if __name__ == "__main__":

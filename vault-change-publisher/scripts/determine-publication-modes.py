@@ -23,11 +23,13 @@ STATE_CHANGE_FIELDS = (
     "local_head",
     "operation_in_progress",
     "git_control_sha256",
-    "index_sha256",
+    "index_entries",
     "dirty_worktree_sha256",
     "dirty_digest",
     "diff_snapshot_sha256",
 )
+
+VOLATILE_INDEX_FIELDS = frozenset({"index_sha256", "index_identity"})
 
 
 def digest(value: object) -> str:
@@ -36,6 +38,13 @@ def digest(value: object) -> str:
         value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def semantic_state(value: dict[str, object]) -> dict[str, object]:
+    """Exclude Git index stat-cache serialization from a state identity."""
+    return {
+        key: item for key, item in value.items() if key not in VOLATILE_INDEX_FIELDS
+    }
 
 
 def target_binding(root: object, target: object) -> tuple[str, bool]:
@@ -120,8 +129,8 @@ def vault_mode(
         "reasons": reasons,
         "artifact_target": artifact_target,
         "retry_disposition": retry_disposition,
-        "initial_state_sha256": digest(initial),
-        "review_state_sha256": digest(current),
+        "initial_state_sha256": digest(semantic_state(initial)),
+        "review_state_sha256": digest(semantic_state(current)),
     }
 
 
@@ -152,23 +161,35 @@ def apply_residual_guards(
             or not isinstance(commit_snapshots, list)
         ):
             raise ModeError("publication mode hint shape is invalid")
-        deferred_paths = sorted(
-            snapshot.get("path")
-            for snapshot in snapshots
-            if isinstance(snapshot, dict)
-            and snapshot.get("materialization_status") == "deferred"
-            and isinstance(snapshot.get("path"), str)
-        )
+        deferred_paths = []
+        for snapshot in snapshots:
+            if not isinstance(snapshot, dict):
+                raise ModeError("dirty snapshot entry is invalid")
+            status = snapshot.get("materialization_status")
+            path = snapshot.get("path")
+            if status not in {"available", "deferred", "not_required"}:
+                raise ModeError("dirty snapshot materialization status is invalid")
+            if not isinstance(path, str):
+                raise ModeError("dirty residual path is invalid")
+            if status == "deferred":
+                deferred_paths.append(path)
+        deferred_paths.sort()
         if len(deferred_paths) != len(set(deferred_paths)):
             raise ModeError("deferred residual path is duplicated")
         entry["guard_deferred_paths"] = deferred_paths
-        blocked_commits = [
-            snapshot.get("commit")
-            for snapshot in commit_snapshots
-            if isinstance(snapshot, dict)
-            and snapshot.get("materialization_status") != "available"
-            and isinstance(snapshot.get("commit"), str)
-        ]
+        blocked_commits = []
+        for snapshot in commit_snapshots:
+            if not isinstance(snapshot, dict):
+                raise ModeError("local commit snapshot entry is invalid")
+            status = snapshot.get("materialization_status")
+            commit = snapshot.get("commit")
+            if status not in {"available", "blocked"}:
+                raise ModeError("local commit materialization status is invalid")
+            if not isinstance(commit, str):
+                raise ModeError("local commit identity is invalid")
+            if status != "available":
+                blocked_commits.append(commit)
+        blocked_commits.sort()
         if len(blocked_commits) != len(set(blocked_commits)):
             raise ModeError("blocked local commit is duplicated")
         entry["guard_blocked_commits"] = blocked_commits

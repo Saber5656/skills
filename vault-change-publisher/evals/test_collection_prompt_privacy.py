@@ -103,6 +103,75 @@ class CollectionPromptPrivacyTests(unittest.TestCase):
         self.assertIn("copy the trusted", prompt)
         self.assertIn("再集計・上書きしない", skill)
 
+    def test_fallback_count_and_direct_date_evidence_are_disjoint(self) -> None:
+        """Prevent search-result counts from escaping the sealed fallback candidate set."""
+        prompt = (
+            ROOT / "vault-change-publisher/assets/daily-it-news.collect.prompt.md"
+        ).read_text(encoding="utf-8")
+        skill = (ROOT / "summarize-it-news/SKILL.md").read_text(encoding="utf-8")
+        for content in (prompt, skill):
+            self.assertIn("needs_search_fallback", content)
+            self.assertIn("date_evidence", content)
+            self.assertIn("access_constraint", content)
+        self.assertIn("sole candidate set", prompt)
+        self.assertIn("must not also appear", prompt)
+        self.assertIn("1件のresolutionだけ", skill)
+        self.assertIn("監査行へ合算しない", skill)
+
+    def test_complete_collection_preflights_exact_fallback_request(self) -> None:
+        """Catch correctable listing choices before the collection agent returns."""
+        prompt = (
+            ROOT / "vault-change-publisher/assets/daily-it-news.collect.prompt.md"
+        ).read_text(encoding="utf-8")
+        publisher = (ROOT / "vault-change-publisher/SKILL.md").read_text(
+            encoding="utf-8"
+        )
+        summarizer = (ROOT / "summarize-it-news/SKILL.md").read_text(
+            encoding="utf-8"
+        )
+        for content in (prompt, publisher, summarizer):
+            self.assertIn("--check-resolutions", content)
+        self.assertNotIn("resolution_verification_root", prompt)
+        self.assertIn("Do not pass or substitute another catalog", prompt)
+        self.assertIn("canonical request path", prompt)
+        self.assertIn("catalog/manifest/run rootの任意引数は受け付けず", publisher)
+        self.assertIn("A `complete` result is forbidden", prompt)
+        self.assertIn("at most three distinct candidates", prompt)
+        self.assertIn("individual official article", prompt)
+        self.assertIn("date falls outside the collection window", prompt)
+        self.assertIn("independently repeats", prompt)
+        self.assertIn("agent preflightをauthorityとして信頼しない", publisher)
+
+    def test_resolution_preflight_inputs_are_executable_bound(self) -> None:
+        """Keep an untrusted agent from selecting the verifier's host allowlist."""
+        prompt = (
+            ROOT / "vault-change-publisher/assets/daily-it-news.collect.prompt.md"
+        ).read_text(encoding="utf-8")
+        runner = (
+            ROOT
+            / "vault-change-publisher/assets/run-daily-it-news-vulnerability-check.sh"
+        ).read_text(encoding="utf-8")
+        collector = (
+            ROOT / "summarize-it-news/scripts/collect-public-sources.py"
+        ).read_text(encoding="utf-8")
+        command = prompt.split("```sh", 1)[1].split("```", 1)[0]
+        self.assertIn('"<resolution_verifier>" --check-resolutions', command)
+        self.assertIn("<collection_output_root>/source-resolutions.json", command)
+        self.assertNotIn("source_catalog", command)
+        self.assertNotIn("source_manifest", command)
+        self.assertNotIn("resolution_verification_root", runner)
+        self.assertIn("checked_runtime_inputs(Path(argv[2]))", collector)
+        self.assertIn("len(argv) == 3", collector)
+        self.assertIn("canonical_runtime_root()", collector)
+        self.assertIn("pwd.getpwuid(os.getuid()).pw_dir", collector)
+        self.assertIn("validate_manifest_catalog_binding", collector)
+        self.assertIn('runtime / "it-news-sources.json"', collector)
+        self.assertIn("checked_verification_output", collector)
+        self.assertNotIn(
+            'len(argv) == 6 and argv[1] == "--verify-resolutions"',
+            collector,
+        )
+
     def test_coverage_tier_is_exact_catalog_integer(self) -> None:
         prompt = (
             ROOT / "vault-change-publisher/assets/daily-it-news.collect.prompt.md"
@@ -233,7 +302,7 @@ class CollectionPromptPrivacyTests(unittest.TestCase):
                 / "vault-change-publisher/references/publication-review-result.schema.json"
             ).read_text(encoding="utf-8")
         )
-        mode_contract = next(
+        mode_contracts = [
             contract
             for contract in schema["allOf"]
             if contract.get("if", {})
@@ -243,7 +312,13 @@ class CollectionPromptPrivacyTests(unittest.TestCase):
             .get("publication_mode", {})
             .get("enum")
             == ["sweep", "own_only"]
+        ]
+        self.assertEqual(
+            len(mode_contracts),
+            1,
+            "expected exactly one successful-publication next_action contract",
         )
+        mode_contract = mode_contracts[0]
         self.assertEqual(
             mode_contract["then"]["properties"]["next_action"],
             {"type": "null"},

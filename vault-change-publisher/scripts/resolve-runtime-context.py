@@ -35,6 +35,7 @@ REQUIRED_KEYS = ALLOWED_KEYS
 CONTROL_COMMAND_TIMEOUT_SECONDS = 30
 EXTERNAL_BINARY_TIMEOUT_SECONDS = 60
 SUPPORTED_GITLEAKS_MAJOR = 8
+MINIMUM_GITLEAKS_VERSION = (8, 19, 0)
 
 
 class ContextError(RuntimeError):
@@ -320,11 +321,16 @@ def remote_url(repo_root: Path) -> str:
 
 
 def validated_gitleaks_version(value: str) -> str:
-    """Require the pinned CLI major whose invocation contract is reviewed."""
+    """Require the reviewed v8 CLI with native git, dir, and stdin commands."""
     match = re.search(r"(?<![0-9])(\d+)\.(\d+)\.(\d+)(?![0-9])", value)
-    if match is None or int(match.group(1)) != SUPPORTED_GITLEAKS_MAJOR:
+    version = tuple(int(group) for group in match.groups()) if match else None
+    if (
+        version is None
+        or version[0] != SUPPORTED_GITLEAKS_MAJOR
+        or version < MINIMUM_GITLEAKS_VERSION
+    ):
         raise ContextError(
-            f"Gitleaks major version {SUPPORTED_GITLEAKS_MAJOR} is required"
+            "Gitleaks version 8.19.0 or later within major version 8 is required"
         )
     return value
 
@@ -392,6 +398,11 @@ def resolve_context(local_config: Path, workdir: Path) -> dict[str, str]:
         check=True,
         capture_output=True,
         text=True,
+        env={
+            key: value
+            for key, value in clean_git_environment().items()
+            if not key.startswith("GITLEAKS_")
+        },
         timeout=EXTERNAL_BINARY_TIMEOUT_SECONDS,
     ).stdout.strip()
     context = {

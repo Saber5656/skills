@@ -7,12 +7,25 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import stat
 import subprocess
 import sys
-import tempfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
+from atomic_file_ops import (
+    AtomicTransactionError,
+    allocate_private_entry_path,
+    fsync_after_rename,
+    link_no_replace_durable,
+    mkdir_durable,
+    open_absolute_directory_chain,
+    publish_head_index_transaction,
+    read_named_entry_contract,
+    rename_no_replace,
+    retain_path_no_replace,
+    verify_rename_no_replace,
+)
 from evidence_hunk import canonical_patch
 from git_diff_digest import git_diff_digest
 from isolated_git_transport import (
@@ -172,22 +185,60 @@ def control_digest(repo: str) -> str:
             digest.update(config_path.read_bytes())
         digest.update(b"\0")
     hooks = common_dir / "hooks"
-    if hooks.exists():
-        for root, directories, files in os.walk(hooks, followlinks=False):
-            directories.sort()
-            files.sort()
-            for filename in files:
-                path = Path(root) / filename
-                digest.update(str(path.relative_to(common_dir)).encode("utf-8"))
+    if os.path.lexists(hooks):
+        digest.update(b"hooks\0")
+        digest.update(f"{hooks.lstat().st_mode:o}".encode("ascii"))
+        digest.update(b"\0")
+        walk_hooks = False
+        if hooks.is_symlink():
+            digest.update(b"symlink\0")
+            digest.update(os.fsencode(os.readlink(hooks)))
+            digest.update(b"\0")
+            try:
+                target_mode = hooks.stat().st_mode
+            except FileNotFoundError:
+                digest.update(b"dangling\0")
+            else:
+                digest.update(f"{target_mode:o}".encode("ascii"))
                 digest.update(b"\0")
-                digest.update(f"{path.lstat().st_mode:o}".encode("ascii"))
-                digest.update(b"\0")
-                if path.is_symlink():
-                    digest.update(b"symlink\0")
-                    digest.update(os.readlink(path).encode("utf-8"))
+                if hooks.is_dir():
+                    digest.update(b"target-directory\0")
+                    walk_hooks = True
                 else:
-                    digest.update(path.read_bytes())
-                digest.update(b"\0")
+                    digest.update(b"target-unsupported\0")
+        elif not hooks.is_dir():
+            digest.update(b"unsupported\0")
+        else:
+            digest.update(b"directory\0")
+            walk_hooks = True
+        if walk_hooks:
+            for root, directories, files in os.walk(hooks, followlinks=False):
+                directories.sort()
+                files.sort()
+                for name in directories:
+                    path = Path(root) / name
+                    digest.update(str(path.relative_to(common_dir)).encode("utf-8"))
+                    digest.update(b"\0")
+                    digest.update(f"{path.lstat().st_mode:o}".encode("ascii"))
+                    digest.update(b"\0")
+                    if path.is_symlink():
+                        digest.update(b"symlink\0")
+                        digest.update(os.fsencode(os.readlink(path)))
+                    else:
+                        digest.update(b"directory\0")
+                    digest.update(b"\0")
+                for filename in files:
+                    path = Path(root) / filename
+                    digest.update(str(path.relative_to(common_dir)).encode("utf-8"))
+                    digest.update(b"\0")
+                    digest.update(f"{path.lstat().st_mode:o}".encode("ascii"))
+                    digest.update(b"\0")
+                    if path.is_symlink():
+                        digest.update(b"symlink\0")
+                        digest.update(os.fsencode(os.readlink(path)))
+                    else:
+                        digest.update(path.read_bytes())
+                    digest.update(b"\0")
     return digest.hexdigest()
 
 
@@ -222,6 +273,28 @@ def remote_head(repo: str, remote_url: str, git_dir: str | None = None) -> str:
     return result[0]
 
 
+def require_fast_forward_target(
+    repo: str,
+    expected_remote: str,
+    local_head: str,
+    git_dir: str | None = None,
+) -> None:
+    """Prove the fixed non-force update preserves reviewed remote history."""
+    result = git(
+        repo,
+        "merge-base",
+        "--is-ancestor",
+        expected_remote,
+        local_head,
+        check=False,
+        git_dir=git_dir,
+    )
+    if result.returncode != 0:
+        raise FinalizationError(
+            "evidence push target is not a descendant of expected remote"
+        )
+
+
 def push_evidence_with_retry(
     repo: str,
     remote_url: str,
@@ -229,9 +302,23 @@ def push_evidence_with_retry(
     evidence_commit: str,
     before_remote: str,
 ) -> str:
-    """Retry a fixed non-force push across transient remote verification errors."""
+    """Retry a fixed non-force push across transient verification errors."""
+    require_fast_forward_target(repo, before_remote, evidence_commit, git_dir)
     remote = before_remote
     for _ in range(3):
+        try:
+            remote = remote_head(repo, remote_url, git_dir)
+        except (
+            FinalizationError,
+            OSError,
+            subprocess.SubprocessError,
+            TransportError,
+        ):
+            continue
+        if remote == evidence_commit:
+            return remote
+        if remote != before_remote:
+            break
         git(
             repo,
             "push",
@@ -381,6 +468,145 @@ def stable_regular_bytes(path: Path) -> bytes:
         os.close(descriptor)
 
 
+def index_file_contract(path: Path) -> tuple[bytes, list[int]]:
+    """Read one stable no-follow shared index and seal its inode contract."""
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise FinalizationError("Git index is not a regular file")
+        content = bytearray()
+        while chunk := os.read(descriptor, 1024 * 1024):
+            content.extend(chunk)
+        after = os.fstat(descriptor)
+        contract = [
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mode,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        ]
+        if contract != [
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mode,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        ]:
+            raise FinalizationError("Git index changed while it was read")
+        return bytes(content), contract
+    finally:
+        os.close(descriptor)
+
+
+def prepare_shared_index_candidate(
+    repo: str,
+    git_dir: str,
+    baseline: dict[str, object],
+    target: str,
+    index_blob: str,
+    directory: Path,
+) -> tuple[str, dict[str, object]]:
+    """Apply only the reviewed evidence entry to the exact shared index."""
+    index_path = Path(git_dir) / "index"
+    content, identity = index_file_contract(index_path)
+    if (
+        hashlib.sha256(content).hexdigest() != baseline.get("index_sha256")
+        or identity != baseline.get("index_identity")
+    ):
+        raise FinalizationError("shared Git index differs from evidence review")
+    candidate_path = allocate_private_entry_path(
+        directory,
+        prefix=".evidence-shared-index-work-",
+        entry_name="index",
+    )
+    descriptor = os.open(
+        candidate_path,
+        os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+        stat.S_IMODE(identity[3]),
+    )
+    try:
+        view = memoryview(content)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise FinalizationError("could not prepare evidence Git index")
+            view = view[written:]
+        os.fchmod(descriptor, stat.S_IMODE(identity[3]))
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    try:
+        git(
+            repo,
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            f"100644,{index_blob},{target}",
+            git_dir=git_dir,
+            index_file=candidate_path,
+        )
+        candidate_content, candidate_identity = index_file_contract(
+            Path(candidate_path)
+        )
+        return candidate_path, {
+            "sha256": hashlib.sha256(candidate_content).hexdigest(),
+            "identity": candidate_identity,
+        }
+    except Exception as original:
+        try:
+            retain_path_no_replace(
+                candidate_path,
+                label="failed evidence shared-index candidate",
+                prefix=".evidence-shared-index-retained-",
+                allow_missing=True,
+            )
+        except AtomicTransactionError as cleanup_error:
+            raise FinalizationError(
+                f"evidence shared-index cleanup failed closed: {cleanup_error}"
+            ) from original
+        raise
+
+
+def publish_evidence_head_and_index(
+    repo: str,
+    git_dir: str,
+    baseline: dict[str, object],
+    base_head: str,
+    candidate_head: str,
+    candidate_index_path: str,
+    candidate_index_contract: dict[str, object],
+    progress: dict[str, bool],
+) -> None:
+    """Publish evidence HEAD/index through the shared durable transaction."""
+    expected_digest = baseline.get("index_sha256")
+    expected_identity = baseline.get("index_identity")
+    if not isinstance(expected_digest, str) or not isinstance(expected_identity, list):
+        raise FinalizationError("reviewed evidence index contract is malformed")
+    try:
+        publish_head_index_transaction(
+            git_dir,
+            base_head=base_head,
+            candidate_head=candidate_head,
+            expected_index_sha256=expected_digest,
+            expected_index_identity=expected_identity,
+            candidate_index_path=candidate_index_path,
+            candidate_index_sha256=str(candidate_index_contract.get("sha256")),
+            candidate_index_identity=candidate_index_contract.get("identity"),
+            read_head=lambda: git(
+                repo, "rev-parse", "HEAD", git_dir=git_dir
+            ).stdout.strip(),
+            update_head=lambda new, old: git(
+                repo, "update-ref", "HEAD", new, old, git_dir=git_dir
+            ),
+            mutation_tracker=progress,
+        )
+    except AtomicTransactionError as exc:
+        raise FinalizationError(str(exc)) from exc
+
+
 def git_object_bytes(repo: str, git_dir: str, object_spec: str) -> bytes:
     """Read one Git object through an explicit size gate before allocation."""
     size = git(
@@ -428,112 +654,783 @@ def write_all(descriptor: int, content: bytes) -> None:
         offset += count
 
 
-def replace_worktree_candidate(
-    repo: str, target: str, expected_sha256: str, candidate: bytes
-) -> dict[str, object]:
-    """Atomically install one reviewed worktree variant with a rollback receipt."""
-    path = Path(repo) / target
-    original = stable_regular_bytes(path)
-    if hashlib.sha256(original).hexdigest() != expected_sha256:
-        raise FinalizationError("evidence worktree source changed after review")
-    before = path.lstat()
-    if not stat.S_ISREG(before.st_mode):
-        raise FinalizationError("evidence worktree target is not regular")
-    parent = path.parent
-    parent_fd = os.open(
-        parent,
-        os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
-    )
-    temporary_name = f".{path.name}.publication-{os.getpid()}.tmp"
-    temporary_fd = None
+def descriptor_bytes(descriptor: int) -> tuple[bytes, os.stat_result]:
+    """Read bounded regular bytes while retaining descriptor identity."""
+    before = os.fstat(descriptor)
+    if not stat.S_ISREG(before.st_mode) or before.st_size > MAX_TASK_BYTES:
+        raise FinalizationError("evidence worktree target is not a bounded regular file")
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    content = bytearray()
+    while chunk := os.read(descriptor, 1024 * 1024):
+        content.extend(chunk)
+        if len(content) > MAX_TASK_BYTES:
+            raise FinalizationError("evidence worktree target exceeded the size limit")
+    after = os.fstat(descriptor)
+    if (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mode,
+    ) != (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mode,
+    ):
+        raise FinalizationError("evidence worktree target changed while being read")
+    return bytes(content), after
+
+
+def descriptor_matches_candidate(
+    descriptor: int, receipt: dict[str, object]
+) -> bool:
+    """Bind rollback authority to this run's exact inode, bytes, size, and mode."""
     try:
-        temporary_fd = os.open(
-            temporary_name,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
-            stat.S_IMODE(before.st_mode),
+        content, metadata = descriptor_bytes(descriptor)
+    except FinalizationError:
+        return False
+    return (
+        (metadata.st_dev, metadata.st_ino) == tuple(receipt["candidate_identity"])
+        and metadata.st_size == receipt["candidate_size"]
+        and metadata.st_mode == receipt["candidate_mode"]
+        and hashlib.sha256(content).hexdigest() == receipt["candidate_sha256"]
+    )
+
+
+def descriptor_matches_original(
+    descriptor: int, receipt: dict[str, object]
+) -> bool:
+    """Bind the saved source to its exact pre-install inode and metadata."""
+    try:
+        content, metadata = descriptor_bytes(descriptor)
+    except FinalizationError:
+        return False
+    return (
+        (metadata.st_dev, metadata.st_ino) == tuple(receipt["original_identity"])
+        and metadata.st_size == receipt["original_size"]
+        and metadata.st_mode == receipt["original_full_mode"]
+        and metadata.st_mtime_ns == receipt["original_mtime_ns"]
+        and hashlib.sha256(content).hexdigest() == receipt["original_sha256"]
+    )
+
+
+def open_target_parent(
+    repo: str, target: str
+) -> tuple[int, str, tuple[tuple[int, int], ...]]:
+    """Open a target parent and return every traversed directory identity."""
+    relative = PurePosixPath(target)
+    raw_components = target.split("/")
+    if (
+        not target
+        or relative.is_absolute()
+        or not relative.parts
+        or tuple(raw_components) != relative.parts
+        or any(component in {"", ".", ".."} for component in raw_components)
+    ):
+        raise FinalizationError("evidence target is not a safe relative path")
+    flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+    opened: list[int] = []
+    identities: list[tuple[int, int]] = []
+    try:
+        opened.append(os.open(repo, flags))
+        metadata = os.fstat(opened[-1])
+        identities.append((metadata.st_dev, metadata.st_ino))
+        for component in relative.parts[:-1]:
+            opened.append(os.open(component, flags, dir_fd=opened[-1]))
+            metadata = os.fstat(opened[-1])
+            identities.append((metadata.st_dev, metadata.st_ino))
+    except OSError as exc:
+        for descriptor in reversed(opened):
+            os.close(descriptor)
+        raise FinalizationError(
+            "evidence target parent contains a symlink or non-directory"
+        ) from exc
+    parent_fd = opened.pop()
+    for descriptor in reversed(opened):
+        os.close(descriptor)
+    return parent_fd, relative.name, tuple(identities)
+
+
+def verify_target_parent_chain(
+    repo: str,
+    target: str,
+    expected: object,
+) -> None:
+    """Rebind a target to the reviewed Vault root and every parent inode."""
+    descriptor, _name, identities = open_target_parent(repo, target)
+    try:
+        normalized = tuple(tuple(item) for item in expected)  # type: ignore[arg-type]
+        if identities != normalized:
+            raise FinalizationError("evidence target parent chain changed")
+    except (TypeError, ValueError) as exc:
+        raise FinalizationError("evidence target parent receipt is invalid") from exc
+    finally:
+        os.close(descriptor)
+
+
+def open_receipt_quarantine(
+    receipt: dict[str, object]
+) -> tuple[int, int]:
+    """Reopen the private original quarantine and verify its directory inode."""
+    name = str(receipt["original_quarantine_name"])
+    if (
+        "/" in name
+        or "\\" in name
+        or any(ord(character) < 0x20 or ord(character) == 0x7F for character in name)
+        or not name.startswith(".publication-evidence-original-")
+    ):
+        raise FinalizationError("evidence quarantine receipt is invalid")
+    flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+    root_fd, root_chain = open_absolute_directory_chain(
+        str(receipt["original_quarantine_root"])
+    )
+    descriptor = -1
+    try:
+        root_metadata = os.fstat(root_fd)
+        if (root_metadata.st_dev, root_metadata.st_ino) != tuple(
+            receipt["original_quarantine_root_identity"]
+        ) or root_chain != tuple(
+            tuple(item) for item in receipt["original_quarantine_root_chain"]
+        ):
+            raise FinalizationError("evidence quarantine root changed")
+        descriptor = os.open(name, flags, dir_fd=root_fd)
+        metadata = os.fstat(descriptor)
+        named = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
+        if (
+            (metadata.st_dev, metadata.st_ino)
+            != tuple(receipt["original_quarantine_identity"])
+            or (named.st_dev, named.st_ino)
+            != tuple(receipt["original_quarantine_identity"])
+        ):
+            raise FinalizationError("evidence original quarantine changed")
+        return root_fd, descriptor
+    except Exception:
+        if descriptor >= 0:
+            os.close(descriptor)
+        os.close(root_fd)
+        raise
+
+
+def open_receipt_candidate_quarantine(
+    receipt: dict[str, object]
+) -> tuple[int, int]:
+    """Reopen the durable candidate reservation and bind its full root chain."""
+    name = str(receipt["candidate_quarantine_name"])
+    if (
+        "/" in name
+        or "\\" in name
+        or any(ord(character) < 0x20 or ord(character) == 0x7F for character in name)
+        or not name.startswith(".publication-evidence-candidate-")
+    ):
+        raise FinalizationError("evidence candidate quarantine receipt is invalid")
+    flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+    root_fd, root_chain = open_absolute_directory_chain(
+        str(receipt["original_quarantine_root"])
+    )
+    descriptor = -1
+    try:
+        root_metadata = os.fstat(root_fd)
+        if (
+            (root_metadata.st_dev, root_metadata.st_ino)
+            != tuple(receipt["original_quarantine_root_identity"])
+            or root_chain
+            != tuple(
+                tuple(item) for item in receipt["original_quarantine_root_chain"]
+            )
+        ):
+            raise FinalizationError("evidence candidate quarantine root changed")
+        descriptor = os.open(name, flags, dir_fd=root_fd)
+        metadata = os.fstat(descriptor)
+        named = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
+        if (
+            (metadata.st_dev, metadata.st_ino)
+            != tuple(receipt["candidate_quarantine_identity"])
+            or (named.st_dev, named.st_ino)
+            != tuple(receipt["candidate_quarantine_identity"])
+        ):
+            raise FinalizationError("evidence candidate quarantine changed")
+        return root_fd, descriptor
+    except Exception:
+        if descriptor >= 0:
+            os.close(descriptor)
+        os.close(root_fd)
+        raise
+
+
+def restore_quarantined_entry(
+    quarantine_fd: int,
+    parent_fd: int,
+    target_name: str,
+    entry_name: str = "artifact",
+) -> bool:
+    """Restore a quarantined entry only when no concurrent occupant exists."""
+    try:
+        rename_no_replace(quarantine_fd, entry_name, parent_fd, target_name)
+        fsync_after_rename(quarantine_fd, parent_fd)
+        return True
+    except FileExistsError:
+        return False
+
+
+def replace_worktree_candidate(
+    repo: str,
+    target: str,
+    expected_sha256: str,
+    candidate: bytes,
+    quarantine_root: str | None = None,
+    recovery_receipt: dict[str, object] | None = None,
+) -> dict[str, object]:
+    """Install a candidate after durably recording both recovery tombstones."""
+    parent_fd, target_name, parent_chain = open_target_parent(repo, target)
+    quarantine_root = quarantine_root or str(Path(repo) / ".git")
+    quarantine_root_fd = -1
+    original_fd = -1
+    candidate_fd = -1
+    installed_fd = -1
+    quarantine_fd = -1
+    candidate_quarantine_fd = -1
+    quarantine_name = f".publication-evidence-original-{secrets.token_hex(16)}"
+    candidate_quarantine_name = (
+        f".publication-evidence-candidate-{secrets.token_hex(16)}"
+    )
+    original_retained = False
+    detached_original = False
+    receipt = recovery_receipt if recovery_receipt is not None else {}
+    try:
+        quarantine_root_fd, quarantine_root_chain = open_absolute_directory_chain(
+            quarantine_root
+        )
+        if os.fstat(quarantine_root_fd).st_dev != os.fstat(parent_fd).st_dev:
+            raise FinalizationError(
+                "evidence quarantine is not on the target filesystem"
+            )
+        original_fd = os.open(
+            target_name,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
             dir_fd=parent_fd,
         )
-        os.fchmod(temporary_fd, stat.S_IMODE(before.st_mode))
-        write_all(temporary_fd, candidate)
-        os.fsync(temporary_fd)
-        current = path.lstat()
-        if (
-            current.st_dev,
-            current.st_ino,
-            current.st_size,
-            current.st_mtime_ns,
-            current.st_mode,
-        ) != (
+        original, before = descriptor_bytes(original_fd)
+        if hashlib.sha256(original).hexdigest() != expected_sha256:
+            raise FinalizationError("evidence worktree source changed after review")
+        original_contract = (
             before.st_dev,
             before.st_ino,
             before.st_size,
             before.st_mtime_ns,
             before.st_mode,
-        ) or stable_regular_bytes(path) != original:
+        )
+        current = os.stat(target_name, dir_fd=parent_fd, follow_symlinks=False)
+        current_bytes, current_descriptor_metadata = descriptor_bytes(original_fd)
+        if (
+            (
+                current.st_dev,
+                current.st_ino,
+                current.st_size,
+                current.st_mtime_ns,
+                current.st_mode,
+            )
+            != original_contract
+            or (current_descriptor_metadata.st_dev, current_descriptor_metadata.st_ino)
+            != (before.st_dev, before.st_ino)
+            or current_bytes != original
+        ):
             raise FinalizationError("evidence worktree target raced before replacement")
-        os.replace(temporary_name, path.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
-        temporary_name = ""
-        os.fsync(parent_fd)
-    finally:
-        if temporary_fd is not None:
-            os.close(temporary_fd)
-        if temporary_name:
+        verify_target_parent_chain(repo, target, parent_chain)
+
+        # Retain and describe the reviewed original before any candidate file is
+        # created.  Every subsequent fault can therefore emit actionable,
+        # descriptor-bound recovery evidence.
+        mkdir_durable(quarantine_name, 0o700, parent_fd=quarantine_root_fd)
+        quarantine_fd = os.open(
+            quarantine_name,
+            os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=quarantine_root_fd,
+        )
+        verify_rename_no_replace(quarantine_fd)
+        # Give the reviewed original a durable private name before this process
+        # removes its canonical name. A later pathname race can no longer turn
+        # the exact inode into an unnamed open descriptor.
+        link_no_replace_durable(
+            parent_fd, target_name, quarantine_fd, "artifact"
+        )
+        original_retained = True
+        held = os.stat("artifact", dir_fd=quarantine_fd, follow_symlinks=False)
+        held_bytes, held_descriptor_metadata = descriptor_bytes(original_fd)
+        if (
+            (held.st_dev, held.st_ino) != (before.st_dev, before.st_ino)
+            or (held_descriptor_metadata.st_dev, held_descriptor_metadata.st_ino)
+            != (before.st_dev, before.st_ino)
+            or held_descriptor_metadata.st_size != before.st_size
+            or held_descriptor_metadata.st_mode != before.st_mode
+            or held_bytes != original
+        ):
+            raise FinalizationError(
+                "evidence install raced before original reservation"
+            )
+        root_metadata = os.fstat(quarantine_root_fd)
+        quarantine_metadata = os.fstat(quarantine_fd)
+        receipt.update(
+            {
+                "repo": repo,
+                "target": target,
+                "original": original,
+                "original_mode": stat.S_IMODE(before.st_mode),
+                "original_full_mode": before.st_mode,
+                "original_mtime_ns": before.st_mtime_ns,
+                "original_sha256": hashlib.sha256(original).hexdigest(),
+                "original_identity": (before.st_dev, before.st_ino),
+                "original_size": before.st_size,
+                "original_quarantine_name": quarantine_name,
+                "original_quarantine_root": quarantine_root,
+                "original_quarantine_root_identity": (
+                    root_metadata.st_dev,
+                    root_metadata.st_ino,
+                ),
+                "original_quarantine_root_chain": quarantine_root_chain,
+                "original_quarantine_identity": (
+                    quarantine_metadata.st_dev,
+                    quarantine_metadata.st_ino,
+                ),
+                "target_parent_chain": parent_chain,
+                "original_restored": True,
+                "original_detached": False,
+                "canonical_candidate_installed": False,
+            }
+        )
+
+        mkdir_durable(
+            candidate_quarantine_name, 0o700, parent_fd=quarantine_root_fd
+        )
+        candidate_quarantine_fd = os.open(
+            candidate_quarantine_name,
+            os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=quarantine_root_fd,
+        )
+        verify_rename_no_replace(candidate_quarantine_fd)
+        candidate_quarantine_metadata = os.fstat(candidate_quarantine_fd)
+        candidate_fd = os.open(
+            "artifact",
+            os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            stat.S_IMODE(before.st_mode),
+            dir_fd=candidate_quarantine_fd,
+        )
+        os.fchmod(candidate_fd, stat.S_IMODE(before.st_mode))
+
+        def record_candidate_contract() -> None:
+            candidate_bytes, candidate_metadata = descriptor_bytes(candidate_fd)
+            receipt.update(
+                {
+                    "candidate_quarantine_name": candidate_quarantine_name,
+                    "candidate_quarantine_identity": (
+                        candidate_quarantine_metadata.st_dev,
+                        candidate_quarantine_metadata.st_ino,
+                    ),
+                    "rollback_candidate_quarantine_name": candidate_quarantine_name,
+                    "rollback_candidate_quarantine_identity": (
+                        candidate_quarantine_metadata.st_dev,
+                        candidate_quarantine_metadata.st_ino,
+                    ),
+                    "candidate_sha256": hashlib.sha256(candidate_bytes).hexdigest(),
+                    "candidate_identity": (
+                        candidate_metadata.st_dev,
+                        candidate_metadata.st_ino,
+                    ),
+                    "candidate_size": candidate_metadata.st_size,
+                    "candidate_mode": candidate_metadata.st_mode,
+                }
+            )
+
+        # Populate a valid empty candidate contract immediately. If a bounded
+        # write fails, replace it with the exact partial-file contract before
+        # propagating the original error.
+        record_candidate_contract()
+        try:
+            write_all(candidate_fd, candidate)
+            os.fsync(candidate_fd)
+            os.fsync(candidate_quarantine_fd)
+        except Exception:
             try:
-                os.unlink(temporary_name, dir_fd=parent_fd)
+                os.fsync(candidate_fd)
+                os.fsync(candidate_quarantine_fd)
+                record_candidate_contract()
+            except Exception:
+                pass
+            raise
+        record_candidate_contract()
+        candidate_metadata = os.fstat(candidate_fd)
+        candidate_sha256 = hashlib.sha256(candidate).hexdigest()
+        if receipt["candidate_sha256"] != candidate_sha256:
+            raise FinalizationError("evidence candidate write is incomplete")
+
+        rename_no_replace(parent_fd, target_name, quarantine_fd, "detached")
+        detached_original = True
+        receipt["original_restored"] = False
+        receipt["original_detached"] = True
+        fsync_after_rename(parent_fd, quarantine_fd)
+        detached = os.stat(
+            "detached", dir_fd=quarantine_fd, follow_symlinks=False
+        )
+        if (detached.st_dev, detached.st_ino) != (before.st_dev, before.st_ino):
+            if restore_quarantined_entry(
+                quarantine_fd, parent_fd, target_name, "detached"
+            ):
+                detached_original = False
+                receipt["original_restored"] = True
+                receipt["original_detached"] = False
+                raise FinalizationError(
+                    "evidence install raced; replacement was restored"
+                )
+            raise FinalizationError(
+                "evidence install raced; replacement and original were retained"
+            )
+        try:
+            detached_content, detached_contract = read_named_entry_contract(
+                quarantine_fd, "detached", max_bytes=before.st_size
+            )
+        except AtomicTransactionError as exc:
+            raise FinalizationError(
+                "evidence retained original changed after detachment"
+            ) from exc
+        if (
+            detached_contract[:5]
+            != [
+                before.st_dev,
+                before.st_ino,
+                before.st_size,
+                before.st_mode,
+                before.st_mtime_ns,
+            ]
+            or hashlib.sha256(detached_content).hexdigest() != expected_sha256
+        ):
+            raise FinalizationError(
+                "evidence retained original changed after detachment"
+            )
+        try:
+            # Keep the exact candidate under its private durable name for the
+            # full transaction.  Publishing a hardlink means a concurrent
+            # unlink/replace of the canonical path can never strand the only
+            # surviving inode on this process's open descriptor.
+            link_no_replace_durable(
+                candidate_quarantine_fd, "artifact", parent_fd, target_name
+            )
+        except OSError as exc:
+            if restore_quarantined_entry(
+                quarantine_fd, parent_fd, target_name, "detached"
+            ):
+                detached_original = False
+                receipt["original_restored"] = True
+                receipt["original_detached"] = False
+                raise FinalizationError(
+                    "evidence install collision; original was restored"
+                ) from exc
+            raise FinalizationError(
+                "evidence install collision; original was quarantined"
+            ) from exc
+        receipt["canonical_candidate_installed"] = True
+        installed_fd = os.open(
+            target_name,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=parent_fd,
+        )
+        installed = os.stat(target_name, dir_fd=parent_fd, follow_symlinks=False)
+        installed_bytes, installed_metadata = descriptor_bytes(installed_fd)
+        if (
+            (installed.st_dev, installed.st_ino)
+            != (candidate_metadata.st_dev, candidate_metadata.st_ino)
+            or (installed_metadata.st_dev, installed_metadata.st_ino)
+            != (candidate_metadata.st_dev, candidate_metadata.st_ino)
+            or installed_metadata.st_size != candidate_metadata.st_size
+            or installed_metadata.st_mode != candidate_metadata.st_mode
+            or hashlib.sha256(installed_bytes).hexdigest() != candidate_sha256
+        ):
+            raise FinalizationError(
+                "evidence candidate changed after installation; original retained"
+            )
+        verify_target_parent_chain(repo, target, parent_chain)
+        return receipt
+    finally:
+        if original_fd >= 0:
+            os.close(original_fd)
+        if candidate_fd >= 0:
+            os.close(candidate_fd)
+        if installed_fd >= 0:
+            os.close(installed_fd)
+        if quarantine_fd >= 0:
+            os.close(quarantine_fd)
+        if candidate_quarantine_fd >= 0:
+            os.close(candidate_quarantine_fd)
+        if not original_retained and quarantine_root_fd >= 0:
+            try:
+                os.rmdir(quarantine_name, dir_fd=quarantine_root_fd)
             except FileNotFoundError:
                 pass
+        if quarantine_root_fd >= 0:
+            os.close(quarantine_root_fd)
         os.close(parent_fd)
-    return {
-        "repo": repo,
-        "target": target,
-        "original": original,
-        "original_mode": stat.S_IMODE(before.st_mode),
-        "original_mtime_ns": before.st_mtime_ns,
-        "candidate_sha256": hashlib.sha256(candidate).hexdigest(),
-    }
+
+
+def finalize_worktree_candidate(receipt: dict[str, object]) -> None:
+    """Verify final state while retaining the original as a private tombstone."""
+    parent_fd, target_name, parent_chain = open_target_parent(
+        str(receipt["repo"]), str(receipt["target"])
+    )
+    quarantine_root_fd = -1
+    quarantine_fd = -1
+    candidate_quarantine_root_fd = -1
+    candidate_quarantine_fd = -1
+    candidate_fd = -1
+    retained_candidate_fd = -1
+    original_fd = -1
+    try:
+        if parent_chain != tuple(
+            tuple(item) for item in receipt["target_parent_chain"]
+        ):
+            raise FinalizationError("evidence target parent chain changed")
+        quarantine_root_fd, quarantine_fd = open_receipt_quarantine(receipt)
+        (
+            candidate_quarantine_root_fd,
+            candidate_quarantine_fd,
+        ) = open_receipt_candidate_quarantine(receipt)
+        original_fd = os.open(
+            "artifact",
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=quarantine_fd,
+        )
+        candidate_fd = os.open(
+            target_name,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=parent_fd,
+        )
+        retained_candidate_fd = os.open(
+            "artifact",
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=candidate_quarantine_fd,
+        )
+        original_named = os.stat(
+            "artifact", dir_fd=quarantine_fd, follow_symlinks=False
+        )
+        candidate_named = os.stat(
+            target_name, dir_fd=parent_fd, follow_symlinks=False
+        )
+        retained_candidate_named = os.stat(
+            "artifact", dir_fd=candidate_quarantine_fd, follow_symlinks=False
+        )
+        if (
+            (original_named.st_dev, original_named.st_ino)
+            != tuple(receipt["original_identity"])
+            or (candidate_named.st_dev, candidate_named.st_ino)
+            != tuple(receipt["candidate_identity"])
+            or (retained_candidate_named.st_dev, retained_candidate_named.st_ino)
+            != tuple(receipt["candidate_identity"])
+            or not descriptor_matches_original(original_fd, receipt)
+            or not descriptor_matches_candidate(candidate_fd, receipt)
+            or not descriptor_matches_candidate(retained_candidate_fd, receipt)
+        ):
+            raise FinalizationError(
+                "evidence transaction changed before final verification"
+            )
+        verify_target_parent_chain(
+            str(receipt["repo"]),
+            str(receipt["target"]),
+            receipt["target_parent_chain"],
+        )
+        os.fsync(quarantine_fd)
+        os.fsync(candidate_quarantine_fd)
+        os.fsync(quarantine_root_fd)
+        os.fsync(candidate_quarantine_root_fd)
+        os.fsync(parent_fd)
+    finally:
+        if original_fd >= 0:
+            os.close(original_fd)
+        if candidate_fd >= 0:
+            os.close(candidate_fd)
+        if retained_candidate_fd >= 0:
+            os.close(retained_candidate_fd)
+        if quarantine_fd >= 0:
+            os.close(quarantine_fd)
+        if candidate_quarantine_fd >= 0:
+            os.close(candidate_quarantine_fd)
+        if quarantine_root_fd >= 0:
+            os.close(quarantine_root_fd)
+        if candidate_quarantine_root_fd >= 0:
+            os.close(candidate_quarantine_root_fd)
+        os.close(parent_fd)
 
 
 def rollback_worktree_candidate(receipt: dict[str, object]) -> None:
-    """Restore only this run's exact uncommitted evidence candidate."""
-    repo = str(receipt["repo"])
-    target = str(receipt["target"])
-    path = Path(repo) / target
-    candidate = stable_regular_bytes(path)
-    if hashlib.sha256(candidate).hexdigest() != receipt["candidate_sha256"]:
-        raise FinalizationError("evidence rollback refused after target change")
-    parent_fd = os.open(
-        path.parent,
-        os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+    """Restore the original and retain the failed candidate as a tombstone."""
+    parent_fd, target_name, parent_chain = open_target_parent(
+        str(receipt["repo"]), str(receipt["target"])
     )
-    temporary_name = f".{path.name}.rollback-{os.getpid()}.tmp"
-    temporary_fd = None
+    canonical_candidate_fd = -1
+    retained_candidate_fd = -1
+    original_fd = -1
+    original_quarantine_root_fd = -1
+    original_quarantine_fd = -1
+    candidate_quarantine_root_fd = -1
+    candidate_quarantine_fd = -1
     try:
-        temporary_fd = os.open(
-            temporary_name,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
-            int(receipt["original_mode"]),
-            dir_fd=parent_fd,
+        (
+            original_quarantine_root_fd,
+            original_quarantine_fd,
+        ) = open_receipt_quarantine(receipt)
+        (
+            candidate_quarantine_root_fd,
+            candidate_quarantine_fd,
+        ) = open_receipt_candidate_quarantine(receipt)
+        if parent_chain != tuple(
+            tuple(item) for item in receipt["target_parent_chain"]
+        ):
+            raise FinalizationError("evidence rollback parent chain changed")
+        original_fd = os.open(
+            "artifact",
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=original_quarantine_fd,
         )
-        os.fchmod(temporary_fd, int(receipt["original_mode"]))
-        write_all(temporary_fd, bytes(receipt["original"]))
-        os.fsync(temporary_fd)
-        os.replace(temporary_name, path.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
-        temporary_name = ""
-        os.utime(
-            path.name,
-            ns=(int(receipt["original_mtime_ns"]), int(receipt["original_mtime_ns"])),
-            dir_fd=parent_fd,
-            follow_symlinks=False,
+        if not descriptor_matches_original(original_fd, receipt):
+            raise FinalizationError("evidence rollback original changed")
+        retained_candidate_fd = os.open(
+            "artifact",
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=candidate_quarantine_fd,
         )
+        held = os.stat(
+            "artifact", dir_fd=candidate_quarantine_fd, follow_symlinks=False
+        )
+        if (
+            (held.st_dev, held.st_ino) != tuple(receipt["candidate_identity"])
+            or not descriptor_matches_candidate(retained_candidate_fd, receipt)
+        ):
+            raise FinalizationError("evidence rollback candidate tombstone changed")
+        try:
+            canonical_candidate_fd = os.open(
+                target_name,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=parent_fd,
+            )
+        except FileNotFoundError:
+            canonical_candidate_fd = -1
+        if canonical_candidate_fd >= 0:
+            current = os.stat(
+                target_name, dir_fd=parent_fd, follow_symlinks=False
+            )
+            if (
+                (current.st_dev, current.st_ino)
+                != tuple(receipt["candidate_identity"])
+                or not descriptor_matches_candidate(
+                    canonical_candidate_fd, receipt
+                )
+            ):
+                raise FinalizationError(
+                    "evidence rollback refused after target replacement"
+                )
+            # Move the canonical name into the already durable reservation.
+            # The `artifact` hardlink remains the recovery contract even when
+            # this extra diagnostic name cannot be created.
+            rename_no_replace(
+                parent_fd, target_name, candidate_quarantine_fd, "worktree"
+            )
+            fsync_after_rename(parent_fd, candidate_quarantine_fd)
+            try:
+                moved_content, moved_contract = read_named_entry_contract(
+                    candidate_quarantine_fd,
+                    "worktree",
+                    max_bytes=int(receipt["candidate_size"]),
+                )
+                moved_matches = (
+                    moved_contract[:4]
+                    == [
+                        int(receipt["candidate_identity"][0]),
+                        int(receipt["candidate_identity"][1]),
+                        int(receipt["candidate_size"]),
+                        int(receipt["candidate_mode"]),
+                    ]
+                    and hashlib.sha256(moved_content).hexdigest()
+                    == receipt["candidate_sha256"]
+                )
+            except (AtomicTransactionError, KeyError, TypeError, ValueError):
+                moved_matches = False
+            if not moved_matches:
+                try:
+                    rename_no_replace(
+                        candidate_quarantine_fd,
+                        "worktree",
+                        parent_fd,
+                        target_name,
+                    )
+                    fsync_after_rename(candidate_quarantine_fd, parent_fd)
+                    raise FinalizationError(
+                        "evidence rollback retained candidate changed; "
+                        "replacement was restored"
+                    )
+                except FileExistsError as exc:
+                    raise FinalizationError(
+                        "evidence rollback retained candidate changed; "
+                        "replacement and tombstones were retained"
+                    ) from exc
+        try:
+            link_no_replace_durable(
+                original_quarantine_fd, "artifact", parent_fd, target_name
+            )
+            receipt["original_restored"] = True
+            receipt["original_detached"] = False
+            receipt["canonical_candidate_installed"] = False
+        except OSError as exc:
+            raise FinalizationError(
+                "evidence rollback collision; both tombstones were retained"
+            ) from exc
+        if not descriptor_matches_candidate(retained_candidate_fd, receipt):
+            raise FinalizationError(
+                "evidence rollback candidate changed in quarantine"
+            )
+        try:
+            restored_fd = os.open(
+                target_name,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=parent_fd,
+            )
+        except OSError as exc:
+            raise FinalizationError(
+                "evidence rollback original disappeared after restore"
+            ) from exc
+        try:
+            restored_named = os.stat(
+                target_name, dir_fd=parent_fd, follow_symlinks=False
+            )
+            if (
+                (restored_named.st_dev, restored_named.st_ino)
+                != tuple(receipt["original_identity"])
+                or not descriptor_matches_original(original_fd, receipt)
+                or not descriptor_matches_original(restored_fd, receipt)
+            ):
+                raise FinalizationError(
+                    "evidence rollback original changed after restore"
+                )
+        finally:
+            os.close(restored_fd)
+        verify_target_parent_chain(
+            str(receipt["repo"]),
+            str(receipt["target"]),
+            receipt["target_parent_chain"],
+        )
+        os.fsync(original_quarantine_root_fd)
+        os.fsync(candidate_quarantine_root_fd)
         os.fsync(parent_fd)
     finally:
-        if temporary_fd is not None:
-            os.close(temporary_fd)
-        if temporary_name:
-            try:
-                os.unlink(temporary_name, dir_fd=parent_fd)
-            except FileNotFoundError:
-                pass
+        if canonical_candidate_fd >= 0:
+            os.close(canonical_candidate_fd)
+        if retained_candidate_fd >= 0:
+            os.close(retained_candidate_fd)
+        if original_fd >= 0:
+            os.close(original_fd)
+        if original_quarantine_fd >= 0:
+            os.close(original_quarantine_fd)
+        if candidate_quarantine_fd >= 0:
+            os.close(candidate_quarantine_fd)
+        if candidate_quarantine_root_fd >= 0:
+            os.close(candidate_quarantine_root_fd)
+        if original_quarantine_root_fd >= 0:
+            os.close(original_quarantine_root_fd)
         os.close(parent_fd)
 
 
@@ -578,9 +1475,12 @@ def isolated_evidence_commit(
         env=clean_environment(),
         timeout=LOCAL_COMMAND_TIMEOUT_SECONDS,
     ).stdout.decode("ascii").strip()
-    descriptor, index_path = tempfile.mkstemp(prefix="evidence-index-", dir=str(directory))
-    os.close(descriptor)
-    os.unlink(index_path)
+    index_path = allocate_private_entry_path(
+        directory,
+        prefix=".evidence-index-work-",
+        entry_name="index",
+    )
+    index_contract = None
     try:
         git(repo, "read-tree", expected_head, git_dir=git_dir, index_file=index_path)
         git(
@@ -599,11 +1499,24 @@ def isolated_evidence_commit(
             repo, "commit-tree", tree, "-p", expected_head, git_dir=git_dir,
             publisher_identity=publisher_identity, input_text=message + "\n",
         ).stdout.strip()
+        index_content, index_identity = index_file_contract(Path(index_path))
+        index_contract = {
+            "sha256": hashlib.sha256(index_content).hexdigest(),
+            "identity": index_identity,
+        }
     finally:
         try:
-            os.unlink(index_path)
-        except FileNotFoundError:
-            pass
+            retain_path_no_replace(
+                index_path,
+                expected=index_contract,
+                label="evidence-only temporary index",
+                prefix=".evidence-index-retained-",
+                allow_missing=index_contract is None,
+            )
+        except AtomicTransactionError as cleanup_error:
+            raise FinalizationError(
+                f"evidence-only index cleanup failed closed: {cleanup_error}"
+            )
     if git(
         repo, "show", "-s", "--format=%P", commit, git_dir=git_dir
     ).stdout.strip() != expected_head:
@@ -619,11 +1532,132 @@ def isolated_evidence_commit(
     return commit, head_blob, index_blob, index_candidate
 
 
+def evidence_recovery(
+    receipt: dict[str, object],
+    head_updated: bool,
+    index_updated: bool,
+) -> dict[str, object]:
+    """Expose bounded, repo-relative tombstone data for manual recovery."""
+    original_root_fd = -1
+    original_quarantine_fd = -1
+    candidate_root_fd = -1
+    candidate_quarantine_fd = -1
+    original_fd = -1
+    candidate_fd = -1
+    try:
+        original_root_fd, original_quarantine_fd = open_receipt_quarantine(receipt)
+        candidate_root_fd, candidate_quarantine_fd = (
+            open_receipt_candidate_quarantine(receipt)
+        )
+        original_fd = os.open(
+            "artifact",
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=original_quarantine_fd,
+        )
+        candidate_fd = os.open(
+            "artifact",
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=candidate_quarantine_fd,
+        )
+        if not descriptor_matches_original(
+            original_fd, receipt
+        ) or not descriptor_matches_candidate(candidate_fd, receipt):
+            raise FinalizationError("evidence recovery tombstone contract changed")
+    finally:
+        for descriptor in (
+            original_fd,
+            candidate_fd,
+            original_quarantine_fd,
+            candidate_quarantine_fd,
+            original_root_fd,
+            candidate_root_fd,
+        ):
+            if descriptor >= 0:
+                os.close(descriptor)
+    target = str(receipt["target"])
+    relative = PurePosixPath(target)
+    if (
+        relative.is_absolute()
+        or str(relative) != target
+        or not relative.parts
+        or any(part in {"", ".", ".."} for part in relative.parts)
+        or any(ord(character) < 0x20 or ord(character) == 0x7F for character in target)
+        or "\\" in target
+    ):
+        raise FinalizationError("evidence recovery target is not repo-relative")
+    base_head = str(receipt["base_head"])
+    candidate_head = str(receipt["candidate_head"])
+    if not re.fullmatch(r"[0-9a-f]{40}", base_head) or not re.fullmatch(
+        r"[0-9a-f]{40}", candidate_head
+    ):
+        raise FinalizationError("evidence recovery HEAD contract is invalid")
+    recovery: dict[str, object] = {
+        "target_path": target,
+        "quarantine_scope": "agents_git_dir",
+        "quarantine_root_identity": list(
+            receipt["original_quarantine_root_identity"]
+        ),
+        "base_head": base_head,
+        "candidate_head": candidate_head,
+        "original_restored": bool(receipt.get("original_restored", False)),
+        "original_tombstone": {
+            "directory": str(receipt["original_quarantine_name"]),
+            "directory_identity": list(
+                receipt["original_quarantine_identity"]
+            ),
+            "entry": "artifact",
+            "identity": list(receipt["original_identity"]),
+            "sha256": str(receipt["original_sha256"]),
+            "size": int(receipt["original_size"]),
+            "mode": int(receipt["original_full_mode"]),
+        },
+        "candidate": {
+            "identity": list(receipt["candidate_identity"]),
+            "sha256": str(receipt["candidate_sha256"]),
+            "size": int(receipt["candidate_size"]),
+            "mode": int(receipt["candidate_mode"]),
+        },
+        "head_updated": head_updated,
+        "index_updated": index_updated,
+    }
+    rollback_name = receipt.get("rollback_candidate_quarantine_name")
+    if isinstance(rollback_name, str):
+        if (
+            "/" in rollback_name
+            or "\\" in rollback_name
+            or any(
+                ord(character) < 0x20 or ord(character) == 0x7F
+                for character in rollback_name
+            )
+            or not rollback_name.startswith(
+                ".publication-evidence-candidate-"
+            )
+        ):
+            raise FinalizationError(
+                "evidence recovery candidate tombstone is invalid"
+            )
+        recovery["rollback_candidate_tombstone"] = {
+            "directory": rollback_name,
+            "directory_identity": list(
+                receipt["rollback_candidate_quarantine_identity"]
+            ),
+            "entry": "artifact",
+            "identity": list(receipt["candidate_identity"]),
+            "sha256": str(receipt["candidate_sha256"]),
+            "size": int(receipt["candidate_size"]),
+            "mode": int(receipt["candidate_mode"]),
+        }
+    return recovery
+
+
 def partial_result(
     runtime: dict[str, str],
     pre: dict[str, object],
     initial: dict[str, object],
     reason: str,
+    receipt: dict[str, object] | None = None,
+    head_updated: bool = False,
+    index_updated: bool = False,
 ) -> dict[str, object]:
     """Capture actual local/remote evidence state after any failure."""
     finalization_commits: list[str] = []
@@ -706,7 +1740,26 @@ def partial_result(
             "next_action": reason,
         }
     )
+    if receipt is not None:
+        result["evidence_recovery"] = evidence_recovery(
+            receipt, head_updated, index_updated
+        )
     return result
+
+
+def publish_success_result_after_cleanup(
+    output: Path,
+    result: dict[str, object],
+    shared_index_candidate: tuple[str, dict[str, object]],
+) -> None:
+    """Publish success only after the private shared-index entry is retained."""
+    retain_path_no_replace(
+        shared_index_candidate[0],
+        expected=shared_index_candidate[1],
+        label="evidence shared-index candidate",
+        prefix=".evidence-shared-index-retained-",
+    )
+    output.write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
 
 
 def main(argv: list[str]) -> int:
@@ -724,6 +1777,9 @@ def main(argv: list[str]) -> int:
     initial: dict[str, object] = {}
     worktree_receipt: dict[str, object] | None = None
     head_updated = False
+    index_updated = False
+    mutation_progress = {"head_updated": False, "index_updated": False}
+    shared_index_candidate: tuple[str, dict[str, object]] | None = None
     try:
         runtime = json.loads(stable_regular_bytes(Path(argv[1])))
         pre = json.loads(stable_regular_bytes(Path(argv[2])))
@@ -765,35 +1821,43 @@ def main(argv: list[str]) -> int:
         evidence_commit, _head_blob, index_blob, index_candidate = (
             isolated_evidence_commit(runtime, plan, publisher_identity, output.parent)
         )
+        shared_index_candidate = prepare_shared_index_candidate(
+            repo,
+            str(runtime["agents_git_dir"]),
+            baseline["agents_vault"],
+            target,
+            index_blob,
+            output.parent,
+        )
         # Candidate construction mutates only the object database. Rebind both
         # Vaults immediately before the first worktree/ref/index mutation.
         if capture_complete(argv[1]) != baseline:
             raise FinalizationError("Vault state changed before evidence commit")
         worktree_candidate = private_candidate(plan, "worktree")
+        worktree_receipt = {
+            "base_head": str(plan["base_head"]),
+            "candidate_head": evidence_commit,
+        }
         worktree_receipt = replace_worktree_candidate(
             repo,
             target,
             str(plan["worktree_source_sha256"]),
             worktree_candidate,
+            str(runtime["agents_git_dir"]),
+            recovery_receipt=worktree_receipt,
         )
-        git(
+        publish_evidence_head_and_index(
             repo,
-            "update-ref",
-            "HEAD",
-            evidence_commit,
+            str(runtime["agents_git_dir"]),
+            baseline["agents_vault"],
             str(plan["base_head"]),
-            git_dir=runtime["agents_git_dir"],
+            evidence_commit,
+            shared_index_candidate[0],
+            shared_index_candidate[1],
+            mutation_progress,
         )
-        head_updated = True
-        git(
-            repo,
-            "update-index",
-            "--add",
-            "--cacheinfo",
-            f"100644,{index_blob},{target}",
-            git_dir=runtime["agents_git_dir"],
-        )
-        worktree_receipt = None
+        head_updated = mutation_progress["head_updated"]
+        index_updated = mutation_progress["index_updated"]
         committed_state = capture_complete(argv[1])
         if committed_state["user_vault"] != baseline["user_vault"]:
             raise FinalizationError("User Vault changed during evidence commit")
@@ -809,6 +1873,7 @@ def main(argv: list[str]) -> int:
             raise FinalizationError("evidence commit HEAD mismatch")
         if control_digest(repo) != pre["agents_vault"]["git_control_sha256"]:
             raise FinalizationError("Git config or hooks changed during finalization")
+        finalize_worktree_candidate(worktree_receipt)
         before_remote = remote_head(
             repo, runtime["agents_remote_url"], runtime["agents_git_dir"]
         )
@@ -854,19 +1919,35 @@ def main(argv: list[str]) -> int:
                 "clean": clean,
             }
         )
+        user = dict(initial["user_vault"])
+        user["clean"] = user_clean
         final = dict(initial)
         final.update(
             {
                 "outcome": "success",
                 "phase": "evidence_finalization",
                 "agents_vault": agents,
+                "user_vault": user,
                 "evidence_finalization_commit": evidence_commit,
+                "evidence_recovery": evidence_recovery(
+                    worktree_receipt, head_updated, index_updated
+                ),
                 "next_action": None,
             }
         )
-        output.write_text(json.dumps(final, ensure_ascii=False), encoding="utf-8")
+        if shared_index_candidate is None:
+            raise FinalizationError("evidence shared-index candidate is unavailable")
+        completed_shared_index_candidate = shared_index_candidate
+        # Ownership leaves this scope before retention starts. If the pathname
+        # was replaced, the helper retains the third-party inode and raises;
+        # the generic finally block must not attempt to claim it a second time.
+        shared_index_candidate = None
+        publish_success_result_after_cleanup(
+            output, final, completed_shared_index_candidate
+        )
         return 0
     except (
+        AtomicTransactionError,
         FinalizationError,
         KeyError,
         OSError,
@@ -876,13 +1957,27 @@ def main(argv: list[str]) -> int:
         subprocess.SubprocessError,
         TransportError,
     ) as exc:
-        if worktree_receipt is not None and not head_updated:
-            try:
-                rollback_worktree_candidate(worktree_receipt)
-            except Exception as rollback_exc:
-                exc = FinalizationError(
-                    f"{exc}; evidence worktree rollback failed: {rollback_exc}"
-                )
+        head_updated = mutation_progress["head_updated"]
+        index_updated = mutation_progress["index_updated"]
+        recovery_receipt = (
+            worktree_receipt
+            if isinstance(worktree_receipt, dict)
+            and "original_identity" in worktree_receipt
+            and "candidate_identity" in worktree_receipt
+            else None
+        )
+        if recovery_receipt is not None and not head_updated:
+            if recovery_receipt.get("canonical_candidate_installed") or recovery_receipt.get(
+                "original_detached"
+            ):
+                try:
+                    rollback_worktree_candidate(recovery_receipt)
+                except Exception as rollback_exc:
+                    exc = FinalizationError(
+                        f"{exc}; evidence worktree rollback failed: {rollback_exc}"
+                    )
+            else:
+                recovery_receipt["original_restored"] = True
         print(f"evidence finalization failed:{exc}", file=sys.stderr)
         if runtime and pre and initial:
             try:
@@ -893,6 +1988,9 @@ def main(argv: list[str]) -> int:
                             pre,
                             initial,
                             f"Repair evidence finalization without force: {exc}",
+                            recovery_receipt,
+                            head_updated,
+                            index_updated,
                         ),
                         ensure_ascii=False,
                     ),
@@ -901,6 +1999,19 @@ def main(argv: list[str]) -> int:
             except Exception as capture_exc:
                 print(f"could not capture partial state:{capture_exc}", file=sys.stderr)
         return 75
+    finally:
+        if shared_index_candidate is not None:
+            try:
+                retain_path_no_replace(
+                    shared_index_candidate[0],
+                    expected=shared_index_candidate[1],
+                    label="evidence shared-index candidate",
+                    prefix=".evidence-shared-index-retained-",
+                )
+            except AtomicTransactionError as cleanup_error:
+                raise FinalizationError(
+                    f"evidence shared-index cleanup failed closed: {cleanup_error}"
+                )
 
 
 if __name__ == "__main__":

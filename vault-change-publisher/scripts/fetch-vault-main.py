@@ -41,39 +41,42 @@ def clean_environment() -> dict[str, str]:
 def fetch_main(repo: str, git_dir: str, remote_url: str) -> None:
     """Fetch one literal remote main into the exact tracking ref without force."""
     fetched = None
+    last_error: Exception | None = None
     with IsolatedGitTransport(git_dir) as transport:
         for attempt in range(3):
-            before = transport.run(
-                "ls-remote", "--exit-code", remote_url, "refs/heads/main"
-            ).stdout.split()
-            if len(before) != 2:
-                raise FetchError("could not resolve fixed remote main")
-            result = transport.run(
-                "fetch",
-                "--no-tags",
-                "--no-recurse-submodules",
-                "--no-write-fetch-head",
-                remote_url,
-                "refs/heads/main:refs/remotes/origin/main",
-                check=False,
-            )
-            if result.returncode != 0:
-                if attempt < 2:
-                    time.sleep(0.2)
-                continue
-            candidate = transport.run(
-                "rev-parse", "--verify", "refs/remotes/origin/main"
-            ).stdout.strip()
-            after = transport.run(
-                "ls-remote", "--exit-code", remote_url, "refs/heads/main"
-            ).stdout.split()
-            if len(after) == 2 and before[0] == candidate == after[0]:
-                fetched = candidate
-                break
+            try:
+                before = transport.run(
+                    "ls-remote", "--exit-code", remote_url, "refs/heads/main"
+                ).stdout.split()
+                if len(before) != 2:
+                    raise FetchError("could not resolve fixed remote main")
+                result = transport.run(
+                    "fetch",
+                    "--no-tags",
+                    "--no-recurse-submodules",
+                    "--no-write-fetch-head",
+                    remote_url,
+                    "refs/heads/main:refs/remotes/origin/main",
+                    check=False,
+                )
+                if result.returncode != 0:
+                    raise FetchError("fixed main fetch command failed")
+                candidate = transport.run(
+                    "rev-parse", "--verify", "refs/remotes/origin/main"
+                ).stdout.strip()
+                after = transport.run(
+                    "ls-remote", "--exit-code", remote_url, "refs/heads/main"
+                ).stdout.split()
+                if len(after) == 2 and before[0] == candidate == after[0]:
+                    fetched = candidate
+                    break
+                last_error = FetchError("fixed main fetch did not stabilize")
+            except (FetchError, subprocess.SubprocessError, TransportError) as exc:
+                last_error = exc
             if attempt < 2:
                 time.sleep(0.2)
     if fetched is None:
-        raise FetchError("fixed main fetch did not stabilize")
+        raise FetchError("fixed main fetch did not stabilize") from last_error
     local_command = [
         "git",
         f"--git-dir={git_dir}",

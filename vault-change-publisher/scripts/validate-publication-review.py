@@ -6,8 +6,10 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import stat
 import sys
+from copy import deepcopy
 from pathlib import Path
 from pathlib import PurePosixPath
 from typing import Any, Optional
@@ -15,6 +17,22 @@ from typing import Any, Optional
 
 class ReviewError(RuntimeError):
     """Represent a review result that cannot authorize mutation."""
+
+
+VOLATILE_INDEX_FIELDS = frozenset({"index_sha256", "index_identity"})
+
+
+def same_semantic_vault_state(
+    left: object, right: object
+) -> bool:
+    """Compare Git/Vault meaning while ignoring index stat-cache serialization."""
+    if not isinstance(left, dict) or not isinstance(right, dict):
+        return False
+    return {
+        key: value for key, value in left.items() if key not in VOLATILE_INDEX_FIELDS
+    } == {
+        key: value for key, value in right.items() if key not in VOLATILE_INDEX_FIELDS
+    }
 
 
 def sha256(path: Path) -> str:
@@ -211,6 +229,236 @@ def validate_dirty_snapshots(
     return manifest
 
 
+def normalize_own_only_residuals(
+    review: dict[str, object],
+    context: dict[str, object],
+    pre: dict[str, object],
+    materialization: dict[str, object],
+) -> tuple[dict[str, object], dict[str, object]]:
+    """Complete only own-only residual structure from sealed snapshot identity.
+
+    The model still owns the core-quality and publication-mode decisions.  This
+    projection prevents a large dirty-path set from becoming a model copying
+    task after it has already selected ``own_only`` with a deferred residual
+    review.  Supplied reasons are retained only for exact captured paths.
+    """
+    result = deepcopy(review)
+    receipt: dict[str, object] = {}
+    generic_reason = (
+        "pre-existing dirty path excluded unchanged because "
+        "publication_mode_hint requires own_only"
+    )
+    for key in ("agents_vault", "user_vault"):
+        manifest = result.get(key)
+        state = pre.get(key)
+        if not isinstance(manifest, dict) or not isinstance(state, dict):
+            raise ReviewError("own-only normalization input is malformed")
+        should_normalize = (
+            manifest.get("publication_mode") == "own_only"
+            and manifest.get("core_review_status") == "quality_ok"
+            and manifest.get("review_or_validation_status") == "quality_ok"
+            and manifest.get("residual_review_status") == "deferred"
+        )
+        if not should_normalize:
+            receipt[key] = {"normalized": False, "dirty_path_count": 0}
+            continue
+
+        dirty_paths = state.get("dirty_paths")
+        if (
+            not isinstance(dirty_paths, list)
+            or any(not isinstance(path, str) or not path for path in dirty_paths)
+            or len(dirty_paths) != len(set(dirty_paths))
+        ):
+            raise ReviewError("captured dirty paths are not unique strings")
+        ordered_paths = sorted(dirty_paths)
+        dirty_set = set(ordered_paths)
+
+        supplied_lists: dict[str, list[str]] = {}
+        for field in ("excluded_paths", "unrelated_dirty_paths"):
+            supplied = manifest.get(field)
+            if (
+                not isinstance(supplied, list)
+                or any(not isinstance(path, str) for path in supplied)
+                or len(supplied) != len(set(supplied))
+                or not set(supplied).issubset(dirty_set)
+            ):
+                raise ReviewError(
+                    f"own-only {field} contains duplicate or foreign paths"
+                )
+            supplied_lists[field] = supplied
+
+        supplied_deferred = manifest.get("deferred_cleanup")
+        if not isinstance(supplied_deferred, list):
+            raise ReviewError("own-only deferred cleanup is not a list")
+        reasons: dict[str, str] = {}
+        for item in supplied_deferred:
+            if not isinstance(item, dict):
+                raise ReviewError("own-only deferred cleanup entry is malformed")
+            path = item.get("path")
+            reason = item.get("reason")
+            if (
+                not isinstance(path, str)
+                or path not in dirty_set
+                or path in reasons
+                or not isinstance(reason, str)
+                or not reason
+            ):
+                raise ReviewError(
+                    "own-only deferred cleanup contains duplicate or foreign paths"
+                )
+            reasons[path] = reason
+
+        materialized_vaults = materialization.get("vaults")
+        if not isinstance(materialized_vaults, dict):
+            raise ReviewError("own-only materialization manifest is malformed")
+        vault_entries = materialized_vaults.get(key)
+        if not isinstance(vault_entries, list) or len(vault_entries) != len(
+            ordered_paths
+        ):
+            raise ReviewError("own-only materialized residual count mismatch")
+        materialized_by_path: dict[str, dict[str, object]] = {}
+        for entry in vault_entries:
+            if not isinstance(entry, dict) or entry.get("path") in materialized_by_path:
+                raise ReviewError("own-only materialized residual identity is invalid")
+            path = entry.get("path")
+            if not isinstance(path, str) or path not in dirty_set:
+                raise ReviewError("own-only materialized residual path is foreign")
+            materialized_by_path[path] = entry
+
+        original_reason_count = len(reasons)
+        for path in ordered_paths:
+            if path in reasons:
+                continue
+            entry = materialized_by_path[path]
+            materialization_reason = entry.get("materialization_reason")
+            reasons[path] = (
+                materialization_reason
+                if isinstance(materialization_reason, str) and materialization_reason
+                else generic_reason
+            )
+
+        manifest["excluded_paths"] = ordered_paths
+        manifest["unrelated_dirty_paths"] = ordered_paths
+        manifest["deferred_cleanup"] = [
+            {"path": path, "reason": reasons[path]} for path in ordered_paths
+        ]
+        receipt[key] = {
+            "normalized": True,
+            "dirty_path_count": len(ordered_paths),
+            "supplied_excluded_count": len(supplied_lists["excluded_paths"]),
+            "supplied_unrelated_count": len(
+                supplied_lists["unrelated_dirty_paths"]
+            ),
+            "supplied_reason_count": original_reason_count,
+            "filled_reason_count": len(ordered_paths) - original_reason_count,
+        }
+    return result, receipt
+
+
+def write_exclusive_json(path: Path, value: object) -> bytes:
+    """Create one immutable runner-owned JSON result beside its raw input."""
+    content = (
+        json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        + "\n"
+    ).encode("utf-8")
+    directory_flags = (
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    )
+    directory_fd = os.open(path.parent, directory_flags)
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            path.name,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=directory_fd,
+        )
+        view = memoryview(content)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise ReviewError("could not write normalized publication review")
+            view = view[written:]
+        os.fsync(descriptor)
+        os.fsync(directory_fd)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        os.close(directory_fd)
+    return content
+
+
+def canonicalize_own_only_main(argv: list[str]) -> int:
+    """Write a sealed structural projection while preserving the raw review."""
+    if len(argv) != 7:
+        print(
+            "usage: validate-publication-review.py --canonicalize-own-only "
+            "RAW_REVIEW CONTEXT PRE_STATE OUTPUT RECEIPT",
+            file=sys.stderr,
+        )
+        return 64
+    try:
+        raw_path = Path(argv[2])
+        context_path = Path(argv[3])
+        pre_path = Path(argv[4])
+        output_path = Path(argv[5])
+        receipt_path = Path(argv[6])
+        if not (
+            raw_path.parent == output_path.parent == receipt_path.parent
+            and len({raw_path.name, output_path.name, receipt_path.name}) == 3
+        ):
+            raise ReviewError("review normalization outputs are not sibling paths")
+        raw_bytes = read_regular_nofollow(raw_path)
+        context_bytes = read_regular_nofollow(context_path)
+        pre_bytes = read_regular_nofollow(pre_path)
+        raw = json.loads(raw_bytes)
+        context = json.loads(context_bytes)
+        pre = json.loads(pre_bytes)
+        context_digest = hashlib.sha256(context_bytes).hexdigest()
+        if raw.get("publication_context_sha256") != context_digest:
+            raise ReviewError("raw review context digest mismatch")
+        if pre != context.get("pre_collection_state"):
+            raise ReviewError("normalization pre-state differs from reviewed context")
+        materialization = validate_dirty_snapshots(context, pre)
+        normalized, normalization = normalize_own_only_residuals(
+            raw, context, pre, materialization
+        )
+        normalized_bytes = (
+            json.dumps(
+                normalized,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode("utf-8")
+        receipt = {
+            "version": 1,
+            "raw_review_sha256": hashlib.sha256(raw_bytes).hexdigest(),
+            "canonical_review_sha256": hashlib.sha256(normalized_bytes).hexdigest(),
+            "publication_context_sha256": context_digest,
+            "vaults": normalization,
+        }
+        actual_bytes = write_exclusive_json(output_path, normalized)
+        if actual_bytes != normalized_bytes:
+            raise ReviewError("normalized publication review encoding drifted")
+        write_exclusive_json(receipt_path, receipt)
+    except (
+        KeyError,
+        OSError,
+        TypeError,
+        ValueError,
+        json.JSONDecodeError,
+        ReviewError,
+    ) as exc:
+        print(f"publication review normalization failed:{exc}", file=sys.stderr)
+        return 75
+    return 0
+
+
 def relative_target(root: str, target: str) -> str:
     """Return a normalized repo-relative planned target."""
     root_path = Path(root).resolve()
@@ -227,6 +475,92 @@ def relative_target(root: str, target: str) -> str:
     return str(relative)
 
 
+def validate_carried_commit_result(
+    context: dict[str, object],
+    pre: dict[str, object],
+    plan: dict[str, object],
+) -> set[str]:
+    """Bind earlier same-run progress to the new per-Vault review snapshot."""
+    if (
+        "carried_commit_result" not in context
+        and "carried_commit_result_file" not in context
+        and "carried_commit_result_sha256" not in context
+    ):
+        return set()
+    carry_path = context.get("carried_commit_result_file")
+    if not isinstance(carry_path, str) or not carry_path:
+        raise ReviewError("carried commit result path is missing")
+    carried_bytes = read_regular_nofollow(Path(carry_path))
+    try:
+        carried = json.loads(carried_bytes)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ReviewError("carried commit result is unreadable") from exc
+    if carried != context.get("carried_commit_result"):
+        raise ReviewError("carried commit result differs from the reviewed context")
+    carried_digest = context.get("carried_commit_result_sha256")
+    if carried is None:
+        if carried_digest is not None:
+            raise ReviewError("empty carried progress unexpectedly has a digest")
+        return set()
+    if (
+        not isinstance(carried, dict)
+        or hashlib.sha256(carried_bytes).hexdigest() != carried_digest
+        or carried.get("outcome") != "partial_publication"
+        or carried.get("phase") != "local_commit"
+        or carried.get("daily_pipeline_status") != "complete"
+        or not isinstance(carried.get("resumable_state"), dict)
+    ):
+        raise ReviewError("carried commit result is not resumable same-run progress")
+
+    completed: set[str] = set()
+    definitions = (
+        ("agents_vault", "advisory_path", "advisory_target", "agents_vault_root"),
+        ("user_vault", "summary_path", "summary_target", "user_vault_root"),
+    )
+    for key, result_path_key, plan_key, root_key in definitions:
+        result_path = carried.get(result_path_key)
+        hinted = context["publication_mode_hint"][key].get(
+            "artifact_already_committed"
+        )
+        if not isinstance(result_path, str):
+            if result_path is not None or hinted is not False:
+                raise ReviewError("carried Vault hint disagrees with publication progress")
+            continue
+        if hinted is not True or plan.get(plan_key) != result_path:
+            raise ReviewError("carried artifact target differs from the new plan")
+        claimed = carried.get(key)
+        resumable = carried["resumable_state"].get(key)
+        state = pre.get(key)
+        if not all(isinstance(value, dict) for value in (claimed, resumable, state)):
+            raise ReviewError("carried Vault state is malformed")
+        commits = claimed.get("commit_hashes")
+        if (
+            claimed.get("commit_status") != "complete"
+            or not isinstance(commits, list)
+            or not commits
+            or any(
+                not isinstance(commit, str)
+                or re.fullmatch(r"[0-9a-f]{40}", commit) is None
+                for commit in commits
+            )
+            or not same_semantic_vault_state(resumable, state)
+            or claimed.get("local_head") != state.get("local_head")
+            or claimed.get("post_dirty_digest") != state.get("dirty_digest")
+        ):
+            raise ReviewError("carried Vault no longer matches its resumable state")
+        relative = relative_target(str(context["runtime"][root_key]), result_path)
+        captured_commits = {
+            commit.get("commit"): commit for commit in state.get("local_commits", [])
+        }
+        if any(commit not in captured_commits for commit in commits) or not any(
+            relative in captured_commits[commit].get("changed_paths", [])
+            for commit in commits
+        ):
+            raise ReviewError("carried artifact commit is absent from local-only history")
+        completed.add(key)
+    return completed
+
+
 def validate_manifest(
     manifest: dict[str, object],
     state: dict[str, object],
@@ -238,6 +572,7 @@ def validate_manifest(
     mode_hint: dict[str, object],
     materialized_dirty: Optional[list[dict[str, object]]] = None,
     materialized_commits: Optional[list[dict[str, object]]] = None,
+    carried: bool = False,
 ) -> None:
     """Bind one layered review manifest to state and one planned artifact."""
     if manifest["repo_root"] != repo_root or manifest["task_id"] != task_id:
@@ -328,6 +663,10 @@ def validate_manifest(
         raise ReviewError("typed validation evidence mismatch")
     mode = declared_mode
     required_mode = mode_hint["required_mode"]
+    if mode_hint.get("artifact_already_committed", False) is not carried:
+        raise ReviewError("carried artifact hint is inconsistent")
+    if carried and (mode != "own_only" or required_mode != "own_only"):
+        raise ReviewError("carried artifact must remain in own_only mode")
     rank = {"sweep": 0, "own_only": 1, "blocked": 2}
     if mode not in rank or required_mode not in rank or rank[mode] < rank[required_mode]:
         raise ReviewError("review mode weakens the deterministic mode hint")
@@ -412,6 +751,8 @@ def validate_manifest(
             expected_owned.add(expected_evidence)
         if sorted(manifest["owned_paths"]) != sorted(expected_owned):
             raise ReviewError("own_only contains a non-owned path")
+        expected_commit_required = not carried
+        expected_grouped = [] if carried else [artifact_target]
         if (
             manifest["approved_dirty_entries"]
             or sorted(manifest["excluded_paths"]) != dirty_paths
@@ -421,8 +762,8 @@ def validate_manifest(
             or manifest["core_review_status"] != "quality_ok"
             or evidence["file_guard"] != "passed"
             or evidence["secret_scan"] != "passed"
-            or manifest["commit_required"] is not True
-            or grouped != [artifact_target]
+            or manifest["commit_required"] is not expected_commit_required
+            or grouped != expected_grouped
         ):
             raise ReviewError("own_only manifest does not defer the exact residual scope")
     else:
@@ -467,6 +808,8 @@ def validate_root_contract(review: dict[str, Any]) -> None:
 
 def main(argv: list[str]) -> int:
     """Validate the approved review and return a fail-closed status."""
+    if len(argv) > 1 and argv[1] == "--canonicalize-own-only":
+        return canonicalize_own_only_main(argv)
     if len(argv) != 7:
         print(
             "usage: validate-publication-review.py REVIEW CONTEXT PRE_STATE PLAN AUTH_SHA REVIEW_SHA",
@@ -492,6 +835,7 @@ def main(argv: list[str]) -> int:
         if sha256_regular_nofollow(Path(context["authorization_task"])) != argv[5]:
             raise ReviewError("authorization snapshot digest mismatch")
         materialization = validate_dirty_snapshots(context, pre)
+        carried_vaults = validate_carried_commit_result(context, pre, plan)
         manifest = context["publication_manifest"]["artifact_manifest"]
         gitleaks_version = context["runtime"]["gitleaks_version"]
         validate_manifest(
@@ -509,6 +853,7 @@ def main(argv: list[str]) -> int:
             context["publication_mode_hint"]["agents_vault"],
             materialization["vaults"]["agents_vault"],
             materialization["local_commits"]["agents_vault"],
+            "agents_vault" in carried_vaults,
         )
         validate_manifest(
             review["user_vault"],
@@ -525,6 +870,7 @@ def main(argv: list[str]) -> int:
             context["publication_mode_hint"]["user_vault"],
             materialization["vaults"]["user_vault"],
             materialization["local_commits"]["user_vault"],
+            "user_vault" in carried_vaults,
         )
         validate_root_contract(review)
     except (

@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import hashlib
 import selectors
+import stat
 import subprocess
 import sys
 import os
@@ -126,6 +127,39 @@ def file_sha256(path: Path) -> str:
     finally:
         os.close(descriptor)
     return digest.hexdigest()
+
+
+def stable_index_snapshot(path: Path) -> tuple[str, list[int]]:
+    """Hash one index through the same descriptor that supplies its identity."""
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    digest = hashlib.sha256()
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise ValueError("Git index is not a regular file")
+        while chunk := os.read(descriptor, 1024 * 1024):
+            digest.update(chunk)
+        after = os.fstat(descriptor)
+        identity = [
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mode,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        ]
+        if identity != [
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mode,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        ]:
+            raise ValueError("Git index changed while it was captured")
+        return digest.hexdigest(), identity
+    finally:
+        os.close(descriptor)
 
 
 def is_ancestor(repo: str, ancestor: str, descendant: str) -> bool:
@@ -264,23 +298,62 @@ def capture(repo: str, include_local_history: bool = False) -> dict[str, object]
             control.update(config_path.read_bytes())
         control.update(b"\0")
     hooks_path = common_dir / "hooks"
-    if hooks_path.exists():
-        for root, directories, files in os.walk(hooks_path, followlinks=False):
-            directories.sort()
-            files.sort()
-            for filename in files:
-                path = Path(root) / filename
-                relative = path.relative_to(common_dir)
-                control.update(str(relative).encode("utf-8"))
+    if os.path.lexists(hooks_path):
+        control.update(b"hooks\0")
+        control.update(f"{hooks_path.lstat().st_mode:o}".encode("ascii"))
+        control.update(b"\0")
+        walk_hooks = False
+        if hooks_path.is_symlink():
+            control.update(b"symlink\0")
+            control.update(os.fsencode(os.readlink(hooks_path)))
+            control.update(b"\0")
+            try:
+                target_mode = hooks_path.stat().st_mode
+            except FileNotFoundError:
+                control.update(b"dangling\0")
+            else:
+                control.update(f"{target_mode:o}".encode("ascii"))
                 control.update(b"\0")
-                control.update(f"{path.lstat().st_mode:o}".encode("ascii"))
-                control.update(b"\0")
-                if path.is_symlink():
-                    control.update(b"symlink\0")
-                    control.update(os.readlink(path).encode("utf-8"))
+                if hooks_path.is_dir():
+                    control.update(b"target-directory\0")
+                    walk_hooks = True
                 else:
-                    control.update(path.read_bytes())
-                control.update(b"\0")
+                    control.update(b"target-unsupported\0")
+        elif not hooks_path.is_dir():
+            control.update(b"unsupported\0")
+        else:
+            control.update(b"directory\0")
+            walk_hooks = True
+        if walk_hooks:
+            for root, directories, files in os.walk(hooks_path, followlinks=False):
+                directories.sort()
+                files.sort()
+                for name in directories:
+                    path = Path(root) / name
+                    relative = path.relative_to(common_dir)
+                    control.update(str(relative).encode("utf-8"))
+                    control.update(b"\0")
+                    control.update(f"{path.lstat().st_mode:o}".encode("ascii"))
+                    control.update(b"\0")
+                    if path.is_symlink():
+                        control.update(b"symlink\0")
+                        control.update(os.fsencode(os.readlink(path)))
+                    else:
+                        control.update(b"directory\0")
+                    control.update(b"\0")
+                for filename in files:
+                    path = Path(root) / filename
+                    relative = path.relative_to(common_dir)
+                    control.update(str(relative).encode("utf-8"))
+                    control.update(b"\0")
+                    control.update(f"{path.lstat().st_mode:o}".encode("ascii"))
+                    control.update(b"\0")
+                    if path.is_symlink():
+                        control.update(b"symlink\0")
+                        control.update(os.fsencode(os.readlink(path)))
+                    else:
+                        control.update(path.read_bytes())
+                    control.update(b"\0")
     status = git(repo, "status", "--porcelain=v1", "--untracked-files=all")
     staged_paths = [
         value
@@ -331,13 +404,14 @@ def capture(repo: str, include_local_history: bool = False) -> dict[str, object]
                 }
             )
             continue
-        if relative in staged_paths and relative not in head_worktree_paths:
+        index_entry = None
+        if relative in staged_paths:
             index_entry = git(repo, "ls-files", "--stage", "--", relative).split()
             if len(index_entry) < 4:
-                dirty_entries.append(
-                    {"path": relative, "git_blob_oid": None, "mode": None}
+                raise ValueError(
+                    f"staged path index entry is unavailable: {relative}"
                 )
-                continue
+        if index_entry is not None and relative not in head_worktree_paths:
             mode = index_entry[0]
             blob_oid = index_entry[1]
         else:
@@ -419,7 +493,11 @@ def capture(repo: str, include_local_history: bool = False) -> dict[str, object]
     # The absolute git dir above is the canonical location for the active
     # worktree index.
     index_path = git_dir / "index"
-    index_sha256 = file_sha256(index_path) if index_path.exists() else hashlib.sha256(b"").hexdigest()
+    if index_path.exists():
+        index_sha256, index_identity = stable_index_snapshot(index_path)
+    else:
+        index_sha256 = hashlib.sha256(b"").hexdigest()
+        index_identity = None
     index_entries = []
     raw_index_entries = git(repo, "ls-files", "--stage", "-z")
     for raw_entry in (value for value in raw_index_entries.split("\0") if value):
@@ -474,6 +552,7 @@ def capture(repo: str, include_local_history: bool = False) -> dict[str, object]
         "staged_paths": staged_paths,
         "index_entries": index_entries,
         "index_sha256": index_sha256,
+        "index_identity": index_identity,
         "dirty_worktree_sha256": hashlib.sha256(dirty_worktree).hexdigest(),
         "dirty_digest": hashlib.sha256(
             (status + ("\n" if status else "")).encode("utf-8")
@@ -507,6 +586,7 @@ def blocked_capture(repo: object, reason: BaseException) -> dict[str, object]:
         "staged_paths": [],
         "index_entries": [],
         "index_sha256": zero_digest,
+        "index_identity": None,
         "dirty_worktree_sha256": zero_digest,
         "dirty_digest": zero_digest,
         "diff_snapshot_sha256": zero_digest,

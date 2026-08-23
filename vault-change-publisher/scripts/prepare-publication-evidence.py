@@ -6,7 +6,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import re
 import secrets
 import selectors
 import stat
@@ -15,11 +14,25 @@ import sys
 import time
 from pathlib import Path, PurePosixPath
 
-from evidence_hunk import canonical_patch, insert_evidence_block
+from evidence_hunk import (
+    EvidenceHunkError,
+    canonical_patch,
+    insert_evidence_block,
+    markdown_evidence_boundary,
+)
 from isolated_git_transport import (
     LOCAL_COMMAND_TIMEOUT_SECONDS,
     kill_process_group,
     run_local_command,
+)
+from atomic_file_ops import (
+    AtomicTransactionError,
+    fsync_after_rename,
+    link_no_replace_durable,
+    mkdir_durable,
+    rename_no_replace,
+    retain_named_entry_no_replace,
+    verify_rename_no_replace,
 )
 
 
@@ -91,22 +104,12 @@ def capture_complete(runtime_file: str) -> dict[str, object]:
         check=True,
         capture_output=True,
         text=True,
-        env={
-            **{key: value for key, value in os.environ.items() if not key.startswith("GIT_")},
-            "GIT_CONFIG_NOSYSTEM": "1",
-            "GIT_CONFIG_GLOBAL": os.devnull,
-            "GIT_NO_LAZY_FETCH": "1",
-            "GIT_NO_REPLACE_OBJECTS": "1",
-            "GIT_OPTIONAL_LOCKS": "0",
-        },
+        env=clean_git_environment(),
         timeout=LOCAL_COMMAND_TIMEOUT_SECONDS,
     )
     return json.loads(completed.stdout)
 
 
-EVIDENCE_HEADING = "### Vault Publication Evidence"
-SECTION_BOUNDARY = re.compile(r"^ {0,3}#{1,3}(?:[ \t]+|$)")
-FENCE_START = re.compile(r"^ {0,3}(`{3,}|~{3,})")
 MAX_TASK_BYTES = 10 * 1024 * 1024
 
 
@@ -252,67 +255,6 @@ def stable_identity(metadata: os.stat_result) -> tuple[int, int, int, int, int]:
     )
 
 
-def markdown_evidence_boundary(lines: list[str]) -> int:
-    """Find the canonical section boundary while ignoring fenced content."""
-    headings = []
-    fence_character = None
-    fence_length = 0
-    fence_start_index = None
-    for index, line in enumerate(lines):
-        text = line.rstrip("\r\n")
-        if fence_character is not None:
-            closing = re.match(
-                rf"^ {{0,3}}{re.escape(fence_character)}{{{fence_length},}}[ \t]*$",
-                text,
-            )
-            if closing:
-                fence_character = None
-                fence_length = 0
-                fence_start_index = None
-            continue
-        opening = FENCE_START.match(text)
-        if opening:
-            fence_character = opening.group(1)[0]
-            fence_length = len(opening.group(1))
-            fence_start_index = index
-            continue
-        if text == EVIDENCE_HEADING:
-            headings.append(index)
-    if fence_character is not None:
-        location = (
-            "in evidence section"
-            if headings and fence_start_index is not None and fence_start_index > headings[0]
-            else "before evidence heading"
-        )
-        raise EvidenceError(f"unterminated fenced block {location}")
-    if len(headings) != 1:
-        raise EvidenceError("canonical evidence heading is missing or duplicated")
-
-    fence_character = None
-    fence_length = 0
-    for index in range(headings[0] + 1, len(lines)):
-        text = lines[index].rstrip("\r\n")
-        if fence_character is not None:
-            closing = re.match(
-                rf"^ {{0,3}}{re.escape(fence_character)}{{{fence_length},}}[ \t]*$",
-                text,
-            )
-            if closing:
-                fence_character = None
-                fence_length = 0
-            continue
-        opening = FENCE_START.match(text)
-        if opening:
-            fence_character = opening.group(1)[0]
-            fence_length = len(opening.group(1))
-            continue
-        if SECTION_BOUNDARY.match(text):
-            return index
-    if fence_character is not None:
-        raise EvidenceError("unterminated fenced block in evidence section")
-    return len(lines)
-
-
 def read_bounded_descriptor(descriptor: int) -> bytes:
     """Read at most the standing-task limit from the descriptor's start."""
     os.lseek(descriptor, 0, os.SEEK_SET)
@@ -322,6 +264,43 @@ def read_bounded_descriptor(descriptor: int) -> bytes:
         if len(content) > MAX_TASK_BYTES:
             raise EvidenceError("evidence target grew beyond the allowed size")
     return bytes(content)
+
+
+def descriptor_sealed_contract(
+    descriptor: int,
+) -> tuple[bytes, tuple[int, int, int, int, int]]:
+    """Read one regular inode and bind content to stable identity and mode."""
+    before = os.fstat(descriptor)
+    if not stat.S_ISREG(before.st_mode):
+        raise EvidenceError("evidence entry is not a regular file")
+    content = read_bounded_descriptor(descriptor)
+    after = os.fstat(descriptor)
+    if stable_identity(before) != stable_identity(after) or before.st_mode != after.st_mode:
+        raise EvidenceError("evidence entry changed while its contract was read")
+    if len(content) != after.st_size:
+        raise EvidenceError("evidence entry size differs from its sealed content")
+    return content, (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mode,
+        after.st_mtime_ns,
+    )
+
+
+def named_sealed_contract(
+    directory_fd: int, name: str
+) -> tuple[bytes, tuple[int, int, int, int, int]]:
+    """Open and seal one direct named entry through its bound directory."""
+    descriptor = os.open(
+        name,
+        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+        dir_fd=directory_fd,
+    )
+    try:
+        return descriptor_sealed_contract(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def write_all(descriptor: int, content: bytes) -> None:
@@ -374,7 +353,10 @@ def insert_under_evidence_section_no_follow(
         if marker in existing:
             raise EvidenceError("run evidence marker already exists")
         lines = text.splitlines(keepends=True)
-        boundary_index = markdown_evidence_boundary(lines)
+        try:
+            boundary_index = markdown_evidence_boundary(lines)
+        except EvidenceHunkError as exc:
+            raise EvidenceError(str(exc)) from exc
         offset = len("".join(lines[:boundary_index]).encode("utf-8"))
         prefix = existing[:offset]
         suffix = existing[offset:]
@@ -385,8 +367,10 @@ def insert_under_evidence_section_no_follow(
 
         temporary_name = None
         temporary_fd = None
+        temporary_identity = None
+        original_reservation_fd = None
         try:
-            temporary_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            temporary_flags = os.O_RDWR | os.O_CREAT | os.O_EXCL
             if hasattr(os, "O_NOFOLLOW"):
                 temporary_flags |= os.O_NOFOLLOW
             for _ in range(10):
@@ -398,6 +382,11 @@ def insert_under_evidence_section_no_follow(
                         stat.S_IMODE(before.st_mode),
                         dir_fd=directory_fd,
                     )
+                    temporary_metadata = os.fstat(temporary_fd)
+                    temporary_identity = (
+                        temporary_metadata.st_dev,
+                        temporary_metadata.st_ino,
+                    )
                     temporary_name = candidate
                     break
                 except FileExistsError:
@@ -405,7 +394,13 @@ def insert_under_evidence_section_no_follow(
             if temporary_fd is None or temporary_name is None:
                 raise EvidenceError("could not create evidence temporary file")
             write_all(temporary_fd, updated)
+            os.fchmod(temporary_fd, stat.S_IMODE(before.st_mode))
             os.fsync(temporary_fd)
+            temporary_content, temporary_contract = descriptor_sealed_contract(
+                temporary_fd
+            )
+            if temporary_content != updated:
+                raise EvidenceError("evidence temporary content differs after write")
 
             path_metadata = os.stat(
                 relative.name, dir_fd=directory_fd, follow_symlinks=False
@@ -426,22 +421,171 @@ def insert_under_evidence_section_no_follow(
                     raise EvidenceError("evidence target changed before replacement")
             finally:
                 os.close(verification_fd)
-            os.replace(
-                temporary_name,
-                relative.name,
-                src_dir_fd=directory_fd,
-                dst_dir_fd=directory_fd,
+            # Reserve the reviewed inode before removing its canonical name.
+            # The following no-replace transitions form a pathname CAS: a
+            # third-party update can be retained and rejected, but never
+            # overwritten by an unconditional rename.
+            reservation_name = (
+                f".{relative.name}.evidence-original-{secrets.token_hex(8)}"
             )
-            temporary_name = None
-            os.fsync(directory_fd)
+            mkdir_durable(reservation_name, 0o700, parent_fd=directory_fd)
+            original_reservation_fd = os.open(
+                reservation_name,
+                os.O_RDONLY
+                | os.O_DIRECTORY
+                | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=directory_fd,
+            )
+            verify_rename_no_replace(original_reservation_fd)
+            link_no_replace_durable(
+                directory_fd,
+                relative.name,
+                original_reservation_fd,
+                "artifact",
+            )
+            retained_content, retained_contract = named_sealed_contract(
+                original_reservation_fd, "artifact"
+            )
+            expected_retained_contract = (
+                before.st_dev,
+                before.st_ino,
+                before.st_size,
+                before.st_mode,
+                before.st_mtime_ns,
+            )
+            if (
+                retained_contract != expected_retained_contract
+                or retained_content != existing
+            ):
+                raise EvidenceError(
+                    "evidence target raced before original reservation"
+                )
+            rename_no_replace(
+                directory_fd,
+                relative.name,
+                original_reservation_fd,
+                "detached",
+            )
+            fsync_after_rename(directory_fd, original_reservation_fd)
+            detached_content, detached_contract = named_sealed_contract(
+                original_reservation_fd, "detached"
+            )
+            if detached_contract != expected_retained_contract or detached_content != existing:
+                try:
+                    rename_no_replace(
+                        original_reservation_fd,
+                        "detached",
+                        directory_fd,
+                        relative.name,
+                    )
+                    fsync_after_rename(original_reservation_fd, directory_fd)
+                except FileExistsError:
+                    pass
+                raise EvidenceError(
+                    "evidence target raced during original detachment"
+                )
+            candidate_moved = False
+            try:
+                named_temporary_content, named_temporary_contract = named_sealed_contract(
+                    directory_fd, temporary_name
+                )
+                if (
+                    named_temporary_content != temporary_content
+                    or named_temporary_contract != temporary_contract
+                ):
+                    raise EvidenceError(
+                        "evidence temporary changed before installation"
+                    )
+                rename_no_replace(
+                    directory_fd,
+                    temporary_name,
+                    directory_fd,
+                    relative.name,
+                )
+                fsync_after_rename(directory_fd, directory_fd)
+                candidate_moved = True
+                temporary_name = None
+                installed_content, installed_contract = named_sealed_contract(
+                    directory_fd, relative.name
+                )
+                if (
+                    installed_content != temporary_content
+                    or installed_contract != temporary_contract
+                ):
+                    raise EvidenceError(
+                        "evidence candidate changed during installation"
+                    )
+            except Exception as exc:
+                cleanup_error = None
+                if candidate_moved:
+                    try:
+                        installed_content, installed_contract = named_sealed_contract(
+                            directory_fd, relative.name
+                        )
+                    except FileNotFoundError:
+                        installed_content = None
+                        installed_contract = None
+                    if installed_content is not None and installed_contract is not None:
+                        try:
+                            _, retained_candidate = retain_named_entry_no_replace(
+                                directory_fd,
+                                relative.name,
+                                (installed_contract[0], installed_contract[1]),
+                                label="installed evidence candidate",
+                                prefix=".evidence-candidate-retained-",
+                            )
+                            if (
+                                retained_candidate[0] != installed_content
+                                or tuple(retained_candidate[1][:4])
+                                != installed_contract[:4]
+                            ):
+                                raise EvidenceError(
+                                    "installed evidence candidate changed during retention"
+                                )
+                        except (AtomicTransactionError, EvidenceError) as retention_error:
+                            cleanup_error = retention_error
+                try:
+                    link_no_replace_durable(
+                        original_reservation_fd,
+                        "artifact",
+                        directory_fd,
+                        relative.name,
+                    )
+                except FileExistsError:
+                    # Preserve the concurrent occupant and the reviewed
+                    # original tombstone; never overwrite either one.
+                    pass
+                if cleanup_error is not None:
+                    raise EvidenceError(
+                        f"evidence candidate cleanup failed closed: {cleanup_error}"
+                    ) from exc
+                if isinstance(exc, EvidenceError):
+                    raise
+                raise EvidenceError(
+                    "evidence candidate collided with a concurrent target"
+                ) from exc
         finally:
             if temporary_fd is not None:
                 os.close(temporary_fd)
+            if original_reservation_fd is not None:
+                os.close(original_reservation_fd)
             if temporary_name is not None:
+                if temporary_identity is None:
+                    raise EvidenceError(
+                        "evidence temporary identity is unavailable; entry retained in place"
+                    )
                 try:
-                    os.unlink(temporary_name, dir_fd=directory_fd)
-                except FileNotFoundError:
-                    pass
+                    retain_named_entry_no_replace(
+                        directory_fd,
+                        temporary_name,
+                        temporary_identity,
+                        label="evidence temporary entry",
+                        prefix=f".{relative.name}.evidence-retained-",
+                    )
+                except AtomicTransactionError as exc:
+                    raise EvidenceError(
+                        f"evidence temporary cleanup failed closed: {exc}"
+                    ) from exc
     finally:
         for descriptor in reversed(opened):
             os.close(descriptor)

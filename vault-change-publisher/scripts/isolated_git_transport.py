@@ -61,6 +61,13 @@ def kill_process_group(
         ) from first_exc
 
 
+def close_process_streams(process: subprocess.Popen[Any]) -> None:
+    """Close every pipe owned by one completed or aborted subprocess."""
+    for stream in (process.stdin, process.stdout, process.stderr):
+        if stream is not None:
+            stream.close()
+
+
 def run_local_command(
     arguments: Sequence[str],
     *,
@@ -96,12 +103,21 @@ def run_local_command(
         try:
             kill_process_group(process)
         finally:
-            for stream in (process.stdin, process.stdout, process.stderr):
-                if stream is not None:
-                    stream.close()
+            close_process_streams(process)
         raise subprocess.TimeoutExpired(
             command, timeout, output=exc.output, stderr=exc.stderr
         ) from exc
+    except BaseException as original:
+        cleanup_error = None
+        try:
+            kill_process_group(process)
+        except ProcessCleanupError as exc:
+            cleanup_error = exc
+        finally:
+            close_process_streams(process)
+        if cleanup_error is not None:
+            raise original from cleanup_error
+        raise
     completed = subprocess.CompletedProcess(
         command, process.returncode, output, errors
     )
@@ -247,31 +263,30 @@ class IsolatedGitTransport:
             stdout, stderr = process.communicate(input=input, timeout=self.timeout)
         except subprocess.TimeoutExpired as exc:
             try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            try:
-                process.wait(timeout=PROCESS_CLEANUP_TIMEOUT_SECONDS)
-            except subprocess.TimeoutExpired as cleanup_exc:
-                try:
-                    process.kill()
-                except ProcessLookupError:
-                    pass
-                try:
-                    process.wait(timeout=PROCESS_CLEANUP_TIMEOUT_SECONDS)
-                except subprocess.TimeoutExpired as final_exc:
-                    raise TransportError(
-                        "Git transport process could not be reaped after timeout"
-                    ) from final_exc
+                kill_process_group(process)
+            except ProcessCleanupError as cleanup_exc:
                 raise TransportError(
-                    "Git transport required a second bounded kill after timeout"
+                    "Git transport process could not be reaped after timeout"
                 ) from cleanup_exc
-            for stream in (process.stdin, process.stdout, process.stderr):
-                if stream is not None:
-                    stream.close()
+            finally:
+                close_process_streams(process)
             raise TransportError(
                 f"Git transport exceeded {self.timeout} second deadline"
             ) from exc
+        except BaseException as original:
+            cleanup_error = None
+            try:
+                kill_process_group(process)
+            except ProcessCleanupError as exc:
+                cleanup_error = exc
+            finally:
+                close_process_streams(process)
+            if cleanup_error is not None:
+                raise TransportError(
+                    "Git transport process could not be reaped after failure"
+                ) from cleanup_error
+            raise
+        close_process_streams(process)
         completed = subprocess.CompletedProcess(
             command, process.returncode, stdout, stderr
         )

@@ -112,6 +112,7 @@ RESOLVER_SPEC.loader.exec_module(RESOLVER_MODULE)
 import isolated_git_transport as TRANSPORT_MODULE
 import git_diff_digest as DIFF_MODULE
 import trusted_gitleaks as TRUSTED_GITLEAKS_MODULE
+import atomic_file_ops as ATOMIC_FILE_OPS_MODULE
 
 
 def source_coverage_markdown() -> str:
@@ -394,6 +395,923 @@ def load_environment(*, checkout_root, environ, require_catalog):
         """Remove the isolated fixture."""
         self.temp_dir.cleanup()
 
+    def test_collection_date_parser_rejects_embedded_date_substrings(self) -> None:
+        """Accept complete sealed dates, never arbitrary text containing a date."""
+        parser = COLLECTION_VALIDATOR_MODULE.parse_publication_date
+        self.assertEqual(parser("2026-08-18"), date(2026, 8, 18))
+        self.assertEqual(
+            parser("Tue, 18 Aug 2026 12:00:00 GMT"), date(2026, 8, 18)
+        )
+        self.assertEqual(parser("2026/8/18"), date(2026, 8, 18))
+        for value in (
+            "not-a-date 2026-08-18",
+            "2026-08-18 trailing",
+            "prefix Tue, 18 Aug 2026 12:00:00 GMT",
+            " 2026-08-18",
+            "2026/8/18 ",
+            "2026-02-30",
+        ):
+            with self.subTest(value=value):
+                self.assertIsNone(parser(value))
+
+    def test_semantic_state_ignores_only_index_stat_cache_serialization(self) -> None:
+        """A Git read may refresh raw index bytes without changing staged meaning."""
+        initial = {
+            "capture_status": "available",
+            "branch": "main",
+            "upstream": "origin/main",
+            "local_head": "a" * 40,
+            "remote_head": "a" * 40,
+            "history_relation": "equal",
+            "history_capture_status": "available",
+            "operation_in_progress": False,
+            "git_control_sha256": "b" * 64,
+            "dirty_worktree_sha256": "c" * 64,
+            "dirty_digest": "d" * 64,
+            "diff_snapshot_sha256": "e" * 64,
+            "dirty_paths": [],
+            "staged_paths": [],
+            "index_entries": [],
+            "index_sha256": "1" * 64,
+            "index_identity": [1, 2, 3, 33188, 4, 5],
+        }
+        refreshed = json.loads(json.dumps(initial))
+        refreshed["index_sha256"] = "2" * 64
+        refreshed["index_identity"] = [1, 6, 3, 33188, 7, 8]
+
+        self.assertTrue(
+            REVIEW_MODULE.same_semantic_vault_state(initial, refreshed)
+        )
+        self.assertTrue(
+            COMMITTER_MODULE.same_semantic_vault_state(initial, refreshed)
+        )
+        mode = MODE_MODULE.vault_mode(initial, refreshed, "reports/news.md")
+        self.assertFalse(mode["state_changed"])
+        self.assertEqual(mode["required_mode"], "sweep")
+        self.assertEqual(
+            mode["initial_state_sha256"], mode["review_state_sha256"]
+        )
+
+        semantic_drift = json.loads(json.dumps(refreshed))
+        semantic_drift["index_entries"] = [
+            {
+                "path": "parallel.md",
+                "mode": "100644",
+                "git_blob_oid": "f" * 40,
+                "stage": 0,
+            }
+        ]
+        self.assertFalse(
+            REVIEW_MODULE.same_semantic_vault_state(initial, semantic_drift)
+        )
+        self.assertFalse(
+            COMMITTER_MODULE.same_semantic_vault_state(initial, semantic_drift)
+        )
+        drift_mode = MODE_MODULE.vault_mode(
+            initial, semantic_drift, "reports/news.md"
+        )
+        self.assertTrue(drift_mode["state_changed"])
+        self.assertIn("index_entries", drift_mode["changed_fields"])
+
+    def test_normal_publication_rejects_raw_index_churn_but_resume_accepts_it(
+        self,
+    ) -> None:
+        """Limit the raw stat-cache exception to resumable progress comparison."""
+        reviewed = {
+            "local_head": "a" * 40,
+            "dirty_digest": "b" * 64,
+            "staged_paths": [],
+            "index_entries": [],
+            "index_sha256": "1" * 64,
+            "index_identity": [1, 2, 3, 33188, 4, 5],
+        }
+        refreshed = json.loads(json.dumps(reviewed))
+        refreshed["index_sha256"] = "2" * 64
+        refreshed["index_identity"] = [1, 6, 3, 33188, 7, 8]
+        with mock.patch.object(
+            COMMITTER_MODULE, "capture_one", return_value=refreshed
+        ):
+            with self.assertRaisesRegex(
+                COMMITTER_MODULE.CommitError, "state changed after approved review"
+            ):
+                COMMITTER_MODULE.capture_one_exact(
+                    "/capture", "/runtime", "user_vault", reviewed
+                )
+            COMMITTER_MODULE.capture_one_semantic(
+                "/capture", "/runtime", "user_vault", reviewed
+            )
+
+        before_install = {
+            **reviewed,
+            "dirty_lines": [],
+            "dirty_paths": [],
+            "dirty_entries": [],
+            "dirty_metadata": [],
+        }
+        after_install = json.loads(json.dumps(before_install))
+        after_install.update({
+            "dirty_lines": ["?? news.md"],
+            "dirty_paths": ["news.md"],
+            "dirty_entries": [{
+                "path": "news.md",
+                "mode": "100644",
+                "git_blob_oid": "c" * 40,
+            }],
+            "index_sha256": "2" * 64,
+            "index_identity": [1, 6, 3, 33188, 7, 8],
+        })
+        with self.assertRaisesRegex(
+            COMMITTER_MODULE.CommitError,
+            "control state changed during artifact installation",
+        ):
+            COMMITTER_MODULE.validate_installed_vault(
+                before_install, after_install, "news.md"
+            )
+        COMMITTER_MODULE.validate_installed_vault(
+            before_install,
+            after_install,
+            "news.md",
+            allow_volatile_index=True,
+        )
+
+    def test_carried_review_accepts_stat_cache_churn_and_failed_peer_replan(self) -> None:
+        """Retain one completed Vault while its failed peer receives a new review."""
+        summary_target = self.user / "summary.md"
+        advisory_target = self.agents / "advisory.md"
+        commit = "a" * 40
+        old_user = {
+            "local_head": commit,
+            "remote_head": "b" * 40,
+            "history_relation": "local_ahead",
+            "history_capture_status": "available",
+            "history_snapshot_sha256": "c" * 64,
+            "dirty_digest": "d" * 64,
+            "dirty_paths": [],
+            "staged_paths": [],
+            "index_entries": [],
+            "index_sha256": "1" * 64,
+            "index_identity": [1, 2, 3, 33188, 4, 5],
+            "local_commits": [
+                {"commit": commit, "changed_paths": ["summary.md"]}
+            ],
+        }
+        current_user = json.loads(json.dumps(old_user))
+        current_user["index_sha256"] = "2" * 64
+        current_user["index_identity"] = [1, 6, 3, 33188, 7, 8]
+        old_agents = {
+            "local_head": "e" * 40,
+            "dirty_digest": "f" * 64,
+            "dirty_paths": [],
+            "staged_paths": [],
+            "index_entries": [],
+            "index_sha256": "3" * 64,
+            "index_identity": [9, 10, 3, 33188, 11, 12],
+            "local_commits": [],
+        }
+        replanned_agents = json.loads(json.dumps(old_agents))
+        replanned_agents["dirty_digest"] = "0" * 64
+        replanned_agents["dirty_paths"] = ["parallel.md"]
+        carried = {
+            "outcome": "partial_publication",
+            "phase": "local_commit",
+            "daily_pipeline_status": "complete",
+            "summary_path": str(summary_target),
+            "advisory_path": None,
+            "agents_vault": {
+                "commit_status": "not_started",
+                "commit_hashes": [],
+                "local_head": old_agents["local_head"],
+                "post_dirty_digest": old_agents["dirty_digest"],
+            },
+            "user_vault": {
+                "commit_status": "complete",
+                "commit_hashes": [commit],
+                "local_head": commit,
+                "post_dirty_digest": old_user["dirty_digest"],
+            },
+            "resumable_state": {
+                "agents_vault": old_agents,
+                "user_vault": old_user,
+            },
+        }
+        carry_path = self.workdir / "carried-result.json"
+        carry_path.write_text(json.dumps(carried), encoding="utf-8")
+        context = {
+            "carried_commit_result_file": str(carry_path),
+            "carried_commit_result": carried,
+            "carried_commit_result_sha256": hashlib.sha256(
+                carry_path.read_bytes()
+            ).hexdigest(),
+            "publication_mode_hint": {
+                "agents_vault": {"artifact_already_committed": False},
+                "user_vault": {"artifact_already_committed": True},
+            },
+            "runtime": {
+                "agents_vault_root": str(self.agents),
+                "user_vault_root": str(self.user),
+            },
+        }
+        pre = {
+            "agents_vault": replanned_agents,
+            "user_vault": current_user,
+        }
+        plan = {
+            "advisory_target": str(advisory_target),
+            "summary_target": str(summary_target),
+        }
+
+        self.assertEqual(
+            REVIEW_MODULE.validate_carried_commit_result(context, pre, plan),
+            {"user_vault"},
+        )
+
+        changed_index = json.loads(json.dumps(pre))
+        changed_index["user_vault"]["index_entries"] = [
+            {
+                "path": "parallel.md",
+                "mode": "100644",
+                "git_blob_oid": "1" * 40,
+                "stage": 0,
+            }
+        ]
+        with self.assertRaisesRegex(
+            REVIEW_MODULE.ReviewError, "no longer matches its resumable state"
+        ):
+            REVIEW_MODULE.validate_carried_commit_result(
+                context, changed_index, plan
+            )
+
+    def test_cross_context_committer_carries_completed_vault_after_index_refresh(
+        self,
+    ) -> None:
+        """Commit a replanned peer without rejecting raw index stat-cache churn."""
+        summary = self.user / "summary.md"
+        advisory = self.agents / "advisory.md"
+        summary.write_text("summary\n", encoding="utf-8")
+        advisory.write_text("advisory\n", encoding="utf-8")
+        user_head = "a" * 40
+        agents_old_head = "b" * 40
+        agents_current_head = "c" * 40
+        user_old = {
+            "local_head": user_head,
+            "dirty_digest": "d" * 64,
+            "dirty_lines": [],
+            "dirty_paths": [],
+            "staged_paths": [],
+            "index_entries": [],
+            "index_sha256": "1" * 64,
+            "index_identity": [1, 2, 3, 33188, 4, 5],
+        }
+        user_current = json.loads(json.dumps(user_old))
+        user_current["index_sha256"] = "2" * 64
+        user_current["index_identity"] = [1, 6, 3, 33188, 7, 8]
+        agents_old = {
+            "local_head": agents_old_head,
+            "dirty_digest": "e" * 64,
+            "dirty_lines": [],
+            "dirty_paths": [],
+            "staged_paths": [],
+            "index_entries": [],
+            "index_sha256": "3" * 64,
+            "index_identity": [9, 10, 3, 33188, 11, 12],
+        }
+        agents_current = json.loads(json.dumps(agents_old))
+        agents_current["local_head"] = agents_current_head
+        agents_current["dirty_digest"] = "f" * 64
+        agents_current["dirty_lines"] = ["?? parallel.md"]
+        agents_current["dirty_paths"] = ["parallel.md"]
+        pre = {
+            "agents_vault": agents_current,
+            "user_vault": user_current,
+        }
+        runtime = {
+            "agents_vault_root": str(self.agents),
+            "agents_git_dir": str(self.agents / ".git"),
+            "user_vault_root": str(self.user),
+            "user_git_dir": str(self.user / ".git"),
+            "gitleaks_bin": str(self.fake_gitleaks),
+            "publisher_git_name": "Fixture Publisher",
+            "publisher_git_email": "publisher@example.invalid",
+        }
+        collection = {
+            "daily_pipeline_status": "complete",
+            "summary_sha256": hashlib.sha256(summary.read_bytes()).hexdigest(),
+            "advisory_sha256": hashlib.sha256(advisory.read_bytes()).hexdigest(),
+            "notification_result": "none",
+        }
+        plan = {
+            "summary_target": str(summary),
+            "advisory_target": str(advisory),
+        }
+        carried = {
+            "outcome": "partial_publication",
+            "phase": "local_commit",
+            "daily_pipeline_status": "complete",
+            "summary_path": str(summary),
+            "advisory_path": None,
+            "agents_vault": {
+                "commit_status": "not_started",
+                "commit_hashes": [],
+                "local_head": agents_old_head,
+                "post_dirty_digest": agents_old["dirty_digest"],
+            },
+            "user_vault": {
+                "commit_status": "complete",
+                "commit_hashes": [user_head],
+                "local_head": user_head,
+                "post_dirty_digest": user_old["dirty_digest"],
+                "pre_local_head": "0" * 40,
+                "pre_dirty_digest": "0" * 64,
+                "clean": True,
+            },
+            "resumable_state": {
+                "agents_vault": agents_old,
+                "user_vault": user_old,
+            },
+        }
+        carried_path = self.workdir / "cross-context-carried.json"
+        carried_path.write_text(json.dumps(carried), encoding="utf-8")
+        context = {
+            "runtime": runtime,
+            "pre_collection_state": pre,
+            "verified_collection": collection,
+            "artifact_plan": plan,
+            "carried_commit_result": carried,
+            "carried_commit_result_sha256": hashlib.sha256(
+                carried_path.read_bytes()
+            ).hexdigest(),
+        }
+        context_path = self.workdir / "cross-context.json"
+        context_path.write_text(json.dumps(context), encoding="utf-8")
+        review = {
+            "outcome": "approved",
+            "publication_context_sha256": hashlib.sha256(
+                context_path.read_bytes()
+            ).hexdigest(),
+            "agents_vault": {
+                "publication_mode": "own_only",
+                "deferred_cleanup": [{"path": "parallel.md", "reason": "deferred"}],
+                "commit_required": True,
+                "commit_groups": [{"message": "advisory", "paths": ["advisory.md"]}],
+            },
+            "user_vault": {
+                "publication_mode": "own_only",
+                "deferred_cleanup": [],
+                "commit_required": False,
+                "commit_groups": [],
+            },
+        }
+        review_path = self.workdir / "cross-context-review.json"
+        review_path.write_text(json.dumps(review), encoding="utf-8")
+        inputs = []
+        for name, value in (
+            ("cross-runtime.json", runtime),
+            ("cross-pre.json", pre),
+            ("cross-collection.json", collection),
+            ("cross-plan.json", plan),
+        ):
+            path = self.workdir / name
+            path.write_text(json.dumps(value), encoding="utf-8")
+            inputs.append(path)
+        output = self.workdir / "cross-context-commit-result.json"
+        agents_result = {
+            "commit_status": "complete",
+            "commit_hashes": ["4" * 40],
+            "pre_local_head": agents_current_head,
+            "local_head": "4" * 40,
+            "pre_dirty_digest": agents_current["dirty_digest"],
+            "post_dirty_digest": agents_current["dirty_digest"],
+            "clean": False,
+            "publication_mode": "own_only",
+            "deferred_cleanup": review["agents_vault"]["deferred_cleanup"],
+        }
+
+        with mock.patch.object(
+            COMMITTER_MODULE, "capture_state", return_value=pre
+        ), mock.patch.object(
+            COMMITTER_MODULE, "capture_one", return_value=user_current
+        ), mock.patch.object(
+            COMMITTER_MODULE, "verify_carried_artifact"
+        ) as verified, mock.patch.object(
+            COMMITTER_MODULE,
+            "publish_one_vault",
+            return_value=(agents_result, True, False, None, None),
+        ) as published:
+            status = COMMITTER_MODULE.main(
+                [
+                    "commit-reviewed-publication.py",
+                    *(str(path) for path in inputs),
+                    str(context_path),
+                    str(review_path),
+                    "/unused-installer",
+                    "/unused-capture",
+                    hashlib.sha256(review_path.read_bytes()).hexdigest(),
+                    str(output),
+                    str(carried_path),
+                ]
+            )
+
+        self.assertEqual(status, 0)
+        result = json.loads(output.read_text(encoding="utf-8"))
+        self.assertEqual(result["outcome"], "ready_to_push")
+        self.assertEqual(result["user_vault"]["commit_hashes"], [user_head])
+        self.assertEqual(result["agents_vault"], agents_result)
+        verified.assert_called_once()
+        published.assert_called_once()
+
+    def test_durable_directory_operations_persist_destination_first(self) -> None:
+        """Persist new dirents before removal and persist newly created parents."""
+        source = self.root / "durable-source"
+        destination = self.root / "durable-destination"
+        source.mkdir()
+        destination.mkdir()
+        source_fd = os.open(source, os.O_RDONLY | os.O_DIRECTORY)
+        destination_fd = os.open(destination, os.O_RDONLY | os.O_DIRECTORY)
+        calls: list[int] = []
+        real_fsync = os.fsync
+
+        def record_fsync(descriptor: int) -> None:
+            calls.append(descriptor)
+            real_fsync(descriptor)
+
+        try:
+            with mock.patch.object(
+                ATOMIC_FILE_OPS_MODULE.os,
+                "fsync",
+                side_effect=record_fsync,
+            ):
+                ATOMIC_FILE_OPS_MODULE.fsync_after_rename(
+                    source_fd, destination_fd
+                )
+            self.assertEqual(calls, [destination_fd, source_fd])
+            calls.clear()
+            with mock.patch.object(
+                ATOMIC_FILE_OPS_MODULE.os,
+                "fsync",
+                side_effect=record_fsync,
+            ):
+                ATOMIC_FILE_OPS_MODULE.mkdir_durable(
+                    "child", 0o700, parent_fd=destination_fd
+                )
+            self.assertEqual(calls, [destination_fd])
+            self.assertTrue((destination / "child").is_dir())
+        finally:
+            os.close(source_fd)
+            os.close(destination_fd)
+
+    def test_transaction_cleanup_retains_a_post_check_replacement(self) -> None:
+        """Move, retain, and reject an inode swapped in after the final check."""
+        git_dir = self.root / "cleanup-retention-git"
+        git_dir.mkdir()
+        target = git_dir / "owned-private-entry"
+        target.write_bytes(b"owned\n")
+        directory_fd = os.open(git_dir, os.O_RDONLY | os.O_DIRECTORY)
+        content, identity = ATOMIC_FILE_OPS_MODULE._read_entry_contract(
+            directory_fd,
+            target.name,
+        )
+        expected = {
+            "sha256": hashlib.sha256(content).hexdigest(),
+            "identity": identity,
+        }
+        replacement = git_dir / "replacement"
+        replacement.write_bytes(b"third-party\n")
+        real_rename = ATOMIC_FILE_OPS_MODULE.rename_no_replace
+
+        def replace_after_check(*arguments: object, **kwargs: object) -> None:
+            os.replace(replacement, target)
+            real_rename(*arguments, **kwargs)
+
+        try:
+            with mock.patch.object(
+                ATOMIC_FILE_OPS_MODULE,
+                "rename_no_replace",
+                side_effect=replace_after_check,
+            ), self.assertRaisesRegex(
+                ATOMIC_FILE_OPS_MODULE.AtomicTransactionError,
+                "third-party inode retained",
+            ):
+                ATOMIC_FILE_OPS_MODULE._retain_matching_entry(
+                    directory_fd, target.name, expected
+                )
+        finally:
+            os.close(directory_fd)
+        retained = list(
+            git_dir.glob(ATOMIC_FILE_OPS_MODULE.RETAINED_ENTRY_PREFIX + "*")
+        )
+        self.assertEqual(len(retained), 1)
+        self.assertEqual((retained[0] / "entry").read_bytes(), b"third-party\n")
+        self.assertFalse(target.exists())
+
+    def test_rename_capability_probe_is_retained_without_unlink(self) -> None:
+        """Exercise no-replace support and keep the exact probe inode private."""
+        directory = self.root / "rename-probe-retention"
+        directory.mkdir()
+        directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            ATOMIC_FILE_OPS_MODULE.verify_rename_no_replace(directory_fd)
+        finally:
+            os.close(directory_fd)
+        retained = list(directory.glob(".rename-no-replace-retained-*"))
+        self.assertEqual(len(retained), 1)
+        self.assertEqual((retained[0] / "entry").read_bytes(), b"")
+        self.assertEqual(list(directory.glob(".rename-no-replace-source-*")), [])
+
+    def test_failed_entry_creation_retains_a_cleanup_replacement(self) -> None:
+        """Never unlink a replacement inserted during failed-entry cleanup."""
+        git_dir = self.root / "failed-entry-retention-git"
+        git_dir.mkdir()
+        target = git_dir / "candidate"
+        replacement = git_dir / "replacement"
+        replacement.write_bytes(b"third-party\n")
+        directory_fd = os.open(git_dir, os.O_RDONLY | os.O_DIRECTORY)
+
+        def fail_after_replacement(_descriptor: int, _content: bytes) -> None:
+            os.replace(replacement, target)
+            raise OSError("injected write failure")
+
+        try:
+            with mock.patch.object(
+                ATOMIC_FILE_OPS_MODULE,
+                "_write_all",
+                side_effect=fail_after_replacement,
+            ), self.assertRaisesRegex(
+                ATOMIC_FILE_OPS_MODULE.AtomicTransactionError,
+                "third-party inode retained",
+            ):
+                ATOMIC_FILE_OPS_MODULE._create_entry(
+                    directory_fd, target.name, b"owned\n", 0o600
+                )
+        finally:
+            os.close(directory_fd)
+        retained = list(
+            git_dir.glob(ATOMIC_FILE_OPS_MODULE.RETAINED_ENTRY_PREFIX + "*")
+        )
+        self.assertEqual(len(retained), 1)
+        self.assertEqual((retained[0] / "entry").read_bytes(), b"third-party\n")
+        self.assertFalse(target.exists())
+
+    def test_head_index_exchange_preserves_a_racing_destination(self) -> None:
+        """Never overwrite a new shared index inserted at the final CAS boundary."""
+        git_dir = self.root / "atomic-race-git"
+        git_dir.mkdir()
+        index = git_dir / "index"
+        index.write_bytes(b"reviewed-index")
+        metadata = index.stat()
+        expected_identity = [
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_size,
+            metadata.st_mode,
+            metadata.st_mtime_ns,
+            metadata.st_ctime_ns,
+        ]
+        candidate = self.workdir / "atomic-race-candidate"
+        candidate.write_bytes(b"publication-index")
+        base_head = "1" * 40
+        candidate_head = "2" * 40
+        head = {"value": base_head}
+
+        def update_head(new: str, old: str) -> None:
+            self.assertEqual(head["value"], old)
+            head["value"] = new
+
+        def replace_at_boundary(phase: str) -> None:
+            if phase != "before_index_exchange":
+                return
+            replacement = git_dir / "third-party-index"
+            replacement.write_bytes(b"third-party-staged-index")
+            os.replace(replacement, index)
+
+        with self.assertRaisesRegex(
+            ATOMIC_FILE_OPS_MODULE.AtomicTransactionError,
+            "atomic exchange",
+        ):
+            ATOMIC_FILE_OPS_MODULE.publish_head_index_transaction(
+                git_dir,
+                base_head=base_head,
+                candidate_head=candidate_head,
+                expected_index_sha256=hashlib.sha256(b"reviewed-index").hexdigest(),
+                expected_index_identity=expected_identity,
+                candidate_index_path=candidate,
+                read_head=lambda: head["value"],
+                update_head=update_head,
+                fault_injector=replace_at_boundary,
+            )
+        self.assertEqual(head["value"], base_head)
+        self.assertEqual(index.read_bytes(), b"third-party-staged-index")
+        self.assertFalse((git_dir / "index.lock").exists())
+        self.assertFalse(
+            (git_dir / ATOMIC_FILE_OPS_MODULE.HEAD_INDEX_TRANSACTION_JOURNAL).exists()
+        )
+
+    def test_expected_index_link_rejects_same_content_inode_rebind(self) -> None:
+        """Bind the reviewed index descriptor across hard-link creation."""
+        git_dir = self.root / "atomic-expected-index-rebind"
+        git_dir.mkdir()
+        index = git_dir / "index"
+        index.write_bytes(b"reviewed-index")
+        reviewed = index.stat()
+        expected_identity = [
+            reviewed.st_dev,
+            reviewed.st_ino,
+            reviewed.st_size,
+            reviewed.st_mode,
+            reviewed.st_mtime_ns,
+            reviewed.st_ctime_ns,
+        ]
+        candidate = self.workdir / "atomic-expected-index-rebind-candidate"
+        candidate.write_bytes(b"publication-index")
+
+        def replace_before_link(phase: str) -> None:
+            if phase == "before_expected_index_link":
+                replacement = git_dir / "same-content-different-inode"
+                replacement.write_bytes(b"reviewed-index")
+                os.replace(replacement, index)
+
+        with self.assertRaisesRegex(
+            ATOMIC_FILE_OPS_MODULE.AtomicTransactionError,
+            "rebound to another inode",
+        ):
+            ATOMIC_FILE_OPS_MODULE.publish_head_index_transaction(
+                git_dir,
+                base_head="1" * 40,
+                candidate_head="2" * 40,
+                expected_index_sha256=hashlib.sha256(b"reviewed-index").hexdigest(),
+                expected_index_identity=expected_identity,
+                candidate_index_path=candidate,
+                read_head=lambda: "1" * 40,
+                update_head=lambda _new, _old: self.fail("HEAD must not change"),
+                fault_injector=replace_before_link,
+            )
+        self.assertEqual(index.read_bytes(), b"reviewed-index")
+        self.assertNotEqual(index.stat().st_ino, reviewed.st_ino)
+        retained = list(
+            git_dir.glob(ATOMIC_FILE_OPS_MODULE.RETAINED_ENTRY_PREFIX + "*")
+        )
+        self.assertGreaterEqual(len(retained), 1)
+
+    def test_other_cleanup_retains_check_to_move_replacement(self) -> None:
+        """Reject a second unrelated inode inserted after cleanup classification."""
+        git_dir = self.root / "atomic-other-cleanup-race"
+        git_dir.mkdir()
+        target = git_dir / "index.lock"
+        target.write_bytes(b"first-third-party\n")
+        replacement = git_dir / "replacement"
+        replacement.write_bytes(b"second-third-party\n")
+        expected_file = git_dir / "expected"
+        candidate_file = git_dir / "candidate"
+        expected_file.write_bytes(b"expected\n")
+        candidate_file.write_bytes(b"candidate\n")
+        directory_fd = os.open(git_dir, os.O_RDONLY | os.O_DIRECTORY)
+        expected_content, expected_identity = ATOMIC_FILE_OPS_MODULE._read_entry_contract(
+            directory_fd, expected_file.name
+        )
+        candidate_content, candidate_identity = ATOMIC_FILE_OPS_MODULE._read_entry_contract(
+            directory_fd, candidate_file.name
+        )
+        journal = {
+            "expected_index": {
+                "sha256": hashlib.sha256(expected_content).hexdigest(),
+                "identity": expected_identity,
+            },
+            "candidate_index": {
+                "sha256": hashlib.sha256(candidate_content).hexdigest(),
+                "identity": candidate_identity,
+            },
+            "displaced_name": ATOMIC_FILE_OPS_MODULE.HEAD_INDEX_DISPLACED_PREFIX
+            + "fixture",
+        }
+        real_retain = ATOMIC_FILE_OPS_MODULE.retain_named_entry_no_replace
+
+        def replace_before_move(*args: object, **kwargs: object):
+            os.replace(replacement, target)
+            return real_retain(*args, **kwargs)
+
+        try:
+            with mock.patch.object(
+                ATOMIC_FILE_OPS_MODULE,
+                "retain_named_entry_no_replace",
+                side_effect=replace_before_move,
+            ), self.assertRaisesRegex(
+                ATOMIC_FILE_OPS_MODULE.AtomicTransactionError,
+                "third-party inode retained",
+            ):
+                ATOMIC_FILE_OPS_MODULE._preserve_private_entry(
+                    directory_fd, target.name, journal
+                )
+        finally:
+            os.close(directory_fd)
+        retained = list(
+            git_dir.glob(ATOMIC_FILE_OPS_MODULE.HEAD_INDEX_DISPLACED_PREFIX + "*")
+        )
+        self.assertEqual(len(retained), 1)
+        self.assertEqual((retained[0] / "entry").read_bytes(), b"second-third-party\n")
+        self.assertFalse(target.exists())
+
+    def test_head_index_journal_recovers_both_crash_boundaries(self) -> None:
+        """Roll back a pre-HEAD crash and roll forward a committed HEAD crash."""
+
+        class SimulatedCrash(BaseException):
+            pass
+
+        for crash_phase, expected_status, expected_head, expected_bytes in (
+            ("index_exchanged", "rolled_back", "1" * 40, b"reviewed-index"),
+            ("head_updated", "rolled_forward", "2" * 40, b"publication-index"),
+        ):
+            with self.subTest(crash_phase=crash_phase):
+                git_dir = self.root / f"atomic-crash-{crash_phase}"
+                git_dir.mkdir()
+                index = git_dir / "index"
+                index.write_bytes(b"reviewed-index")
+                metadata = index.stat()
+                expected_identity = [
+                    metadata.st_dev,
+                    metadata.st_ino,
+                    metadata.st_size,
+                    metadata.st_mode,
+                    metadata.st_mtime_ns,
+                    metadata.st_ctime_ns,
+                ]
+                candidate = self.workdir / f"candidate-{crash_phase}"
+                candidate.write_bytes(b"publication-index")
+                head = {"value": "1" * 40}
+
+                def update_head(new: str, old: str) -> None:
+                    if head["value"] != old:
+                        raise RuntimeError("fixture HEAD CAS failed")
+                    head["value"] = new
+
+                def crash(phase: str) -> None:
+                    if phase == crash_phase:
+                        raise SimulatedCrash()
+
+                with self.assertRaises(SimulatedCrash):
+                    ATOMIC_FILE_OPS_MODULE.publish_head_index_transaction(
+                        git_dir,
+                        base_head="1" * 40,
+                        candidate_head="2" * 40,
+                        expected_index_sha256=hashlib.sha256(
+                            b"reviewed-index"
+                        ).hexdigest(),
+                        expected_index_identity=expected_identity,
+                        candidate_index_path=candidate,
+                        read_head=lambda: head["value"],
+                        update_head=update_head,
+                        fault_injector=crash,
+                    )
+                self.assertTrue(
+                    (
+                        git_dir
+                        / ATOMIC_FILE_OPS_MODULE.HEAD_INDEX_TRANSACTION_JOURNAL
+                    ).is_file()
+                )
+                status = ATOMIC_FILE_OPS_MODULE.recover_head_index_transaction(
+                    git_dir,
+                    read_head=lambda: head["value"],
+                    update_head=update_head,
+                )
+                self.assertEqual(status, expected_status)
+                self.assertEqual(head["value"], expected_head)
+                self.assertEqual(index.read_bytes(), expected_bytes)
+                self.assertFalse((git_dir / "index.lock").exists())
+                self.assertFalse(
+                    (
+                        git_dir
+                        / ATOMIC_FILE_OPS_MODULE.HEAD_INDEX_TRANSACTION_JOURNAL
+                    ).exists()
+                )
+
+    def test_head_index_recovery_survives_destination_replacement_after_exchange(self) -> None:
+        """Restore the reviewed index while retaining a post-exchange racing inode."""
+        git_dir = self.root / "atomic-post-exchange-race"
+        git_dir.mkdir()
+        index = git_dir / "index"
+        index.write_bytes(b"reviewed-index")
+        metadata = index.stat()
+        expected_identity = [
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_size,
+            metadata.st_mode,
+            metadata.st_mtime_ns,
+            metadata.st_ctime_ns,
+        ]
+        candidate = self.workdir / "atomic-post-exchange-candidate"
+        candidate.write_bytes(b"publication-index")
+        head = {"value": "1" * 40}
+
+        def update_head(new: str, old: str) -> None:
+            self.assertEqual(head["value"], old)
+            head["value"] = new
+
+        def replace_after_exchange(phase: str) -> None:
+            if phase == "index_exchanged":
+                replacement = git_dir / "third-party-index"
+                replacement.write_bytes(b"post-exchange-third-party-index")
+                os.replace(replacement, index)
+
+        with self.assertRaisesRegex(
+            ATOMIC_FILE_OPS_MODULE.AtomicTransactionError,
+            "atomic exchange",
+        ):
+            ATOMIC_FILE_OPS_MODULE.publish_head_index_transaction(
+                git_dir,
+                base_head="1" * 40,
+                candidate_head="2" * 40,
+                expected_index_sha256=hashlib.sha256(b"reviewed-index").hexdigest(),
+                expected_index_identity=expected_identity,
+                candidate_index_path=candidate,
+                read_head=lambda: head["value"],
+                update_head=update_head,
+                fault_injector=replace_after_exchange,
+            )
+        self.assertEqual(head["value"], "1" * 40)
+        self.assertEqual(index.read_bytes(), b"reviewed-index")
+        displaced = list(
+            git_dir.glob(ATOMIC_FILE_OPS_MODULE.HEAD_INDEX_DISPLACED_PREFIX + "*")
+        )
+        self.assertEqual(len(displaced), 1)
+        self.assertEqual(
+            (displaced[0] / "entry").read_bytes(),
+            b"post-exchange-third-party-index",
+        )
+        self.assertFalse((git_dir / "index.lock").exists())
+        self.assertFalse(
+            (git_dir / ATOMIC_FILE_OPS_MODULE.HEAD_INDEX_TRANSACTION_JOURNAL).exists()
+        )
+        self.assertFalse(
+            list(git_dir.glob(ATOMIC_FILE_OPS_MODULE.HEAD_INDEX_CANDIDATE_PREFIX + "*"))
+        )
+        self.assertFalse(
+            list(git_dir.glob(ATOMIC_FILE_OPS_MODULE.HEAD_INDEX_EXPECTED_PREFIX + "*"))
+        )
+
+    def test_head_index_recovery_survives_lock_replacement_after_exchange(self) -> None:
+        """Restore reviewed staged state when the displaced lock name is replaced."""
+        git_dir = self.root / "atomic-post-exchange-lock-race"
+        git_dir.mkdir()
+        index = git_dir / "index"
+        index.write_bytes(b"reviewed-index")
+        metadata = index.stat()
+        expected_identity = [
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_size,
+            metadata.st_mode,
+            metadata.st_mtime_ns,
+            metadata.st_ctime_ns,
+        ]
+        candidate = self.workdir / "atomic-post-exchange-lock-candidate"
+        candidate.write_bytes(b"publication-index")
+        head = {"value": "1" * 40}
+
+        def update_head(new: str, old: str) -> None:
+            self.assertEqual(head["value"], old)
+            head["value"] = new
+
+        def replace_lock_after_exchange(phase: str) -> None:
+            if phase == "index_exchanged":
+                replacement = git_dir / "third-party-lock"
+                replacement.write_bytes(b"post-exchange-third-party-lock")
+                os.replace(replacement, git_dir / "index.lock")
+
+        with self.assertRaisesRegex(
+            ATOMIC_FILE_OPS_MODULE.AtomicTransactionError,
+            "atomic exchange",
+        ):
+            ATOMIC_FILE_OPS_MODULE.publish_head_index_transaction(
+                git_dir,
+                base_head="1" * 40,
+                candidate_head="2" * 40,
+                expected_index_sha256=hashlib.sha256(b"reviewed-index").hexdigest(),
+                expected_index_identity=expected_identity,
+                candidate_index_path=candidate,
+                read_head=lambda: head["value"],
+                update_head=update_head,
+                fault_injector=replace_lock_after_exchange,
+            )
+        self.assertEqual(head["value"], "1" * 40)
+        self.assertEqual(index.read_bytes(), b"reviewed-index")
+        displaced = list(
+            git_dir.glob(ATOMIC_FILE_OPS_MODULE.HEAD_INDEX_DISPLACED_PREFIX + "*")
+        )
+        self.assertEqual(len(displaced), 1)
+        self.assertEqual(
+            (displaced[0] / "entry").read_bytes(),
+            b"post-exchange-third-party-lock",
+        )
+        self.assertFalse((git_dir / "index.lock").exists())
+        self.assertFalse(
+            (git_dir / ATOMIC_FILE_OPS_MODULE.HEAD_INDEX_TRANSACTION_JOURNAL).exists()
+        )
+        self.assertFalse(
+            list(git_dir.glob(ATOMIC_FILE_OPS_MODULE.HEAD_INDEX_CANDIDATE_PREFIX + "*"))
+        )
+        self.assertFalse(
+            list(git_dir.glob(ATOMIC_FILE_OPS_MODULE.HEAD_INDEX_EXPECTED_PREFIX + "*"))
+        )
+
     def test_codex_schema_projection_preserves_canonical_contract(self) -> None:
         source_path = SKILL_ROOT / "references" / "publication-review-result.schema.json"
         source = json.loads(source_path.read_text(encoding="utf-8"))
@@ -507,6 +1425,147 @@ def load_environment(*, checkout_root, environ, require_catalog):
         ):
             REVIEW_MODULE.validate_root_contract(review)
 
+    def test_own_only_normalization_completes_large_sealed_residual_set(self) -> None:
+        """A model omission cannot make a large own-only path set block core work."""
+        agents_paths = [f"parallel/{index:03d}.md" for index in range(128)]
+        user_paths = [".codex-handoff/unsafe.md"]
+
+        def manifest(
+            excluded: list[str], deferred: list[dict[str, str]]
+        ) -> dict[str, object]:
+            return {
+                "publication_mode": "own_only",
+                "core_review_status": "quality_ok",
+                "review_or_validation_status": "quality_ok",
+                "residual_review_status": "deferred",
+                "excluded_paths": excluded,
+                "unrelated_dirty_paths": list(excluded),
+                "deferred_cleanup": deferred,
+                "owned_paths": ["artifact.md"],
+                "commit_groups": [
+                    {"message": "publish artifact", "paths": ["artifact.md"]}
+                ],
+            }
+
+        review = {
+            "outcome": "approved",
+            "agents_vault": manifest([], []),
+            "user_vault": manifest(
+                user_paths,
+                [{"path": user_paths[0], "reason": "reviewed unsafe handoff"}],
+            ),
+            "next_action": None,
+        }
+        pre = {
+            "agents_vault": {"dirty_paths": agents_paths},
+            "user_vault": {"dirty_paths": user_paths},
+        }
+        materialization = {
+            "vaults": {
+                "agents_vault": [
+                    {
+                        "path": path,
+                        "materialization_status": (
+                            "deferred" if index == 17 else "available"
+                        ),
+                        "materialization_reason": (
+                            "dirty_entry_secret_scan_rejected"
+                            if index == 17
+                            else None
+                        ),
+                    }
+                    for index, path in enumerate(agents_paths)
+                ],
+                "user_vault": [
+                    {
+                        "path": user_paths[0],
+                        "materialization_status": "deferred",
+                        "materialization_reason": "dirty_entry_added_machine_home_path",
+                    }
+                ],
+            }
+        }
+        normalized, receipt = REVIEW_MODULE.normalize_own_only_residuals(
+            review, {}, pre, materialization
+        )
+
+        self.assertEqual(review["agents_vault"]["excluded_paths"], [])
+        self.assertEqual(
+            normalized["agents_vault"]["excluded_paths"], sorted(agents_paths)
+        )
+        self.assertEqual(
+            normalized["agents_vault"]["unrelated_dirty_paths"],
+            sorted(agents_paths),
+        )
+        agents_reasons = {
+            entry["path"]: entry["reason"]
+            for entry in normalized["agents_vault"]["deferred_cleanup"]
+        }
+        self.assertEqual(
+            agents_reasons[agents_paths[17]], "dirty_entry_secret_scan_rejected"
+        )
+        self.assertIn("publication_mode_hint", agents_reasons[agents_paths[0]])
+        self.assertEqual(
+            normalized["user_vault"]["deferred_cleanup"],
+            [{"path": user_paths[0], "reason": "reviewed unsafe handoff"}],
+        )
+        self.assertEqual(
+            normalized["agents_vault"]["commit_groups"],
+            review["agents_vault"]["commit_groups"],
+        )
+        self.assertEqual(receipt["agents_vault"]["dirty_path_count"], 128)
+        self.assertEqual(receipt["agents_vault"]["filled_reason_count"], 128)
+        self.assertEqual(receipt["user_vault"]["filled_reason_count"], 0)
+
+    def test_own_only_normalization_rejects_foreign_or_duplicate_model_paths(self) -> None:
+        """Structural completion cannot launder a path outside the sealed state."""
+        base = {
+            "publication_mode": "own_only",
+            "core_review_status": "quality_ok",
+            "review_or_validation_status": "quality_ok",
+            "residual_review_status": "deferred",
+            "excluded_paths": ["foreign.md"],
+            "unrelated_dirty_paths": [],
+            "deferred_cleanup": [],
+        }
+        review = {
+            "agents_vault": base,
+            "user_vault": {
+                **base,
+                "excluded_paths": [],
+            },
+        }
+        pre = {
+            "agents_vault": {"dirty_paths": ["captured.md"]},
+            "user_vault": {"dirty_paths": []},
+        }
+        materialization = {
+            "vaults": {
+                "agents_vault": [
+                    {"path": "captured.md", "materialization_reason": None}
+                ],
+                "user_vault": [],
+            }
+        }
+        with self.assertRaisesRegex(
+            REVIEW_MODULE.ReviewError, "duplicate or foreign paths"
+        ):
+            REVIEW_MODULE.normalize_own_only_residuals(
+                review, {}, pre, materialization
+            )
+
+        review["agents_vault"]["excluded_paths"] = []
+        review["agents_vault"]["deferred_cleanup"] = [
+            {"path": "captured.md", "reason": "one"},
+            {"path": "captured.md", "reason": "two"},
+        ]
+        with self.assertRaisesRegex(
+            REVIEW_MODULE.ReviewError, "duplicate or foreign paths"
+        ):
+            REVIEW_MODULE.normalize_own_only_residuals(
+                review, {}, pre, materialization
+            )
+
     def test_canonical_publication_schemas_enforce_terminal_state(self) -> None:
         """Reject success/ready labels that do not contain publishable commits."""
         automation_schema = json.loads(
@@ -538,9 +1597,75 @@ def load_environment(*, checkout_root, environ, require_catalog):
             },
             "deferred_cleanup": deferred,
             "evidence_finalization_commit": "b" * 40,
+            "evidence_recovery": {
+                "target_path": "tasks/standing.md",
+                "quarantine_scope": "agents_git_dir",
+                "quarantine_root_identity": [1, 1],
+                "base_head": "a" * 40,
+                "candidate_head": "b" * 40,
+                "original_restored": False,
+                "original_tombstone": {
+                    "directory": ".publication-evidence-original-fixture",
+                    "directory_identity": [1, 4],
+                    "entry": "artifact",
+                    "identity": [1, 2],
+                    "sha256": "1" * 64,
+                    "size": 10,
+                    "mode": 0o100644,
+                },
+                "candidate": {
+                    "identity": [1, 3],
+                    "sha256": "2" * 64,
+                    "size": 20,
+                    "mode": 0o100644,
+                },
+                "head_updated": True,
+                "index_updated": True,
+            },
             "next_action": None,
         }
         CANONICAL_MODULE.validate(success, automation_schema, automation_schema)
+        for unsafe_target in (
+            "/private/task.md",
+            "../task.md",
+            "tasks/standing\nsecret.md",
+        ):
+            with self.subTest(unsafe_recovery_target=repr(unsafe_target)):
+                unsafe_recovery = json.loads(json.dumps(success))
+                unsafe_recovery["evidence_recovery"]["target_path"] = (
+                    unsafe_target
+                )
+                with self.assertRaises(CANONICAL_MODULE.CanonicalValidationError):
+                    CANONICAL_MODULE.validate(
+                        unsafe_recovery, automation_schema, automation_schema
+                    )
+        for unsafe_directory in (
+            ".publication-evidence-original/bad",
+            ".publication-evidence-original\\bad",
+            ".publication-evidence-original\nbad",
+            ".publication-evidence-original\x7fbad",
+        ):
+            with self.subTest(unsafe_tombstone_directory=repr(unsafe_directory)):
+                unsafe_recovery = json.loads(json.dumps(success))
+                unsafe_recovery["evidence_recovery"]["original_tombstone"][
+                    "directory"
+                ] = unsafe_directory
+                with self.assertRaises(CANONICAL_MODULE.CanonicalValidationError):
+                    CANONICAL_MODULE.validate(
+                        unsafe_recovery, automation_schema, automation_schema
+                    )
+        missing_tombstone = json.loads(json.dumps(success))
+        del missing_tombstone["evidence_recovery"]["original_tombstone"]
+        with self.assertRaises(CANONICAL_MODULE.CanonicalValidationError):
+            CANONICAL_MODULE.validate(
+                missing_tombstone, automation_schema, automation_schema
+            )
+        invalid_recovery_head = json.loads(json.dumps(success))
+        invalid_recovery_head["evidence_recovery"]["candidate_head"] = "short"
+        with self.assertRaises(CANONICAL_MODULE.CanonicalValidationError):
+            CANONICAL_MODULE.validate(
+                invalid_recovery_head, automation_schema, automation_schema
+            )
         invalid_success = json.loads(json.dumps(success))
         invalid_success["user_vault"]["commit_hashes"] = []
         with self.assertRaises(CANONICAL_MODULE.CanonicalValidationError):
@@ -591,6 +1716,41 @@ def load_environment(*, checkout_root, environ, require_catalog):
             "next_action": "repair blocked User Vault",
         }
         CANONICAL_MODULE.validate(ready, commit_schema, commit_schema)
+        invalid_retry = json.loads(json.dumps(ready))
+        invalid_retry["retry_disposition"] = "none"
+        invalid_retry["replan_vaults"] = ["agents_vault"]
+        with self.assertRaises(CANONICAL_MODULE.CanonicalValidationError):
+            CANONICAL_MODULE.validate(
+                invalid_retry, commit_schema, commit_schema
+            )
+        invalid_ready_retry = json.loads(json.dumps(invalid_retry))
+        invalid_ready_retry["retry_disposition"] = "replan"
+        with self.assertRaises(CANONICAL_MODULE.CanonicalValidationError):
+            CANONICAL_MODULE.validate(
+                invalid_ready_retry, commit_schema, commit_schema
+            )
+        blocked_retry = json.loads(json.dumps(ready))
+        blocked_retry.update(
+            {
+                "outcome": "blocked",
+                "summary_path": None,
+                "advisory_path": None,
+                "agents_vault": blocked_vault,
+                "user_vault": blocked_vault,
+                "publication_mode": {
+                    "agents_vault": "blocked",
+                    "user_vault": "blocked",
+                },
+                "retry_disposition": "replan",
+                "replan_vaults": ["user_vault"],
+                "next_action": "retry collision-safe User target",
+            }
+        )
+        CANONICAL_MODULE.validate(blocked_retry, commit_schema, commit_schema)
+        empty_replan = json.loads(json.dumps(blocked_retry))
+        empty_replan["replan_vaults"] = []
+        with self.assertRaises(CANONICAL_MODULE.CanonicalValidationError):
+            CANONICAL_MODULE.validate(empty_replan, commit_schema, commit_schema)
         invalid_ready = json.loads(json.dumps(ready))
         invalid_ready["agents_vault"] = blocked_vault
         invalid_ready["publication_mode"]["agents_vault"] = "blocked"
@@ -742,6 +1902,13 @@ def load_environment(*, checkout_root, environ, require_catalog):
         self.assertEqual(
             DIFF_MODULE.clean_git_environment()["GIT_LITERAL_PATHSPECS"], "1"
         )
+        for environment in (
+            PUSH_MODULE.clean_git_environment(),
+            EVIDENCE_MODULE.clean_git_environment(),
+        ):
+            self.assertEqual(environment["GIT_CONFIG_COUNT"], "1")
+            self.assertEqual(environment["GIT_CONFIG_KEY_0"], "core.fsmonitor")
+            self.assertEqual(environment["GIT_CONFIG_VALUE_0"], "false")
         heads = {
             "agents": create_empty_base(self.agents),
             "user": create_empty_base(self.user),
@@ -1000,8 +2167,7 @@ def load_environment(*, checkout_root, environ, require_catalog):
         completed_bytes = subprocess.CompletedProcess([], 0, stdout=b"", stderr=b"")
 
         def assert_bound_config(arguments: list[str], **kwargs: object):
-            if "--config" not in arguments:
-                return completed_bytes
+            self.assertIn("--config", arguments)
             pass_fds = kwargs.get("pass_fds")
             self.assertIsInstance(pass_fds, tuple)
             self.assertEqual(len(pass_fds), 1)
@@ -1035,6 +2201,10 @@ def load_environment(*, checkout_root, environ, require_catalog):
         ) as staged_run, mock.patch.object(
             COMMITTER_MODULE,
             "git_bytes",
+            return_value=subprocess.CompletedProcess([], 0, stdout=b"", stderr=b""),
+        ), mock.patch.object(
+            COMMITTER_MODULE,
+            "git",
             return_value=subprocess.CompletedProcess([], 0, stdout=b"", stderr=b""),
         ):
             COMMITTER_MODULE.scan_staged(
@@ -1253,6 +2423,31 @@ def load_environment(*, checkout_root, environ, require_catalog):
         self.assertEqual(process.wait.call_count, 2)
         process.kill.assert_called_once()
 
+    def test_transport_unexpected_exception_kills_reaps_and_closes(self) -> None:
+        """Clean up transport children on every communicate failure, not just timeout."""
+        transport = object.__new__(TRANSPORT_MODULE.IsolatedGitTransport)
+        transport.git_dir = Path("/isolated/transport.git")
+        transport.environment = {}
+        transport.timeout = 1
+        process = mock.MagicMock()
+        process.pid = 4242
+        process.stdin = mock.MagicMock()
+        process.stdout = mock.MagicMock()
+        process.stderr = mock.MagicMock()
+        process.communicate.side_effect = RuntimeError("fixture transport failure")
+        with mock.patch.object(
+            TRANSPORT_MODULE.subprocess, "Popen", return_value=process
+        ), mock.patch.object(TRANSPORT_MODULE.os, "killpg") as killpg:
+            with self.assertRaisesRegex(RuntimeError, "fixture transport failure"):
+                transport.run("ls-remote", "ssh://example.invalid/repo")
+        killpg.assert_called_once_with(4242, TRANSPORT_MODULE.signal.SIGKILL)
+        process.wait.assert_called_once_with(
+            timeout=TRANSPORT_MODULE.PROCESS_CLEANUP_TIMEOUT_SECONDS
+        )
+        process.stdin.close.assert_called_once_with()
+        process.stdout.close.assert_called_once_with()
+        process.stderr.close.assert_called_once_with()
+
     def test_local_runner_timeout_kills_descendant_process_group(self) -> None:
         """Kill a spawned descendant, not only the timed-out direct helper."""
         pid_file = self.workdir / "local-runner-descendant.pid"
@@ -1275,6 +2470,29 @@ def load_environment(*, checkout_root, environ, require_catalog):
             time.sleep(0.05)
         else:
             self.fail("timed-out local helper descendant remained alive")
+
+    def test_local_runner_unexpected_exception_kills_reaps_and_closes(self) -> None:
+        """Clean up the private process group before propagating helper errors."""
+        process = mock.MagicMock()
+        process.pid = 4242
+        process.stdin = mock.MagicMock()
+        process.stdout = mock.MagicMock()
+        process.stderr = mock.MagicMock()
+        process.communicate.side_effect = RuntimeError("fixture communication failure")
+        with mock.patch.object(
+            TRANSPORT_MODULE.subprocess, "Popen", return_value=process
+        ), mock.patch.object(TRANSPORT_MODULE.os, "killpg") as killpg:
+            with self.assertRaisesRegex(RuntimeError, "fixture communication failure"):
+                TRANSPORT_MODULE.run_local_command(
+                    ["/fixture/helper"], capture_output=True
+                )
+        killpg.assert_called_once_with(4242, TRANSPORT_MODULE.signal.SIGKILL)
+        process.wait.assert_called_once_with(
+            timeout=TRANSPORT_MODULE.PROCESS_CLEANUP_TIMEOUT_SECONDS
+        )
+        process.stdin.close.assert_called_once_with()
+        process.stdout.close.assert_called_once_with()
+        process.stderr.close.assert_called_once_with()
 
     def test_materializer_bounded_read_kills_descendant_on_deadline(self) -> None:
         """Apply the same wall deadline and process-group cleanup to review input."""
@@ -2364,19 +3582,24 @@ def load_environment(*, checkout_root, environ, require_catalog):
 
     def test_owned_artifact_rollback_is_exact_and_refuses_drift(self) -> None:
         """Undo only an unchanged O_EXCL artifact after a pre-commit failure."""
-        target = self.workdir / "owned-artifact.md"
+        target = self.user / "owned-artifact.md"
         target.write_text("verified\n", encoding="utf-8")
         digest = hashlib.sha256(target.read_bytes()).hexdigest()
-        receipt = COMMITTER_MODULE.installed_artifact_receipt(target, digest)
-        with mock.patch.object(
-            COMMITTER_MODULE.os, "unlink", wraps=os.unlink
-        ) as unlink:
-            COMMITTER_MODULE.rollback_owned_artifact(receipt)
-        self.assertIsNotNone(unlink.call_args.kwargs.get("dir_fd"))
+        receipt = COMMITTER_MODULE.installed_artifact_receipt(
+            target, digest, self.user, self.user / ".git"
+        )
+        COMMITTER_MODULE.rollback_owned_artifact(receipt)
         self.assertFalse(target.exists())
+        reservation = self.user / ".git" / str(receipt["reservation_name"])
+        self.assertEqual((reservation / "artifact").read_bytes(), b"verified\n")
+        self.assertEqual(
+            (reservation / "rollback-worktree").read_bytes(), b"verified\n"
+        )
 
         target.write_text("verified\n", encoding="utf-8")
-        receipt = COMMITTER_MODULE.installed_artifact_receipt(target, digest)
+        receipt = COMMITTER_MODULE.installed_artifact_receipt(
+            target, digest, self.user, self.user / ".git"
+        )
         target.write_text("other task\n", encoding="utf-8")
         with self.assertRaisesRegex(
             COMMITTER_MODULE.CommitError, "rollback refused"
@@ -2385,27 +3608,30 @@ def load_environment(*, checkout_root, environ, require_catalog):
         self.assertEqual(target.read_text(encoding="utf-8"), "other task\n")
 
         target.write_text("verified\n", encoding="utf-8")
-        receipt = COMMITTER_MODULE.installed_artifact_receipt(target, digest)
-        real_rename = os.rename
+        receipt = COMMITTER_MODULE.installed_artifact_receipt(
+            target, digest, self.user, self.user / ".git"
+        )
+        real_rename = COMMITTER_MODULE.rename_no_replace
+        rename_calls = 0
 
         def replace_before_quarantine(*args: object, **kwargs: object) -> None:
-            target.unlink()
-            target.write_text("third party\n", encoding="utf-8")
+            nonlocal rename_calls
+            rename_calls += 1
+            if rename_calls == 1:
+                target.unlink()
+                target.write_text("third party\n", encoding="utf-8")
             real_rename(*args, **kwargs)
 
         with mock.patch.object(
-            COMMITTER_MODULE.os,
-            "rename",
+            COMMITTER_MODULE,
+            "rename_no_replace",
             side_effect=replace_before_quarantine,
         ):
             with self.assertRaisesRegex(
-                COMMITTER_MODULE.CommitError, "rollback quarantined"
+                COMMITTER_MODULE.CommitError, "replacement was restored"
             ):
                 COMMITTER_MODULE.rollback_owned_artifact(receipt)
         self.assertEqual(target.read_text(encoding="utf-8"), "third party\n")
-        self.assertEqual(
-            list(self.workdir.glob(".vault-publisher-rollback-*")), []
-        )
 
         target.write_text("verified\n", encoding="utf-8")
         real_read = os.read
@@ -2426,22 +3652,22 @@ def load_environment(*, checkout_root, environ, require_catalog):
             COMMITTER_MODULE.os,
             "read",
             side_effect=replace_between_read_and_identity,
-        ):
-            swapped_receipt = COMMITTER_MODULE.installed_artifact_receipt(
-                target, digest
-            )
-        with self.assertRaisesRegex(
+        ), self.assertRaisesRegex(
             COMMITTER_MODULE.CommitError, "changed before publication"
         ):
-            COMMITTER_MODULE.require_owned_artifact(swapped_receipt)
+            COMMITTER_MODULE.installed_artifact_receipt(
+                target, digest, self.user, self.user / ".git"
+            )
         self.assertEqual(target.read_text(encoding="utf-8"), "verified\n")
 
     def test_owned_artifact_receipt_allows_timestamp_only_file_provider_drift(self) -> None:
         """Treat File Provider timestamp normalization as non-identity metadata."""
-        target = self.workdir / "file-provider-artifact.md"
+        target = self.user / "file-provider-artifact.md"
         target.write_text("verified\n", encoding="utf-8")
         digest = hashlib.sha256(target.read_bytes()).hexdigest()
-        receipt = COMMITTER_MODULE.installed_artifact_receipt(target, digest)
+        receipt = COMMITTER_MODULE.installed_artifact_receipt(
+            target, digest, self.user, self.user / ".git"
+        )
         before = target.stat()
         normalized_mtime = max(1, before.st_mtime_ns - 1_000_000_000)
         os.utime(target, ns=(normalized_mtime, normalized_mtime))
@@ -2455,10 +3681,13 @@ def load_environment(*, checkout_root, environ, require_catalog):
 
     def test_owned_artifact_receipt_rejects_mode_drift(self) -> None:
         """Keep mode changes fail-closed even when inode and bytes are unchanged."""
-        target = self.workdir / "mode-drift-artifact.md"
+        target = self.user / "mode-drift-artifact.md"
         target.write_text("verified\n", encoding="utf-8")
+        os.chmod(target, 0o644)
         digest = hashlib.sha256(target.read_bytes()).hexdigest()
-        receipt = COMMITTER_MODULE.installed_artifact_receipt(target, digest)
+        receipt = COMMITTER_MODULE.installed_artifact_receipt(
+            target, digest, self.user, self.user / ".git"
+        )
         os.chmod(target, 0o600)
         with self.assertRaisesRegex(
             COMMITTER_MODULE.CommitError, "changed before publication"
@@ -2471,33 +3700,95 @@ def load_environment(*, checkout_root, environ, require_catalog):
         self.assertEqual(target.read_text(encoding="utf-8"), "verified\n")
         self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o600)
 
+    def test_committer_rejects_same_bytes_different_artifact_inode(self) -> None:
+        """Bind blob construction and HEAD update to the installer reservation."""
+        base = self.user / "base.md"
+        base.write_text("base\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.user), "add", base.name], check=True)
+        subprocess.run(
+            [
+                "git", "-C", str(self.user),
+                "-c", "user.name=Fixture",
+                "-c", "user.email=fixture@example.invalid",
+                "commit", "-q", "-m", "base",
+            ],
+            check=True,
+        )
+        target = self.user / "same-bytes-replacement.md"
+        target.write_text("verified\n", encoding="utf-8")
+        digest = hashlib.sha256(target.read_bytes()).hexdigest()
+        receipt = COMMITTER_MODULE.installed_artifact_receipt(
+            target, digest, self.user, self.user / ".git"
+        )
+        original_identity = tuple(receipt["identity"])
+        target.unlink()
+        target.write_text("verified\n", encoding="utf-8")
+        self.assertNotEqual(
+            (target.stat().st_dev, target.stat().st_ino), original_identity
+        )
+        head = subprocess.check_output(
+            ["git", "-C", str(self.user), "rev-parse", "HEAD"], text=True
+        ).strip()
+        manifest = {
+            "approved_dirty_entries": [],
+            "commit_groups": [
+                {"message": "publish exact artifact", "paths": [target.name]}
+            ],
+        }
+        with self.assertRaisesRegex(
+            COMMITTER_MODULE.CommitError, "changed before publication"
+        ):
+            COMMITTER_MODULE.commit_groups(
+                str(self.user),
+                str(self.user / ".git"),
+                str(self.fake_gitleaks),
+                {"local_head": head, "dirty_digest": hashlib.sha256(b"").hexdigest()},
+                manifest,
+                target.name,
+                digest,
+                self.workdir,
+                artifact_receipt=receipt,
+            )
+        self.assertEqual(
+            subprocess.check_output(
+                ["git", "-C", str(self.user), "rev-parse", "HEAD"], text=True
+            ).strip(),
+            head,
+        )
+
     def test_owned_artifact_rollback_revalidates_after_quarantine(self) -> None:
         """Restore same-inode content, size, or mode drift instead of deleting it."""
-        target = self.workdir / "quarantine-revalidation.md"
+        target = self.user / "quarantine-revalidation.md"
         digest = hashlib.sha256(b"verified\n").hexdigest()
 
         for drift in ("content", "size", "mode"):
             with self.subTest(drift=drift):
                 target.write_text("verified\n", encoding="utf-8")
                 os.chmod(target, 0o644)
-                receipt = COMMITTER_MODULE.installed_artifact_receipt(target, digest)
+                receipt = COMMITTER_MODULE.installed_artifact_receipt(
+                    target, digest, self.user, self.user / ".git"
+                )
                 original_identity = (target.stat().st_dev, target.stat().st_ino)
-                real_rename = os.rename
+                real_rename = COMMITTER_MODULE.rename_no_replace
+                rename_calls = 0
 
                 def drift_before_quarantine(
                     *args: object, **kwargs: object
                 ) -> None:
-                    if drift == "content":
-                        target.write_text("tampered\n", encoding="utf-8")
-                    elif drift == "size":
-                        target.write_text("verified plus drift\n", encoding="utf-8")
-                    else:
-                        os.chmod(target, 0o600)
+                    nonlocal rename_calls
+                    rename_calls += 1
+                    if rename_calls == 1:
+                        if drift == "content":
+                            target.write_text("tampered\n", encoding="utf-8")
+                        elif drift == "size":
+                            target.write_text("verified plus drift\n", encoding="utf-8")
+                        else:
+                            os.chmod(target, 0o600)
                     real_rename(*args, **kwargs)
 
                 with mock.patch.object(
-                    COMMITTER_MODULE.os,
-                    "rename",
+                    COMMITTER_MODULE,
+                    "rename_no_replace",
                     side_effect=drift_before_quarantine,
                 ), self.assertRaisesRegex(
                     COMMITTER_MODULE.CommitError,
@@ -2517,24 +3808,29 @@ def load_environment(*, checkout_root, environ, require_catalog):
                     )
                 else:
                     self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o600)
-                self.assertEqual(
-                    list(self.workdir.glob(".vault-publisher-rollback-*")), []
-                )
                 target.unlink()
 
         target.write_text("verified\n", encoding="utf-8")
-        receipt = COMMITTER_MODULE.installed_artifact_receipt(target, digest)
+        os.chmod(target, 0o644)
+        receipt = COMMITTER_MODULE.installed_artifact_receipt(
+            target, digest, self.user, self.user / ".git"
+        )
         owned_identity = (target.stat().st_dev, target.stat().st_ino)
-        real_rename = os.rename
+        real_rename = COMMITTER_MODULE.rename_no_replace
+        rename_calls = 0
 
         def drift_and_reoccupy(*args: object, **kwargs: object) -> None:
-            os.chmod(target, 0o600)
+            nonlocal rename_calls
+            rename_calls += 1
+            if rename_calls == 1:
+                os.chmod(target, 0o600)
             real_rename(*args, **kwargs)
-            target.write_text("new occupant\n", encoding="utf-8")
+            if rename_calls == 1:
+                target.write_text("new occupant\n", encoding="utf-8")
 
         with mock.patch.object(
-            COMMITTER_MODULE.os,
-            "rename",
+            COMMITTER_MODULE,
+            "rename_no_replace",
             side_effect=drift_and_reoccupy,
         ), self.assertRaisesRegex(
             COMMITTER_MODULE.CommitError,
@@ -2542,12 +3838,83 @@ def load_environment(*, checkout_root, environ, require_catalog):
         ):
             COMMITTER_MODULE.rollback_owned_artifact(receipt)
         self.assertEqual(target.read_text(encoding="utf-8"), "new occupant\n")
-        quarantines = list(self.workdir.glob(".vault-publisher-rollback-*"))
-        self.assertEqual(len(quarantines), 1)
-        held = quarantines[0] / "artifact"
+        held = (
+            self.user
+            / ".git"
+            / str(receipt["reservation_name"])
+            / "artifact"
+        )
         self.assertEqual((held.stat().st_dev, held.stat().st_ino), owned_identity)
         self.assertEqual(held.read_text(encoding="utf-8"), "verified\n")
         self.assertEqual(stat.S_IMODE(held.stat().st_mode), 0o600)
+
+    def test_owned_artifact_rollback_reopens_post_move_retention(self) -> None:
+        """Seal rollback-worktree through its destination after the no-replace move."""
+        target = self.user / "post-move-rollback-revalidation.md"
+        digest = hashlib.sha256(b"verified\n").hexdigest()
+
+        for drift in ("content", "size", "mode"):
+            with self.subTest(drift=drift):
+                target.write_bytes(b"verified\n")
+                target.chmod(0o644)
+                receipt = COMMITTER_MODULE.installed_artifact_receipt(
+                    target, digest, self.user, self.user / ".git"
+                )
+                original_identity = (target.stat().st_dev, target.stat().st_ino)
+                real_rename = COMMITTER_MODULE.rename_no_replace
+                rename_calls = 0
+
+                def drift_after_quarantine(
+                    source_fd: int,
+                    source_name: str,
+                    destination_fd: int,
+                    destination_name: str,
+                ) -> None:
+                    nonlocal rename_calls
+                    rename_calls += 1
+                    real_rename(
+                        source_fd, source_name, destination_fd, destination_name
+                    )
+                    if rename_calls != 1:
+                        return
+                    retained_fd = os.open(
+                        destination_name,
+                        os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0),
+                        dir_fd=destination_fd,
+                    )
+                    try:
+                        if drift == "content":
+                            os.write(retained_fd, b"tampered\n")
+                            os.ftruncate(retained_fd, len(b"tampered\n"))
+                        elif drift == "size":
+                            os.write(retained_fd, b"verified plus drift\n")
+                            os.ftruncate(retained_fd, len(b"verified plus drift\n"))
+                        else:
+                            os.fchmod(retained_fd, 0o600)
+                        os.fsync(retained_fd)
+                    finally:
+                        os.close(retained_fd)
+
+                with mock.patch.object(
+                    COMMITTER_MODULE,
+                    "rename_no_replace",
+                    side_effect=drift_after_quarantine,
+                ), self.assertRaisesRegex(
+                    COMMITTER_MODULE.CommitError,
+                    "changed during rollback; rollback refused",
+                ):
+                    COMMITTER_MODULE.rollback_owned_artifact(receipt)
+                self.assertEqual(
+                    (target.stat().st_dev, target.stat().st_ino), original_identity
+                )
+                if drift == "content":
+                    self.assertEqual(target.read_bytes(), b"tampered\n")
+                elif drift == "size":
+                    self.assertEqual(target.read_bytes(), b"verified plus drift\n")
+                else:
+                    self.assertEqual(target.read_bytes(), b"verified\n")
+                    self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o600)
+                target.unlink()
 
     def test_owned_artifact_rollback_restores_non_hardlinkable_replacements(self) -> None:
         """Restore directory and symlink replacements without changing Git state."""
@@ -2561,55 +3928,60 @@ def load_environment(*, checkout_root, environ, require_catalog):
                 target = self.user / f"rollback-{replacement_type}.md"
                 target.write_text("verified\n", encoding="utf-8")
                 digest = hashlib.sha256(target.read_bytes()).hexdigest()
-                receipt = COMMITTER_MODULE.installed_artifact_receipt(target, digest)
+                receipt = COMMITTER_MODULE.installed_artifact_receipt(
+                    target, digest, self.user, self.user / ".git"
+                )
                 symlink_source = self.user / f"rollback-{replacement_type}-source"
                 if replacement_type == "symlink":
                     symlink_source.write_text("symlink target\n", encoding="utf-8")
                 replacement_fingerprint: tuple[int, int, int, int, int] | None = None
                 status_before = b""
                 index_before = b""
-                real_rename = os.rename
+                real_rename = COMMITTER_MODULE.rename_no_replace
+                rename_calls = 0
 
                 def replace_before_quarantine(*args: object, **kwargs: object) -> None:
-                    nonlocal replacement_fingerprint, status_before, index_before
-                    target.unlink()
-                    if replacement_type == "directory":
-                        target.mkdir(mode=0o750)
-                        (target / "preserved.txt").write_text(
-                            "directory content\n", encoding="utf-8"
+                    nonlocal replacement_fingerprint, status_before, index_before, rename_calls
+                    rename_calls += 1
+                    if rename_calls == 1:
+                        target.unlink()
+                        if replacement_type == "directory":
+                            target.mkdir(mode=0o750)
+                            (target / "preserved.txt").write_text(
+                                "directory content\n", encoding="utf-8"
+                            )
+                            os.chmod(target, 0o750)
+                        else:
+                            target.symlink_to(symlink_source.name)
+                        os.utime(
+                            target,
+                            ns=(fixed_mtime, fixed_mtime),
+                            follow_symlinks=False,
                         )
-                        os.chmod(target, 0o750)
-                    else:
-                        target.symlink_to(symlink_source.name)
-                    os.utime(
-                        target,
-                        ns=(fixed_mtime, fixed_mtime),
-                        follow_symlinks=False,
-                    )
-                    metadata = os.lstat(target)
-                    replacement_fingerprint = (
-                        metadata.st_dev,
-                        metadata.st_ino,
-                        metadata.st_mode,
-                        metadata.st_size,
-                        metadata.st_mtime_ns,
-                    )
-                    status_before = subprocess.check_output(
-                        [
-                            "git", "-C", str(self.user), "status",
-                            "--porcelain=v2", "-z", "--untracked-files=all",
-                        ]
-                    )
-                    index_before = (self.user / ".git" / "index").read_bytes()
+                        metadata = os.lstat(target)
+                        replacement_fingerprint = (
+                            metadata.st_dev,
+                            metadata.st_ino,
+                            metadata.st_mode,
+                            metadata.st_size,
+                            metadata.st_mtime_ns,
+                        )
+                        status_before = subprocess.check_output(
+                            [
+                                "git", "-C", str(self.user), "status",
+                                "--porcelain=v2", "-z", "--untracked-files=all",
+                            ]
+                        )
+                        index_before = (self.user / ".git" / "index").read_bytes()
                     real_rename(*args, **kwargs)
 
                 with mock.patch.object(
-                    COMMITTER_MODULE.os,
-                    "rename",
+                    COMMITTER_MODULE,
+                    "rename_no_replace",
                     side_effect=replace_before_quarantine,
                 ):
                     with self.assertRaisesRegex(
-                        COMMITTER_MODULE.CommitError, "rollback quarantined"
+                        COMMITTER_MODULE.CommitError, "replacement was restored"
                     ):
                         COMMITTER_MODULE.rollback_owned_artifact(receipt)
                 metadata = os.lstat(target)
@@ -2667,7 +4039,7 @@ def load_environment(*, checkout_root, environ, require_catalog):
         }
         collection = {"summary_sha256": digest}
         with mock.patch.object(
-            COMMITTER_MODULE, "capture_one_exact"
+            COMMITTER_MODULE, "capture_one_semantic"
         ), mock.patch.object(
             COMMITTER_MODULE, "validate_installed_vault"
         ), mock.patch.object(
@@ -2978,6 +4350,9 @@ def load_environment(*, checkout_root, environ, require_catalog):
         with mock.patch.object(
             COMMITTER_MODULE, "current_state", return_value=final_state
         ):
+            index_bytes, index_identity = COMMITTER_MODULE.index_file_contract(
+                Path(git_dir) / "index"
+            )
             result = COMMITTER_MODULE.commit_groups(
                 str(repo),
                 git_dir,
@@ -2985,6 +4360,8 @@ def load_environment(*, checkout_root, environ, require_catalog):
                 {
                     "local_head": before,
                     "dirty_digest": hashlib.sha256(b"").hexdigest(),
+                    "index_sha256": hashlib.sha256(index_bytes).hexdigest(),
+                    "index_identity": index_identity,
                 },
                 manifest,
                 "artifact.md",
@@ -3829,12 +5206,20 @@ def load_environment(*, checkout_root, environ, require_catalog):
         def reject_race() -> None:
             raise COMMITTER_MODULE.CommitError("fixture scope race")
 
+        index_bytes, index_identity = COMMITTER_MODULE.index_file_contract(
+            repo / ".git" / "index"
+        )
         with self.assertRaises(COMMITTER_MODULE.CommitError):
             COMMITTER_MODULE.commit_groups(
                 str(repo),
                 str(repo / ".git"),
                 str(self.fake_gitleaks),
-                {"local_head": before, "dirty_digest": hashlib.sha256(b"").hexdigest()},
+                {
+                    "local_head": before,
+                    "dirty_digest": hashlib.sha256(b"").hexdigest(),
+                    "index_sha256": hashlib.sha256(index_bytes).hexdigest(),
+                    "index_identity": index_identity,
+                },
                 manifest,
                 "artifact.md",
                 hashlib.sha256(b"artifact\n").hexdigest(),
@@ -3846,6 +5231,142 @@ def load_environment(*, checkout_root, environ, require_catalog):
                 ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True
             ).strip(),
             before,
+        )
+
+    def test_local_committer_index_cas_preserves_concurrent_staging(self) -> None:
+        """Reject an index race without overwriting the third-party staged entry."""
+        repo = self.user
+        (repo / "base.md").write_text("base\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "base.md"], check=True)
+        subprocess.run(
+            [
+                "git", "-C", str(repo),
+                "-c", "user.name=Fixture",
+                "-c", "user.email=fixture@example.invalid",
+                "commit", "-q", "-m", "base",
+            ],
+            check=True,
+        )
+        subprocess.run(["git", "-C", str(repo), "branch", "-M", "main"], check=True)
+        subprocess.run(
+            ["git", "-C", str(repo), "push", "-q", "-u", "origin", "main"],
+            check=True,
+        )
+        before = subprocess.check_output(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True
+        ).strip()
+        concurrent = repo / "concurrent.md"
+        concurrent.write_text("third party staged\n", encoding="utf-8")
+        pre = CAPTURE_MODULE.capture(str(repo), include_local_history=True)
+        artifact = repo / "summary.md"
+        artifact.write_text("verified summary\n", encoding="utf-8")
+
+        def stage_concurrently() -> None:
+            subprocess.run(
+                ["git", "-C", str(repo), "add", "concurrent.md"], check=True
+            )
+
+        with self.assertRaisesRegex(
+            COMMITTER_MODULE.CommitError, "shared Git index raced"
+        ):
+            COMMITTER_MODULE.commit_groups(
+                str(repo),
+                str(repo / ".git"),
+                str(self.fake_gitleaks),
+                pre,
+                {
+                    "approved_dirty_entries": [],
+                    "commit_groups": [
+                        {"message": "docs: publish summary", "paths": ["summary.md"]}
+                    ],
+                },
+                "summary.md",
+                hashlib.sha256(artifact.read_bytes()).hexdigest(),
+                self.workdir,
+                before_update=stage_concurrently,
+                publication_mode="own_only",
+            )
+        self.assertEqual(
+            subprocess.check_output(
+                ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True
+            ).strip(),
+            before,
+        )
+        self.assertTrue(
+            subprocess.check_output(
+                ["git", "-C", str(repo), "ls-files", "--stage", "concurrent.md"],
+                text=True,
+            ).strip()
+        )
+
+    def test_evidence_finalizer_index_cas_preserves_concurrent_staging(self) -> None:
+        """Apply the same expected inode/digest CAS to evidence finalization."""
+        repo = self.agents
+        target = "tasks/standing.md"
+        subprocess.run(["git", "-C", str(repo), "add", "--all"], check=True)
+        subprocess.run(
+            [
+                "git", "-C", str(repo),
+                "-c", "user.name=Fixture",
+                "-c", "user.email=fixture@example.invalid",
+                "commit", "-q", "-m", "base",
+            ],
+            check=True,
+        )
+        subprocess.run(["git", "-C", str(repo), "branch", "-M", "main"], check=True)
+        subprocess.run(
+            ["git", "-C", str(repo), "push", "-q", "-u", "origin", "main"],
+            check=True,
+        )
+        baseline = CAPTURE_MODULE.capture(str(repo), include_local_history=True)
+        candidate_blob = subprocess.run(
+            ["git", "-C", str(repo), "hash-object", "-w", "--stdin"],
+            input=b"candidate standing task\n",
+            check=True,
+            capture_output=True,
+        ).stdout.decode("ascii").strip()
+        candidate_index, candidate_contract = FINALIZER_MODULE.prepare_shared_index_candidate(
+            str(repo),
+            str(repo / ".git"),
+            baseline,
+            target,
+            candidate_blob,
+            self.workdir,
+        )
+        concurrent = repo / "concurrent-evidence.md"
+        concurrent.write_text("third party staged\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "-C", str(repo), "add", concurrent.name], check=True
+        )
+        progress = {"head_updated": False, "index_updated": False}
+        base_head = str(baseline["local_head"])
+        try:
+            with self.assertRaisesRegex(
+                FINALIZER_MODULE.FinalizationError, "shared Git index raced"
+            ):
+                FINALIZER_MODULE.publish_evidence_head_and_index(
+                    str(repo),
+                    str(repo / ".git"),
+                    baseline,
+                    base_head,
+                    base_head,
+                    candidate_index,
+                    candidate_contract,
+                    progress,
+                )
+        finally:
+            ATOMIC_FILE_OPS_MODULE.retain_path_no_replace(
+                candidate_index,
+                expected=candidate_contract,
+                label="test evidence shared-index candidate",
+                prefix=".test-evidence-index-retained-",
+            )
+        self.assertEqual(progress, {"head_updated": False, "index_updated": False})
+        self.assertTrue(
+            subprocess.check_output(
+                ["git", "-C", str(repo), "ls-files", "--stage", concurrent.name],
+                text=True,
+            ).strip()
         )
 
     def test_fixed_fetch_pins_remote_refspec_and_environment(self) -> None:
@@ -3889,6 +5410,56 @@ def load_environment(*, checkout_root, environ, require_catalog):
             local_run.call_args_list[-1].kwargs["env"]["GIT_CONFIG_GLOBAL"],
             os.devnull,
         )
+
+    def test_fixed_fetch_retries_transient_transport_exceptions(self) -> None:
+        """Retry bounded ls-remote and candidate-resolution transport failures."""
+        oid = "a" * 40
+        before = subprocess.CompletedProcess(
+            [], 0, f"{oid}\trefs/heads/main\n", ""
+        )
+        fetched = subprocess.CompletedProcess([], 0, "", "")
+        candidate = subprocess.CompletedProcess([], 0, oid + "\n", "")
+        local_results = [
+            subprocess.CompletedProcess([], 1, "", ""),
+            subprocess.CompletedProcess([], 0, "", ""),
+        ]
+        scenarios = {
+            "initial_ls_remote": [
+                TRANSPORT_MODULE.TransportError("transient ls-remote"),
+                before,
+                fetched,
+                candidate,
+                before,
+            ],
+            "candidate_rev_parse": [
+                before,
+                fetched,
+                TRANSPORT_MODULE.TransportError("transient rev-parse"),
+                before,
+                fetched,
+                candidate,
+                before,
+            ],
+        }
+        for label, side_effects in scenarios.items():
+            with self.subTest(label=label):
+                transport = mock.MagicMock()
+                transport.__enter__.return_value = transport
+                transport.__exit__.return_value = None
+                transport.run.side_effect = side_effects
+                with mock.patch.object(
+                    FETCH_MODULE, "IsolatedGitTransport", return_value=transport
+                ), mock.patch.object(
+                    FETCH_MODULE,
+                    "run_local_command",
+                    side_effect=list(local_results),
+                ), mock.patch.object(FETCH_MODULE.time, "sleep") as sleep:
+                    FETCH_MODULE.fetch_main(
+                        "/vault/worktree",
+                        "/local/gitdir",
+                        "ssh://git@example.invalid/repo",
+                    )
+                sleep.assert_called_once_with(0.2)
 
     def test_fixed_fetch_invalid_utf8_uses_standard_failure_contract(self) -> None:
         """Convert malformed runtime bytes into status 75 without a traceback."""
@@ -3949,15 +5520,49 @@ def load_environment(*, checkout_root, environ, require_catalog):
     def test_resolver_pins_gitleaks_major_and_uses_distinct_deadlines(self) -> None:
         """Keep scanner compatibility separate from short Git control probes."""
         self.assertEqual(
+            RESOLVER_MODULE.validated_gitleaks_version("gitleaks version 8.19.0"),
+            "gitleaks version 8.19.0",
+        )
+        self.assertEqual(
             RESOLVER_MODULE.validated_gitleaks_version("gitleaks version 8.30.1"),
             "gitleaks version 8.30.1",
         )
+        with self.assertRaisesRegex(RESOLVER_MODULE.ContextError, "8.19.0"):
+            RESOLVER_MODULE.validated_gitleaks_version("gitleaks version 8.18.1")
         with self.assertRaisesRegex(RESOLVER_MODULE.ContextError, "major version 8"):
             RESOLVER_MODULE.validated_gitleaks_version("gitleaks version 9.0.0")
         self.assertGreater(
             RESOLVER_MODULE.EXTERNAL_BINARY_TIMEOUT_SECONDS,
             RESOLVER_MODULE.CONTROL_COMMAND_TIMEOUT_SECONDS,
         )
+
+    def test_resolver_sanitizes_gitleaks_version_probe_environment(self) -> None:
+        """Do not let ambient Git or Gitleaks variables control the version probe."""
+        self.fake_gitleaks.write_text(
+            "#!/bin/sh\n"
+            "if [ \"${GIT_DIR+x}\" = x ] || [ \"${GITLEAKS_CONFIG+x}\" = x ]; then\n"
+            "  exit 97\n"
+            "fi\n"
+            "[ \"$1\" = version ] && echo 'fixture-gitleaks 8.30.1'\n"
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        result = subprocess.run(
+            [
+                str(SCRIPTS / "resolve-runtime-context.py"),
+                str(self.config),
+                str(self.workdir),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            env={
+                **os.environ,
+                "GIT_DIR": "/attacker/gitdir",
+                "GITLEAKS_CONFIG": "/attacker/gitleaks.toml",
+            },
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
 
     def test_resolver_rejects_git_transport_rewrite_and_include(self) -> None:
         """Reject repository-local config that can redirect fixed Git transport."""
@@ -4318,6 +5923,129 @@ def load_environment(*, checkout_root, environ, require_catalog):
         )["agents_vault"]["git_control_sha256"]
         self.assertNotEqual(before_mode, after_mode)
 
+        hook_directory = self.agents / ".git" / "hooks" / "nested"
+        hook_directory.mkdir()
+        after_directory = json.loads(
+            subprocess.run(
+                [str(SCRIPTS / "capture-vault-state.py"), str(context)],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+        )["agents_vault"]["git_control_sha256"]
+        self.assertNotEqual(after_mode, after_directory)
+
+        first_target = self.workdir / "external-hooks-one"
+        second_target = self.workdir / "external-hooks-two"
+        first_target.mkdir()
+        second_target.mkdir()
+        linked_directory = self.agents / ".git" / "hooks" / "linked"
+        linked_directory.symlink_to(first_target, target_is_directory=True)
+        first_link = json.loads(
+            subprocess.run(
+                [str(SCRIPTS / "capture-vault-state.py"), str(context)],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+        )["agents_vault"]["git_control_sha256"]
+        linked_directory.unlink()
+        linked_directory.symlink_to(second_target, target_is_directory=True)
+        second_link = json.loads(
+            subprocess.run(
+                [str(SCRIPTS / "capture-vault-state.py"), str(context)],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+        )["agents_vault"]["git_control_sha256"]
+        self.assertNotEqual(after_directory, first_link)
+        self.assertNotEqual(first_link, second_link)
+        self.assertEqual(PUSH_MODULE.git_control_digest(str(self.agents)), second_link)
+        self.assertEqual(FINALIZER_MODULE.control_digest(str(self.agents)), second_link)
+
+        hooks_path = self.agents / ".git" / "hooks"
+        shutil.rmtree(hooks_path)
+        top_level_target = self.workdir / "top-level-hooks"
+        top_level_target.mkdir()
+        top_level_hook = top_level_target / "pre-push"
+        top_level_hook.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        top_level_hook.chmod(0o755)
+        hooks_path.symlink_to(top_level_target, target_is_directory=True)
+        top_level_before = json.loads(
+            subprocess.run(
+                [str(SCRIPTS / "capture-vault-state.py"), str(context)],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+        )["agents_vault"]["git_control_sha256"]
+        self.assertEqual(
+            PUSH_MODULE.git_control_digest(str(self.agents)), top_level_before
+        )
+        self.assertEqual(
+            FINALIZER_MODULE.control_digest(str(self.agents)), top_level_before
+        )
+        top_level_hook.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+        top_level_after = json.loads(
+            subprocess.run(
+                [str(SCRIPTS / "capture-vault-state.py"), str(context)],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+        )["agents_vault"]["git_control_sha256"]
+        self.assertNotEqual(top_level_before, top_level_after)
+        self.assertEqual(
+            PUSH_MODULE.git_control_digest(str(self.agents)), top_level_after
+        )
+        self.assertEqual(
+            FINALIZER_MODULE.control_digest(str(self.agents)), top_level_after
+        )
+        top_level_hook.chmod(0o700)
+        top_level_mode_after = json.loads(
+            subprocess.run(
+                [str(SCRIPTS / "capture-vault-state.py"), str(context)],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+        )["agents_vault"]["git_control_sha256"]
+        self.assertNotEqual(top_level_after, top_level_mode_after)
+        self.assertEqual(
+            PUSH_MODULE.git_control_digest(str(self.agents)), top_level_mode_after
+        )
+        self.assertEqual(
+            FINALIZER_MODULE.control_digest(str(self.agents)), top_level_mode_after
+        )
+
+    def test_capture_rejects_staged_deletion_with_worktree_replacement(self) -> None:
+        """Fail closed when a staged path exists only as an untracked replacement."""
+        for repo in (self.agents, self.user):
+            tracked = repo / "tracked.md"
+            tracked.write_text("head\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(repo), "add", "tracked.md"], check=True)
+            subprocess.run(
+                [
+                    "git", "-C", str(repo),
+                    "-c", "user.name=Fixture",
+                    "-c", "user.email=fixture@example.invalid",
+                    "commit", "-q", "-m", "initial",
+                ],
+                check=True,
+            )
+            subprocess.run(["git", "-C", str(repo), "branch", "-M", "main"], check=True)
+            subprocess.run(
+                ["git", "-C", str(repo), "push", "-q", "-u", "origin", "main"],
+                check=True,
+            )
+        subprocess.run(
+            ["git", "-C", str(self.agents), "rm", "--cached", "-q", "tracked.md"],
+            check=True,
+        )
+        with self.assertRaisesRegex(ValueError, "index entry is unavailable"):
+            CAPTURE_MODULE.capture(str(self.agents))
+
     def test_mode_determiner_constrains_each_vault_independently(self) -> None:
         """Convert collection-time drift and staged state into own_only, not failure."""
         base = {
@@ -4412,6 +6140,45 @@ def load_environment(*, checkout_root, environ, require_catalog):
         )
         self.assertEqual(guarded["user_vault"]["required_mode"], "sweep")
         self.assertEqual(guarded["user_vault"]["guard_deferred_paths"], [])
+
+    def test_residual_guard_rejects_malformed_snapshot_entries(self) -> None:
+        """Fail closed instead of silently ignoring malformed review inputs."""
+        hint = {
+            "version": 1,
+            "agents_vault": {"required_mode": "sweep", "reasons": []},
+            "user_vault": {"required_mode": "sweep", "reasons": []},
+        }
+        for entry in (
+            "not-an-object",
+            {"path": "dirty.md"},
+            {"path": "dirty.md", "materialization_status": "unexpected"},
+            {"materialization_status": "available"},
+        ):
+            with self.subTest(dirty_entry=entry):
+                manifest = {
+                    "version": 4,
+                    "vaults": {"agents_vault": [entry], "user_vault": []},
+                    "local_commits": {"agents_vault": [], "user_vault": []},
+                }
+                with self.assertRaises(MODE_MODULE.ModeError):
+                    MODE_MODULE.apply_residual_guards(hint, manifest)
+        for entry in (
+            "not-an-object",
+            {"commit": "a" * 40},
+            {"commit": "a" * 40, "materialization_status": "unexpected"},
+            {"materialization_status": "available"},
+        ):
+            with self.subTest(local_commit_entry=entry):
+                manifest = {
+                    "version": 4,
+                    "vaults": {"agents_vault": [], "user_vault": []},
+                    "local_commits": {
+                        "agents_vault": [entry],
+                        "user_vault": [],
+                    },
+                }
+                with self.assertRaises(MODE_MODULE.ModeError):
+                    MODE_MODULE.apply_residual_guards(hint, manifest)
 
     def test_unavailable_local_history_blocks_only_its_vault(self) -> None:
         """Do not publish an unreviewable local-ahead commit as an ancestor."""
@@ -4578,6 +6345,545 @@ def load_environment(*, checkout_root, environ, require_catalog):
         result_path.write_text(json.dumps(payload), encoding="utf-8")
         self.assertEqual(subprocess.run(command, check=False).returncode, 75)
 
+    def test_collection_constraint_canonicalizer_preserves_raw_evidence(self) -> None:
+        """Correct only authorized coverage cells and retain raw agent artifacts."""
+        staging = self.workdir / "staging"
+        staging.mkdir()
+        source_manifest = write_source_manifest(staging)
+        verified_resolutions = write_verified_resolutions(staging)
+        summary = staging / "SUMMARY-IT-NEWS-2026-07-31.md"
+        advisory = staging / "Personal-Vulnerability-Advisory-2026-07-31.md"
+        raw_summary = (
+            source_coverage_markdown()
+            .replace("robotsで取得禁止", "paywall")
+            .replace(
+                "| InfoQ | 1 | 対象期間記事なし |",
+                "| InfoQ | 1 | 取得済み |",
+                1,
+            )
+            .replace(
+                "| 窓の杜 Internet | 2 |",
+                "|   窓の杜 Internet   |  2  |",
+            )
+        )
+        summary.write_text(raw_summary, encoding="utf-8")
+        digest = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
+        advisory.write_text(
+            f"- 入力ニュース: {summary.name} "
+            f"(same-run SHA-256: {digest(summary)})\n",
+            encoding="utf-8",
+        )
+        raw_result_path = self.workdir / "collection-agent-result.json"
+        canonical_result_path = self.workdir / "collection-result.json"
+        receipt_path = self.workdir / "collection-normalization.json"
+        payload = {
+            "daily_pipeline_status": "complete",
+            "run_id": "20260731T040000+0900",
+            "summary_path": str(summary),
+            "summary_sha256": digest(summary),
+            "advisory_path": str(advisory),
+            "advisory_sha256": digest(advisory),
+            "notification_result": "none",
+            "vault_artifacts_complete": True,
+            "next_action": None,
+        }
+        raw_result_path.write_text(json.dumps(payload), encoding="utf-8")
+        raw_files = {
+            path: (path.read_bytes(), path.stat().st_mode, path.stat().st_mtime_ns)
+            for path in (summary, advisory, raw_result_path)
+        }
+        command = [
+            str(SCRIPTS / "validate-collection-result.py"),
+            "--canonicalize-constraints",
+            str(raw_result_path),
+            str(staging),
+            payload["run_id"],
+            "0",
+            str(SOURCE_CATALOG),
+            str(source_manifest),
+            str(verified_resolutions),
+            str(canonical_result_path),
+            str(receipt_path),
+        ]
+        previous_umask = os.umask(0o777)
+        try:
+            normalization = subprocess.run(
+                command, check=False, capture_output=True, text=True
+            )
+        finally:
+            os.umask(previous_umask)
+        self.assertEqual(normalization.returncode, 0, normalization.stderr)
+        for path, (content, mode, mtime_ns) in raw_files.items():
+            self.assertEqual(path.read_bytes(), content)
+            self.assertEqual(path.stat().st_mode, mode)
+            self.assertEqual(path.stat().st_mtime_ns, mtime_ns)
+
+        canonical = json.loads(canonical_result_path.read_text(encoding="utf-8"))
+        canonical_summary = Path(canonical["summary_path"])
+        canonical_advisory = Path(canonical["advisory_path"])
+        self.assertEqual(canonical_summary.parent.name, "canonical-artifacts")
+        self.assertEqual(
+            stat.S_IMODE(canonical_summary.parent.stat().st_mode), 0o700
+        )
+        for private_file in (
+            canonical_summary,
+            canonical_advisory,
+            canonical_result_path,
+            receipt_path,
+        ):
+            self.assertEqual(stat.S_IMODE(private_file.stat().st_mode), 0o600)
+        expected_canonical_summary = raw_summary.replace(
+            "paywall", "robots"
+        ).replace(
+            "| InfoQ | 1 | 取得済み |",
+            "| InfoQ | 1 | 対象期間記事なし |",
+            1,
+        )
+        self.assertEqual(
+            canonical_summary.read_text(encoding="utf-8"),
+            expected_canonical_summary,
+        )
+        self.assertIn("paywall", summary.read_text(encoding="utf-8"))
+        self.assertNotIn("paywall", canonical_summary.read_text(encoding="utf-8"))
+        self.assertIn(
+            "| InfoQ | 1 | 取得済み |",
+            summary.read_text(encoding="utf-8"),
+        )
+        self.assertIn(
+            "| InfoQ | 1 | 対象期間記事なし |",
+            canonical_summary.read_text(encoding="utf-8"),
+        )
+        self.assertEqual(canonical["summary_sha256"], digest(canonical_summary))
+        self.assertEqual(canonical["advisory_sha256"], digest(canonical_advisory))
+        self.assertIn(
+            f"same-run SHA-256: {canonical['summary_sha256']}",
+            canonical_advisory.read_text(encoding="utf-8"),
+        )
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        self.assertEqual(receipt["projection"], "sealed_source_coverage_cells_v1")
+        self.assertEqual(receipt["corrected_reason_count"], 1)
+        self.assertEqual(receipt["corrected_status_count"], 1)
+        self.assertEqual(
+            receipt["status_corrections"],
+            [
+                {
+                    "source": "InfoQ",
+                    "supplied": "取得済み",
+                    "sealed": "対象期間記事なし",
+                    "item_count": 0,
+                }
+            ],
+        )
+        self.assertEqual(
+            receipt["raw_collection_result_sha256"],
+            hashlib.sha256(raw_result_path.read_bytes()).hexdigest(),
+        )
+        self.assertEqual(
+            receipt["canonical_collection_result_sha256"],
+            hashlib.sha256(canonical_result_path.read_bytes()).hexdigest(),
+        )
+        expected_evidence = {
+            "catalog": SOURCE_CATALOG,
+            "manifest": source_manifest,
+            "verified_resolutions": verified_resolutions,
+        }
+        self.assertEqual(set(receipt["source_evidence"]), set(expected_evidence))
+        for label, path in expected_evidence.items():
+            self.assertEqual(receipt["source_evidence"][label]["path"], str(path))
+            self.assertEqual(
+                receipt["source_evidence"][label]["sha256"],
+                hashlib.sha256(path.read_bytes()).hexdigest(),
+            )
+        validation = subprocess.run(
+            [
+                str(SCRIPTS / "validate-collection-result.py"),
+                str(canonical_result_path),
+                str(staging),
+                payload["run_id"],
+                "0",
+                str(SOURCE_CATALOG),
+                str(source_manifest),
+                str(verified_resolutions),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(validation.returncode, 0, validation.stderr)
+
+    def test_collection_constraint_canonicalizer_rejects_existing_or_symlink_targets(
+        self,
+    ) -> None:
+        """Never replace pre-existing canonical directories or audit outputs."""
+        for collision in (
+            "canonical_symlink",
+            "result_file",
+            "receipt_symlink",
+        ):
+            with self.subTest(collision=collision):
+                root = self.workdir / collision
+                root.mkdir()
+                staging = root / "staging"
+                staging.mkdir()
+                source_manifest = write_source_manifest(staging)
+                verified_resolutions = write_verified_resolutions(staging)
+                summary = staging / "SUMMARY-IT-NEWS-2026-07-31.md"
+                advisory = staging / "Personal-Vulnerability-Advisory-2026-07-31.md"
+                summary.write_text(
+                    source_coverage_markdown().replace(
+                        "robotsで取得禁止", "paywall"
+                    ),
+                    encoding="utf-8",
+                )
+                summary_sha256 = hashlib.sha256(summary.read_bytes()).hexdigest()
+                advisory.write_text(
+                    f"- 入力ニュース: {summary.name} "
+                    f"(same-run SHA-256: {summary_sha256})\n",
+                    encoding="utf-8",
+                )
+                raw_result_path = root / "collection-agent-result.json"
+                canonical_result_path = root / "collection-result.json"
+                receipt_path = root / "collection-normalization.json"
+                raw_result_path.write_text(
+                    json.dumps(
+                        {
+                            "daily_pipeline_status": "complete",
+                            "run_id": "20260731T040000+0900",
+                            "summary_path": str(summary),
+                            "summary_sha256": summary_sha256,
+                            "advisory_path": str(advisory),
+                            "advisory_sha256": hashlib.sha256(
+                                advisory.read_bytes()
+                            ).hexdigest(),
+                            "notification_result": "none",
+                            "vault_artifacts_complete": True,
+                            "next_action": None,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                raw_before = {
+                    path: (
+                        path.read_bytes(),
+                        stat.S_IMODE(path.stat().st_mode),
+                        path.stat().st_mtime_ns,
+                    )
+                    for path in (summary, advisory, raw_result_path)
+                }
+                sentinel = root / "sentinel"
+                sentinel.write_bytes(b"third-party\n")
+                if collision == "canonical_symlink":
+                    outside = root / "outside"
+                    outside.mkdir()
+                    (staging / "canonical-artifacts").symlink_to(
+                        outside, target_is_directory=True
+                    )
+                elif collision == "result_file":
+                    canonical_result_path.write_bytes(b"third-party\n")
+                else:
+                    receipt_path.symlink_to(sentinel)
+                command = [
+                    str(SCRIPTS / "validate-collection-result.py"),
+                    "--canonicalize-constraints",
+                    str(raw_result_path),
+                    str(staging),
+                    "20260731T040000+0900",
+                    "0",
+                    str(SOURCE_CATALOG),
+                    str(source_manifest),
+                    str(verified_resolutions),
+                    str(canonical_result_path),
+                    str(receipt_path),
+                ]
+                normalization = subprocess.run(
+                    command, check=False, capture_output=True, text=True
+                )
+                self.assertEqual(normalization.returncode, 75)
+                self.assertEqual(sentinel.read_bytes(), b"third-party\n")
+                if collision == "result_file":
+                    self.assertEqual(
+                        canonical_result_path.read_bytes(), b"third-party\n"
+                    )
+                for path, expected in raw_before.items():
+                    self.assertEqual(
+                        (
+                            path.read_bytes(),
+                            stat.S_IMODE(path.stat().st_mode),
+                            path.stat().st_mtime_ns,
+                        ),
+                        expected,
+                    )
+
+    def test_collection_artifact_reads_are_bounded_and_stable(self) -> None:
+        """Reject descriptor growth and metadata drift during raw artifact reads."""
+        descriptor = os.open(__file__, os.O_RDONLY)
+        try:
+            with mock.patch.object(
+                COLLECTION_VALIDATOR_MODULE.os,
+                "read",
+                side_effect=[
+                    b"x" * (COLLECTION_VALIDATOR_MODULE.MAX_ARTIFACT_BYTES + 1)
+                ],
+            ), self.assertRaisesRegex(
+                COLLECTION_VALIDATOR_MODULE.ValidationError, "grew"
+            ):
+                COLLECTION_VALIDATOR_MODULE.digest_fd(descriptor)
+        finally:
+            os.close(descriptor)
+
+        staging = self.workdir / "artifact-drift"
+        staging.mkdir()
+        summary = staging / "SUMMARY-IT-NEWS-2026-07-31.md"
+        summary.write_bytes(b"stable\n")
+        os.chmod(summary, 0o640)
+        expected_hash = hashlib.sha256(summary.read_bytes()).hexdigest()
+        real_digest = COLLECTION_VALIDATOR_MODULE.digest_fd
+
+        def drift_mode(open_descriptor: int) -> tuple[str, bytes]:
+            result = real_digest(open_descriptor)
+            os.fchmod(open_descriptor, 0o600)
+            return result
+
+        with mock.patch.object(
+            COLLECTION_VALIDATOR_MODULE,
+            "digest_fd",
+            side_effect=drift_mode,
+        ), self.assertRaisesRegex(
+            COLLECTION_VALIDATOR_MODULE.ValidationError, "changed while"
+        ):
+            COLLECTION_VALIDATOR_MODULE.validate_artifact(
+                str(summary),
+                expected_hash,
+                staging,
+                0,
+                "2026-07-31",
+                "summary",
+            )
+
+        evidence = staging / "source-evidence.json"
+        evidence.write_bytes(b'{"version":1}\n')
+        os.chmod(evidence, 0o640)
+        real_read = os.read
+        first_read = True
+
+        def drift_evidence_mode(open_descriptor: int, count: int) -> bytes:
+            nonlocal first_read
+            chunk = real_read(open_descriptor, count)
+            if first_read:
+                first_read = False
+                os.fchmod(open_descriptor, 0o600)
+            return chunk
+
+        with mock.patch.object(
+            COLLECTION_VALIDATOR_MODULE.os,
+            "read",
+            side_effect=drift_evidence_mode,
+        ), self.assertRaisesRegex(
+            COLLECTION_VALIDATOR_MODULE.ValidationError, "changed while"
+        ):
+            COLLECTION_VALIDATOR_MODULE.read_regular_nofollow(
+                evidence, "source evidence"
+            )
+
+    def test_collection_constraint_canonicalizer_rejects_ambiguous_rows(self) -> None:
+        """Refuse to project missing, duplicate, or non-constraint source rows."""
+        valid = source_coverage_markdown()
+        constrained_row = valid.splitlines()[-1]
+        cases = {
+            "missing": "\n".join(valid.splitlines()[:-1]) + "\n",
+            "duplicate": valid + constrained_row + "\n",
+            "wrong status": valid.replace(
+                "アクセス制約", "対象期間記事なし", 1
+            ),
+        }
+        for label, summary in cases.items():
+            with self.subTest(label=label):
+                with self.assertRaises(COLLECTION_VALIDATOR_MODULE.ValidationError):
+                    COLLECTION_VALIDATOR_MODULE.canonicalize_summary_constraint_reasons(
+                        summary,
+                        {
+                            json.loads(SOURCE_CATALOG.read_text(encoding="utf-8"))[
+                                "sources"
+                            ][-1]["name"]: "robots"
+                        },
+                    )
+
+    def test_collection_coverage_projection_normalizes_count_implied_status(self) -> None:
+        """Normalize only normal status cells implied by the unchanged row count."""
+        root = self.workdir / "coverage-status-projection"
+        root.mkdir()
+        manifest = write_source_manifest(root)
+        resolutions = write_verified_resolutions(root)
+        constraints, retrieved, _ = (
+            COLLECTION_VALIDATOR_MODULE.sealed_coverage_authority(
+                SOURCE_CATALOG, manifest, resolutions
+            )
+        )
+        raw = (
+            source_coverage_markdown()
+            .replace(
+                "| TechCrunch | 1 | 取得済み |",
+                "| TechCrunch | 1 | 対象期間記事なし |",
+                1,
+            )
+            .replace(
+                "| InfoQ | 1 | 対象期間記事なし |",
+                "| InfoQ | 1 | 取得済み |",
+                1,
+            )
+        )
+        projected, reason_corrections, status_corrections = (
+            COLLECTION_VALIDATOR_MODULE.canonicalize_summary_coverage(
+                raw, constraints, retrieved
+            )
+        )
+        self.assertEqual(len(reason_corrections), 1)
+        self.assertEqual(
+            status_corrections,
+            [
+                {
+                    "source": "TechCrunch",
+                    "supplied": "対象期間記事なし",
+                    "sealed": "取得済み",
+                    "item_count": 1,
+                },
+                {
+                    "source": "InfoQ",
+                    "supplied": "取得済み",
+                    "sealed": "対象期間記事なし",
+                    "item_count": 0,
+                },
+            ],
+        )
+        self.assertIn("| TechCrunch | 1 | 取得済み |", projected)
+        self.assertIn("| InfoQ | 1 | 対象期間記事なし |", projected)
+        COLLECTION_VALIDATOR_MODULE.validate_source_coverage(
+            projected, SOURCE_CATALOG, manifest, resolutions, date(2026, 7, 31)
+        )
+
+        fallback_root = self.workdir / "coverage-status-fallback"
+        fallback_root.mkdir()
+        fallback_summary, fallback_catalog, fallback_manifest, fallback_verified = (
+            write_minimal_coverage_fixture(
+                fallback_root,
+                extract_entries=[],
+                evidence_updates={
+                    "status": "needs_search_fallback",
+                    "method": None,
+                    "final_url": None,
+                    "extract_file": None,
+                    "extracted_entry_count": 0,
+                    "attempts": [
+                        {"method": "rss", "status": "failed", "reason": "fixture"}
+                    ],
+                },
+                resolutions=[
+                    {
+                        "name": "Fixture News",
+                        "status": "verified_fallback",
+                        "method": "official_alternate",
+                    }
+                ],
+                status="取得済み",
+                count=0,
+            )
+        )
+        fallback_constraints, fallback_retrieved, _ = (
+            COLLECTION_VALIDATOR_MODULE.sealed_coverage_authority(
+                fallback_catalog, fallback_manifest, fallback_verified
+            )
+        )
+        self.assertEqual(fallback_constraints, {})
+        self.assertEqual(fallback_retrieved, {"Fixture News"})
+        fallback_projected, _, fallback_status_corrections = (
+            COLLECTION_VALIDATOR_MODULE.canonicalize_summary_coverage(
+                fallback_summary, fallback_constraints, fallback_retrieved
+            )
+        )
+        self.assertIn("| Fixture News | 1 | 対象期間記事なし |", fallback_projected)
+        self.assertEqual(fallback_status_corrections[0]["item_count"], 0)
+
+    def test_collection_coverage_projection_does_not_mask_wrong_count(self) -> None:
+        """Keep sealed date/count validation authoritative after status projection."""
+        root = self.workdir / "coverage-wrong-count"
+        root.mkdir()
+        manifest = write_source_manifest(root)
+        resolutions = write_verified_resolutions(root)
+        constraints, retrieved, _ = (
+            COLLECTION_VALIDATOR_MODULE.sealed_coverage_authority(
+                SOURCE_CATALOG, manifest, resolutions
+            )
+        )
+        raw = source_coverage_markdown().replace(
+            "| TechCrunch | 1 | 取得済み | RSS | https://techcrunch.com/feed/ | 1 |",
+            "| TechCrunch | 1 | 取得済み | RSS | https://techcrunch.com/feed/ | 0 |",
+            1,
+        )
+        projected, _, status_corrections = (
+            COLLECTION_VALIDATOR_MODULE.canonicalize_summary_coverage(
+                raw, constraints, retrieved
+            )
+        )
+        self.assertEqual(status_corrections[0]["source"], "TechCrunch")
+        with self.assertRaisesRegex(
+            COLLECTION_VALIDATOR_MODULE.ValidationError,
+            "does not match dated extract evidence",
+        ):
+            COLLECTION_VALIDATOR_MODULE.validate_source_coverage(
+                projected,
+                SOURCE_CATALOG,
+                manifest,
+                resolutions,
+                date(2026, 7, 31),
+            )
+
+        unauthorized = source_coverage_markdown().replace(
+            "| InfoQ | 1 | 対象期間記事なし |",
+            "| InfoQ | 1 | アクセス制約 |",
+            1,
+        )
+        with self.assertRaisesRegex(
+            COLLECTION_VALIDATOR_MODULE.ValidationError,
+            "unauthorized status",
+        ):
+            COLLECTION_VALIDATOR_MODULE.canonicalize_summary_coverage(
+                unauthorized, constraints, retrieved
+            )
+
+    def test_collection_constraint_projection_does_not_authorize_foreign_rows(
+        self,
+    ) -> None:
+        """Leave foreign rows outside projection and reject them semantically."""
+        root = self.workdir / "foreign-coverage-row"
+        root.mkdir()
+        manifest = write_source_manifest(root)
+        resolutions = write_verified_resolutions(root)
+        catalog = json.loads(SOURCE_CATALOG.read_text(encoding="utf-8"))
+        constrained_name = catalog["sources"][-1]["name"]
+        summary = (
+            source_coverage_markdown().replace("robotsで取得禁止", "paywall")
+            + "| Foreign Source | 2 | アクセス制約 | 公開ページ | "
+            "https://foreign.example.invalid/ | 0 | robots |\n"
+        )
+        projected, corrections = (
+            COLLECTION_VALIDATOR_MODULE.canonicalize_summary_constraint_reasons(
+                summary, {constrained_name: "robots"}
+            )
+        )
+        self.assertEqual(len(corrections), 1)
+        self.assertIn("Foreign Source", projected)
+        with self.assertRaisesRegex(
+            COLLECTION_VALIDATOR_MODULE.ValidationError,
+            "does not match the catalog",
+        ):
+            COLLECTION_VALIDATOR_MODULE.validate_source_coverage(
+                projected,
+                SOURCE_CATALOG,
+                manifest,
+                resolutions,
+                date(2026, 7, 31),
+            )
+
     def test_collection_validator_preserves_query_article_identity(self) -> None:
         """Count distinct query-addressed articles instead of collapsing their evidence."""
         root = self.workdir / "query-coverage"
@@ -4593,6 +6899,33 @@ def load_environment(*, checkout_root, environ, require_catalog):
         COLLECTION_VALIDATOR_MODULE.validate_source_coverage(
             summary, catalog, manifest, verified, date(2026, 7, 31)
         )
+
+    def test_collection_validator_rejects_unsafe_sealed_entry_urls(self) -> None:
+        """Fail closed on malformed, credentialed, or foreign extract URLs."""
+        invalid_urls = (
+            "https://example.test:bad/story",
+            "https://example.test:65536/story",
+            "https://user:pass@example.test/story",
+            "https://bad_host.test/story",
+            "https://other.test/story",
+        )
+        for index, invalid_url in enumerate(invalid_urls):
+            with self.subTest(url=invalid_url):
+                root = self.workdir / f"unsafe-sealed-url-{index}"
+                root.mkdir()
+                summary, catalog, manifest, verified = write_minimal_coverage_fixture(
+                    root,
+                    extract_entries=[
+                        {"url": invalid_url, "published": "2026-07-31"}
+                    ],
+                )
+                with self.assertRaisesRegex(
+                    COLLECTION_VALIDATOR_MODULE.ValidationError,
+                    "source extract entry URL is invalid",
+                ):
+                    COLLECTION_VALIDATOR_MODULE.validate_source_coverage(
+                        summary, catalog, manifest, verified, date(2026, 7, 31)
+                    )
 
     def test_collection_validator_uses_inclusive_seven_jst_calendar_dates(self) -> None:
         """Include run_date-6 through run_date after timezone normalization."""
@@ -4788,7 +7121,7 @@ def load_environment(*, checkout_root, environ, require_catalog):
             "source extract filename is invalid",
         ):
             COLLECTION_VALIDATOR_MODULE.sealed_extract_entries(
-                self.workdir / "source-manifest.json", {}
+                self.workdir / "source-manifest.json", {}, set()
             )
 
     def test_collection_validator_requires_gate_attempt_transport_evidence(self) -> None:
@@ -5108,6 +7441,8 @@ def load_environment(*, checkout_root, environ, require_catalog):
         context = {
             "agents_vault_root": str(self.agents),
             "user_vault_root": str(self.user),
+            "agents_git_dir": str(self.agents / ".git"),
+            "user_git_dir": str(self.user / ".git"),
             "it_news_archive_relative": "10_Prompt",
             "advisory_archive_relative": "03-Contexts/Reports/Security",
         }
@@ -5176,7 +7511,11 @@ def load_environment(*, checkout_root, environ, require_catalog):
         normalized_mtime = max(1, advisory_stat.st_mtime_ns - 1_000_000_000)
         os.utime(installed_advisory, ns=(normalized_mtime, normalized_mtime))
         validated_receipt = COMMITTER_MODULE.validated_installer_receipt(
-            advisory_receipt, installed_advisory, digest(advisory)
+            advisory_receipt,
+            installed_advisory,
+            digest(advisory),
+            str(self.agents),
+            str(self.agents / ".git"),
         )
         self.assertEqual(validated_receipt["identity"], tuple(advisory_receipt["identity"]))
         self.assertEqual(
@@ -5191,7 +7530,11 @@ def load_environment(*, checkout_root, environ, require_catalog):
             COMMITTER_MODULE.CommitError, "changed before publication"
         ):
             COMMITTER_MODULE.validated_installer_receipt(
-                advisory_receipt, installed_advisory, digest(advisory)
+                advisory_receipt,
+                installed_advisory,
+                digest(advisory),
+                str(self.agents),
+                str(self.agents / ".git"),
             )
         installed_advisory.unlink()
 
@@ -5294,17 +7637,25 @@ def load_environment(*, checkout_root, environ, require_catalog):
         digest = hashlib.sha256(source.read_bytes()).hexdigest()
         relative = PurePosixPath("installed")
         target = self.user / "installed" / "summary.md"
+        before_reservations = set(
+            (self.user / ".git").glob(".vault-publisher-install-*")
+        )
 
-        def replace_then_fail(_descriptor: int, _content: object) -> int:
+        real_link = INSTALLER_MODULE.link_no_replace_durable
+
+        def replace_then_fail(*arguments: object) -> None:
+            real_link(*arguments)
             target.unlink()
             target.write_text("third-party replacement\n", encoding="utf-8")
             raise OSError("fixture write failure")
 
         with mock.patch.object(
-            INSTALLER_MODULE.os, "write", side_effect=replace_then_fail
+            INSTALLER_MODULE,
+            "link_no_replace_durable",
+            side_effect=replace_then_fail,
         ), self.assertRaisesRegex(
-            INSTALLER_MODULE.InstallError, "replaced during failed cleanup"
-        ):
+            INSTALLER_MODULE.InstallError, "planned destination is no longer available"
+        ) as raised:
             INSTALLER_MODULE.install(
                 source,
                 digest,
@@ -5312,13 +7663,65 @@ def load_environment(*, checkout_root, environ, require_catalog):
                 relative,
                 target.name,
                 target,
+                self.user / ".git",
             )
+        self.assertIsInstance(raised.exception.__cause__, INSTALLER_MODULE.InstallError)
+        self.assertIn("replaced during failed cleanup", str(raised.exception.__cause__))
         self.assertEqual(
             target.read_text(encoding="utf-8"), "third-party replacement\n"
+        )
+        reservations = set(
+            (self.user / ".git").glob(".vault-publisher-install-*")
+        ) - before_reservations
+        self.assertEqual(len(reservations), 1)
+        self.assertEqual(
+            (next(iter(reservations)) / "artifact").read_bytes(),
+            source.read_bytes(),
         )
         self.assertEqual(
             list(target.parent.glob(".vault-publisher-install-*")), []
         )
+
+    def test_installer_first_write_failure_keeps_partial_private_inode(self) -> None:
+        """Do not mask an early write failure with uninitialized cleanup metadata."""
+        source = self.workdir / "early-write-source.md"
+        source.write_bytes(b"verified artifact\n")
+        digest = hashlib.sha256(source.read_bytes()).hexdigest()
+        relative = PurePosixPath("early-write")
+        target = self.user / "early-write" / "summary.md"
+        before_reservations = set(
+            (self.user / ".git").glob(".vault-publisher-install-*")
+        )
+        real_write = INSTALLER_MODULE.os.write
+        calls = 0
+
+        def fail_after_partial_write(descriptor: int, content: bytes) -> int:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return real_write(descriptor, content[:3])
+            raise OSError("fixture early write failure")
+
+        with mock.patch.object(
+            INSTALLER_MODULE.os,
+            "write",
+            side_effect=fail_after_partial_write,
+        ), self.assertRaisesRegex(OSError, "fixture early write failure"):
+            INSTALLER_MODULE.install(
+                source,
+                digest,
+                self.user,
+                relative,
+                target.name,
+                target,
+                self.user / ".git",
+            )
+        self.assertFalse(target.exists())
+        reservations = set(
+            (self.user / ".git").glob(".vault-publisher-install-*")
+        ) - before_reservations
+        self.assertEqual(len(reservations), 1)
+        self.assertEqual((next(iter(reservations)) / "artifact").read_bytes(), b"ver")
 
     def test_installer_failure_cleanup_restores_non_hardlinkable_replacements(
         self,
@@ -5343,8 +7746,11 @@ def load_environment(*, checkout_root, environ, require_catalog):
                 status_before = b""
                 index_before = b""
 
-                def replace_then_fail(_descriptor: int, _content: object) -> int:
+                real_link = INSTALLER_MODULE.link_no_replace_durable
+
+                def replace_then_fail(*arguments: object) -> None:
                     nonlocal replacement_fingerprint, status_before, index_before
+                    real_link(*arguments)
                     target.unlink()
                     if replacement_type == "directory":
                         target.mkdir(mode=0o750)
@@ -5377,10 +7783,13 @@ def load_environment(*, checkout_root, environ, require_catalog):
                     raise OSError("fixture write failure")
 
                 with mock.patch.object(
-                    INSTALLER_MODULE.os, "write", side_effect=replace_then_fail
+                    INSTALLER_MODULE,
+                    "link_no_replace_durable",
+                    side_effect=replace_then_fail,
                 ), self.assertRaisesRegex(
-                    INSTALLER_MODULE.InstallError, "replaced during failed cleanup"
-                ):
+                    INSTALLER_MODULE.InstallError,
+                    "planned destination is no longer available",
+                ) as raised:
                     INSTALLER_MODULE.install(
                         source,
                         digest,
@@ -5388,7 +7797,14 @@ def load_environment(*, checkout_root, environ, require_catalog):
                         relative,
                         target.name,
                         target,
+                        self.user / ".git",
                     )
+                self.assertIsInstance(
+                    raised.exception.__cause__, INSTALLER_MODULE.InstallError
+                )
+                self.assertIn(
+                    "replaced during failed cleanup", str(raised.exception.__cause__)
+                )
                 metadata = os.lstat(target)
                 self.assertEqual(
                     (
@@ -5419,9 +7835,183 @@ def load_environment(*, checkout_root, environ, require_catalog):
                 self.assertEqual(
                     (self.user / ".git" / "index").read_bytes(), index_before
                 )
+
+    def test_installer_failure_retains_same_inode_drift(self) -> None:
+        """Never unlink an installer inode after content, size, or mode drift."""
+        source = self.workdir / "staged-drift-summary.md"
+        source.write_text("verified artifact\n", encoding="utf-8")
+        digest = hashlib.sha256(source.read_bytes()).hexdigest()
+        real_link = INSTALLER_MODULE.link_no_replace_durable
+        for drift in ("content", "size", "mode"):
+            with self.subTest(drift=drift):
+                relative = PurePosixPath(f"installer-drift-{drift}")
+                target = self.user / str(relative) / "summary.md"
+                before_quarantines = set(
+                    (self.user / ".git").glob(".vault-publisher-install-*")
+                )
+
+                def drift_then_fail(*arguments: object) -> None:
+                    real_link(*arguments)
+                    if drift == "content":
+                        target.write_text("tampered\n", encoding="utf-8")
+                    elif drift == "size":
+                        target.write_text("tampered with extra bytes\n", encoding="utf-8")
+                    else:
+                        os.chmod(target, 0o640)
+                    raise OSError("fixture write failure")
+
+                with mock.patch.object(
+                    INSTALLER_MODULE,
+                    "link_no_replace_durable",
+                    side_effect=drift_then_fail,
+                ), self.assertRaisesRegex(
+                    INSTALLER_MODULE.InstallError,
+                    "planned destination is no longer available",
+                ) as raised:
+                    INSTALLER_MODULE.install(
+                        source,
+                        digest,
+                        self.user,
+                        relative,
+                        target.name,
+                        target,
+                        self.user / ".git",
+                    )
+                self.assertIsInstance(
+                    raised.exception.__cause__, INSTALLER_MODULE.InstallError
+                )
+                self.assertIn(
+                    "changed and was retained", str(raised.exception.__cause__)
+                )
+                self.assertFalse(target.exists())
+                quarantines = set(
+                    (self.user / ".git").glob(".vault-publisher-install-*")
+                ) - before_quarantines
+                self.assertEqual(len(quarantines), 1)
+                held = next(iter(quarantines)) / "artifact"
+                self.assertTrue(held.is_file())
+                if drift == "content":
+                    self.assertEqual(held.read_text(encoding="utf-8"), "tampered\n")
+                elif drift == "size":
+                    self.assertEqual(
+                        held.read_text(encoding="utf-8"),
+                        "tampered with extra bytes\n",
+                    )
+                else:
+                    self.assertEqual(stat.S_IMODE(held.stat().st_mode), 0o640)
                 self.assertEqual(
                     list(target.parent.glob(".vault-publisher-install-*")), []
                 )
+
+    def test_installer_hash_rewinds_a_post_write_descriptor(self) -> None:
+        """Hash all owned bytes even when cleanup begins with the fd at EOF."""
+        artifact = self.workdir / "installer-post-write-hash.md"
+        content = b"non-empty installer artifact\n"
+        artifact.write_bytes(content)
+        descriptor = os.open(artifact, os.O_RDWR | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            os.lseek(descriptor, 0, os.SEEK_END)
+            self.assertEqual(
+                INSTALLER_MODULE.sha256_fd(descriptor),
+                hashlib.sha256(content).hexdigest(),
+            )
+            self.assertEqual(os.lseek(descriptor, 0, os.SEEK_CUR), 0)
+        finally:
+            os.close(descriptor)
+
+    def test_installer_failure_reopens_post_move_retention(self) -> None:
+        """Read failed-install worktree from its bound reservation after movement."""
+        source = self.workdir / "post-move-installer-summary.md"
+        source.write_bytes(b"verified artifact\n")
+        digest = hashlib.sha256(source.read_bytes()).hexdigest()
+
+        for drift in ("content", "size", "mode"):
+            with self.subTest(drift=drift):
+                relative = PurePosixPath(f"installer-post-move-{drift}")
+                target = self.user / str(relative) / "summary.md"
+                before_reservations = set(
+                    (self.user / ".git").glob(".vault-publisher-install-*")
+                )
+                real_link = INSTALLER_MODULE.link_no_replace_durable
+                real_rename = INSTALLER_MODULE.rename_no_replace
+
+                def install_then_fail(*arguments: object) -> None:
+                    real_link(*arguments)
+                    raise OSError("fixture post-install failure")
+
+                def drift_after_cleanup_move(
+                    source_fd: int,
+                    source_name: str,
+                    destination_fd: int,
+                    destination_name: str,
+                ) -> None:
+                    real_rename(
+                        source_fd, source_name, destination_fd, destination_name
+                    )
+                    retained_fd = os.open(
+                        destination_name,
+                        os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0),
+                        dir_fd=destination_fd,
+                    )
+                    try:
+                        if drift == "content":
+                            os.write(retained_fd, b"tampered artifact\n")
+                            os.ftruncate(retained_fd, len(b"tampered artifact\n"))
+                        elif drift == "size":
+                            os.write(retained_fd, b"verified artifact extended\n")
+                            os.ftruncate(
+                                retained_fd, len(b"verified artifact extended\n")
+                            )
+                        else:
+                            os.fchmod(retained_fd, 0o640)
+                        os.fsync(retained_fd)
+                    finally:
+                        os.close(retained_fd)
+
+                with mock.patch.object(
+                    INSTALLER_MODULE,
+                    "link_no_replace_durable",
+                    side_effect=install_then_fail,
+                ), mock.patch.object(
+                    INSTALLER_MODULE,
+                    "rename_no_replace",
+                    side_effect=drift_after_cleanup_move,
+                ), self.assertRaisesRegex(
+                    INSTALLER_MODULE.InstallError,
+                    "planned destination is no longer available",
+                ) as raised:
+                    INSTALLER_MODULE.install(
+                        source,
+                        digest,
+                        self.user,
+                        relative,
+                        target.name,
+                        target,
+                        self.user / ".git",
+                    )
+                self.assertIsInstance(
+                    raised.exception.__cause__, INSTALLER_MODULE.InstallError
+                )
+                self.assertIn(
+                    "changed and was retained", str(raised.exception.__cause__)
+                )
+                self.assertFalse(target.exists())
+                reservations = set(
+                    (self.user / ".git").glob(".vault-publisher-install-*")
+                ) - before_reservations
+                self.assertEqual(len(reservations), 1)
+                reservation = next(iter(reservations))
+                held = reservation / "worktree"
+                self.assertTrue(held.is_file())
+                if drift == "content":
+                    self.assertEqual(held.read_bytes(), b"tampered artifact\n")
+                elif drift == "size":
+                    self.assertEqual(
+                        held.read_bytes(), b"verified artifact extended\n"
+                    )
+                else:
+                    self.assertEqual(held.read_bytes(), b"verified artifact\n")
+                    self.assertEqual(stat.S_IMODE(held.stat().st_mode), 0o640)
 
     def test_evidence_preparer_invalid_utf8_fails_closed(self) -> None:
         """Convert malformed runtime JSON into the status-75 contract."""
@@ -5627,30 +8217,742 @@ def load_environment(*, checkout_root, environ, require_catalog):
                 b"candidate\n",
             )
             self.assertEqual(target.stat().st_mode & 0o777, 0o664)
+            normalized_mtime = max(1, target.stat().st_mtime_ns - 1_000_000_000)
+            os.utime(target, ns=(normalized_mtime, normalized_mtime))
             FINALIZER_MODULE.rollback_worktree_candidate(receipt)
         finally:
             os.umask(previous_umask)
         self.assertEqual(target.read_bytes(), b"before\n")
         self.assertEqual(target.stat().st_mode & 0o777, 0o664)
 
+    def test_evidence_partial_candidate_write_keeps_complete_recovery_receipt(self) -> None:
+        """Describe both retained artifacts even when candidate writing fails early."""
+        target = self.agents / "tasks" / "standing.md"
+        original = target.read_bytes()
+        receipt: dict[str, object] = {
+            "base_head": "1" * 40,
+            "candidate_head": "2" * 40,
+        }
+
+        def fail_after_partial_write(descriptor: int, content: bytes) -> None:
+            os.write(descriptor, content[:7])
+            raise FINALIZER_MODULE.FinalizationError("fixture partial write")
+
+        with mock.patch.object(
+            FINALIZER_MODULE,
+            "write_all",
+            side_effect=fail_after_partial_write,
+        ), self.assertRaisesRegex(
+            FINALIZER_MODULE.FinalizationError, "fixture partial write"
+        ):
+            FINALIZER_MODULE.replace_worktree_candidate(
+                str(self.agents),
+                "tasks/standing.md",
+                hashlib.sha256(original).hexdigest(),
+                b"candidate standing task\n",
+                str(self.agents / ".git"),
+                recovery_receipt=receipt,
+            )
+        self.assertEqual(target.read_bytes(), original)
+        self.assertTrue(receipt["original_restored"])
+        self.assertFalse(receipt["canonical_candidate_installed"])
+        self.assertEqual(receipt["candidate_size"], 7)
+        recovery = FINALIZER_MODULE.evidence_recovery(receipt, False, False)
+        self.assertEqual(recovery["candidate"]["size"], 7)
+        self.assertTrue(recovery["original_restored"])
+
+    def test_evidence_rollback_refuses_same_byte_replacement(self) -> None:
+        """Bind rollback authority to the installed candidate inode, not its SHA alone."""
+        target = self.agents / "evidence-same-byte-replacement.md"
+        target.write_bytes(b"before\n")
+        target.chmod(0o664)
+        receipt = FINALIZER_MODULE.replace_worktree_candidate(
+            str(self.agents),
+            target.name,
+            hashlib.sha256(b"before\n").hexdigest(),
+            b"candidate\n",
+        )
+        owned_identity = tuple(receipt["candidate_identity"])
+        target.unlink()
+        target.write_bytes(b"candidate\n")
+        target.chmod(stat.S_IMODE(int(receipt["candidate_mode"])))
+        replacement_identity = (target.stat().st_dev, target.stat().st_ino)
+        self.assertNotEqual(replacement_identity, owned_identity)
+
+        with self.assertRaisesRegex(
+            FINALIZER_MODULE.FinalizationError, "rollback refused"
+        ):
+            FINALIZER_MODULE.rollback_worktree_candidate(receipt)
+        self.assertEqual(target.read_bytes(), b"candidate\n")
+        self.assertEqual(
+            (target.stat().st_dev, target.stat().st_ino), replacement_identity
+        )
+
+    def test_evidence_install_restores_a_last_check_replacement(self) -> None:
+        """Never overwrite an entry swapped in immediately before install quarantine."""
+        target = self.agents / "evidence-install-race.md"
+        target.write_bytes(b"before\n")
+        target.chmod(0o664)
+        real_rename = FINALIZER_MODULE.rename_no_replace
+        calls = 0
+        replacement_identity: tuple[int, int] | None = None
+
+        def replace_before_quarantine(*args: object, **kwargs: object) -> None:
+            nonlocal calls, replacement_identity
+            calls += 1
+            if calls == 1:
+                target.unlink()
+                target.write_bytes(b"third party\n")
+                target.chmod(0o640)
+                replacement_identity = (target.stat().st_dev, target.stat().st_ino)
+            real_rename(*args, **kwargs)
+
+        with mock.patch.object(
+            FINALIZER_MODULE,
+            "rename_no_replace",
+            side_effect=replace_before_quarantine,
+        ), self.assertRaisesRegex(
+            FINALIZER_MODULE.FinalizationError, "replacement was restored"
+        ):
+            FINALIZER_MODULE.replace_worktree_candidate(
+                str(self.agents),
+                target.name,
+                hashlib.sha256(b"before\n").hexdigest(),
+                b"candidate\n",
+            )
+        self.assertEqual(target.read_bytes(), b"third party\n")
+        self.assertEqual(
+            (target.stat().st_dev, target.stat().st_ino), replacement_identity
+        )
+        self.assertEqual(
+            list(self.agents.glob(f".{target.name}.publication-quarantine-*")), []
+        )
+
+    def test_evidence_rollback_restores_a_last_check_replacement(self) -> None:
+        """Restore, rather than delete, an entry swapped in before rollback quarantine."""
+        target = self.agents / "evidence-rollback-race.md"
+        target.write_bytes(b"before\n")
+        target.chmod(0o664)
+        receipt = FINALIZER_MODULE.replace_worktree_candidate(
+            str(self.agents),
+            target.name,
+            hashlib.sha256(b"before\n").hexdigest(),
+            b"candidate\n",
+        )
+        real_rename = FINALIZER_MODULE.rename_no_replace
+        calls = 0
+        replacement_identity: tuple[int, int] | None = None
+
+        def replace_before_quarantine(*args: object, **kwargs: object) -> None:
+            nonlocal calls, replacement_identity
+            calls += 1
+            if calls == 1:
+                target.unlink()
+                target.write_bytes(b"candidate\n")
+                target.chmod(stat.S_IMODE(int(receipt["candidate_mode"])))
+                replacement_identity = (target.stat().st_dev, target.stat().st_ino)
+            real_rename(*args, **kwargs)
+
+        with mock.patch.object(
+            FINALIZER_MODULE,
+            "rename_no_replace",
+            side_effect=replace_before_quarantine,
+        ), self.assertRaisesRegex(
+            FINALIZER_MODULE.FinalizationError, "replacement was restored"
+        ):
+            FINALIZER_MODULE.rollback_worktree_candidate(receipt)
+        self.assertEqual(target.read_bytes(), b"candidate\n")
+        self.assertEqual(
+            (target.stat().st_dev, target.stat().st_ino), replacement_identity
+        )
+        self.assertEqual(
+            list(self.agents.glob(f".{target.name}.rollback-quarantine-*")), []
+        )
+
+    def test_evidence_rollback_quarantines_owned_candidate_on_reoccupation(self) -> None:
+        """Preserve both the owned candidate and a new path occupant on collision."""
+        target = self.agents / "evidence-rollback-reoccupation.md"
+        target.write_bytes(b"before\n")
+        target.chmod(0o664)
+        receipt = FINALIZER_MODULE.replace_worktree_candidate(
+            str(self.agents),
+            target.name,
+            hashlib.sha256(b"before\n").hexdigest(),
+            b"candidate\n",
+        )
+        owned_identity = tuple(receipt["candidate_identity"])
+        real_rename = FINALIZER_MODULE.rename_no_replace
+        calls = 0
+
+        def reoccupy_after_quarantine(*args: object, **kwargs: object) -> None:
+            nonlocal calls
+            calls += 1
+            real_rename(*args, **kwargs)
+            if calls == 1:
+                target.write_bytes(b"new occupant\n")
+
+        with mock.patch.object(
+            FINALIZER_MODULE,
+            "rename_no_replace",
+            side_effect=reoccupy_after_quarantine,
+        ), self.assertRaisesRegex(
+            FINALIZER_MODULE.FinalizationError,
+            "both tombstones were retained",
+        ):
+            FINALIZER_MODULE.rollback_worktree_candidate(receipt)
+        self.assertEqual(target.read_bytes(), b"new occupant\n")
+        quarantines = list(
+            (self.agents / ".git").glob(".publication-evidence-candidate-*")
+        )
+        self.assertEqual(len(quarantines), 1)
+        held = quarantines[0] / "artifact"
+        self.assertEqual((held.stat().st_dev, held.stat().st_ino), owned_identity)
+        self.assertEqual(held.read_bytes(), b"candidate\n")
+
+    def test_evidence_original_detachment_reopens_post_move_retention(self) -> None:
+        """Seal detached original bytes through the bound quarantine directory."""
+        for drift in ("content", "size", "mode"):
+            with self.subTest(drift=drift):
+                target = self.agents / f"evidence-original-post-move-{drift}.md"
+                target.write_bytes(b"before\n")
+                target.chmod(0o664)
+                quarantine_root = self.agents / ".git"
+                before_quarantines = set(
+                    quarantine_root.glob(".publication-evidence-original-*")
+                )
+                real_rename = FINALIZER_MODULE.rename_no_replace
+
+                def drift_after_detachment(
+                    source_fd: int,
+                    source_name: str,
+                    destination_fd: int,
+                    destination_name: str,
+                ) -> None:
+                    real_rename(
+                        source_fd, source_name, destination_fd, destination_name
+                    )
+                    retained_fd = os.open(
+                        destination_name,
+                        os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0),
+                        dir_fd=destination_fd,
+                    )
+                    try:
+                        if drift == "content":
+                            os.write(retained_fd, b"tamper\n")
+                            os.ftruncate(retained_fd, len(b"tamper\n"))
+                        elif drift == "size":
+                            os.write(retained_fd, b"before extended\n")
+                            os.ftruncate(retained_fd, len(b"before extended\n"))
+                        else:
+                            os.fchmod(retained_fd, 0o600)
+                        os.fsync(retained_fd)
+                    finally:
+                        os.close(retained_fd)
+
+                with mock.patch.object(
+                    FINALIZER_MODULE,
+                    "rename_no_replace",
+                    side_effect=drift_after_detachment,
+                ), self.assertRaisesRegex(
+                    FINALIZER_MODULE.FinalizationError,
+                    "retained original changed after detachment",
+                ):
+                    FINALIZER_MODULE.replace_worktree_candidate(
+                        str(self.agents),
+                        target.name,
+                        hashlib.sha256(b"before\n").hexdigest(),
+                        b"candidate\n",
+                    )
+                self.assertFalse(target.exists())
+                quarantines = set(
+                    quarantine_root.glob(".publication-evidence-original-*")
+                ) - before_quarantines
+                self.assertEqual(len(quarantines), 1)
+                quarantine = next(iter(quarantines))
+                retained = quarantine / "detached"
+                reserved = quarantine / "artifact"
+                self.assertEqual(
+                    (retained.stat().st_dev, retained.stat().st_ino),
+                    (reserved.stat().st_dev, reserved.stat().st_ino),
+                )
+                if drift == "content":
+                    self.assertEqual(retained.read_bytes(), b"tamper\n")
+                elif drift == "size":
+                    self.assertEqual(retained.read_bytes(), b"before extended\n")
+                else:
+                    self.assertEqual(retained.read_bytes(), b"before\n")
+                    self.assertEqual(stat.S_IMODE(retained.stat().st_mode), 0o600)
+
+    def test_evidence_install_retains_original_on_same_inode_drift(self) -> None:
+        """Recheck candidate bytes, size, and mode after the install rename."""
+        mutations = {
+            "content": lambda target: target.write_bytes(b"changed!\n"),
+            "size": lambda target: target.write_bytes(b"candidate extended\n"),
+            "mode": lambda target: target.chmod(0o600),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(drift=name):
+                directory = self.agents / f"install-{name}"
+                directory.mkdir()
+                target = directory / "standing.md"
+                target.write_bytes(b"before\n")
+                target.chmod(0o664)
+                quarantine_root = self.agents / ".git"
+                before_quarantines = set(
+                    quarantine_root.glob(".publication-evidence-original-*")
+                )
+                real_link = FINALIZER_MODULE.link_no_replace_durable
+                calls = 0
+
+                def mutate_after_candidate_install(
+                    *args: object, **kwargs: object
+                ) -> None:
+                    nonlocal calls
+                    calls += 1
+                    real_link(*args, **kwargs)
+                    if calls == 2:
+                        mutate(target)
+
+                with mock.patch.object(
+                    FINALIZER_MODULE,
+                    "link_no_replace_durable",
+                    side_effect=mutate_after_candidate_install,
+                ), self.assertRaisesRegex(
+                    FINALIZER_MODULE.FinalizationError,
+                    "candidate changed after installation",
+                ):
+                    FINALIZER_MODULE.replace_worktree_candidate(
+                        str(self.agents),
+                        str(target.relative_to(self.agents)),
+                        hashlib.sha256(b"before\n").hexdigest(),
+                        b"candidate\n",
+                    )
+                quarantines = list(
+                    set(quarantine_root.glob(".publication-evidence-original-*"))
+                    - before_quarantines
+                )
+                self.assertEqual(len(quarantines), 1)
+                self.assertEqual(
+                    (quarantines[0] / "artifact").read_bytes(), b"before\n"
+                )
+
+    def test_evidence_rollback_refuses_same_inode_metadata_drift(self) -> None:
+        """Preserve a same-inode concurrent edit and the retained original."""
+        mutations = {
+            "content": lambda target: target.write_bytes(b"changed!\n"),
+            "size": lambda target: target.write_bytes(b"candidate extended\n"),
+            "mode": lambda target: target.chmod(0o600),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(drift=name):
+                directory = self.agents / f"rollback-{name}"
+                directory.mkdir()
+                target = directory / "standing.md"
+                target.write_bytes(b"before\n")
+                target.chmod(0o664)
+                receipt = FINALIZER_MODULE.replace_worktree_candidate(
+                    str(self.agents),
+                    str(target.relative_to(self.agents)),
+                    hashlib.sha256(b"before\n").hexdigest(),
+                    b"candidate\n",
+                )
+                identity = (target.stat().st_dev, target.stat().st_ino)
+                mutate(target)
+                self.assertEqual(
+                    (target.stat().st_dev, target.stat().st_ino), identity
+                )
+                with self.assertRaisesRegex(
+                    FINALIZER_MODULE.FinalizationError,
+                    "candidate tombstone changed",
+                ):
+                    FINALIZER_MODULE.rollback_worktree_candidate(receipt)
+                original = (
+                    Path(str(receipt["original_quarantine_root"]))
+                    / str(receipt["original_quarantine_name"])
+                    / "artifact"
+                )
+                self.assertEqual(original.read_bytes(), b"before\n")
+
+    def test_evidence_rollback_reopens_post_move_worktree(self) -> None:
+        """Seal the extra rollback worktree through its destination directory."""
+        for drift in ("content", "size", "mode"):
+            with self.subTest(drift=drift):
+                target = self.agents / f"evidence-rollback-post-move-{drift}.md"
+                target.write_bytes(b"before\n")
+                target.chmod(0o664)
+                receipt = FINALIZER_MODULE.replace_worktree_candidate(
+                    str(self.agents),
+                    target.name,
+                    hashlib.sha256(b"before\n").hexdigest(),
+                    b"candidate\n",
+                )
+                real_rename = FINALIZER_MODULE.rename_no_replace
+
+                def drift_after_move(
+                    source_fd: int,
+                    source_name: str,
+                    destination_fd: int,
+                    destination_name: str,
+                ) -> None:
+                    real_rename(
+                        source_fd, source_name, destination_fd, destination_name
+                    )
+                    if destination_name != "worktree":
+                        return
+                    retained_fd = os.open(
+                        destination_name,
+                        os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0),
+                        dir_fd=destination_fd,
+                    )
+                    try:
+                        if drift == "content":
+                            os.write(retained_fd, b"changed!!\n")
+                            os.ftruncate(retained_fd, len(b"changed!!\n"))
+                        elif drift == "size":
+                            os.write(retained_fd, b"candidate extended\n")
+                            os.ftruncate(retained_fd, len(b"candidate extended\n"))
+                        else:
+                            os.fchmod(retained_fd, 0o600)
+                        os.fsync(retained_fd)
+                    finally:
+                        os.close(retained_fd)
+
+                with mock.patch.object(
+                    FINALIZER_MODULE,
+                    "rename_no_replace",
+                    side_effect=drift_after_move,
+                ), self.assertRaisesRegex(
+                    FINALIZER_MODULE.FinalizationError,
+                    "retained candidate changed; replacement was restored",
+                ):
+                    FINALIZER_MODULE.rollback_worktree_candidate(receipt)
+                self.assertTrue(target.exists())
+                retained = (
+                    Path(str(receipt["original_quarantine_root"]))
+                    / str(receipt["candidate_quarantine_name"])
+                    / "artifact"
+                )
+                self.assertEqual(
+                    (target.stat().st_dev, target.stat().st_ino),
+                    (retained.stat().st_dev, retained.stat().st_ino),
+                )
+                if drift == "content":
+                    self.assertEqual(target.read_bytes(), b"changed!!\n")
+                elif drift == "size":
+                    self.assertEqual(target.read_bytes(), b"candidate extended\n")
+                else:
+                    self.assertEqual(target.read_bytes(), b"candidate\n")
+                    self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o600)
+
+    def test_evidence_success_result_waits_for_index_retention(self) -> None:
+        """Never expose success JSON before shared-index cleanup succeeds."""
+        output = self.workdir / "gated-evidence-result.json"
+        candidate = (
+            str(self.workdir / "private-index"),
+            {"sha256": "a" * 64, "identity": [1, 2, 3, 0o100600, 4, 5]},
+        )
+        result = {"outcome": "success"}
+
+        def reject_retention(*args: object, **kwargs: object) -> None:
+            self.assertFalse(output.exists())
+            raise ATOMIC_FILE_OPS_MODULE.AtomicTransactionError(
+                "fixture retention failure"
+            )
+
+        with mock.patch.object(
+            FINALIZER_MODULE,
+            "retain_path_no_replace",
+            side_effect=reject_retention,
+        ), self.assertRaisesRegex(
+            ATOMIC_FILE_OPS_MODULE.AtomicTransactionError,
+            "fixture retention failure",
+        ):
+            FINALIZER_MODULE.publish_success_result_after_cleanup(
+                output, result, candidate
+            )
+        self.assertFalse(output.exists())
+
+        def accept_retention(*args: object, **kwargs: object) -> str:
+            self.assertFalse(output.exists())
+            return str(self.workdir / "retained-index")
+
+        with mock.patch.object(
+            FINALIZER_MODULE,
+            "retain_path_no_replace",
+            side_effect=accept_retention,
+        ):
+            FINALIZER_MODULE.publish_success_result_after_cleanup(
+                output, result, candidate
+            )
+        self.assertEqual(json.loads(output.read_text(encoding="utf-8")), result)
+
+    def test_evidence_install_retains_candidate_after_path_replacement(self) -> None:
+        """Keep the exact candidate durable when its canonical hardlink is replaced."""
+        target = self.agents / "candidate-path-replacement.md"
+        target.write_bytes(b"before\n")
+        receipt: dict[str, object] = {
+            "base_head": "a" * 40,
+            "candidate_head": "b" * 40,
+        }
+        real_link = FINALIZER_MODULE.link_no_replace_durable
+        calls = 0
+
+        def replace_after_candidate_link(*args: object, **kwargs: object) -> None:
+            nonlocal calls
+            calls += 1
+            real_link(*args, **kwargs)
+            if calls == 2:
+                target.unlink()
+                target.write_bytes(b"third party\n")
+
+        with mock.patch.object(
+            FINALIZER_MODULE,
+            "link_no_replace_durable",
+            side_effect=replace_after_candidate_link,
+        ), self.assertRaisesRegex(
+            FINALIZER_MODULE.FinalizationError,
+            "candidate changed after installation",
+        ):
+            FINALIZER_MODULE.replace_worktree_candidate(
+                str(self.agents),
+                target.name,
+                hashlib.sha256(b"before\n").hexdigest(),
+                b"candidate\n",
+                recovery_receipt=receipt,
+            )
+        candidate = (
+            Path(str(receipt["original_quarantine_root"]))
+            / str(receipt["candidate_quarantine_name"])
+            / "artifact"
+        )
+        self.assertEqual(candidate.read_bytes(), b"candidate\n")
+        self.assertEqual(
+            (candidate.stat().st_dev, candidate.stat().st_ino),
+            tuple(receipt["candidate_identity"]),
+        )
+        self.assertEqual(target.read_bytes(), b"third party\n")
+
+    def test_evidence_transaction_finalizes_retained_original(self) -> None:
+        """Retain the private original after explicit phase-two verification."""
+        directory = self.agents / "finalize-transaction"
+        directory.mkdir()
+        target = directory / "standing.md"
+        target.write_bytes(b"before\n")
+        target.chmod(0o664)
+        receipt = FINALIZER_MODULE.replace_worktree_candidate(
+            str(self.agents),
+            str(target.relative_to(self.agents)),
+            hashlib.sha256(b"before\n").hexdigest(),
+            b"candidate\n",
+        )
+        quarantine = (
+            Path(str(receipt["original_quarantine_root"]))
+            / str(receipt["original_quarantine_name"])
+        )
+        self.assertEqual((quarantine / "artifact").read_bytes(), b"before\n")
+        FINALIZER_MODULE.finalize_worktree_candidate(receipt)
+        self.assertEqual(target.read_bytes(), b"candidate\n")
+        self.assertEqual((quarantine / "artifact").read_bytes(), b"before\n")
+
+    def test_evidence_rollback_rechecks_original_after_restore(self) -> None:
+        """Detect same-inode original drift in the final restore window."""
+        target = self.agents / "restore-recheck.md"
+        target.write_bytes(b"before\n")
+        target.chmod(0o664)
+        receipt = FINALIZER_MODULE.replace_worktree_candidate(
+            str(self.agents),
+            target.name,
+            hashlib.sha256(b"before\n").hexdigest(),
+            b"candidate\n",
+        )
+        real_link = FINALIZER_MODULE.link_no_replace_durable
+
+        def drift_after_restore(*args: object, **kwargs: object) -> None:
+            real_link(*args, **kwargs)
+            target.write_bytes(b"restored but changed\n")
+
+        with mock.patch.object(
+            FINALIZER_MODULE,
+            "link_no_replace_durable",
+            side_effect=drift_after_restore,
+        ), self.assertRaisesRegex(
+            FINALIZER_MODULE.FinalizationError,
+            "original changed after restore",
+        ):
+            FINALIZER_MODULE.rollback_worktree_candidate(receipt)
+        self.assertEqual(target.read_bytes(), b"restored but changed\n")
+        rollback_tombstones = list(
+            (self.agents / ".git").glob(".publication-evidence-candidate-*")
+        )
+        self.assertEqual(len(rollback_tombstones), 1)
+        self.assertEqual(
+            (rollback_tombstones[0] / "artifact").read_bytes(), b"candidate\n"
+        )
+
+    def test_evidence_rebinds_parent_chain_and_quarantine_root(self) -> None:
+        """Reject directory replacement across transaction phases."""
+        parent = self.agents / "parent-binding"
+        parent.mkdir()
+        target = parent / "standing.md"
+        target.write_bytes(b"before\n")
+        receipt = FINALIZER_MODULE.replace_worktree_candidate(
+            str(self.agents),
+            str(target.relative_to(self.agents)),
+            hashlib.sha256(b"before\n").hexdigest(),
+            b"candidate\n",
+        )
+        moved_parent = self.agents / "parent-binding-original"
+        parent.rename(moved_parent)
+        parent.mkdir()
+        replacement = parent / "standing.md"
+        replacement.write_bytes(b"third party\n")
+        with self.assertRaisesRegex(
+            FINALIZER_MODULE.FinalizationError, "parent chain changed"
+        ):
+            FINALIZER_MODULE.finalize_worktree_candidate(receipt)
+        self.assertEqual(replacement.read_bytes(), b"third party\n")
+        self.assertEqual(
+            (moved_parent / "standing.md").read_bytes(), b"candidate\n"
+        )
+
+        custom_root = self.agents / "private-quarantine"
+        custom_root.mkdir()
+        second = self.agents / "quarantine-binding.md"
+        second.write_bytes(b"before\n")
+        second_receipt = FINALIZER_MODULE.replace_worktree_candidate(
+            str(self.agents),
+            second.name,
+            hashlib.sha256(b"before\n").hexdigest(),
+            b"candidate\n",
+            str(custom_root),
+        )
+        moved_root = self.agents / "private-quarantine-original"
+        custom_root.rename(moved_root)
+        custom_root.mkdir()
+        with self.assertRaisesRegex(
+            FINALIZER_MODULE.FinalizationError, "quarantine root changed"
+        ):
+            FINALIZER_MODULE.finalize_worktree_candidate(second_receipt)
+        self.assertEqual(second.read_bytes(), b"candidate\n")
+
+    def test_evidence_rollback_retains_original_after_restore_name_race(self) -> None:
+        """Keep the exact original tombstone after replacement or deletion."""
+        for race in ("replacement", "deletion"):
+            with self.subTest(race=race):
+                target = self.agents / f"restore-name-race-{race}.md"
+                target.write_bytes(b"before\n")
+                receipt = FINALIZER_MODULE.replace_worktree_candidate(
+                    str(self.agents),
+                    target.name,
+                    hashlib.sha256(b"before\n").hexdigest(),
+                    b"candidate\n",
+                )
+                real_link = FINALIZER_MODULE.link_no_replace_durable
+
+                def race_after_restore(*arguments: object, **kwargs: object) -> None:
+                    real_link(*arguments, **kwargs)
+                    target.unlink()
+                    if race == "replacement":
+                        target.write_bytes(b"third party\n")
+
+                with mock.patch.object(
+                    FINALIZER_MODULE,
+                    "link_no_replace_durable",
+                    side_effect=race_after_restore,
+                ), self.assertRaisesRegex(
+                    FINALIZER_MODULE.FinalizationError, "after restore"
+                ):
+                    FINALIZER_MODULE.rollback_worktree_candidate(receipt)
+                original = (
+                    Path(str(receipt["original_quarantine_root"]))
+                    / str(receipt["original_quarantine_name"])
+                    / "artifact"
+                )
+                candidate = (
+                    Path(str(receipt["original_quarantine_root"]))
+                    / str(receipt["rollback_candidate_quarantine_name"])
+                    / "artifact"
+                )
+                self.assertEqual(original.read_bytes(), b"before\n")
+                self.assertEqual(candidate.read_bytes(), b"candidate\n")
+                if race == "replacement":
+                    self.assertEqual(target.read_bytes(), b"third party\n")
+                else:
+                    self.assertFalse(target.exists())
+
+    def test_evidence_target_rejects_intermediate_symlink(self) -> None:
+        """Bind every evidence parent component to the Vault root descriptor."""
+        outside = self.root / "outside-evidence"
+        nested = outside / "nested"
+        nested.mkdir(parents=True)
+        target = nested / "standing.md"
+        target.write_bytes(b"outside before\n")
+        (self.agents / "linked-evidence").symlink_to(outside, target_is_directory=True)
+        with self.assertRaisesRegex(
+            FINALIZER_MODULE.FinalizationError,
+            "parent contains a symlink",
+        ):
+            FINALIZER_MODULE.replace_worktree_candidate(
+                str(self.agents),
+                "linked-evidence/nested/standing.md",
+                hashlib.sha256(b"outside before\n").hexdigest(),
+                b"candidate\n",
+            )
+        self.assertEqual(target.read_bytes(), b"outside before\n")
+
     def test_evidence_push_retries_transient_remote_verification(self) -> None:
         """A transient ls-remote failure must not discard a successful fixed push."""
         commit = "b" * 40
         completed = subprocess.CompletedProcess([], 0, "", "")
         with mock.patch.object(
+            FINALIZER_MODULE, "require_fast_forward_target"
+        ) as ancestry, mock.patch.object(
             FINALIZER_MODULE, "git", return_value=completed
         ) as git, mock.patch.object(
             FINALIZER_MODULE,
             "remote_head",
-            side_effect=[TRANSPORT_MODULE.TransportError("transient"), commit],
+            side_effect=[
+                "a" * 40,
+                TRANSPORT_MODULE.TransportError("transient"),
+                commit,
+            ],
         ):
             remote = FINALIZER_MODULE.push_evidence_with_retry(
                 "/agents", "remote", "/agents/.git", commit, "a" * 40
             )
         self.assertEqual(remote, commit)
-        self.assertEqual(git.call_count, 2)
+        self.assertEqual(git.call_count, 1)
+        ancestry.assert_called_once_with(
+            "/agents", "a" * 40, commit, "/agents/.git"
+        )
         for call in git.call_args_list:
-            self.assertEqual(call.args[-3:], ("push", "remote", f"{commit}:refs/heads/main"))
+            self.assertEqual(
+                call.args[-3:],
+                ("push", "remote", f"{commit}:refs/heads/main"),
+            )
+            self.assertFalse(
+                any(str(argument).startswith("--force") for argument in call.args)
+            )
+
+    def test_evidence_push_rejects_non_descendant_target_before_transport(self) -> None:
+        """Do not let evidence publication rewrite reviewed remote history."""
+        completed = subprocess.CompletedProcess([], 1, "", "")
+        with mock.patch.object(FINALIZER_MODULE, "git", return_value=completed) as git:
+            with self.assertRaisesRegex(
+                FINALIZER_MODULE.FinalizationError, "not a descendant"
+            ):
+                FINALIZER_MODULE.push_evidence_with_retry(
+                    "/agents", "remote", "/agents/.git", "b" * 40, "a" * 40
+                )
+        git.assert_called_once_with(
+            "/agents",
+            "merge-base",
+            "--is-ancestor",
+            "a" * 40,
+            "b" * 40,
+            check=False,
+            git_dir="/agents/.git",
+        )
 
     def test_evidence_target_content_guards_fail_closed(self) -> None:
         """Reject malformed, oversized, growing, and oversized-output targets."""
@@ -5747,6 +9049,43 @@ def load_environment(*, checkout_root, environ, require_catalog):
                 self.assertEqual(task.read_bytes(), original)
                 self.assertEqual(list(task.parent.glob("*.evidence-*.tmp")), [])
 
+    def test_evidence_temp_cleanup_retains_a_post_check_replacement(self) -> None:
+        """Fail closed without deleting a temporary pathname replacement."""
+        task = self.agents / "tasks" / "standing.md"
+        relative = Path("tasks/standing.md")
+        original = task.read_bytes()
+        block = (
+            "\n#### Daily publication evidence — fixture\n"
+            "<!-- vault-change-publisher:fixture -->\n"
+        ).encode()
+
+        def replace_temporary_then_fail(_descriptor: int, _content: bytes) -> None:
+            temporary = next(task.parent.glob(f".{task.name}.evidence-*.tmp"))
+            replacement = task.parent / ".evidence-third-party-replacement"
+            replacement.write_bytes(b"third-party temporary\n")
+            os.replace(replacement, temporary)
+            raise OSError("injected temporary write failure")
+
+        with mock.patch.object(
+            EVIDENCE_MODULE,
+            "write_all",
+            side_effect=replace_temporary_then_fail,
+        ), self.assertRaisesRegex(
+            EVIDENCE_MODULE.EvidenceError,
+            "third-party inode retained",
+        ):
+            EVIDENCE_MODULE.insert_under_evidence_section_no_follow(
+                self.agents, relative, block
+            )
+        retained = list(
+            task.parent.glob(f".{task.name}.evidence-retained-*")
+        )
+        self.assertEqual(len(retained), 1)
+        self.assertEqual(
+            (retained[0] / "entry").read_bytes(), b"third-party temporary\n"
+        )
+        self.assertEqual(task.read_bytes(), original)
+
     def test_evidence_concurrent_mutation_is_not_overwritten(self) -> None:
         """Detect a target edit before replacement and preserve that edit."""
         task = self.agents / "tasks" / "standing.md"
@@ -5772,6 +9111,122 @@ def load_environment(*, checkout_root, environ, require_catalog):
                 )
         self.assertEqual(task.read_text(encoding="utf-8"), concurrent)
 
+    def test_evidence_detach_race_is_restored_without_overwrite(self) -> None:
+        """Detect an edit after final verification and restore that exact occupant."""
+        task = self.agents / "tasks" / "standing.md"
+        relative = Path("tasks/standing.md")
+        concurrent = task.read_text(encoding="utf-8") + "late concurrent edit\n"
+        block = (
+            "\n#### Daily publication evidence — fixture\n"
+            "<!-- vault-change-publisher:fixture -->\n"
+        ).encode()
+        real_rename = EVIDENCE_MODULE.rename_no_replace
+        calls = 0
+
+        def mutate_before_detach(*args: object, **kwargs: object) -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                task.write_text(concurrent, encoding="utf-8")
+            real_rename(*args, **kwargs)
+
+        with mock.patch.object(
+            EVIDENCE_MODULE,
+            "rename_no_replace",
+            side_effect=mutate_before_detach,
+        ), self.assertRaisesRegex(
+            EVIDENCE_MODULE.EvidenceError,
+            "raced during original detachment",
+        ):
+            EVIDENCE_MODULE.insert_under_evidence_section_no_follow(
+                self.agents, relative, block
+            )
+        self.assertEqual(task.read_text(encoding="utf-8"), concurrent)
+
+    def test_evidence_candidate_post_move_replacement_is_retained(self) -> None:
+        """Verify the installed name, retain a replacement, and restore the task."""
+        task = self.agents / "tasks" / "standing.md"
+        relative = Path("tasks/standing.md")
+        original = task.read_bytes()
+        block = (
+            "\n#### Daily publication evidence — fixture\n"
+            "<!-- vault-change-publisher:fixture -->\n"
+        ).encode()
+        replacement = task.parent / ".post-move-third-party"
+        replacement.write_bytes(b"third-party standing replacement\n")
+        real_rename = EVIDENCE_MODULE.rename_no_replace
+        calls = 0
+
+        def replace_after_candidate_move(*args: object, **kwargs: object) -> None:
+            nonlocal calls
+            calls += 1
+            real_rename(*args, **kwargs)
+            if calls == 2:
+                os.replace(replacement, task)
+
+        with mock.patch.object(
+            EVIDENCE_MODULE,
+            "rename_no_replace",
+            side_effect=replace_after_candidate_move,
+        ), self.assertRaisesRegex(
+            EVIDENCE_MODULE.EvidenceError,
+            "changed during installation",
+        ):
+            EVIDENCE_MODULE.insert_under_evidence_section_no_follow(
+                self.agents, relative, block
+            )
+        self.assertEqual(task.read_bytes(), original)
+        retained = list(task.parent.glob(".evidence-candidate-retained-*"))
+        self.assertEqual(len(retained), 1)
+        self.assertEqual(
+            (retained[0] / "entry").read_bytes(),
+            b"third-party standing replacement\n",
+        )
+
+    def test_publication_cleanup_paths_contain_no_pathname_unlink(self) -> None:
+        """Keep every reviewed publication temporary on a retention transition."""
+        for module in (
+            ATOMIC_FILE_OPS_MODULE,
+            EVIDENCE_MODULE,
+            FINALIZER_MODULE,
+            COMMITTER_MODULE,
+        ):
+            with self.subTest(module=module.__name__):
+                source = Path(module.__file__).read_text(encoding="utf-8")
+                self.assertNotIn("os.unlink(", source)
+
+    def test_owned_temporary_cleanup_retains_a_replacement(self) -> None:
+        """Reject replacement of a prepared index at the common cleanup boundary."""
+        path = Path(
+            ATOMIC_FILE_OPS_MODULE.allocate_private_entry_path(
+                self.workdir,
+                prefix=".owned-index-work-",
+                entry_name="index",
+            )
+        )
+        path.write_bytes(b"owned-index\n")
+        content, identity = FINALIZER_MODULE.index_file_contract(path)
+        contract = {
+            "sha256": hashlib.sha256(content).hexdigest(),
+            "identity": identity,
+        }
+        replacement = path.parent / "replacement"
+        replacement.write_bytes(b"third-party-index\n")
+        os.replace(replacement, path)
+        with self.assertRaisesRegex(
+            ATOMIC_FILE_OPS_MODULE.AtomicTransactionError,
+            "third-party inode retained",
+        ):
+            ATOMIC_FILE_OPS_MODULE.retain_path_no_replace(
+                path,
+                expected=contract,
+                label="owned publication index",
+                prefix=".owned-index-retained-",
+            )
+        retained = list(path.parent.glob(".owned-index-retained-*"))
+        self.assertEqual(len(retained), 1)
+        self.assertEqual((retained[0] / "entry").read_bytes(), b"third-party-index\n")
+
     def test_failed_push_does_not_report_unpublished_preexisting_commits(self) -> None:
         """Include local-ahead hashes only after remote publication succeeds."""
         reported = {
@@ -5786,9 +9241,36 @@ def load_environment(*, checkout_root, environ, require_catalog):
         failed = PUSH_MODULE.final_vault(reported, "failed", "0" * 40, pre)
         self.assertEqual(failed["commit_hashes"], [])
         self.assertEqual(failed["commit_status"], "not_started")
+        not_started = PUSH_MODULE.final_vault(
+            reported, "not_started", "0" * 40, pre
+        )
+        self.assertEqual(not_started["commit_hashes"], [])
+        self.assertEqual(not_started["commit_status"], "not_started")
         complete = PUSH_MODULE.final_vault(reported, "complete", "b" * 40, pre)
         self.assertEqual(complete["commit_hashes"], ["a" * 40])
         self.assertEqual(complete["commit_status"], "complete")
+
+    def test_pusher_rejects_completed_commit_status_for_blocked_vault(self) -> None:
+        """A blocked Vault cannot claim that its publication commit completed."""
+        head = create_empty_base(self.user)
+        subprocess.run(["git", "-C", str(self.user), "branch", "-M", "main"], check=True)
+        subprocess.run(
+            ["git", "-C", str(self.user), "push", "-q", "-u", "origin", "main"],
+            check=True,
+        )
+        pre = CAPTURE_MODULE.capture(str(self.user), include_local_history=True)
+        reported = {
+            "publication_mode": "blocked",
+            "commit_status": "complete",
+            "commit_hashes": [],
+            "pre_local_head": head,
+            "local_head": head,
+            "post_dirty_digest": pre["dirty_digest"],
+        }
+        with self.assertRaisesRegex(PUSH_MODULE.PushError, "blocked Vault changed"):
+            PUSH_MODULE.validate_local(
+                str(self.user), pre, reported, current_state=pre
+            )
 
     def test_fixed_pusher_validates_and_pushes_exact_heads(self) -> None:
         """Push both validated local main heads outside the Codex process."""
@@ -6187,13 +9669,15 @@ def load_environment(*, checkout_root, environ, require_catalog):
         )
         CANONICAL_MODULE.validate(result, schema, schema)
 
-    def test_fixed_push_is_non_force_and_bounded(self) -> None:
-        """Retry a fixed refspec at most three times and stop on remote drift."""
+    def test_fixed_non_force_push_is_bounded(self) -> None:
+        """Retry one fixed fast-forward non-force refspec at most three times."""
         before = "a" * 40
         local = "b" * 40
         failed = subprocess.CompletedProcess([], 1, "", "rejected")
         with mock.patch.object(
             PUSH_MODULE, "remote_head", return_value=before
+        ), mock.patch.object(
+            PUSH_MODULE, "require_fast_forward_target"
         ), mock.patch.object(PUSH_MODULE, "git", return_value=failed) as git:
             self.assertEqual(
                 PUSH_MODULE.push_one(
@@ -6205,11 +9689,20 @@ def load_environment(*, checkout_root, environ, require_catalog):
             for call in git.call_args_list:
                 self.assertEqual(
                     call.args[1:],
-                    ("push", "remote", f"{local}:refs/heads/main"),
+                    (
+                        "push",
+                        "remote",
+                        f"{local}:refs/heads/main",
+                    ),
                 )
-                self.assertNotIn("--force", call.args)
+                self.assertFalse(
+                    any(str(argument).startswith("--force") for argument in call.args)
+                )
+                self.assertFalse(call.args[-1].startswith("+"))
         with mock.patch.object(
             PUSH_MODULE, "remote_head", return_value="c" * 40
+        ), mock.patch.object(
+            PUSH_MODULE, "require_fast_forward_target"
         ), mock.patch.object(PUSH_MODULE, "git") as git:
             self.assertEqual(
                 PUSH_MODULE.push_one(
@@ -6218,6 +9711,166 @@ def load_environment(*, checkout_root, environ, require_catalog):
                 ("failed", "c" * 40),
             )
             git.assert_not_called()
+
+    def test_fixed_push_rejects_non_descendant_target_before_transport(self) -> None:
+        """Never send a non-descendant target to the non-force transport."""
+        completed = subprocess.CompletedProcess([], 1, "", "")
+        with mock.patch.object(PUSH_MODULE, "git", return_value=completed) as git:
+            with self.assertRaisesRegex(PUSH_MODULE.PushError, "not a descendant"):
+                PUSH_MODULE.push_one(
+                    "/vault", "remote", "b" * 40, True, "a" * 40, "/vault/.git"
+                )
+        git.assert_called_once_with(
+            "/vault",
+            "merge-base",
+            "--is-ancestor",
+            "a" * 40,
+            "b" * 40,
+            check=False,
+            git_dir="/vault/.git",
+        )
+
+    def test_fixed_non_force_push_safely_restores_ancestor_rewind_race(self) -> None:
+        """A plain fast-forward push may restore reviewed commits after a rewind."""
+        repo = self.user
+        origin = self.origins["user"]
+        ancestor = create_empty_base(repo)
+        subprocess.run(["git", "-C", str(repo), "branch", "-M", "main"], check=True)
+        subprocess.run(
+            ["git", "-C", str(repo), "push", "-q", "origin", "main"], check=True
+        )
+        (repo / "expected.md").write_text("expected\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "expected.md"], check=True)
+        subprocess.run(
+            [
+                "git", "-C", str(repo),
+                "-c", "user.name=Fixture",
+                "-c", "user.email=fixture@example.invalid",
+                "commit", "-q", "-m", "expected",
+            ],
+            check=True,
+        )
+        expected = subprocess.check_output(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True
+        ).strip()
+        subprocess.run(
+            ["git", "-C", str(repo), "push", "-q", "origin", "main"], check=True
+        )
+        (repo / "candidate.md").write_text("candidate\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "candidate.md"], check=True)
+        subprocess.run(
+            [
+                "git", "-C", str(repo),
+                "-c", "user.name=Fixture",
+                "-c", "user.email=fixture@example.invalid",
+                "commit", "-q", "-m", "candidate",
+            ],
+            check=True,
+        )
+        candidate = subprocess.check_output(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True
+        ).strip()
+        subprocess.run(
+            [
+                "git", f"--git-dir={origin}", "update-ref",
+                "refs/heads/main", ancestor, expected,
+            ],
+            check=True,
+        )
+        actual_remote_head = PUSH_MODULE.remote_head
+        observations = iter((expected,))
+
+        def stale_once(*args: object, **kwargs: object) -> str:
+            try:
+                return next(observations)
+            except StopIteration:
+                return actual_remote_head(*args, **kwargs)
+
+        with mock.patch.object(PUSH_MODULE, "remote_head", side_effect=stale_once):
+            status, observed = PUSH_MODULE.push_one(
+                str(repo), str(origin), candidate, True, expected, str(repo / ".git")
+            )
+        self.assertEqual((status, observed), ("complete", candidate))
+        self.assertEqual(
+            actual_remote_head(str(repo), str(origin), str(repo / ".git")),
+            candidate,
+        )
+
+    def test_fixed_non_force_push_rejects_divergent_remote_race(self) -> None:
+        """Let the server reject a post-check divergent update without rewriting it."""
+        repo = self.user
+        origin = self.origins["user"]
+        create_empty_base(repo)
+        subprocess.run(["git", "-C", str(repo), "branch", "-M", "main"], check=True)
+        (repo / "expected.md").write_text("expected\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "expected.md"], check=True)
+        subprocess.run(
+            [
+                "git", "-C", str(repo), "-c", "user.name=Fixture",
+                "-c", "user.email=fixture@example.invalid", "commit", "-q",
+                "-m", "expected",
+            ],
+            check=True,
+        )
+        expected = subprocess.check_output(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True
+        ).strip()
+        subprocess.run(
+            ["git", "-C", str(repo), "push", "-q", "-u", "origin", "main"],
+            check=True,
+        )
+        racer = self.root / "remote-racer"
+        subprocess.run(
+            ["git", "clone", "-q", "--branch", "main", str(origin), str(racer)],
+            check=True,
+        )
+        (repo / "candidate.md").write_text("candidate\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "candidate.md"], check=True)
+        subprocess.run(
+            [
+                "git", "-C", str(repo), "-c", "user.name=Fixture",
+                "-c", "user.email=fixture@example.invalid", "commit", "-q",
+                "-m", "candidate",
+            ],
+            check=True,
+        )
+        candidate = subprocess.check_output(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True
+        ).strip()
+        (racer / "racer.md").write_text("racer\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(racer), "add", "racer.md"], check=True)
+        subprocess.run(
+            [
+                "git", "-C", str(racer), "-c", "user.name=Fixture",
+                "-c", "user.email=fixture@example.invalid", "commit", "-q",
+                "-m", "racer",
+            ],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(racer), "push", "-q", "origin", "main"],
+            check=True,
+        )
+        raced = subprocess.check_output(
+            ["git", "-C", str(racer), "rev-parse", "HEAD"], text=True
+        ).strip()
+        actual_remote_head = PUSH_MODULE.remote_head
+        observations = iter((expected,))
+
+        def stale_once(*args: object, **kwargs: object) -> str:
+            try:
+                return next(observations)
+            except StopIteration:
+                return actual_remote_head(*args, **kwargs)
+
+        with mock.patch.object(PUSH_MODULE, "remote_head", side_effect=stale_once):
+            status, observed = PUSH_MODULE.push_one(
+                str(repo), str(origin), candidate, True, expected, str(repo / ".git")
+            )
+        self.assertEqual((status, observed), ("failed", raced))
+        self.assertEqual(
+            actual_remote_head(str(repo), str(origin), str(repo / ".git")), raced
+        )
 
     def test_review_rejects_forbidden_path_in_local_only_history(self) -> None:
         """Apply the .obsidian guard to commits that already exist locally."""
@@ -6705,8 +10358,9 @@ import hashlib, json, os, sys
 from datetime import date,timedelta
 from pathlib import Path
 if sys.argv[1] == "--verify-resolutions":
-    request=json.loads(Path(sys.argv[4]).read_text())
-    Path(sys.argv[5]).write_text(json.dumps({"version":1,"resolutions":request["resolutions"],"date_evidence":[]}))
+    Path(__file__).with_name("resolution-verifier-invoked.marker").write_text("invoked\\n")
+    request=json.loads(Path(sys.argv[2]).read_text())
+    Path(sys.argv[3]).write_text(json.dumps({"version":1,"resolutions":request["resolutions"],"date_evidence":[]}))
     raise SystemExit(0)
 catalog_path=Path(sys.argv[1]); output=Path(sys.argv[2]); output.mkdir()
 catalog=json.loads(catalog_path.read_text())
@@ -6715,6 +10369,14 @@ sources=[]
 for index,source in enumerate(catalog["sources"]):
     url=source["feed_url"] or source["page_url"]
     method="rss" if source["feed_url"] else "public_page"
+    if os.environ.get("FAKE_COLLECTION_CONSTRAINT") == "1" and index == len(catalog["sources"])-1:
+        attempts=[]
+        for attempt_method,attempt_url in (("rss",source["feed_url"]),("public_page",source["page_url"])):
+            if not attempt_url:
+                continue
+            attempts.append({"method":attempt_method,"url":attempt_url,"status":"access_constraint","reason":"robots_disallowed","requested_url":attempt_url,"final_url":attempt_url,"constraint":"robots","http_status":None,"robots_url":f"https://{attempt_url.split('/')[2]}/robots.txt","robots_sha256":"a"*64})
+        sources.append({"name":source["name"],"tier":source["tier"],"status":"access_constraint","method":method,"requested_url":url,"final_url":url,"constraint":"robots","http_status":None,"robots_url":f"https://{url.split('/')[2]}/robots.txt","robots_sha256":"a"*64,"attempts":attempts})
+        continue
     extract_file=f"source-{index}.extract.json"
     (output/extract_file).write_text(json.dumps({"format":"feed" if method=="rss" else "html_links","entries":[{"url":f"{url}?fixture={index}","published":"2020-01-01"}]}))
     sources.append({"name":source["name"],"tier":source["tier"],"status":"fetched","method":method,"final_url":url,"extract_file":extract_file,"extracted_entry_count":1,"jst_window_start":window_start.isoformat(),"jst_window_end":run_date.isoformat(),"jst_window_item_count":0,"attempts":[]})
@@ -6755,6 +10417,19 @@ import json, os, subprocess, sys
 from pathlib import Path
 real=Path(__file__).with_name("commit-reviewed-publication.real.py")
 marker=Path(__file__).with_name("commit-head-drift-once.marker")
+blocked_marker=Path(__file__).with_name("commit-blocked-replan-once.marker")
+if len(sys.argv) > 1 and sys.argv[1] == "--recover":
+    raise SystemExit(subprocess.run([str(real),*sys.argv[1:]],check=False).returncode)
+if os.environ.get("FAKE_COMMIT_BLOCKED_REPLAN_ONCE") == "1" and not blocked_marker.exists():
+    pre=json.loads(Path(sys.argv[2]).read_text())
+    collection=json.loads(Path(sys.argv[3]).read_text())
+    def blocked(key):
+        state=pre[key]
+        return {"commit_status":"not_started","commit_hashes":[],"pre_local_head":state["local_head"],"local_head":state["local_head"],"pre_dirty_digest":state["dirty_digest"],"post_dirty_digest":state["dirty_digest"],"clean":not bool(state.get("dirty_paths",[])),"publication_mode":"blocked","deferred_cleanup":[]}
+    result={"outcome":"blocked","phase":"local_commit","daily_pipeline_status":"complete","summary_path":None,"advisory_path":None,"notification_result":collection.get("notification_result"),"agents_vault":blocked("agents_vault"),"user_vault":blocked("user_vault"),"publication_mode":{"agents_vault":"blocked","user_vault":"blocked"},"deferred_cleanup":{"agents_vault":[],"user_vault":[]},"evidence_finalization_commit":None,"retry_disposition":"replan","replan_vaults":["user_vault"],"next_action":"fixture no-progress target collision"}
+    Path(sys.argv[10]).write_text(json.dumps(result))
+    blocked_marker.write_text("replanned without progress\\n")
+    raise SystemExit(75)
 if os.environ.get("FAKE_COMMIT_HEAD_DRIFT_ONCE") == "1" and not marker.exists():
     runtime=json.loads(Path(sys.argv[1]).read_text())
     for key in ("agents_vault_root",):
@@ -6825,10 +10500,17 @@ if "--search" in args:
     assert len(manifest["sources"]) == len(catalog["sources"])
     (staging/"source-resolutions.json").write_text(json.dumps({"version":1,"resolutions":[],"date_evidence":[]}))
     lines=["summary "+context["run_id"],"","## 確認済みサイト一覧","","| サイト | Tier | 状態 | 取得方法 | 確認URL | 期間内件数 | 理由 |","|---|---:|---|---|---|---:|---|"]
-    for source in catalog["sources"]:
+    evidence_by_name={item["name"]:item for item in manifest["sources"]}
+    for source_index,source in enumerate(catalog["sources"]):
         url=source["feed_url"] or source["page_url"]
         method="RSS" if source["feed_url"] else "公開ページ"
-        lines.append(f"| {source['name']} | {source['tier']} | 対象期間記事なし | {method} | {url} | 0 | fixture確認 |")
+        evidence=evidence_by_name[source["name"]]
+        if evidence["status"] == "access_constraint":
+            reason=os.environ.get("FAKE_COLLECTION_CONSTRAINT_REASON",evidence["constraint"])
+            lines.append(f"| {source['name']} | {source['tier']} | アクセス制約 | {method} | {url} | 0 | {reason} |")
+        else:
+            status="取得済み" if os.environ.get("FAKE_COLLECTION_STATUS_FROM_FETCH") == "1" and source_index == 0 else "対象期間記事なし"
+            lines.append(f"| {source['name']} | {source['tier']} | {status} | {method} | {url} | 0 | fixture確認 |")
     summary.write_text("\\n".join(lines)+"\\n")
     digest=lambda p: hashlib.sha256(p.read_bytes()).hexdigest()
     advisory.write_text(f"- 入力ニュース: {summary.name} (same-run SHA-256: {digest(summary)})\\n")
@@ -6876,13 +10558,18 @@ elif stage=="review":
             owned=sorted(set(initial+existing_paths+([evidence] if evidence else [])))
             excluded=[]; deferred=[]; approved_dirty=state["dirty_entries"]; groups=[{"message":"fixture publication","paths":initial}]; residual="quality_ok"; commit_required=True; finalization=({"target_path":evidence,"template":"daily_publication_v1"} if evidence else None)
         elif mode=="own_only":
+            carried=mode_hint[key].get("artifact_already_committed",False)
             owned=sorted(set([target_rel]+([evidence] if evidence else [])))
-            excluded=state["dirty_paths"]; deferred=[{"path":path,"reason":"fixture deferred residual"} for path in excluded]; approved_dirty=[]; groups=[{"message":"fixture publication","paths":[target_rel]}]; residual="deferred"; commit_required=True; finalization=({"target_path":evidence,"template":"daily_publication_v1"} if evidence else None)
+            excluded=state["dirty_paths"]; deferred=[{"path":path,"reason":"fixture deferred residual"} for path in excluded]; approved_dirty=[]; groups=[] if carried else [{"message":"fixture publication","paths":[target_rel]}]; residual="deferred"; commit_required=not carried; finalization=({"target_path":evidence,"template":"daily_publication_v1"} if evidence else None)
         else:
             owned=[target_rel]; excluded=state["dirty_paths"]; deferred=[{"path":path,"reason":"fixture blocked state"} for path in excluded]; approved_dirty=[]; groups=[]; residual="blocked"; commit_required=False; finalization=None
         approved_commits=[{**commit,"patch_sha256":material.get("patch_sha256")} for commit,material in zip(state["local_commits"],commit_materialization)]
         return {"repo_root":root,"task_id":publication["authorization_task_id"],"publication_mode":mode,"core_review_status":"quality_ok","residual_review_status":residual,"owned_paths":owned,"excluded_paths":excluded,"deferred_cleanup":deferred,"approved_diff_snapshot_sha256":state["diff_snapshot_sha256"],"approved_existing_commits":approved_commits,"approved_dirty_entries":approved_dirty,"reviewed_artifacts":[{"role":item["role"],"source_sha256":item["sha256"],"target_path":target_rel}],"validation_evidence":{"file_guard":"passed","secret_scan":"passed","secret_scan_tool":"gitleaks","secret_scan_tool_version":runtime_context["gitleaks_version"],"reviewed_snapshot_sha256":state["diff_snapshot_sha256"],"reviewed_history_sha256":state["history_snapshot_sha256"]},"review_or_validation_status":"quality_ok","commit_required":commit_required,"unrelated_dirty_paths":excluded,"commit_groups":groups,"evidence_finalization":finalization}
     agents_manifest=manifest("agents"); user_manifest=manifest("user")
+    if os.environ.get("FAKE_OMIT_AGENTS_RESIDUALS") == "1" and agents_manifest["publication_mode"] == "own_only":
+        agents_manifest["excluded_paths"]=[]
+        agents_manifest["unrelated_dirty_paths"]=[]
+        agents_manifest["deferred_cleanup"]=[]
     blocked_modes=agents_manifest["publication_mode"]=="blocked" or user_manifest["publication_mode"]=="blocked"
     both_blocked=agents_manifest["publication_mode"]=="blocked" and user_manifest["publication_mode"]=="blocked"
     result={"outcome":"blocked" if both_blocked else "approved","publication_context_sha256":context["publication_context_sha256"],"agents_vault":agents_manifest,"user_vault":user_manifest,"next_action":"fixture blocked Vault" if blocked_modes else None}
@@ -6925,6 +10612,13 @@ else:
     else:
         result={"outcome":"approved","target_path":plan["target_path"],"evidence_diff_sha256":plan["evidence_diff_sha256"],"publication_context_sha256":plan["publication_context_sha256"],"review_status":"quality_ok","next_action":None}
 output.write_text(json.dumps(result))
+if stage=="collection" and os.environ.get("FAKE_SNAPSHOT_RAW_COLLECTION") == "1":
+    raw_paths=(Path(result["summary_path"]),Path(result["advisory_path"]),output)
+    snapshot=[]
+    for raw_path in raw_paths:
+        metadata=raw_path.stat()
+        snapshot.append({"path":str(raw_path),"content_hex":raw_path.read_bytes().hex(),"mode":metadata.st_mode & 0o7777,"mtime_ns":metadata.st_mtime_ns})
+    (output.parent/"raw-collection-pre-normalization.json").write_text(json.dumps({"files":snapshot}))
 """,
             encoding="utf-8",
         )
@@ -7025,6 +10719,8 @@ output.write_text(json.dumps(result))
         shutil.rmtree(runtime / "logs")
         (runtime / "last-status.txt").unlink()
 
+        verifier_marker = runtime / "resolution-verifier-invoked.marker"
+        verifier_marker.unlink(missing_ok=True)
         invalid_result = subprocess.run(
             [str(runtime / "run-daily-it-news-vulnerability-check.sh")],
             check=False,
@@ -7050,6 +10746,10 @@ output.write_text(json.dumps(result))
         self.assertIn(
             "phase=collection",
             (runtime / "last-status.txt").read_text(encoding="utf-8"),
+        )
+        self.assertFalse(
+            verifier_marker.exists(),
+            "raw schema failure must precede resolution verification",
         )
         subprocess.run(["chmod", "-R", "u+w", str(runtime / "logs")], check=True)
         shutil.rmtree(runtime / "logs")
@@ -7110,6 +10810,11 @@ output.write_text(json.dumps(result))
                 "PATH": os.environ["PATH"],
                 "FAKE_COMMIT_HEAD_DRIFT_ONCE": "1",
                 "FAKE_PLAN_TARGET_CONFLICT_ONCE": "1",
+                "FAKE_OMIT_AGENTS_RESIDUALS": "1",
+                "FAKE_COLLECTION_CONSTRAINT": "1",
+                "FAKE_COLLECTION_CONSTRAINT_REASON": "paywall",
+                "FAKE_COLLECTION_STATUS_FROM_FETCH": "1",
+                "FAKE_SNAPSHOT_RAW_COLLECTION": "1",
             },
         )
         self.assertEqual(
@@ -7143,7 +10848,80 @@ output.write_text(json.dumps(result))
         )
         status_files = list(runtime.glob("last-status.txt"))
         self.assertEqual(len(status_files), 1)
-        self.assertIn("semantic_status=success", status_files[0].read_text())
+        terminal_status = status_files[0].read_text()
+        self.assertIn("semantic_status=success", terminal_status)
+        for audit_name in (
+            "collection-agent-result.json",
+            "collection-result.json",
+            "collection-normalization.json",
+            "publication-review-agent-result.json",
+            "publication-review-result.json",
+            "publication-review-normalization.json",
+        ):
+            self.assertIn(audit_name, terminal_status)
+        collection_results = list(runtime.glob("logs/**/collection-result.json"))
+        self.assertEqual(len(collection_results), 1)
+        collection_result_path = collection_results[0]
+        collection_root = collection_result_path.parent
+        raw_collection_path = collection_root / "collection-agent-result.json"
+        collection_receipt_path = collection_root / "collection-normalization.json"
+        raw_snapshot_path = collection_root / "raw-collection-pre-normalization.json"
+        raw_snapshot = json.loads(raw_snapshot_path.read_text())
+        for raw_file in raw_snapshot["files"]:
+            path = Path(raw_file["path"])
+            metadata = path.stat()
+            self.assertEqual(path.read_bytes(), bytes.fromhex(raw_file["content_hex"]))
+            self.assertEqual(stat.S_IMODE(metadata.st_mode), raw_file["mode"])
+            self.assertEqual(metadata.st_mtime_ns, raw_file["mtime_ns"])
+        raw_collection = json.loads(raw_collection_path.read_text())
+        canonical_collection = json.loads(collection_result_path.read_text())
+        raw_summary_path = Path(raw_collection["summary_path"])
+        canonical_summary_path = Path(canonical_collection["summary_path"])
+        canonical_advisory_path = Path(canonical_collection["advisory_path"])
+        self.assertEqual(
+            stat.S_IMODE(canonical_summary_path.parent.stat().st_mode), 0o700
+        )
+        for private_path in (
+            canonical_summary_path,
+            canonical_advisory_path,
+            collection_result_path,
+            collection_receipt_path,
+        ):
+            self.assertEqual(stat.S_IMODE(private_path.stat().st_mode), 0o600)
+        raw_summary_bytes = raw_summary_path.read_bytes()
+        self.assertIn(b"paywall", raw_summary_bytes)
+        self.assertIn(
+            b"| TechCrunch | 1 | \xe5\x8f\x96\xe5\xbe\x97\xe6\xb8\x88\xe3\x81\xbf |",
+            raw_summary_bytes,
+        )
+        self.assertNotIn("paywall", canonical_summary_path.read_text())
+        self.assertIn("| robots |", canonical_summary_path.read_text())
+        self.assertIn(
+            "| TechCrunch | 1 | 対象期間記事なし |",
+            canonical_summary_path.read_text(),
+        )
+        collection_receipt = json.loads(collection_receipt_path.read_text())
+        self.assertEqual(collection_receipt["corrected_reason_count"], 1)
+        self.assertEqual(collection_receipt["corrected_status_count"], 1)
+        self.assertEqual(
+            collection_receipt["raw_collection_result_sha256"],
+            hashlib.sha256(raw_collection_path.read_bytes()).hexdigest(),
+        )
+        self.assertEqual(
+            collection_receipt["canonical_collection_result_sha256"],
+            hashlib.sha256(collection_result_path.read_bytes()).hexdigest(),
+        )
+        for label in ("catalog", "manifest", "verified_resolutions"):
+            evidence = collection_receipt["source_evidence"][label]
+            evidence_path = Path(evidence["path"])
+            self.assertEqual(
+                evidence["sha256"], hashlib.sha256(evidence_path.read_bytes()).hexdigest()
+            )
+        self.assertEqual(raw_summary_path.read_bytes(), raw_summary_bytes)
+        self.assertIn(
+            f"same-run SHA-256: {canonical_collection['summary_sha256']}",
+            canonical_advisory_path.read_text(),
+        )
         publication_results = list(runtime.glob("logs/**/publication-result.json"))
         self.assertEqual(len(publication_results), 1)
         publication_result = json.loads(publication_results[0].read_text())
@@ -7153,6 +10931,18 @@ output.write_text(json.dumps(result))
         self.assertEqual(
             publication_result["user_vault"]["local_head"],
             publication_result["user_vault"]["remote_head"],
+        )
+        actual_user_clean = not bool(
+            subprocess.check_output(
+                [
+                    "git", "-C", str(self.user), "status",
+                    "--porcelain=v1", "--untracked-files=all",
+                ],
+                text=True,
+            )
+        )
+        self.assertEqual(
+            publication_result["user_vault"]["clean"], actual_user_clean
         )
         self.assertEqual(publication_result["publication_mode"]["user_vault"], "own_only")
         self.assertEqual(
@@ -7172,6 +10962,44 @@ output.write_text(json.dumps(result))
             ],
             [".codex-handoff/unsafe-agents.md", standing_relative],
         )
+        normalization_receipts = list(
+            runtime.glob("logs/**/publication-review-normalization.json")
+        )
+        self.assertGreaterEqual(len(normalization_receipts), 1)
+        self.assertTrue(
+            any(
+                json.loads(path.read_text())["vaults"]["agents_vault"][
+                    "filled_reason_count"
+                ]
+                > 0
+                for path in normalization_receipts
+            )
+        )
+        for receipt_path in normalization_receipts:
+            attempt_root = receipt_path.parent
+            raw_path = attempt_root / "publication-review-agent-result.json"
+            canonical_path = attempt_root / "publication-review-result.json"
+            receipt = json.loads(receipt_path.read_text())
+            raw_review = json.loads(raw_path.read_text())
+            canonical_review = json.loads(canonical_path.read_text())
+            reviewed_state = json.loads(
+                (attempt_root / "reviewed-publication-state.json").read_text()
+            )
+            if raw_review["agents_vault"]["publication_mode"] != "own_only":
+                continue
+            self.assertEqual(raw_review["agents_vault"]["excluded_paths"], [])
+            self.assertEqual(
+                canonical_review["agents_vault"]["excluded_paths"],
+                sorted(reviewed_state["agents_vault"]["dirty_paths"]),
+            )
+            self.assertEqual(
+                receipt["raw_review_sha256"],
+                hashlib.sha256(raw_path.read_bytes()).hexdigest(),
+            )
+            self.assertEqual(
+                receipt["canonical_review_sha256"],
+                hashlib.sha256(canonical_path.read_bytes()).hexdigest(),
+            )
         self.assertEqual(unsafe_handoff.read_bytes(), unsafe_before)
         unsafe_stat_after = unsafe_handoff.stat()
         self.assertEqual(unsafe_stat_after.st_mode, unsafe_stat_before.st_mode)
@@ -7205,6 +11033,57 @@ output.write_text(json.dumps(result))
         self.assertIn(b"unstaged parallel evidence", standing_worktree_after)
         self.assertIn(b"vault-change-publisher:", standing_worktree_after)
         self.assertEqual(standing_status_after, standing_status_before)
+
+        subprocess.run(["chmod", "-R", "u+w", str(runtime / "logs")], check=True)
+        shutil.rmtree(runtime / "logs")
+        (runtime / "last-status.txt").unlink()
+
+        no_progress_replan = subprocess.run(
+            [str(runtime / "run-daily-it-news-vulnerability-check.sh")],
+            check=False,
+            env={
+                **os.environ,
+                "PATH": os.environ["PATH"],
+                "FAKE_COMMIT_BLOCKED_REPLAN_ONCE": "1",
+            },
+        )
+        self.assertEqual(
+            no_progress_replan.returncode,
+            0,
+            msg=(runtime / "last-status.txt").read_text(encoding="utf-8")
+            + "\n"
+            + "\n".join(
+                path.read_text(encoding="utf-8", errors="replace")
+                for path in (runtime / "logs").rglob("*.stderr.log")
+            ),
+        )
+        no_progress_roots = [
+            path
+            for date_root in (runtime / "logs").iterdir()
+            for path in date_root.iterdir()
+            if path.is_dir()
+        ]
+        self.assertEqual(len(no_progress_roots), 1)
+        no_progress_root = no_progress_roots[0]
+        first_no_progress = json.loads(
+            (
+                no_progress_root
+                / "publication-attempt-1"
+                / "publication-commit-result.json"
+            ).read_text()
+        )
+        self.assertEqual(first_no_progress["outcome"], "blocked")
+        self.assertEqual(first_no_progress["retry_disposition"], "replan")
+        second_context = json.loads(
+            (
+                no_progress_root
+                / "publication-attempt-2"
+                / "publication-context.json"
+            ).read_text()
+        )
+        self.assertIsNone(second_context["carried_commit_result"])
+        self.assertIsNone(second_context["carried_commit_result_sha256"])
+        self.assertTrue((runtime / "commit-blocked-replan-once.marker").is_file())
 
         subprocess.run(["chmod", "-R", "u+w", str(runtime / "logs")], check=True)
         shutil.rmtree(runtime / "logs")
@@ -7272,6 +11151,28 @@ output.write_text(json.dumps(result))
             ),
         )
         self.assertEqual(
+            subprocess.check_output(
+                [
+                    "git", "-C", str(self.agents), "rev-list", "--count",
+                    f"{remote_before_persistent['agents']}..{remote_after_persistent['agents']}",
+                ],
+                text=True,
+            ).strip(),
+            "1",
+            msg="a successful peer Vault must be carried, not published again",
+        )
+        advisory_targets = {
+            Path(json.loads(plan.read_text(encoding="utf-8"))["advisory_target"])
+            for plan in persistent_root.glob(
+                "publication-attempt-[1234]/artifact-plan.json"
+            )
+        }
+        self.assertEqual(
+            len(advisory_targets),
+            1,
+            msg="bounded User re-plan changed the completed Agents target",
+        )
+        self.assertEqual(
             remote_after_persistent["user"], remote_before_persistent["user"]
         )
         collision_targets = {
@@ -7300,9 +11201,9 @@ output.write_text(json.dumps(result))
                 "FAKE_CANONICAL_INVALID_FINAL": "1",
             },
         )
-        self.assertEqual(invalid_final.returncode, 75)
+        self.assertEqual(invalid_final.returncode, 65)
         self.assertIn(
-            "semantic_status=process_error",
+            "semantic_status=invalid_result",
             (runtime / "last-status.txt").read_text(encoding="utf-8"),
         )
 

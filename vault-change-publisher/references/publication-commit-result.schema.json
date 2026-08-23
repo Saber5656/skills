@@ -40,6 +40,26 @@
       "then": {"required": ["publication_context_sha256"]}
     },
     {
+      "if": {
+        "required": ["retry_disposition"],
+        "properties": {"retry_disposition": {"const": "none"}}
+      },
+      "then": {"properties": {"replan_vaults": {"maxItems": 0}}}
+    },
+    {
+      "if": {
+        "required": ["retry_disposition"],
+        "properties": {"retry_disposition": {"const": "replan"}}
+      },
+      "then": {
+        "required": ["replan_vaults"],
+        "properties": {
+          "outcome": {"enum": ["blocked", "partial_publication"]},
+          "replan_vaults": {"minItems": 1}
+        }
+      }
+    },
+    {
       "if": {"properties": {"outcome": {"const": "ready_to_push"}}},
       "then": {
         "properties": {
