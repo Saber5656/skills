@@ -355,6 +355,69 @@ def normalize_own_only_residuals(
     return result, receipt
 
 
+def normalize_sealed_validation_evidence(
+    review: dict[str, object],
+    context: dict[str, object],
+    pre: dict[str, object],
+) -> tuple[dict[str, object], dict[str, object]]:
+    """Project copy-only validation identity from the sealed runner context.
+
+    The reviewer still owns both validation judgments (``file_guard`` and
+    ``secret_scan``).  The four fields below are not judgments: they are exact
+    copies of runner-sealed identity that the deterministic validator already
+    requires.  Canonicalizing them prevents a model from confusing the mode
+    hint's review-state digest with the reviewed diff snapshot digest without
+    weakening any publication guard.
+    """
+    result = deepcopy(review)
+    runtime = context.get("runtime")
+    if not isinstance(runtime, dict):
+        raise ReviewError("validation evidence runtime context is malformed")
+    gitleaks_version = runtime.get("gitleaks_version")
+    if not isinstance(gitleaks_version, str) or not gitleaks_version:
+        raise ReviewError("sealed gitleaks version is malformed")
+
+    receipt: dict[str, object] = {}
+    for key in ("agents_vault", "user_vault"):
+        manifest = result.get(key)
+        state = pre.get(key)
+        if not isinstance(manifest, dict) or not isinstance(state, dict):
+            raise ReviewError("validation evidence normalization input is malformed")
+        evidence = manifest.get("validation_evidence")
+        if not isinstance(evidence, dict):
+            raise ReviewError("validation evidence is not an object")
+
+        diff_snapshot = state.get("diff_snapshot_sha256")
+        history_snapshot = state.get("history_snapshot_sha256")
+        for label, value in (
+            ("diff snapshot", diff_snapshot),
+            ("history snapshot", history_snapshot),
+        ):
+            if (
+                not isinstance(value, str)
+                or re.fullmatch(r"[0-9a-f]{64}", value) is None
+            ):
+                raise ReviewError(f"sealed {label} digest is malformed")
+
+        expected = {
+            "secret_scan_tool": "gitleaks",
+            "secret_scan_tool_version": gitleaks_version,
+            "reviewed_snapshot_sha256": diff_snapshot,
+            "reviewed_history_sha256": history_snapshot,
+        }
+        corrected_fields = sorted(
+            field for field, value in expected.items() if evidence.get(field) != value
+        )
+        evidence.update(expected)
+        receipt[key] = {
+            "normalized": bool(corrected_fields),
+            "corrected_field_count": len(corrected_fields),
+            "corrected_fields": corrected_fields,
+            "canonical_values": expected,
+        }
+    return result, receipt
+
+
 def write_exclusive_json(path: Path, value: object) -> bytes:
     """Create one immutable runner-owned JSON result beside its raw input."""
     content = (
@@ -423,8 +486,11 @@ def canonicalize_own_only_main(argv: list[str]) -> int:
         if pre != context.get("pre_collection_state"):
             raise ReviewError("normalization pre-state differs from reviewed context")
         materialization = validate_dirty_snapshots(context, pre)
-        normalized, normalization = normalize_own_only_residuals(
+        normalized, residual_normalization = normalize_own_only_residuals(
             raw, context, pre, materialization
+        )
+        normalized, evidence_normalization = normalize_sealed_validation_evidence(
+            normalized, context, pre
         )
         normalized_bytes = (
             json.dumps(
@@ -436,11 +502,12 @@ def canonicalize_own_only_main(argv: list[str]) -> int:
             + "\n"
         ).encode("utf-8")
         receipt = {
-            "version": 1,
+            "version": 2,
             "raw_review_sha256": hashlib.sha256(raw_bytes).hexdigest(),
             "canonical_review_sha256": hashlib.sha256(normalized_bytes).hexdigest(),
             "publication_context_sha256": context_digest,
-            "vaults": normalization,
+            "vaults": residual_normalization,
+            "validation_evidence": evidence_normalization,
         }
         actual_bytes = write_exclusive_json(output_path, normalized)
         if actual_bytes != normalized_bytes:

@@ -73,6 +73,19 @@ artifact installation, staging, commit, or push.
    unless that same path was independently captured as dirty.
    The standing task records recurring evidence and must not replace the authorization identity
    in either Task Change Manifest.
+   Populate `validation_evidence` using these exact sealed mappings:
+   - `secret_scan_tool` = `"gitleaks"`.
+   - `secret_scan_tool_version` = `publication_context.runtime.gitleaks_version`.
+   - `reviewed_snapshot_sha256` = the corresponding
+     `publication_context.pre_collection_state.<vault>.diff_snapshot_sha256`.
+   - `reviewed_history_sha256` = the corresponding
+     `publication_context.pre_collection_state.<vault>.history_snapshot_sha256`.
+   `publication_context.publication_mode_hint.<vault>.review_state_sha256` binds
+   the deterministic mode decision and is a different identity; never copy it
+   into `reviewed_snapshot_sha256`. After preserving the raw response for audit,
+   the runner deterministically restores only these four copy-only fields from
+   the sealed context. It never changes the reviewer-owned `file_guard` or
+   `secret_scan` judgments.
 5. Manifest rules by mode:
    - `sweep`: `approved_dirty_entries` exactly equals the captured entries;
      `commit_groups` exactly partition captured dirty paths plus the artifact,

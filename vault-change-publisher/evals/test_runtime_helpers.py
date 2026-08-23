@@ -1566,6 +1566,113 @@ def load_environment(*, checkout_root, environ, require_catalog):
                 review, {}, pre, materialization
             )
 
+    def test_validation_evidence_normalization_repairs_only_sealed_identity(self) -> None:
+        """A mode-hint digest copy error cannot replace reviewer judgments."""
+        agents_diff = "a" * 64
+        agents_history = "b" * 64
+        user_diff = "c" * 64
+        user_history = "d" * 64
+        review_state = "e" * 64
+        review = {
+            "outcome": "approved",
+            "agents_vault": {
+                "publication_mode": "own_only",
+                "commit_groups": [{"message": "publish", "paths": ["artifact.md"]}],
+                "validation_evidence": {
+                    "file_guard": "blocked",
+                    "secret_scan": "passed",
+                    "secret_scan_tool": "wrong-tool",
+                    "secret_scan_tool_version": "wrong-version",
+                    "reviewed_snapshot_sha256": review_state,
+                    "reviewed_history_sha256": "f" * 64,
+                },
+            },
+            "user_vault": {
+                "publication_mode": "sweep",
+                "commit_groups": [{"message": "publish", "paths": ["summary.md"]}],
+                "validation_evidence": {
+                    "file_guard": "not-reviewed",
+                    "secret_scan": "blocked",
+                    "secret_scan_tool": "gitleaks",
+                    "secret_scan_tool_version": "8.30.1",
+                    "reviewed_snapshot_sha256": user_diff,
+                    "reviewed_history_sha256": user_history,
+                },
+            },
+            "next_action": None,
+        }
+        pre = {
+            "agents_vault": {
+                "diff_snapshot_sha256": agents_diff,
+                "history_snapshot_sha256": agents_history,
+            },
+            "user_vault": {
+                "diff_snapshot_sha256": user_diff,
+                "history_snapshot_sha256": user_history,
+            },
+        }
+
+        normalized, receipt = REVIEW_MODULE.normalize_sealed_validation_evidence(
+            review, {"runtime": {"gitleaks_version": "8.30.1"}}, pre
+        )
+
+        self.assertEqual(
+            review["agents_vault"]["validation_evidence"][
+                "reviewed_snapshot_sha256"
+            ],
+            review_state,
+        )
+        agents_evidence = normalized["agents_vault"]["validation_evidence"]
+        self.assertEqual(agents_evidence["reviewed_snapshot_sha256"], agents_diff)
+        self.assertEqual(
+            agents_evidence["reviewed_history_sha256"], agents_history
+        )
+        self.assertEqual(agents_evidence["secret_scan_tool"], "gitleaks")
+        self.assertEqual(
+            agents_evidence["secret_scan_tool_version"], "8.30.1"
+        )
+        self.assertEqual(agents_evidence["file_guard"], "blocked")
+        self.assertEqual(agents_evidence["secret_scan"], "passed")
+        self.assertEqual(
+            normalized["agents_vault"]["commit_groups"],
+            review["agents_vault"]["commit_groups"],
+        )
+        self.assertEqual(
+            normalized["user_vault"]["validation_evidence"]["file_guard"],
+            "not-reviewed",
+        )
+        self.assertFalse(receipt["user_vault"]["normalized"])
+        self.assertEqual(receipt["agents_vault"]["corrected_field_count"], 4)
+        self.assertEqual(
+            receipt["agents_vault"]["corrected_fields"],
+            [
+                "reviewed_history_sha256",
+                "reviewed_snapshot_sha256",
+                "secret_scan_tool",
+                "secret_scan_tool_version",
+            ],
+        )
+
+    def test_validation_evidence_normalization_rejects_malformed_evidence(self) -> None:
+        """Missing evidence structure remains a fail-closed review error."""
+        pre = {
+            key: {
+                "diff_snapshot_sha256": "a" * 64,
+                "history_snapshot_sha256": "b" * 64,
+            }
+            for key in ("agents_vault", "user_vault")
+        }
+        review = {
+            "agents_vault": {"validation_evidence": []},
+            "user_vault": {"validation_evidence": {}},
+        }
+        with self.assertRaisesRegex(
+            REVIEW_MODULE.ReviewError, "validation evidence is not an object"
+        ):
+            REVIEW_MODULE.normalize_sealed_validation_evidence(
+                review, {"runtime": {"gitleaks_version": "8.30.1"}}, pre
+            )
+
     def test_canonical_publication_schemas_enforce_terminal_state(self) -> None:
         """Reject success/ready labels that do not contain publishable commits."""
         automation_schema = json.loads(
@@ -10084,6 +10191,18 @@ def load_environment(*, checkout_root, environ, require_catalog):
         self.assertIn("both manifests", prompt)
         self.assertIn("must not replace the authorization identity", prompt)
 
+    def test_review_prompt_distinguishes_diff_and_mode_hint_digests(self) -> None:
+        """Tell the reviewer which sealed digest belongs in typed evidence."""
+        prompt = (SKILL_ROOT / "assets" / "daily-it-news.review.prompt.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            "pre_collection_state.<vault>.diff_snapshot_sha256", prompt
+        )
+        self.assertIn("review_state_sha256", prompt)
+        self.assertIn("never copy it", prompt)
+        self.assertIn("never changes the reviewer-owned `file_guard`", prompt)
+
     def test_review_canonicalizes_both_containment_paths(self) -> None:
         """Accept a target expressed through a symlinked Vault path."""
         real_root = self.root / "real-vault"
@@ -10564,7 +10683,10 @@ elif stage=="review":
         else:
             owned=[target_rel]; excluded=state["dirty_paths"]; deferred=[{"path":path,"reason":"fixture blocked state"} for path in excluded]; approved_dirty=[]; groups=[]; residual="blocked"; commit_required=False; finalization=None
         approved_commits=[{**commit,"patch_sha256":material.get("patch_sha256")} for commit,material in zip(state["local_commits"],commit_materialization)]
-        return {"repo_root":root,"task_id":publication["authorization_task_id"],"publication_mode":mode,"core_review_status":"quality_ok","residual_review_status":residual,"owned_paths":owned,"excluded_paths":excluded,"deferred_cleanup":deferred,"approved_diff_snapshot_sha256":state["diff_snapshot_sha256"],"approved_existing_commits":approved_commits,"approved_dirty_entries":approved_dirty,"reviewed_artifacts":[{"role":item["role"],"source_sha256":item["sha256"],"target_path":target_rel}],"validation_evidence":{"file_guard":"passed","secret_scan":"passed","secret_scan_tool":"gitleaks","secret_scan_tool_version":runtime_context["gitleaks_version"],"reviewed_snapshot_sha256":state["diff_snapshot_sha256"],"reviewed_history_sha256":state["history_snapshot_sha256"]},"review_or_validation_status":"quality_ok","commit_required":commit_required,"unrelated_dirty_paths":excluded,"commit_groups":groups,"evidence_finalization":finalization}
+        reviewed_snapshot=state["diff_snapshot_sha256"]
+        if os.environ.get("FAKE_REVIEW_STATE_AS_TYPED_EVIDENCE") == "1":
+            reviewed_snapshot=mode_hint[key]["review_state_sha256"]
+        return {"repo_root":root,"task_id":publication["authorization_task_id"],"publication_mode":mode,"core_review_status":"quality_ok","residual_review_status":residual,"owned_paths":owned,"excluded_paths":excluded,"deferred_cleanup":deferred,"approved_diff_snapshot_sha256":state["diff_snapshot_sha256"],"approved_existing_commits":approved_commits,"approved_dirty_entries":approved_dirty,"reviewed_artifacts":[{"role":item["role"],"source_sha256":item["sha256"],"target_path":target_rel}],"validation_evidence":{"file_guard":"passed","secret_scan":"passed","secret_scan_tool":"gitleaks","secret_scan_tool_version":runtime_context["gitleaks_version"],"reviewed_snapshot_sha256":reviewed_snapshot,"reviewed_history_sha256":state["history_snapshot_sha256"]},"review_or_validation_status":"quality_ok","commit_required":commit_required,"unrelated_dirty_paths":excluded,"commit_groups":groups,"evidence_finalization":finalization}
     agents_manifest=manifest("agents"); user_manifest=manifest("user")
     if os.environ.get("FAKE_OMIT_AGENTS_RESIDUALS") == "1" and agents_manifest["publication_mode"] == "own_only":
         agents_manifest["excluded_paths"]=[]
@@ -10815,6 +10937,7 @@ if stage=="collection" and os.environ.get("FAKE_SNAPSHOT_RAW_COLLECTION") == "1"
                 "FAKE_COLLECTION_CONSTRAINT_REASON": "paywall",
                 "FAKE_COLLECTION_STATUS_FROM_FETCH": "1",
                 "FAKE_SNAPSHOT_RAW_COLLECTION": "1",
+                "FAKE_REVIEW_STATE_AS_TYPED_EVIDENCE": "1",
             },
         )
         self.assertEqual(
@@ -10975,6 +11098,7 @@ if stage=="collection" and os.environ.get("FAKE_SNAPSHOT_RAW_COLLECTION") == "1"
                 for path in normalization_receipts
             )
         )
+        saw_typed_identity_repair = False
         for receipt_path in normalization_receipts:
             attempt_root = receipt_path.parent
             raw_path = attempt_root / "publication-review-agent-result.json"
@@ -10985,6 +11109,26 @@ if stage=="collection" and os.environ.get("FAKE_SNAPSHOT_RAW_COLLECTION") == "1"
             reviewed_state = json.loads(
                 (attempt_root / "reviewed-publication-state.json").read_text()
             )
+            self.assertEqual(receipt["version"], 2)
+            for key in ("agents_vault", "user_vault"):
+                raw_snapshot = raw_review[key]["validation_evidence"][
+                    "reviewed_snapshot_sha256"
+                ]
+                expected_snapshot = reviewed_state[key]["diff_snapshot_sha256"]
+                self.assertNotEqual(raw_snapshot, expected_snapshot)
+                self.assertEqual(
+                    canonical_review[key]["validation_evidence"][
+                        "reviewed_snapshot_sha256"
+                    ],
+                    expected_snapshot,
+                )
+                evidence_receipt = receipt["validation_evidence"][key]
+                self.assertTrue(evidence_receipt["normalized"])
+                self.assertIn(
+                    "reviewed_snapshot_sha256",
+                    evidence_receipt["corrected_fields"],
+                )
+                saw_typed_identity_repair = True
             if raw_review["agents_vault"]["publication_mode"] != "own_only":
                 continue
             self.assertEqual(raw_review["agents_vault"]["excluded_paths"], [])
@@ -11000,6 +11144,7 @@ if stage=="collection" and os.environ.get("FAKE_SNAPSHOT_RAW_COLLECTION") == "1"
                 receipt["canonical_review_sha256"],
                 hashlib.sha256(canonical_path.read_bytes()).hexdigest(),
             )
+        self.assertTrue(saw_typed_identity_repair)
         self.assertEqual(unsafe_handoff.read_bytes(), unsafe_before)
         unsafe_stat_after = unsafe_handoff.stat()
         self.assertEqual(unsafe_stat_after.st_mode, unsafe_stat_before.st_mode)
