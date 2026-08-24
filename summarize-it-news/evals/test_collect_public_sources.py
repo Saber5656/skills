@@ -1613,6 +1613,26 @@ class PublicSourceCollectorTests(unittest.TestCase):
         self.assertEqual(len(candidates), 1)
         self.assertEqual(candidates[0]["title"], "Canonical headline")
 
+    def test_publisher_javascript_scan_bounds_untrusted_blocks(self) -> None:
+        """Skip oversized publisher blocks while retaining bounded valid records."""
+        parser = MODULE.LinkExtractor(
+            "https://example.test/news", {"example.test"}, ""
+        )
+        oversized = (
+            "{'url':'https://example.test/ignored','title':'"
+            + "x" * MODULE.PUBLISHER_JAVASCRIPT_MAX_BYTES
+            + "','date':'2026/8/18'}"
+        )
+        parser.embedded_script_blocks = [("publisher_javascript", oversized)]
+        MODULE.populate_embedded_script_entries(parser)
+        self.assertEqual(parser.embedded_entries, [])
+
+        valid = "{'url':'https://example.test/valid','title':'Valid','date':'2026/8/18'}"
+        parser.embedded_script_blocks = [("publisher_javascript", valid)]
+        MODULE.populate_embedded_script_entries(parser)
+        self.assertEqual(len(parser.embedded_entries), 1)
+        self.assertEqual(parser.embedded_entries[0]["title"], "Valid")
+
     def test_html_extract_upgrades_existing_headline_at_entry_cap(self) -> None:
         """Keep title arbitration active when the bounded entry set reaches 400."""
         navigation = "".join(

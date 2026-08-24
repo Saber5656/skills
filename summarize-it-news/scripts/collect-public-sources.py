@@ -742,6 +742,7 @@ HTML_NONVOID_ARTICLE_TRUST_ELEMENTS = JSON_LD_NONVOID_TRUST_CONTAINERS | {
 }
 EMBEDDED_SCRIPT_MAX_BYTES = 4 * 1024 * 1024
 EMBEDDED_SCRIPT_MAX_BLOCKS = 32
+PUBLISHER_JAVASCRIPT_MAX_BYTES = 512 * 1024
 
 
 def strict_html_attributes(
@@ -1869,8 +1870,10 @@ def populate_embedded_script_entries(parser: LinkExtractor) -> None:
         return
     for kind, block in parser.embedded_script_blocks:
         if kind == "publisher_javascript":
+            if len(block.encode("utf-8")) > PUBLISHER_JAVASCRIPT_MAX_BYTES:
+                continue
             for match in re.finditer(
-                r"\{'url':'([^']+)','title':'([^']*)'.{0,5000}?'date':'"
+                r"\{'url':'([^']+)','title':'([^']*)'[^{]{0,5000}?'date':'"
                 r"(20\d{2})/(\d{1,2})/(\d{1,2})'",
                 block,
                 re.DOTALL,
