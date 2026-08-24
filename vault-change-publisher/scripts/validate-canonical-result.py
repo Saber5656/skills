@@ -274,8 +274,8 @@ def validate_terminal_semantics(result: Any) -> str:
 
 
 def main(argv: list[str]) -> int:
-    terminal_mode = len(argv) == 4 and argv[1] == "--terminal-status"
-    if (terminal_mode and len(argv) != 4) or (not terminal_mode and len(argv) != 3):
+    terminal_mode = len(argv) > 1 and argv[1] == "--terminal-status"
+    if len(argv) != (4 if terminal_mode else 3):
         print(
             "usage: validate-canonical-result.py [--terminal-status] SCHEMA RESULT",
             file=sys.stderr,

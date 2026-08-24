@@ -1390,6 +1390,15 @@ def load_environment(*, checkout_root, environ, require_catalog):
         with self.assertRaises(CANONICAL_MODULE.CanonicalValidationError):
             CANONICAL_MODULE.validate(result, schema, schema)
 
+    def test_canonical_validator_rejects_short_terminal_status_argv(self) -> None:
+        """Treat a partial terminal-mode invocation as usage error, not a file error."""
+        self.assertEqual(
+            CANONICAL_MODULE.main(
+                ["validate-canonical-result.py", "--terminal-status", "schema.json"]
+            ),
+            64,
+        )
+
     def test_publication_review_root_next_action_tracks_blocked_mode(self) -> None:
         """Deferred cleanup alone keeps an approved review terminally actionable."""
         review = {
