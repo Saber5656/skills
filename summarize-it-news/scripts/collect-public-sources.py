@@ -7,9 +7,11 @@ import concurrent.futures
 import gzip
 import html
 import hashlib
+import ipaddress
 import io
 import json
 import os
+import pwd
 import re
 import socket
 import stat
@@ -28,9 +30,84 @@ from typing import Any, Optional
 from zoneinfo import ZoneInfo
 
 MAX_BYTES = 8 * 1024 * 1024
+MAX_JSON_BYTES = 1024 * 1024
 TIMEOUT_SECONDS = 20
+JSON_LD_MAX_DEPTH = 64
+JSON_LD_MAX_NODES = 10_000
+JSON_LD_MAX_CONTEXT_ITEMS = 64
+JSON_LD_ARTICLE_TYPES = frozenset({
+    "Article",
+    "AdvertiserContentArticle",
+    "NewsArticle",
+    "AnalysisNewsArticle",
+    "AskPublicNewsArticle",
+    "BackgroundNewsArticle",
+    "OpinionNewsArticle",
+    "ReportageNewsArticle",
+    "ReviewNewsArticle",
+    "Report",
+    "SatiricalArticle",
+    "ScholarlyArticle",
+    "MedicalScholarlyArticle",
+    "SocialMediaPosting",
+    "BlogPosting",
+    "LiveBlogPosting",
+    "DiscussionForumPosting",
+    "TechArticle",
+    "APIReference",
+})
+SCHEMA_JSON_LD_CONTEXTS = frozenset({
+    "http://schema.org",
+    "http://schema.org/",
+    "https://schema.org",
+    "https://schema.org/",
+})
+JSON_LD_CONTEXT_UNBOUND = "unbound"
+JSON_LD_CONTEXT_TRUSTED = "trusted"
+JSON_LD_CONTEXT_TAINTED = "tainted"
 USER_AGENT = "CodexITNewsCollector/1.0 (+public-news-research)"
 SOURCE_KEYS = {"name", "tier", "feed_url", "page_url"}
+RUNTIME_DATE_DIRECTORY = re.compile(r"\d{4}-\d{2}-\d{2}\Z")
+RUNTIME_RUN_DIRECTORY = re.compile(
+    r"\d{8}T\d{6}[+-]\d{4}-\d{1,10}-\d{1,10}\Z"
+)
+CANONICAL_RUNTIME_RELATIVE = Path(
+    "AutomationWorkspaces/codex/daily-it-news-vulnerability-check"
+)
+ISO_PUBLICATION_DATE = re.compile(
+    r"\d{4}-\d{2}-\d{2}(?:[Tt ]\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?"
+    r"(?:[Zz]|[+-]\d{2}:?\d{2})?)?\Z"
+)
+RFC_PUBLICATION_DATE = re.compile(
+    r"(?:(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun),[ ]+)?"
+    r"\d{1,2}[ ]+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[ ]+"
+    r"\d{4}[ ]+\d{2}:\d{2}(?::\d{2})?[ ]+(?:[+-]\d{4}|[A-Z]{1,5})\Z",
+    re.IGNORECASE,
+)
+AMBIGUOUS_SCRIPT_CLOSER = re.compile(
+    r"</[\t\n\f\r ]+script(?:[\t\n\f\r />])", re.IGNORECASE
+)
+ENGLISH_MONTHS = {
+    name: number
+    for number, names in enumerate(
+        (
+            (),
+            ("jan", "january"),
+            ("feb", "february"),
+            ("mar", "march"),
+            ("apr", "april"),
+            ("may",),
+            ("jun", "june"),
+            ("jul", "july"),
+            ("aug", "august"),
+            ("sep", "sept", "september"),
+            ("oct", "october"),
+            ("nov", "november"),
+            ("dec", "december"),
+        )
+    )
+    for name in names
+}
 
 
 class CollectionError(RuntimeError):
@@ -47,9 +124,55 @@ class RobotsDisallowed(CollectionError):
         self.robots_sha256 = robots_sha256
 
 
-def load_catalog(path: Path) -> list[dict[str, Any]]:
-    """Load and strictly validate the tracked source catalog."""
-    payload = json.loads(path.read_text(encoding="utf-8"))
+def stable_regular_bytes(path: Path, limit: int = MAX_JSON_BYTES) -> bytes:
+    """Read one bounded regular file without following a final symlink."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_size <= 0
+            or before.st_size > limit
+        ):
+            raise CollectionError("input is not a bounded regular file")
+        chunks: list[bytes] = []
+        remaining = limit + 1
+        while remaining:
+            chunk = os.read(descriptor, min(65536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        content = b"".join(chunks)
+        after = os.fstat(descriptor)
+        before_identity = (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mode,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        )
+        after_identity = (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mode,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        )
+        if len(content) > limit or before_identity != after_identity:
+            raise CollectionError("input changed while it was read")
+        return content
+    finally:
+        os.close(descriptor)
+
+
+def load_catalog_with_digest(path: Path) -> tuple[list[dict[str, Any]], str]:
+    """Load one stable catalog and bind its parsed sources to the same bytes."""
+    content = stable_regular_bytes(path)
+    payload = json.loads(content.decode("utf-8"))
     if payload.get("version") != 1 or not isinstance(payload.get("sources"), list):
         raise CollectionError("unsupported source catalog")
     sources = payload["sources"]
@@ -70,7 +193,12 @@ def load_catalog(path: Path) -> list[dict[str, Any]]:
         names.add(source["name"])
     if not sources:
         raise CollectionError("source catalog is empty")
-    return sources
+    return sources, hashlib.sha256(content).hexdigest()
+
+
+def load_catalog(path: Path) -> list[dict[str, Any]]:
+    """Load and strictly validate the tracked source catalog."""
+    return load_catalog_with_digest(path)[0]
 
 
 def allowed_hosts(sources: list[dict[str, Any]]) -> set[str]:
@@ -260,26 +388,70 @@ def clean_text(value: Optional[str], limit: int = 800) -> Optional[str]:
 
 def validated_publication_date(value: Optional[str]) -> Optional[str]:
     """Return bounded date evidence only when it is a parseable timestamp."""
-    cleaned = clean_text(value, 200)
-    if not cleaned:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > 200
+        or value.strip() != value
+        or "<" in value
+        or ">" in value
+        or html.unescape(value) != value
+    ):
         return None
+    cleaned = value
     try:
-        datetime.fromisoformat(cleaned.replace("Z", "+00:00"))
+        if ISO_PUBLICATION_DATE.fullmatch(cleaned) is None:
+            raise ValueError
+        datetime.fromisoformat(
+            cleaned.replace("Z", "+00:00").replace("z", "+00:00")
+        )
         return cleaned
     except ValueError:
         pass
     try:
+        if RFC_PUBLICATION_DATE.fullmatch(cleaned) is None:
+            raise ValueError
         parsedate_to_datetime(cleaned)
         return cleaned
     except (TypeError, ValueError, OverflowError):
         pass
-    match = re.fullmatch(r"(20\d{2})[./-](\d{1,2})[./-](\d{1,2})", cleaned)
+    # Some publisher lists wrap the complete calendar field in parentheses.
+    # Accept that exact wrapper, but never search a prose field for a date-like
+    # substring (the downstream validator cannot recover the original field).
+    calendar_value = cleaned
+    wrapped = re.fullmatch(r"\(([^()]*)\)", cleaned)
+    if wrapped is not None:
+        calendar_value = wrapped.group(1)
+        if not calendar_value or calendar_value.strip() != calendar_value:
+            return None
+    match = re.fullmatch(
+        r"(20\d{2})[./-](\d{1,2})[./-](\d{1,2})", calendar_value
+    )
     if match:
         try:
             return date(*(int(part) for part in match.groups())).isoformat()
         except ValueError:
             pass
+    match = re.fullmatch(r"([A-Za-z]{3,9})\s+(\d{1,2}),\s*(20\d{2})", cleaned)
+    if match and (month := ENGLISH_MONTHS.get(match.group(1).lower())):
+        try:
+            return date(int(match.group(3)), month, int(match.group(2))).isoformat()
+        except ValueError:
+            pass
     return None
+
+
+def validated_json_ld_publication_date(value: Optional[str]) -> Optional[str]:
+    """Validate JSON-LD dates without applying HTML text transformations."""
+    if (
+        not value
+        or len(value) > 200
+        or "<" in value
+        or ">" in value
+        or html.unescape(value) != value
+    ):
+        return None
+    return validated_publication_date(value)
 
 
 def publication_date_in_jst(value: Optional[str]) -> Optional[date]:
@@ -288,7 +460,9 @@ def publication_date_in_jst(value: Optional[str]) -> Optional[date]:
     if not validated:
         return None
     try:
-        parsed = datetime.fromisoformat(validated.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(
+            validated.replace("Z", "+00:00").replace("z", "+00:00")
+        )
     except ValueError:
         try:
             parsed = parsedate_to_datetime(validated)
@@ -323,10 +497,88 @@ def local_name(tag: str) -> str:
     return tag.rsplit("}", 1)[-1].lower()
 
 
-def extract_xml(content: bytes) -> list[dict[str, Optional[str]]]:
+PUBLIC_HOST_LABEL = re.compile(
+    r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z", re.IGNORECASE
+)
+
+
+def parsed_public_candidate_url(
+    base_url: str, value: str
+) -> Optional[tuple[str, urllib.parse.SplitResult]]:
+    """Join and strictly validate one inert public HTTP(S) candidate URL."""
+    if (
+        not value
+        or len(value) > 4096
+        or any(
+            character.isspace()
+            or ord(character) < 0x20
+            or ord(character) == 0x7F
+            or character == "\\"
+            for character in value
+        )
+    ):
+        return None
+    try:
+        absolute = urllib.parse.urljoin(base_url, value)
+        parsed = urllib.parse.urlsplit(absolute)
+        hostname = parsed.hostname
+        port = parsed.port
+    except (UnicodeError, ValueError):
+        return None
+    if (
+        parsed.scheme.lower() not in {"http", "https"}
+        or not hostname
+        or port == 0
+        or parsed.username is not None
+        or parsed.password is not None
+        or len(absolute) > 4096
+        or (port is None and parsed.netloc.endswith(":"))
+        or "%" in hostname
+    ):
+        return None
+    try:
+        ipaddress.ip_address(hostname)
+    except ValueError:
+        try:
+            ascii_hostname = hostname.encode("idna").decode("ascii")
+        except UnicodeError:
+            return None
+        labels = ascii_hostname.split(".")
+        if (
+            len(ascii_hostname) > 253
+            or any(not PUBLIC_HOST_LABEL.fullmatch(label) for label in labels)
+        ):
+            return None
+    parsed = parsed._replace(fragment="")
+    return parsed.geturl(), parsed
+
+
+def candidate_matches_source_hosts(
+    candidate: tuple[str, urllib.parse.SplitResult],
+    hosts: Optional[set[str]],
+) -> bool:
+    """Bind a sealed candidate to reviewed source hosts and default ports."""
+    if hosts is None:
+        return True
+    parsed = candidate[1]
+    if parsed.hostname not in hosts:
+        return False
+    return (
+        parsed.scheme.lower() == "https" and parsed.port in (None, 443)
+    ) or (
+        parsed.scheme.lower() == "http" and parsed.port in (None, 80)
+    )
+
+
+def extract_xml(
+    content: bytes,
+    base_url: str,
+    hosts: Optional[set[str]] = None,
+) -> list[dict[str, Optional[str]]]:
     """Extract bounded RSS/Atom entry metadata without executing markup."""
     root = ET.fromstring(content)
     entries: list[dict[str, Optional[str]]] = []
+    entries_by_url: dict[str, dict[str, Optional[str]]] = {}
     for item in root.iter():
         if local_name(item.tag) not in {"item", "entry"}:
             continue
@@ -342,15 +594,37 @@ def extract_xml(content: bytes) -> list[dict[str, Optional[str]]]:
             if name == "title" and not fields["title"]:
                 fields["title"] = clean_text("".join(child.itertext()), 300)
             elif name == "link" and not fields["url"]:
-                fields["url"] = child.attrib.get("href") or clean_text(child.text, 1000)
+                href = child.attrib.get("href")
+                if href is not None:
+                    fields["url"] = href
+                elif isinstance(child.text, str):
+                    fields["url"] = child.text.strip()
             elif name in {"pubdate", "published", "updated", "date"} and not fields["published"]:
                 fields["published"] = validated_publication_date(child.text)
             elif name in {"description", "summary", "content"} and not fields["summary"]:
                 fields["summary"] = clean_text("".join(child.itertext()), 800)
+        if fields["url"]:
+            validated_url = parsed_public_candidate_url(base_url, fields["url"])
+            if validated_url is None or not candidate_matches_source_hosts(
+                validated_url, hosts
+            ):
+                continue
+            fields["url"] = validated_url[0]
+            entry_key = canonical_url(validated_url[0])
+            existing = entries_by_url.get(entry_key)
+            if existing is not None:
+                existing["title"] = existing["title"] or fields["title"]
+                existing["published"] = (
+                    existing["published"] or fields["published"]
+                )
+                existing["summary"] = existing["summary"] or fields["summary"]
+                continue
+        if len(entries) >= 200:
+            continue
         if fields["title"] or fields["url"]:
             entries.append(fields)
-        if len(entries) >= 200:
-            break
+            if fields["url"]:
+                entries_by_url[canonical_url(fields["url"])] = fields
     return entries
 
 
@@ -360,87 +634,894 @@ HTML_VOID_ELEMENTS = frozenset({
 })
 
 
-class LinkExtractor(HTMLParser):
-    """Collect bounded public links and visible anchor text from HTML."""
+def schema_json_ld_context_state(value: object, inherited: str) -> str:
+    """Trust only exact Schema.org contexts and keep unknown semantics sticky."""
+    if inherited == JSON_LD_CONTEXT_TAINTED:
+        return JSON_LD_CONTEXT_TAINTED
 
-    def __init__(self, base_url: str) -> None:
-        super().__init__(convert_charrefs=True)
+    def is_exact_schema_context(item: object) -> bool:
+        if isinstance(item, str):
+            return item in SCHEMA_JSON_LD_CONTEXTS
+        return (
+            isinstance(item, dict)
+            and len(item) == 1
+            and "@vocab" in item
+            and item.get("@vocab") in SCHEMA_JSON_LD_CONTEXTS
+        )
+
+    if isinstance(value, list):
+        if not value:
+            return inherited
+        if len(value) > JSON_LD_MAX_CONTEXT_ITEMS:
+            return JSON_LD_CONTEXT_TAINTED
+        return (
+            JSON_LD_CONTEXT_TRUSTED
+            if all(is_exact_schema_context(item) for item in value)
+            else JSON_LD_CONTEXT_TAINTED
+        )
+    return (
+        JSON_LD_CONTEXT_TRUSTED
+        if is_exact_schema_context(value)
+        else JSON_LD_CONTEXT_TAINTED
+    )
+
+
+def is_schema_article_type(value: object, short_names_allowed: bool) -> bool:
+    """Accept only exact Schema.org Article types or their canonical IRIs."""
+    if not isinstance(value, str) or not value or len(value) > 256:
+        return False
+    if any(
+        character.isspace()
+        or ord(character) < 0x20
+        or ord(character) == 0x7F
+        or character == "\\"
+        for character in value
+    ) or "?" in value or "#" in value:
+        return False
+    if short_names_allowed and value in JSON_LD_ARTICLE_TYPES:
+        return True
+    try:
+        parsed = urllib.parse.urlsplit(value)
+        hostname = parsed.hostname
+        port = parsed.port
+    except (UnicodeError, ValueError):
+        return False
+    if (
+        parsed.scheme.lower() not in {"http", "https"}
+        or hostname != "schema.org"
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or (parsed.scheme.lower() == "https" and port not in (None, 443))
+        or (parsed.scheme.lower() == "http" and port not in (None, 80))
+        or (port is None and parsed.netloc.endswith(":"))
+        or not parsed.path.startswith("/")
+        or parsed.path.count("/") != 1
+    ):
+        return False
+    return parsed.path[1:] in JSON_LD_ARTICLE_TYPES
+
+
+HTML5_ASCII_WHITESPACE = "\t\n\f\r "
+STRICT_HTML_ATTRIBUTE_NAME = re.compile(r"[A-Za-z_:][A-Za-z0-9_.:-]*")
+STRICT_HTML_TAG_NAME = re.compile(r"[A-Za-z][A-Za-z0-9:-]*\Z")
+HTML_TAG_NAME_PREFIX = re.compile(r"[A-Za-z][A-Za-z0-9:-]*")
+HTML_CHARACTER_REFERENCE = re.compile(
+    r"&(?:#[xX][0-9A-Fa-f]+;?|#[0-9]+;?|[A-Za-z][A-Za-z0-9]+;)"
+)
+JSON_LD_RAW_TEXT_CONTAINERS = frozenset({
+    "iframe",
+    "noembed",
+    "noframes",
+    "noscript",
+    "plaintext",
+    "style",
+    "textarea",
+    "title",
+    "xmp",
+})
+JSON_LD_OPAQUE_CONTAINERS = frozenset({"math", "svg", "template"})
+JSON_LD_NONVOID_TRUST_CONTAINERS = (
+    JSON_LD_RAW_TEXT_CONTAINERS
+    | JSON_LD_OPAQUE_CONTAINERS
+    | {"frameset", "script", "select"}
+)
+HTML_NONVOID_ARTICLE_TRUST_ELEMENTS = JSON_LD_NONVOID_TRUST_CONTAINERS | {
+    "a",
+    "article",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "li",
+    "p",
+    "time",
+}
+EMBEDDED_SCRIPT_MAX_BYTES = 4 * 1024 * 1024
+EMBEDDED_SCRIPT_MAX_BLOCKS = 32
+PUBLISHER_JAVASCRIPT_MAX_BYTES = 512 * 1024
+
+
+def strict_html_attributes(
+    raw_tag: str, expected_tag: str
+) -> Optional[list[tuple[str, Optional[str]]]]:
+    """Parse one conservative HTML5-compatible start-tag subset."""
+    prefix = f"<{expected_tag}"
+    prefix_length = len(prefix)
+    if (
+        len(raw_tag) < prefix_length + 1
+        or raw_tag[:prefix_length].lower() != prefix
+        or raw_tag[prefix_length] not in HTML5_ASCII_WHITESPACE + ">"
+        or not raw_tag.endswith(">")
+    ):
+        return None
+    index = prefix_length
+    end = len(raw_tag) - 1
+    attributes: list[tuple[str, Optional[str]]] = []
+    while True:
+        while index < end and raw_tag[index] in HTML5_ASCII_WHITESPACE:
+            index += 1
+        if index == end:
+            return attributes
+        if raw_tag[index] in "/<>":
+            return None
+        match = STRICT_HTML_ATTRIBUTE_NAME.match(raw_tag, index, end)
+        if match is None:
+            return None
+        name = match.group(0).lower()
+        index = match.end()
+        if (
+            index < end
+            and raw_tag[index] not in HTML5_ASCII_WHITESPACE + "="
+        ):
+            return None
+        while index < end and raw_tag[index] in HTML5_ASCII_WHITESPACE:
+            index += 1
+        value: Optional[str] = None
+        if index < end and raw_tag[index] == "=":
+            index += 1
+            while index < end and raw_tag[index] in HTML5_ASCII_WHITESPACE:
+                index += 1
+            if index == end:
+                return None
+            if raw_tag[index] in {'"', "'"}:
+                quote = raw_tag[index]
+                index += 1
+                value_start = index
+                index = raw_tag.find(quote, index, end)
+                if index == -1:
+                    return None
+                value = raw_tag[value_start:index]
+                index += 1
+                if (
+                    index < end
+                    and raw_tag[index] not in HTML5_ASCII_WHITESPACE
+                ):
+                    return None
+            else:
+                value_start = index
+                while index < end and raw_tag[index] not in HTML5_ASCII_WHITESPACE:
+                    if raw_tag[index] in {'"', "'", "=", "<", ">", "`"}:
+                        return None
+                    index += 1
+                if value_start == index:
+                    return None
+                value = raw_tag[value_start:index]
+            # HTMLParser resolves character references in attributes even
+            # with convert_charrefs=False.  Reject them at the raw boundary so
+            # a callback value cannot acquire URL syntax that was not present
+            # literally in the reviewed token.
+            if HTML_CHARACTER_REFERENCE.search(value):
+                return None
+        attributes.append((name, value))
+
+
+def strict_script_attributes(
+    raw_tag: str,
+) -> Optional[list[tuple[str, Optional[str]]]]:
+    """Parse one conservative HTML5-compatible script start-tag subset."""
+    return strict_html_attributes(raw_tag, "script")
+
+
+class JsonLdBlockExtractor(HTMLParser):
+    """Collect publication metadata across an HTML5-safe syntax subset."""
+
+    def __init__(self, source_text: str) -> None:
+        super().__init__(convert_charrefs=False)
+        self.source_text = source_text
+        self.line_offsets = [0]
+        self.line_offsets.extend(
+            match.end() for match in re.finditer("\n", source_text)
+        )
+        self.capture = False
+        self.script_open = False
+        self.current: list[str] = []
+        self.blocks: list[str] = []
+        self.meta_dates: list[str] = []
+        self.raw_text_container: Optional[str] = None
+        self.opaque_containers: list[str] = []
+        self.select_depth = 0
+        self.invalid = False
+        if AMBIGUOUS_SCRIPT_CLOSER.search(source_text):
+            self.invalidate()
+
+    def invalidate(self) -> None:
+        """Discard all document JSON-LD after a tokenizer ambiguity."""
+        self.invalid = True
+        self.capture = False
+        self.script_open = False
+        self.current = []
+        self.blocks = []
+        self.meta_dates = []
+
+    def current_raw_end_tag(self) -> Optional[str]:
+        """Recover the raw end-tag lexeme at the current parser position."""
+        line, column = self.getpos()
+        if line <= 0 or line > len(self.line_offsets):
+            return None
+        start = self.line_offsets[line - 1] + column
+        end = self.source_text.find(">", start)
+        if end == -1:
+            return None
+        return self.source_text[start : end + 1]
+
+    def has_safe_end_tag(self, tag: str) -> bool:
+        """Allow only an exact name plus HTML5 ASCII whitespace before `>`."""
+        raw_tag = self.current_raw_end_tag()
+        return bool(
+            raw_tag
+            and re.fullmatch(
+                rf"</{re.escape(tag)}[\t\n\f\r ]*>",
+                raw_tag,
+                re.IGNORECASE,
+            )
+        )
+
+    def handle_starttag(
+        self, tag: str, _attrs: list[tuple[str, Optional[str]]]
+    ) -> None:
+        if self.invalid:
+            return
+        if STRICT_HTML_TAG_NAME.fullmatch(tag) is None:
+            prefix = HTML_TAG_NAME_PREFIX.match(tag)
+            if (
+                prefix is not None
+                and prefix.group(0).lower()
+                in JSON_LD_NONVOID_TRUST_CONTAINERS | {"meta"}
+            ):
+                self.invalidate()
+            return
+        lowered = tag.lower()
+        if self.script_open:
+            self.invalidate()
+            return
+        if self.raw_text_container is not None:
+            # HTMLParser is not an HTML5 tree builder and may emit tag events
+            # from RCDATA/raw-text containers.  Keep them entirely opaque.
+            return
+        if self.opaque_containers:
+            if lowered in JSON_LD_OPAQUE_CONTAINERS:
+                self.opaque_containers.append(lowered)
+            elif lowered in JSON_LD_RAW_TEXT_CONTAINERS:
+                self.raw_text_container = lowered
+            elif lowered == "script":
+                self.script_open = True
+                self.capture = False
+                self.current = []
+            return
+        if self.select_depth:
+            if lowered == "select":
+                self.select_depth += 1
+            elif lowered in JSON_LD_RAW_TEXT_CONTAINERS:
+                self.raw_text_container = lowered
+            elif lowered in JSON_LD_OPAQUE_CONTAINERS:
+                self.opaque_containers.append(lowered)
+            elif lowered == "script":
+                self.script_open = True
+                self.capture = False
+                self.current = []
+            return
+        if lowered in JSON_LD_RAW_TEXT_CONTAINERS:
+            self.raw_text_container = lowered
+            return
+        if lowered in JSON_LD_OPAQUE_CONTAINERS:
+            self.opaque_containers.append(lowered)
+            return
+        # Python's callback parser does not implement the HTML5 frameset,
+        # after-frameset, or after-after-frameset insertion modes.  Once a
+        # frameset token is present, fail the whole document closed rather
+        # than accepting script/meta tokens that a tree builder would ignore.
+        if lowered == "frameset":
+            self.invalidate()
+            return
+        if lowered == "select":
+            self.select_depth = 1
+            return
+        if lowered == "meta":
+            if self.select_depth:
+                return
+            attributes = strict_html_attributes(
+                self.get_starttag_text() or "", "meta"
+            )
+            if attributes is None:
+                return
+            names = [name for name, _value in attributes]
+            if len(names) != len(set(names)):
+                return
+            selectors = [
+                value
+                for name, value in attributes
+                if name in {"property", "name"}
+            ]
+            contents = [
+                value for name, value in attributes if name == "content"
+            ]
+            if (
+                len(selectors) != 1
+                or selectors[0] is None
+                or selectors[0].lower()
+                not in {"article:published_time", "datepublished"}
+                or len(contents) != 1
+                or contents[0] is None
+            ):
+                return
+            published = validated_json_ld_publication_date(contents[0])
+            if published:
+                self.meta_dates.append(published)
+            return
+        if lowered != "script":
+            return
+
+        self.script_open = True
+        raw_tag = self.get_starttag_text() or ""
+        attributes = strict_script_attributes(raw_tag)
+        type_values = (
+            [value for name, value in attributes if name == "type"]
+            if attributes is not None
+            else []
+        )
+        has_src = bool(
+            attributes is not None
+            and any(name == "src" for name, _value in attributes)
+        )
+        self.capture = (
+            len(type_values) == 1
+            and type_values[0] is not None
+            and type_values[0].lower() == "application/ld+json"
+            and not has_src
+        )
+        self.current = []
+
+    def handle_data(self, data: str) -> None:
+        if not self.invalid and self.script_open and self.capture:
+            self.current.append(data)
+
+    def handle_startendtag(
+        self, tag: str, attrs: list[tuple[str, Optional[str]]]
+    ) -> None:
+        """Do not let Python's XHTML shortcut close an HTML5 non-void element."""
+        if tag.lower() in JSON_LD_NONVOID_TRUST_CONTAINERS:
+            self.handle_starttag(tag, attrs)
+            return
+        super().handle_startendtag(tag, attrs)
+
+    def handle_endtag(self, tag: str) -> None:
+        if self.invalid:
+            return
+        if STRICT_HTML_TAG_NAME.fullmatch(tag) is None:
+            prefix = HTML_TAG_NAME_PREFIX.match(tag)
+            if (
+                prefix is not None
+                and prefix.group(0).lower()
+                in JSON_LD_NONVOID_TRUST_CONTAINERS
+            ):
+                self.invalidate()
+            return
+        lowered = tag.lower()
+        if self.script_open:
+            if lowered != "script" or not self.has_safe_end_tag("script"):
+                self.invalidate()
+                return
+            if self.capture:
+                self.blocks.append("".join(self.current))
+            self.capture = False
+            self.script_open = False
+            self.current = []
+            return
+        if self.raw_text_container is not None:
+            if lowered != self.raw_text_container:
+                return
+            if not self.has_safe_end_tag(self.raw_text_container):
+                self.invalidate()
+                return
+            if self.raw_text_container != "plaintext":
+                self.raw_text_container = None
+            return
+        if self.opaque_containers and lowered in JSON_LD_OPAQUE_CONTAINERS:
+            if (
+                lowered != self.opaque_containers[-1]
+                or not self.has_safe_end_tag(lowered)
+            ):
+                self.invalidate()
+                return
+            self.opaque_containers.pop()
+            return
+        if lowered == "select" and self.select_depth:
+            if not self.has_safe_end_tag("select"):
+                self.invalidate()
+                return
+            self.select_depth -= 1
+
+
+def embedded_script_kind(raw_tag: str) -> Optional[str]:
+    """Classify one actual inline script that may contain publisher records."""
+    attributes = strict_script_attributes(raw_tag)
+    if attributes is None:
+        return None
+    names = [name for name, _value in attributes]
+    if len(names) != len(set(names)) or "src" in names:
+        return None
+    by_name = {name: value for name, value in attributes}
+    raw_type = by_name.get("type")
+    script_type = raw_type.casefold() if raw_type is not None else None
+    script_id = by_name.get("id")
+    if script_id == "__NEXT_DATA__" and script_type == "application/json":
+        return "next_data"
+    if script_id == "__NEXT_DATA__":
+        return None
+    if script_type in {None, "text/javascript", "application/javascript"}:
+        return "publisher_javascript"
+    return None
+
+
+class LinkExtractor(HTMLParser):
+    """Collect links and publisher records through one HTML trust boundary."""
+
+    def __init__(
+        self,
+        base_url: str,
+        hosts: Optional[set[str]],
+        source_text: str,
+    ) -> None:
+        super().__init__(convert_charrefs=False)
         self.base_url = base_url
+        self.hosts = hosts
+        self.source_text = source_text
+        self.line_offsets = [0]
+        self.line_offsets.extend(
+            match.end() for match in re.finditer("\n", source_text)
+        )
+        self.invalid = False
+        self.raw_text_container: Optional[str] = None
+        self.opaque_containers: list[str] = []
+        self.select_depth = 0
+        self.script_open = False
+        self.script_kind: Optional[str] = None
+        self.script_text: list[str] = []
+        self.embedded_script_blocks: list[tuple[str, str]] = []
         self.current_href: Optional[str] = None
         self.current_text: list[str] = []
+        self.current_legacy_title_link = False
         self.entries: list[dict[str, Optional[str]]] = []
-        self.seen: set[str] = set()
+        self.entries_by_url: dict[str, dict[str, Optional[str]]] = {}
+        self.embedded_entries: list[dict[str, Optional[str]]] = []
+        self.embedded_entries_by_url: dict[str, dict[str, Optional[str]]] = {}
         self.article_depth = 0
-        self.article_entry_start = 0
+        self.article_link_occurrences: list[
+            tuple[dict[str, Optional[str]], str, bool]
+        ] = []
+        self.article_entry_rejected_at_cap = False
         self.article_published: Optional[str] = None
         self.article_text: list[str] = []
-        self.heading_depth = 0
+        self.article_heading_depths: list[int] = []
         self.current_article_headline = False
         self.in_time = False
+        self.time_datetime: Optional[str] = None
         self.time_text: list[str] = []
         self.date_element_depth = 0
         self.date_element_text: list[str] = []
+        self.legacy_title_depth = 0
+        self.legacy_title_link: Optional[tuple[str, str]] = None
+        self.legacy_pending_title: Optional[tuple[str, str]] = None
+        self.legacy_date_depth = 0
+        self.legacy_date_text: list[str] = []
+        self.legacy_list_item_depth = 0
+        if AMBIGUOUS_SCRIPT_CLOSER.search(source_text):
+            self.invalidate()
+
+    def invalidate(self) -> None:
+        """Discard every article channel after an HTML tokenizer ambiguity."""
+        self.invalid = True
+        self.raw_text_container = None
+        self.opaque_containers = []
+        self.select_depth = 0
+        self.script_open = False
+        self.script_kind = None
+        self.script_text = []
+        self.embedded_script_blocks = []
+        self.entries = []
+        self.entries_by_url = {}
+        self.embedded_entries = []
+        self.embedded_entries_by_url = {}
+        self.discard_open_article_markup()
+        self.article_depth = 0
+        self.article_link_occurrences = []
+        self.article_heading_depths = []
+        self.legacy_title_depth = 0
+        self.legacy_title_link = None
+        self.legacy_pending_title = None
+        self.legacy_date_depth = 0
+        self.legacy_date_text = []
+        self.legacy_list_item_depth = 0
+
+    def current_raw_end_tag(self) -> Optional[str]:
+        """Recover the end-tag lexeme at the callback's source position."""
+        line, column = self.getpos()
+        if line <= 0 or line > len(self.line_offsets):
+            return None
+        start = self.line_offsets[line - 1] + column
+        end = self.source_text.find(">", start)
+        if end == -1:
+            return None
+        return self.source_text[start : end + 1]
+
+    def has_safe_end_tag(self, tag: str) -> bool:
+        raw_tag = self.current_raw_end_tag()
+        return bool(
+            raw_tag
+            and re.fullmatch(
+                rf"</{re.escape(tag)}[\t\n\f\r ]*>",
+                raw_tag,
+                re.IGNORECASE,
+            )
+        )
+
+    def discard_open_article_markup(self) -> None:
+        """Discard unfinished parser state at one article nesting boundary."""
+        self.current_href = None
+        self.current_text = []
+        self.current_article_headline = False
+        self.current_legacy_title_link = False
+        self.in_time = False
+        self.time_datetime = None
+        self.time_text = []
+        self.date_element_depth = 0
+        self.date_element_text = []
+        if self.article_heading_depths:
+            self.article_heading_depths[-1] = 0
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, Optional[str]]]) -> None:
+        if self.invalid:
+            return
+        if STRICT_HTML_TAG_NAME.fullmatch(tag) is None:
+            prefix = HTML_TAG_NAME_PREFIX.match(tag)
+            leading = prefix.group(0).lower() if prefix is not None else ""
+            if leading in HTML_NONVOID_ARTICLE_TRUST_ELEMENTS - {"a"}:
+                self.invalidate()
+            elif leading == "a":
+                self.current_href = None
+                self.current_text = []
+                self.current_article_headline = False
+                self.current_legacy_title_link = False
+            return
         lowered = tag.lower()
-        attributes = dict(attrs)
+        if self.script_open:
+            self.invalidate()
+            return
+        if self.raw_text_container is not None:
+            return
+        if self.opaque_containers:
+            if lowered in JSON_LD_OPAQUE_CONTAINERS:
+                self.opaque_containers.append(lowered)
+            elif lowered in JSON_LD_RAW_TEXT_CONTAINERS:
+                self.raw_text_container = lowered
+            elif lowered == "script":
+                self.script_open = True
+                self.script_kind = None
+                self.script_text = []
+            return
+        if self.select_depth:
+            if lowered == "select":
+                self.select_depth += 1
+            elif lowered in JSON_LD_RAW_TEXT_CONTAINERS:
+                self.raw_text_container = lowered
+            elif lowered in JSON_LD_OPAQUE_CONTAINERS:
+                self.opaque_containers.append(lowered)
+            elif lowered == "script":
+                self.script_open = True
+                self.script_kind = None
+                self.script_text = []
+            return
+        if lowered in JSON_LD_RAW_TEXT_CONTAINERS:
+            self.raw_text_container = lowered
+            return
+        if lowered in JSON_LD_OPAQUE_CONTAINERS:
+            self.opaque_containers.append(lowered)
+            return
+        if lowered == "frameset":
+            self.invalidate()
+            return
+        if lowered == "select":
+            self.select_depth = 1
+            return
+        if lowered == "script":
+            self.script_open = True
+            self.script_kind = embedded_script_kind(
+                self.get_starttag_text() or ""
+            )
+            self.script_text = []
+            return
+
+        strict_attributes = strict_html_attributes(
+            self.get_starttag_text() or "", lowered
+        )
+        attribute_names = (
+            [name for name, _value in strict_attributes]
+            if strict_attributes is not None
+            else []
+        )
+        attributes_valid = (
+            strict_attributes is not None
+            and len(attribute_names) == len(set(attribute_names))
+        )
+        attributes = dict(strict_attributes) if attributes_valid else {}
+        if not attributes_valid and lowered in {"article", "li"}:
+            # These tokens define cross-record scope. Once their raw syntax is
+            # ambiguous, a callback parser cannot safely pair later metadata.
+            self.invalidate()
+            return
+        if not attributes_valid and lowered == "a":
+            self.current_href = None
+            self.current_text = []
+            self.current_article_headline = False
+            self.current_legacy_title_link = False
+            return
+
+        if lowered == "li":
+            # The supported legacy publisher wraps each record in one list
+            # item, sometimes beneath a single outer ``article`` element. A
+            # list-item boundary must never inherit an unfinished record.
+            if self.legacy_list_item_depth == 0:
+                self.legacy_title_depth = 0
+                self.legacy_title_link = None
+                self.legacy_pending_title = None
+                self.legacy_date_depth = 0
+                self.legacy_date_text = []
+            self.legacy_list_item_depth += 1
+
+        legacy_paragraph_scope = self.article_depth == 0 or (
+            self.article_depth == 1 and self.legacy_list_item_depth == 1
+        )
+        if lowered == "p" and legacy_paragraph_scope:
+            # A new paragraph is an implied boundary for the supported legacy
+            # publisher record. Unfinished state never crosses into it.
+            self.legacy_title_depth = 0
+            self.legacy_title_link = None
+            self.legacy_date_depth = 0
+            self.legacy_date_text = []
+            class_tokens = set((attributes.get("class") or "").casefold().split())
+            if "title" in class_tokens:
+                self.legacy_pending_title = None
+                self.legacy_title_depth = 1
+            elif "date" in class_tokens and self.legacy_pending_title is not None:
+                self.legacy_date_depth = 1
         if lowered == "article":
             if self.article_depth == 0:
-                self.article_entry_start = len(self.entries)
+                self.article_link_occurrences = []
+                self.article_entry_rejected_at_cap = False
                 self.article_published = None
                 self.article_text = []
+                self.article_heading_depths = []
+            # No unfinished heading, anchor, or date capture may cross into a
+            # child article. Completed outer occurrences and dates remain.
+            self.discard_open_article_markup()
             self.article_depth += 1
-        if lowered == "time" and self.article_depth:
+            self.article_heading_depths.append(0)
+        if lowered == "time" and attributes_valid and self.article_depth == 1:
             self.in_time = True
             self.time_text = []
-            self.article_published = clean_text(attributes.get("datetime"), 200)
+            self.time_datetime = clean_text(attributes.get("datetime"), 200)
         if self.date_element_depth and lowered not in HTML_VOID_ELEMENTS:
             self.date_element_depth += 1
+        if (
+            self.legacy_title_depth
+            and lowered not in HTML_VOID_ELEMENTS
+            and lowered != "p"
+        ):
+            self.legacy_title_depth += 1
+        if (
+            self.legacy_date_depth
+            and lowered not in HTML_VOID_ELEMENTS
+            and lowered != "p"
+        ):
+            self.legacy_date_depth += 1
         class_tokens = set((attributes.get("class") or "").lower().split())
+        semantic_labels = {
+            label.casefold()
+            for key in ("alt", "aria-label")
+            if (label := clean_text(attributes.get(key), 100))
+        }
+        itemprop_tokens = set((attributes.get("itemprop") or "").casefold().split())
         if (
             lowered not in HTML_VOID_ELEMENTS
             and not self.date_element_depth
-            and self.article_depth
-            and class_tokens.intersection(
-                {"date", "published", "publication-date", "pubdate"}
+            and self.article_depth == 1
+            and (
+                class_tokens.intersection(
+                    {"date", "published", "publication-date", "pubdate"}
+                )
+                or semantic_labels.intersection(
+                    {"date of publication", "publication date", "published date", "公開日"}
+                )
+                or "datepublished" in itemprop_tokens
             )
         ):
             self.date_element_depth = 1
             self.date_element_text = []
-        if lowered in {"h1", "h2", "h3", "h4", "h5", "h6"} and self.article_depth:
-            self.heading_depth += 1
-        if lowered != "a" or len(self.entries) >= 400:
+        if (
+            lowered in {"h1", "h2", "h3", "h4", "h5", "h6"}
+            and self.article_heading_depths
+        ):
+            self.article_heading_depths[-1] += 1
+        if lowered != "a":
             return
+        # A new anchor starts a new parser occurrence even when the previous
+        # malformed anchor omitted its end tag.  Invalid/no-href anchors must
+        # not complete or contaminate that abandoned occurrence later.
+        self.current_href = None
+        self.current_text = []
+        self.current_article_headline = False
+        self.current_legacy_title_link = False
         href = attributes.get("href")
         if href:
-            self.current_href = urllib.parse.urljoin(self.base_url, href)
+            # Nested article metadata is outside the enclosing listing card;
+            # reject it before even parsing attacker-controlled URL syntax.
+            if self.article_depth > 1:
+                return
+            validated = parsed_public_candidate_url(self.base_url, href)
+            if validated is None or not candidate_matches_source_hosts(
+                validated, self.hosts
+            ):
+                return
+            absolute, _parsed = validated
+            # Stop growing the bounded entry set at 400, but keep observing
+            # existing URLs so a later scoped headline can replace an earlier
+            # copy/share label at the boundary.
+            if (
+                len(self.entries) >= 400
+                and canonical_url(absolute) not in self.entries_by_url
+            ):
+                if self.article_depth == 1:
+                    self.article_entry_rejected_at_cap = True
+                return
+            self.current_href = absolute
             self.current_text = []
-            self.current_article_headline = self.article_depth > 0 and self.heading_depth > 0
+            self.current_article_headline = (
+                self.article_depth == 1
+                and bool(self.article_heading_depths)
+                and self.article_heading_depths[-1] > 0
+            )
+            self.current_legacy_title_link = bool(self.legacy_title_depth)
 
     def handle_data(self, data: str) -> None:
+        if self.invalid:
+            return
+        if self.script_open:
+            if self.script_kind is not None:
+                self.script_text.append(data)
+            return
+        if (
+            self.raw_text_container is not None
+            or self.opaque_containers
+            or self.select_depth
+        ):
+            return
         if self.current_href:
             self.current_text.append(data)
         if self.in_time:
             self.time_text.append(data)
         if self.date_element_depth:
             self.date_element_text.append(data)
+        if self.legacy_date_depth:
+            self.legacy_date_text.append(data)
+
+    def handle_entityref(self, name: str) -> None:
+        if self.script_open:
+            self.handle_data(f"&{name};")
+        else:
+            self.handle_data(html.unescape(f"&{name};"))
+
+    def handle_charref(self, name: str) -> None:
+        if self.script_open:
+            self.handle_data(f"&#{name};")
+        else:
+            self.handle_data(html.unescape(f"&#{name};"))
 
     def handle_startendtag(
         self, tag: str, attrs: list[tuple[str, Optional[str]]]
     ) -> None:
-        """Do not synthesize a depth-closing event for HTML void elements."""
-        if tag.lower() in HTML_VOID_ELEMENTS:
+        """Treat an XHTML slash as ignored on every HTML non-void element."""
+        if tag.lower() not in HTML_VOID_ELEMENTS:
             self.handle_starttag(tag, attrs)
             return
         super().handle_startendtag(tag, attrs)
 
     def handle_endtag(self, tag: str) -> None:
+        if self.invalid:
+            return
+        if STRICT_HTML_TAG_NAME.fullmatch(tag) is None:
+            prefix = HTML_TAG_NAME_PREFIX.match(tag)
+            if (
+                prefix is not None
+                and prefix.group(0).lower()
+                in HTML_NONVOID_ARTICLE_TRUST_ELEMENTS
+            ):
+                self.invalidate()
+            return
         lowered = tag.lower()
+        if self.script_open:
+            if lowered != "script" or not self.has_safe_end_tag("script"):
+                self.invalidate()
+                return
+            if self.script_kind is not None:
+                block = "".join(self.script_text)
+                if (
+                    len(self.embedded_script_blocks) < EMBEDDED_SCRIPT_MAX_BLOCKS
+                    and len(block.encode("utf-8")) <= EMBEDDED_SCRIPT_MAX_BYTES
+                ):
+                    self.embedded_script_blocks.append((self.script_kind, block))
+            self.script_open = False
+            self.script_kind = None
+            self.script_text = []
+            return
+        if self.raw_text_container is not None:
+            if lowered != self.raw_text_container:
+                return
+            if not self.has_safe_end_tag(self.raw_text_container):
+                self.invalidate()
+                return
+            if self.raw_text_container != "plaintext":
+                self.raw_text_container = None
+            return
+        if self.opaque_containers:
+            if lowered not in JSON_LD_OPAQUE_CONTAINERS:
+                return
+            if (
+                lowered != self.opaque_containers[-1]
+                or not self.has_safe_end_tag(lowered)
+            ):
+                self.invalidate()
+                return
+            self.opaque_containers.pop()
+            return
+        if self.select_depth:
+            if lowered != "select":
+                return
+            if not self.has_safe_end_tag("select"):
+                self.invalidate()
+                return
+            self.select_depth -= 1
+            return
+        if (
+            lowered in HTML_NONVOID_ARTICLE_TRUST_ELEMENTS
+            and not self.has_safe_end_tag(lowered)
+        ):
+            self.invalidate()
+            return
+        if lowered == "article" and self.article_depth:
+            self.discard_open_article_markup()
         if lowered == "time" and self.in_time:
-            self.article_published = self.article_published or validated_publication_date(
+            completed_time = validated_publication_date(
+                self.time_datetime
+            ) or validated_publication_date(
                 " ".join(self.time_text)
             )
+            self.article_published = self.article_published or completed_time
             self.in_time = False
+            self.time_datetime = None
             self.time_text = []
         if self.date_element_depth and lowered not in HTML_VOID_ELEMENTS:
             self.date_element_depth -= 1
@@ -451,29 +1532,69 @@ class LinkExtractor(HTMLParser):
                 self.date_element_text = []
         if lowered == "article" and self.article_depth:
             self.article_depth -= 1
+            if self.article_heading_depths:
+                self.article_heading_depths.pop()
+            if self.article_heading_depths:
+                self.article_heading_depths[-1] = 0
             if self.article_depth == 0:
                 self.article_published = validated_publication_date(
                     self.article_published
                 )
-                article_entries = self.entries[self.article_entry_start:]
-                candidate = next(
+                selected = next(
                     (
-                        entry for entry in article_entries
-                        if entry.get("candidate_provenance") == "article_headline"
+                        occurrence for occurrence in self.article_link_occurrences
+                        if occurrence[2]
                     ),
-                    article_entries[0] if len(article_entries) == 1 else None,
+                    (
+                        self.article_link_occurrences[0]
+                        if len(self.article_link_occurrences) == 1
+                        and not self.article_entry_rejected_at_cap
+                        else None
+                    ),
                 )
-                for entry in article_entries:
-                    entry["candidate_provenance"] = "article" if entry is candidate else None
-                    if entry is candidate:
-                        entry["published"] = entry["published"] or self.article_published
-                self.in_time = False
-                self.time_text = []
-                self.date_element_depth = 0
-                self.date_element_text = []
+                if selected is not None:
+                    candidate, article_title, is_headline = selected
+                    if is_headline or not candidate["title"]:
+                        candidate["title"] = article_title
+                    candidate["candidate_provenance"] = "article"
+                    candidate["published"] = (
+                        candidate["published"] or self.article_published
+                    )
                 self.article_text = []
-        if lowered in {"h1", "h2", "h3", "h4", "h5", "h6"} and self.heading_depth:
-            self.heading_depth -= 1
+                self.article_link_occurrences = []
+                self.article_entry_rejected_at_cap = False
+                self.article_heading_depths = []
+        if (
+            lowered in {"h1", "h2", "h3", "h4", "h5", "h6"}
+            and self.article_heading_depths
+            and self.article_heading_depths[-1]
+        ):
+            self.article_heading_depths[-1] -= 1
+        if self.legacy_title_depth and lowered not in HTML_VOID_ELEMENTS:
+            self.legacy_title_depth -= 1
+            if self.legacy_title_depth == 0:
+                self.legacy_pending_title = self.legacy_title_link
+                self.legacy_title_link = None
+        if self.legacy_date_depth and lowered not in HTML_VOID_ELEMENTS:
+            self.legacy_date_depth -= 1
+            if self.legacy_date_depth == 0:
+                if self.legacy_pending_title is not None:
+                    title, url = self.legacy_pending_title
+                    self.append_embedded_entry(
+                        title,
+                        url,
+                        " ".join(self.legacy_date_text),
+                    )
+                self.legacy_pending_title = None
+                self.legacy_date_text = []
+        if lowered == "li" and self.legacy_list_item_depth:
+            self.legacy_list_item_depth -= 1
+            if self.legacy_list_item_depth == 0:
+                self.legacy_title_depth = 0
+                self.legacy_title_link = None
+                self.legacy_pending_title = None
+                self.legacy_date_depth = 0
+                self.legacy_date_text = []
         if lowered != "a" or not self.current_href:
             return
         parsed = urllib.parse.urlsplit(self.current_href)
@@ -481,158 +1602,367 @@ class LinkExtractor(HTMLParser):
         if (
             parsed.scheme in {"http", "https"}
             and parsed.hostname
-            and self.current_href not in self.seen
             and title
         ):
-            self.entries.append(
-                {
+            entry_key = canonical_url(self.current_href)
+            entry = self.entries_by_url.get(entry_key)
+            if entry is None:
+                entry = {
                     "title": title,
                     "url": self.current_href,
                     "published": None,
                     "summary": None,
-                    "candidate_provenance": (
-                        "article_headline" if self.current_article_headline else None
-                    ),
+                    "candidate_provenance": None,
                 }
-            )
-            self.seen.add(self.current_href)
+                self.entries.append(entry)
+                self.entries_by_url[entry_key] = entry
+            elif self.current_article_headline:
+                # Listing cards often expose copy/share controls before the real
+                # same-URL heading.  Keep URL deduplication, but let the scoped
+                # article headline replace that control label deterministically.
+                entry["title"] = title
+            if self.article_depth == 1:
+                if (
+                    not self.current_article_headline
+                    and entry["candidate_provenance"] is None
+                ):
+                    # A URL first seen in generic navigation has no trusted
+                    # article title.  Clear that label so the unambiguous
+                    # article occurrence can fill it at the article boundary.
+                    entry["title"] = None
+                self.article_link_occurrences.append(
+                    (entry, title, self.current_article_headline)
+                )
+            if self.current_legacy_title_link:
+                self.legacy_title_link = (title, self.current_href)
         self.current_href = None
         self.current_text = []
         self.current_article_headline = False
+        self.current_legacy_title_link = False
+
+    def append_embedded_entry(self, title: str, url: str, published: str) -> None:
+        """Append one structurally scoped legacy publisher-list record."""
+        validated_url = parsed_public_candidate_url(
+            self.base_url, html.unescape(url)
+        )
+        if validated_url is None:
+            return
+        absolute, _parsed = validated_url
+        cleaned_title = clean_text(title, 300)
+        clean_published = validated_publication_date(published)
+        if (
+            not candidate_matches_source_hosts(validated_url, self.hosts)
+            or not cleaned_title
+            or not clean_published
+        ):
+            return
+        key = canonical_url(absolute)
+        existing = self.embedded_entries_by_url.get(key)
+        if existing is not None:
+            existing["published"] = existing["published"] or clean_published
+            return
+        if len(self.embedded_entries) >= 200:
+            return
+        entry = {
+            "title": cleaned_title,
+            "url": absolute,
+            "published": clean_published,
+            "summary": None,
+            "candidate_provenance": "article",
+        }
+        self.embedded_entries.append(entry)
+        self.embedded_entries_by_url[key] = entry
 
 
-def extract_json_ld(content: bytes, base_url: str) -> list[dict[str, Optional[str]]]:
+def html_trust_state_is_safe(parser: Any) -> bool:
+    """Require every tokenizer-sensitive trust container to close safely."""
+    return not (
+        parser.invalid
+        or parser.script_open
+        or parser.raw_text_container is not None
+        or parser.opaque_containers
+        or parser.select_depth
+    )
+
+
+def extract_json_ld(
+    content: bytes,
+    base_url: str,
+    hosts: Optional[set[str]] = None,
+) -> list[dict[str, Optional[str]]]:
     """Extract article metadata exposed by public JSON-LD blocks."""
     text = content.decode("utf-8", errors="replace")
-    blocks = re.findall(
-        r"<script[^>]+type=[\"']application/ld\+json[\"'][^>]*>(.*?)</script>",
-        text, re.IGNORECASE | re.DOTALL,
-    )
+    # HTMLParser can absorb a whitespace-split pseudo closer into script raw
+    # text and later close that script at an unrelated safe `</script>`.  That
+    # makes already-collected peer blocks look trustworthy even though the
+    # HTML5 tokenizer boundary is ambiguous, so reject the whole document.
+    if AMBIGUOUS_SCRIPT_CLOSER.search(text):
+        return []
+    parser = JsonLdBlockExtractor(text)
+    try:
+        parser.feed(text)
+        parser.close()
+    except (AssertionError, ValueError):
+        # Malformed markup must not turn public-page extraction into a crash.
+        return []
+    if not html_trust_state_is_safe(parser):
+        return []
     entries: list[dict[str, Optional[str]]] = []
+    entries_by_url: dict[str, dict[str, Optional[str]]] = {}
 
-    def visit(value: Any) -> None:
-        if isinstance(value, list):
-            for item in value:
-                visit(item)
-            return
-        if not isinstance(value, dict):
-            return
-        title = clean_text(value.get("headline") or value.get("name"), 300)
-        raw_url = value.get("url") or value.get("mainEntityOfPage")
-        if isinstance(raw_url, dict):
-            raw_url = raw_url.get("@id") or raw_url.get("url")
-        published = validated_publication_date(value.get("datePublished"))
-        raw_type = value.get("@type")
-        types = raw_type if isinstance(raw_type, list) else [raw_type]
-        article_like = any(
-            isinstance(item, str)
-            and (item.lower().endswith("article") or item.lower().endswith("posting"))
-            for item in types
-        )
-        if title and isinstance(raw_url, str) and article_like:
-            entries.append({
-                "title": title,
-                "url": urllib.parse.urljoin(base_url, raw_url),
-                "published": published,
-                "summary": clean_text(value.get("description"), 800),
-                "candidate_provenance": "json_ld" if article_like else None,
-            })
-        for nested in value.values():
-            if isinstance(nested, (dict, list)):
-                visit(nested)
-
-    for block in blocks[:50]:
+    for block in parser.blocks:
+        block_entries: list[dict[str, Optional[str]]] = []
+        block_entries_by_url: dict[str, dict[str, Optional[str]]] = {}
         try:
-            visit(json.loads(html.unescape(block)))
-        except (json.JSONDecodeError, TypeError):
+            # Script elements contain raw text: HTML character references are
+            # literal JSON string content and must not be decoded before the
+            # JSON parser applies JSON's own escape rules.
+            root = json.loads(block)
+            pending: list[tuple[Any, int, str]] = [
+                (root, 0, JSON_LD_CONTEXT_UNBOUND)
+            ]
+            visited_nodes = 0
+            while pending:
+                value, depth, inherited_context_state = pending.pop()
+                visited_nodes += 1
+                if (
+                    depth > JSON_LD_MAX_DEPTH
+                    or visited_nodes > JSON_LD_MAX_NODES
+                ):
+                    raise ValueError("JSON-LD traversal budget exceeded")
+                if isinstance(value, list):
+                    if (
+                        visited_nodes + len(pending) + len(value)
+                        > JSON_LD_MAX_NODES
+                    ):
+                        raise ValueError("JSON-LD traversal budget exceeded")
+                    pending.extend(
+                        (item, depth + 1, inherited_context_state)
+                        for item in reversed(value)
+                    )
+                    continue
+                if not isinstance(value, dict):
+                    continue
+
+                context_state = inherited_context_state
+                if "@context" in value:
+                    context_state = schema_json_ld_context_state(
+                        value.get("@context"), inherited_context_state
+                    )
+
+                raw_title = value.get("headline") or value.get("name")
+                title = (
+                    clean_text(raw_title, 300)
+                    if isinstance(raw_title, str)
+                    else None
+                )
+                raw_url = value.get("url") or value.get("mainEntityOfPage")
+                if isinstance(raw_url, dict):
+                    raw_url = raw_url.get("@id") or raw_url.get("url")
+                raw_published = value.get("datePublished")
+                published = (
+                    validated_json_ld_publication_date(raw_published)
+                    if isinstance(raw_published, str)
+                    else None
+                )
+                raw_summary = value.get("description")
+                summary = (
+                    clean_text(raw_summary, 800)
+                    if isinstance(raw_summary, str)
+                    else None
+                )
+                raw_type = value.get("@type")
+                types = raw_type if isinstance(raw_type, list) else [raw_type]
+                article_like = any(
+                    is_schema_article_type(
+                        item, context_state == JSON_LD_CONTEXT_TRUSTED
+                    )
+                    for item in types
+                )
+                validated_url = (
+                    parsed_public_candidate_url(base_url, raw_url)
+                    if isinstance(raw_url, str)
+                    else None
+                )
+                if (
+                    article_like
+                    and validated_url is not None
+                    and candidate_matches_source_hosts(validated_url, hosts)
+                ):
+                    entry_key = canonical_url(validated_url[0])
+                    existing = block_entries_by_url.get(entry_key)
+                    if existing is not None:
+                        existing["title"] = existing["title"] or title
+                        existing["published"] = (
+                            existing["published"] or published
+                        )
+                        existing["summary"] = existing["summary"] or summary
+                    else:
+                        entry = {
+                            "title": title,
+                            "url": validated_url[0],
+                            "published": published,
+                            "summary": summary,
+                            "candidate_provenance": "json_ld",
+                        }
+                        block_entries.append(entry)
+                        block_entries_by_url[entry_key] = entry
+
+                # A JSON-LD context declaration defines how sibling/descendant
+                # data is interpreted; it is not itself a graph node.  Never
+                # traverse context mappings as article records, even when a
+                # malicious mapping contains record-like keys.
+                nested_values = [
+                    nested
+                    for key, nested in value.items()
+                    if key != "@context"
+                ]
+                if (
+                    visited_nodes + len(pending) + len(nested_values)
+                    > JSON_LD_MAX_NODES
+                ):
+                    raise ValueError("JSON-LD traversal budget exceeded")
+                pending.extend(
+                    (nested, depth + 1, context_state)
+                    for nested in reversed(nested_values)
+                )
+        except (ValueError, TypeError, RecursionError, OverflowError):
+            # A malformed or pathologically structured script block must not
+            # leak partial entries or prevent later JSON-LD/HTML peers.
             continue
+
+        for entry in block_entries:
+            entry_key = canonical_url(str(entry["url"]))
+            existing = entries_by_url.get(entry_key)
+            if existing is not None:
+                existing["published"] = (
+                    existing["published"] or entry["published"]
+                )
+                existing["summary"] = existing["summary"] or entry["summary"]
+            elif entry["title"] and len(entries) < 200:
+                entries.append(entry)
+                entries_by_url[entry_key] = entry
     return entries[:200]
 
 
 def extract_embedded_article_metadata(
-    content: bytes, base_url: str
+    content: bytes,
+    base_url: str,
+    hosts: Optional[set[str]] = None,
 ) -> list[dict[str, Optional[str]]]:
-    """Extract dated article records from bounded publisher list markup/data."""
+    """Extract records only from structurally trusted markup/script blocks."""
     text = content.decode("utf-8", errors="replace")
-    entries: list[dict[str, Optional[str]]] = []
+    parser = LinkExtractor(base_url, hosts, text)
+    try:
+        parser.feed(text)
+        parser.close()
+    except (AssertionError, ValueError):
+        return []
+    if not html_trust_state_is_safe(parser):
+        parser.invalidate()
+    populate_embedded_script_entries(parser)
+    return [] if parser.invalid else parser.embedded_entries[:200]
 
-    def append(title: str, url: str, published: str) -> None:
-        absolute = urllib.parse.urljoin(base_url, html.unescape(url))
-        parsed = urllib.parse.urlsplit(absolute)
-        base_host = urllib.parse.urlsplit(base_url).hostname
-        cleaned_title = clean_text(title, 300)
-        published = validated_publication_date(published)
-        if (
-            parsed.scheme == "https"
-            and parsed.hostname == base_host
-            and cleaned_title
-            and published
-            and len(entries) < 200
-        ):
-            entries.append({
-                "title": cleaned_title,
-                "url": absolute,
-                "published": published,
-                "summary": None,
-                "candidate_provenance": "article",
-            })
 
-    title_pattern = re.compile(
-        r'<p[^>]+class=["\'][^"\']*\btitle\b[^"\']*["\'][^>]*>.*?</p>',
-        re.IGNORECASE | re.DOTALL,
-    )
-    title_matches = list(title_pattern.finditer(text))
-    for index, title_match in enumerate(title_matches):
-        record_end = (
-            title_matches[index + 1].start()
-            if index + 1 < len(title_matches)
-            else len(text)
-        )
-        record = text[title_match.start():record_end]
-        link = re.search(
-            r'<a[^>]+href=["\']([^"\']+)["\'][^>]*>(.*?)</a>',
-            title_match.group(0),
-            re.IGNORECASE | re.DOTALL,
-        )
-        date_match = re.search(
-            r'<p[^>]+class=["\'][^"\']*\bdate\b[^"\']*["\'][^>]*>\s*\(?'
-            r'(20\d{2})/(\d{1,2})/(\d{1,2})',
-            record,
-            re.IGNORECASE | re.DOTALL,
-        )
-        if not link or not date_match:
+def populate_embedded_script_entries(parser: LinkExtractor) -> None:
+    """Parse bounded publisher data captured by the trusted HTML parser."""
+    if not html_trust_state_is_safe(parser):
+        return
+    for kind, block in parser.embedded_script_blocks:
+        if kind == "publisher_javascript":
+            if len(block.encode("utf-8")) > PUBLISHER_JAVASCRIPT_MAX_BYTES:
+                continue
+            for match in re.finditer(
+                r"\{'url':'([^']+)','title':'([^']*)'[^{]{0,5000}?'date':'"
+                r"(20\d{2})/(\d{1,2})/(\d{1,2})'",
+                block,
+                re.DOTALL,
+            ):
+                year, month, day = map(int, match.groups()[2:])
+                try:
+                    published = date(year, month, day).isoformat()
+                except ValueError:
+                    continue
+                parser.append_embedded_entry(
+                    match.group(2) or match.group(1),
+                    match.group(1),
+                    published,
+                )
             continue
-        year, month, day = map(int, date_match.groups())
+        if kind != "next_data":
+            continue
         try:
-            published = date(year, month, day).isoformat()
-        except ValueError:
+            root = json.loads(block)
+            pending: list[tuple[Any, int]] = [(root, 0)]
+            visited = 0
+            while pending:
+                value, depth = pending.pop()
+                visited += 1
+                if depth > JSON_LD_MAX_DEPTH or visited > JSON_LD_MAX_NODES:
+                    raise ValueError("embedded JSON traversal budget exceeded")
+                if isinstance(value, list):
+                    if visited + len(pending) + len(value) > JSON_LD_MAX_NODES:
+                        raise ValueError("embedded JSON traversal budget exceeded")
+                    pending.extend((item, depth + 1) for item in reversed(value))
+                    continue
+                if not isinstance(value, dict):
+                    continue
+                metadata = value.get("metadata")
+                metadata = metadata if isinstance(metadata, dict) else {}
+                article_metadata = value.get("articleMetadata")
+                article_metadata = (
+                    article_metadata if isinstance(article_metadata, dict) else {}
+                )
+                data = value.get("data")
+                data = data if isinstance(data, dict) else {}
+                title = next(
+                    (
+                        candidate
+                        for candidate in (
+                            article_metadata.get("title"),
+                            metadata.get("title"),
+                            value.get("title"),
+                            value.get("headline"),
+                        )
+                        if isinstance(candidate, str)
+                    ),
+                    None,
+                )
+                published = next(
+                    (
+                        candidate
+                        for candidate in (
+                            metadata.get("datePublished"),
+                            value.get("datePublished"),
+                            data.get("date"),
+                        )
+                        if isinstance(candidate, str)
+                    ),
+                    None,
+                )
+                issue_id = data.get("issueId", value.get("issueId"))
+                volume = data.get("issueVolume", value.get("issueVolume"))
+                number = data.get("issueNumber", value.get("issueNumber"))
+                if (
+                    title is not None
+                    and published is not None
+                    and isinstance(issue_id, str)
+                    and isinstance(volume, int)
+                    and not isinstance(volume, bool)
+                    and isinstance(number, int)
+                    and not isinstance(number, bool)
+                ):
+                    parser.append_embedded_entry(
+                        title,
+                        f"/newsletters/{issue_id}/{volume}/{number}",
+                        published,
+                    )
+                nested = list(value.values())
+                if visited + len(pending) + len(nested) > JSON_LD_MAX_NODES:
+                    raise ValueError("embedded JSON traversal budget exceeded")
+                pending.extend((item, depth + 1) for item in reversed(nested))
+        except (ValueError, TypeError, RecursionError, OverflowError):
             continue
-        append(link.group(2), link.group(1), published)
-
-    for match in re.finditer(
-        r"\{'url':'([^']+)','title':'([^']*)'.{0,5000}?'date':'"
-        r"(20\d{2})/(\d{1,2})/(\d{1,2})'",
-        text,
-        re.DOTALL,
-    ):
-        year, month, day = map(int, match.groups()[2:])
-        try:
-            published = date(year, month, day).isoformat()
-        except ValueError:
-            continue
-        append(match.group(2) or match.group(1), match.group(1), published)
-
-    for match in re.finditer(
-        r'datePublished\\?"\s*:\s*\\?"([^"\\]+)\\?".*?'
-        r'articleMetadata.*?title\\?"\s*:\s*\\?"([^"\\]+)\\?".*?'
-        r'issueId\\?"\s*:\s*\\?"([^"\\]+)\\?".*?'
-        r'issueVolume\\?"\s*:\s*(\d+).*?issueNumber\\?"\s*:\s*(\d+)',
-        text,
-        re.DOTALL,
-    ):
-        published, title, issue_id, volume, number = match.groups()
-        append(title, f"/newsletters/{issue_id}/{volume}/{number}", published)
-    return entries[:200]
 
 
 def canonical_url(value: str) -> str:
@@ -641,10 +1971,7 @@ def canonical_url(value: str) -> str:
     path = parsed.path.rstrip("/") or "/"
     host = (parsed.hostname or "").lower()
     host = f"[{host}]" if ":" in host else host
-    try:
-        port = parsed.port
-    except ValueError:
-        port = None
+    port = parsed.port
     default_port = (parsed.scheme.lower() == "https" and port == 443) or (
         parsed.scheme.lower() == "http" and port == 80
     )
@@ -654,48 +1981,88 @@ def canonical_url(value: str) -> str:
     )
 
 
-def extract_primary_publication_date(content: bytes, final_url: str) -> Optional[str]:
+def extract_primary_publication_date(
+    content: bytes,
+    final_url: str,
+    hosts: Optional[set[str]] = None,
+) -> Optional[str]:
     """Return only the publication date belonging to the fetched article itself."""
-    target = canonical_url(final_url)
-    for entry in extract_json_ld(content, final_url):
-        if entry.get("url") and canonical_url(str(entry["url"])) == target:
-            return validated_publication_date(entry.get("published"))
-    text = content.decode("utf-8", errors="replace")
-    meta = re.search(
-        r"<meta[^>]+(?:property|name)=[\"'](?:article:published_time|datePublished)[\"'][^>]+content=[\"']([^\"']+)",
-        text, re.IGNORECASE,
+    published, _provenance = extract_primary_publication_evidence(
+        content, final_url, hosts
     )
-    if not meta:
-        meta = re.search(
-            r"<meta[^>]+content=[\"']([^\"']+)[\"'][^>]+(?:property|name)=[\"'](?:article:published_time|datePublished)[\"']",
-            text, re.IGNORECASE,
-        )
-    return validated_publication_date(meta.group(1)) if meta else None
+    return published
 
 
-def extract_content(content: bytes, content_type: str, final_url: str) -> dict[str, Any]:
+def extract_primary_publication_evidence(
+    content: bytes,
+    final_url: str,
+    hosts: Optional[set[str]] = None,
+) -> tuple[Optional[str], Optional[str]]:
+    """Return one structurally verified primary date and its actual channel."""
+    target = canonical_url(final_url)
+    for entry in extract_json_ld(content, final_url, hosts):
+        if entry.get("url") and canonical_url(str(entry["url"])) == target:
+            published = validated_publication_date(entry.get("published"))
+            if published:
+                return published, "json_ld"
+    text = content.decode("utf-8", errors="replace")
+    parser = JsonLdBlockExtractor(text)
+    try:
+        parser.feed(text)
+        parser.close()
+    except (AssertionError, ValueError):
+        return None, None
+    if not html_trust_state_is_safe(parser):
+        return None, None
+    dates = set(parser.meta_dates)
+    if len(dates) != 1:
+        return None, None
+    return dates.pop(), "html_meta"
+
+
+def extract_content(
+    content: bytes,
+    content_type: str,
+    final_url: str,
+    hosts: Optional[set[str]] = None,
+) -> dict[str, Any]:
     """Create a compact, inert index while retaining raw evidence separately."""
     prefix = content.lstrip()[:32].lower()
     if "xml" in content_type or prefix.startswith((b"<rss", b"<feed", b"<?xml")):
         try:
-            entries = extract_xml(content)
+            entries = extract_xml(content, final_url, hosts)
             return {"format": "feed", "entry_count": len(entries), "entries": entries}
         except ET.ParseError:
             pass
-    parser = LinkExtractor(final_url)
-    parser.feed(content.decode("utf-8", errors="replace"))
+    text = content.decode("utf-8", errors="replace")
+    parser = LinkExtractor(final_url, hosts, text)
+    try:
+        parser.feed(text)
+        parser.close()
+    except (AssertionError, ValueError):
+        parser.invalidate()
+    if not html_trust_state_is_safe(parser):
+        parser.invalidate()
+    populate_embedded_script_entries(parser)
     combined: list[dict[str, Optional[str]]] = []
     by_url: dict[str, dict[str, Optional[str]]] = {}
-    for entry in [
-        *extract_json_ld(content, final_url),
-        *extract_embedded_article_metadata(content, final_url),
+    trusted_entries = [] if parser.invalid else [
+        *extract_json_ld(content, final_url, hosts),
+        *parser.embedded_entries,
         *parser.entries,
-    ]:
+    ]
+    for entry in trusted_entries:
         url = entry.get("url")
         if not isinstance(url, str):
             combined.append(entry)
             continue
-        key = canonical_url(url)
+        validated_url = parsed_public_candidate_url(final_url, url)
+        if validated_url is None or not candidate_matches_source_hosts(
+            validated_url, hosts
+        ):
+            continue
+        entry["url"] = validated_url[0]
+        key = canonical_url(validated_url[0])
         existing = by_url.get(key)
         if existing is None:
             by_url[key] = entry
@@ -759,7 +2126,10 @@ def collect_source(
         try:
             fetched = fetch_url(url, hosts)
             extract = extract_content(
-                fetched["content"], fetched["content_type"], fetched["final_url"]
+                fetched["content"],
+                fetched["content_type"],
+                fetched["final_url"],
+                hosts,
             )
             constraint = detect_access_constraint(fetched["content"])
             if constraint and extract["entry_count"] < 10:
@@ -893,42 +2263,164 @@ def load_bounded_run_json(path: Path, trusted: Path) -> dict[str, Any]:
     parent = path.parent.resolve(strict=True)
     if parent != trusted and trusted not in parent.parents:
         raise CollectionError("JSON input escapes the run root")
-    flags = os.O_RDONLY
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    descriptor = os.open(path, flags)
-    try:
-        metadata = os.fstat(descriptor)
-        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size <= 0 or metadata.st_size > 1024 * 1024:
-            raise CollectionError("JSON input is not a bounded regular file")
-        content = os.read(descriptor, 1024 * 1024 + 1)
-        if len(content) > 1024 * 1024:
-            raise CollectionError("JSON input exceeds size limit")
-    finally:
-        os.close(descriptor)
+    content = stable_regular_bytes(path)
     payload = json.loads(content.decode("utf-8"))
     if not isinstance(payload, dict):
         raise CollectionError("JSON input root is invalid")
     return payload
 
 
+def require_real_directory(path: Path) -> None:
+    """Reject symlinked or non-directory components in the runtime layout."""
+    metadata = os.lstat(path)
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise CollectionError("resolution preflight runtime layout is invalid")
+
+
+def canonical_runtime_root() -> Path:
+    """Resolve the production runtime independently of agent-controlled input."""
+    account_home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+    if not account_home.is_absolute():
+        raise CollectionError("OS account home is not absolute")
+    return account_home / CANONICAL_RUNTIME_RELATIVE
+
+
+def checked_runtime_inputs(request_path: Path) -> tuple[Path, Path, Path, Path]:
+    """Derive reviewed check inputs from the immutable flattened runtime layout."""
+    runtime = canonical_runtime_root()
+    executable = Path(__file__)
+    expected_executable = runtime / "collect-public-sources.py"
+    if (
+        not executable.is_absolute()
+        or executable != expected_executable
+        or runtime.resolve(strict=True) != runtime
+    ):
+        raise CollectionError("resolution verifier is outside the canonical runtime")
+    executable_metadata = os.lstat(executable)
+    if (
+        not stat.S_ISREG(executable_metadata.st_mode)
+        or executable.resolve(strict=True) != executable
+    ):
+        raise CollectionError("resolution verifier is not a regular runtime file")
+    if not request_path.is_absolute():
+        raise CollectionError("resolution request path is not absolute")
+    try:
+        relative = request_path.relative_to(runtime)
+    except ValueError as exc:
+        raise CollectionError("resolution request is outside the runtime run layout") from exc
+    parts = relative.parts
+    if (
+        len(parts) != 5
+        or parts[0] != "logs"
+        or RUNTIME_DATE_DIRECTORY.fullmatch(parts[1]) is None
+        or RUNTIME_RUN_DIRECTORY.fullmatch(parts[2]) is None
+        or parts[2][:8] != parts[1].replace("-", "")
+        or parts[3:] != ("staging", "source-resolutions.json")
+    ):
+        raise CollectionError("resolution request is outside the canonical run layout")
+    run_root = runtime / "logs" / parts[1] / parts[2]
+    staging = run_root / "staging"
+    source_inputs = run_root / "source-inputs"
+    for directory in (
+        runtime,
+        runtime / "logs",
+        runtime / "logs" / parts[1],
+        run_root,
+        staging,
+        source_inputs,
+    ):
+        require_real_directory(directory)
+    expected_request = staging / "source-resolutions.json"
+    if (
+        request_path != expected_request
+        or request_path.is_symlink()
+        or request_path.resolve(strict=True) != request_path
+    ):
+        raise CollectionError("resolution request differs from the canonical run path")
+    catalog = runtime / "it-news-sources.json"
+    manifest = source_inputs / "source-manifest.json"
+    return catalog, manifest, request_path, run_root
+
+
+def checked_verification_output(output_path: Path, run_root: Path) -> Path:
+    """Allow the authoritative runner to create only its exact run-local evidence."""
+    expected = run_root / "verified-source-resolutions.json"
+    if (
+        not output_path.is_absolute()
+        or output_path != expected
+        or output_path.is_symlink()
+        or output_path.exists()
+        or output_path.parent.resolve(strict=True) != run_root
+    ):
+        raise CollectionError("verified fallback output differs from the canonical run path")
+    return output_path
+
+
+def validate_manifest_catalog_binding(
+    manifest: dict[str, Any],
+    sources: list[dict[str, Any]],
+    catalog_sha256: str,
+) -> None:
+    """Bind a sealed source manifest to the exact reviewed catalog bytes."""
+    rows = manifest.get("sources")
+    if not isinstance(rows, list) or len(rows) != len(sources):
+        raise CollectionError("source manifest does not match the reviewed catalog")
+    statuses: list[str] = []
+    names: list[str] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            raise CollectionError("source manifest entry is invalid")
+        name = row.get("name")
+        status = row.get("status")
+        if not isinstance(name, str) or status not in {
+            "fetched",
+            "needs_search_fallback",
+            "access_constraint",
+        }:
+            raise CollectionError("source manifest entry is invalid")
+        names.append(name)
+        statuses.append(status)
+    expected_names = [source["name"] for source in sources]
+    if (
+        manifest.get("catalog_sha256") != catalog_sha256
+        or manifest.get("source_count") != len(sources)
+        or names != expected_names
+        or manifest.get("fetched_count") != statuses.count("fetched")
+        or manifest.get("needs_search_fallback_count")
+        != statuses.count("needs_search_fallback")
+        or manifest.get("access_constraint_count")
+        != statuses.count("access_constraint")
+    ):
+        raise CollectionError("source manifest does not match the reviewed catalog")
+
+
 def verify_resolutions(
     catalog_path: Path,
     source_manifest_path: Path,
     request_path: Path,
-    output_path: Path,
+    output_path: Optional[Path],
+    *,
+    trusted_root: Optional[Path] = None,
 ) -> None:
-    """Independently fetch model-discovered fallback URLs on reviewed hosts."""
-    trusted_value = os.environ.get("COLLECTION_OUTPUT_ROOT")
-    if not trusted_value:
-        raise CollectionError("COLLECTION_OUTPUT_ROOT is required")
-    trusted = Path(trusted_value).resolve(strict=True)
-    sources = load_catalog(catalog_path)
+    """Independently verify model-discovered fallback URLs on reviewed hosts."""
+    if trusted_root is None:
+        trusted_value = os.environ.get("COLLECTION_OUTPUT_ROOT")
+        if not trusted_value:
+            raise CollectionError("COLLECTION_OUTPUT_ROOT is required")
+        trusted = Path(trusted_value).resolve(strict=True)
+    else:
+        trusted = trusted_root.resolve(strict=True)
+    sources, catalog_sha256 = load_catalog_with_digest(catalog_path)
     by_name = {source["name"]: source for source in sources}
     base = load_bounded_run_json(source_manifest_path, trusted)
+    validate_manifest_catalog_binding(base, sources, catalog_sha256)
     unresolved = {
         item["name"] for item in base.get("sources", [])
         if isinstance(item, dict) and item.get("status") == "needs_search_fallback"
+    }
+    direct_date_sources = {
+        item["name"] for item in base.get("sources", [])
+        if isinstance(item, dict) and item.get("status") == "fetched"
     }
     request = load_bounded_run_json(request_path, trusted)
     resolutions = request.get("resolutions")
@@ -959,7 +2451,9 @@ def verify_resolutions(
         hosts = source_hosts(by_name[name])
         fetched = fetch_url(validate_url(url, hosts), hosts)
         constraint = detect_access_constraint(fetched["content"])
-        extract = extract_content(fetched["content"], fetched["content_type"], fetched["final_url"])
+        extract = extract_content(
+            fetched["content"], fetched["content_type"], fetched["final_url"], hosts
+        )
         if extract["entry_count"] >= 10:
             constraint = None
         if method == "access_constraint":
@@ -972,13 +2466,13 @@ def verify_resolutions(
             status = "verified_fallback"
             if extract["entry_count"] == 0:
                 raise CollectionError("verified fallback extract is empty")
-        primary_published = extract_primary_publication_date(
-            fetched["content"], fetched["final_url"]
+        primary_published, primary_provenance = extract_primary_publication_evidence(
+            fetched["content"], fetched["final_url"], hosts
         )
         if extract["format"] == "html_links" and primary_published:
             candidates = [{
                 "url": fetched["final_url"],
-                "candidate_provenance": "json_ld",
+                "candidate_provenance": primary_provenance,
                 "published": primary_published,
             }]
         else:
@@ -1019,21 +2513,30 @@ def verify_resolutions(
             ],
         })
         seen.add(name)
+    if seen != unresolved:
+        raise CollectionError("fallback resolution set does not match unresolved sources")
     verified_dates = []
     seen_date_urls: set[tuple[str, str]] = set()
     for item in date_requests:
         if not isinstance(item, dict) or set(item) != {"name", "url"}:
             raise CollectionError("invalid publication-date evidence request")
         name, url = item["name"], item["url"]
-        if name not in by_name or not isinstance(url, str) or (name, url) in seen_date_urls:
+        if (
+            name not in by_name
+            or name not in direct_date_sources
+            or not isinstance(url, str)
+            or (name, url) in seen_date_urls
+        ):
             raise CollectionError("publication-date evidence is outside catalog scope")
         hosts = source_hosts(by_name[name])
         fetched = fetch_url(validate_url(url, hosts), hosts)
         if canonical_url(url) != canonical_url(fetched["final_url"]):
             raise CollectionError("publication-date evidence redirected to another article")
-        extract = extract_content(fetched["content"], fetched["content_type"], fetched["final_url"])
+        extract = extract_content(
+            fetched["content"], fetched["content_type"], fetched["final_url"], hosts
+        )
         published_date = extract_primary_publication_date(
-            fetched["content"], fetched["final_url"]
+            fetched["content"], fetched["final_url"], hosts
         )
         if not published_date:
             raise CollectionError("article URL lacks publication-date evidence")
@@ -1042,22 +2545,47 @@ def verify_resolutions(
             "published_date": published_date,
         })
         seen_date_urls.add((name, url))
-    parent = output_path.parent.resolve(strict=True)
-    if parent != trusted or output_path.is_symlink() or output_path.exists():
-        raise CollectionError("verified fallback output escapes the run root")
-    with output_path.open("x", encoding="utf-8") as handle:
-        json.dump(
-            {"version": 1, "resolutions": verified, "date_evidence": verified_dates},
-            handle, ensure_ascii=False, indent=2,
-        )
-        handle.write("\n")
+    if output_path is not None:
+        parent = output_path.parent.resolve(strict=True)
+        if parent != trusted or output_path.is_symlink() or output_path.exists():
+            raise CollectionError("verified fallback output escapes the run root")
+        with output_path.open("x", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "version": 1,
+                    "resolutions": verified,
+                    "date_evidence": verified_dates,
+                },
+                handle,
+                ensure_ascii=False,
+                indent=2,
+            )
+            handle.write("\n")
 
 
 def main(argv: list[str]) -> int:
     """Collect all configured sources and emit a run-local manifest."""
     try:
-        if len(argv) == 6 and argv[1] == "--verify-resolutions":
-            verify_resolutions(Path(argv[2]), Path(argv[3]), Path(argv[4]), Path(argv[5]))
+        if len(argv) == 3 and argv[1] == "--check-resolutions":
+            catalog, manifest, request, run_root = checked_runtime_inputs(Path(argv[2]))
+            verify_resolutions(
+                catalog,
+                manifest,
+                request,
+                None,
+                trusted_root=run_root,
+            )
+            return 0
+        if len(argv) == 4 and argv[1] == "--verify-resolutions":
+            catalog, manifest, request, run_root = checked_runtime_inputs(Path(argv[2]))
+            output = checked_verification_output(Path(argv[3]), run_root)
+            verify_resolutions(
+                catalog,
+                manifest,
+                request,
+                output,
+                trusted_root=run_root,
+            )
             return 0
         if len(argv) != 4:
             print(
@@ -1066,7 +2594,7 @@ def main(argv: list[str]) -> int:
             )
             return 64
         catalog_path = Path(argv[1])
-        sources = load_catalog(catalog_path)
+        sources, catalog_sha256 = load_catalog_with_digest(catalog_path)
         hosts = allowed_hosts(sources)
         for source in sources:
             validate_url(source["page_url"], hosts)
@@ -1092,7 +2620,7 @@ def main(argv: list[str]) -> int:
             for future in concurrent.futures.as_completed(futures):
                 results[futures[future] - 1] = future.result()
         manifest = {
-            "catalog_sha256": hashlib.sha256(catalog_path.read_bytes()).hexdigest(),
+            "catalog_sha256": catalog_sha256,
             "source_count": len(sources),
             "fetched_count": sum(item["status"] == "fetched" for item in results if item),
             "needs_search_fallback_count": sum(

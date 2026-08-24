@@ -4,12 +4,14 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import os
 import re
 import stat
 import sys
 import urllib.parse
+from copy import deepcopy
 from datetime import date, datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
@@ -29,18 +31,47 @@ CONSTRAINT_REASON = {
     "captcha": re.compile(r"captcha|キャプチャ", re.IGNORECASE),
     "robots": re.compile(r"robots|ロボット", re.IGNORECASE),
 }
+PUBLIC_HOST_LABEL = re.compile(
+    r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z", re.IGNORECASE
+)
+ISO_PUBLICATION_DATE = re.compile(
+    r"\d{4}-\d{2}-\d{2}(?:[Tt ]\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?"
+    r"(?:[Zz]|[+-]\d{2}:?\d{2})?)?\Z"
+)
+RFC_PUBLICATION_DATE = re.compile(
+    r"(?:(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun),[ ]+)?"
+    r"\d{1,2}[ ]+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[ ]+"
+    r"\d{4}[ ]+\d{2}:\d{2}(?::\d{2})?[ ]+(?:[+-]\d{4}|[A-Z]{1,5})\Z",
+    re.IGNORECASE,
+)
 
 class ValidationError(RuntimeError):
     """Represent a collection result that must block publication."""
 
 
-def digest_fd(descriptor: int) -> tuple[str, bytes]:
+def file_identity(metadata: os.stat_result) -> tuple[int, int, int, int, int, int]:
+    """Return the metadata fields that must remain stable across one read."""
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def digest_fd(
+    descriptor: int, maximum_bytes: int = MAX_ARTIFACT_BYTES
+) -> tuple[str, bytes]:
     """Hash and retain bounded bytes from one already-open descriptor."""
     hasher = hashlib.sha256()
     content = bytearray()
     while chunk := os.read(descriptor, 1024 * 1024):
-        hasher.update(chunk)
         content.extend(chunk)
+        if len(content) > maximum_bytes:
+            raise ValidationError("artifact grew beyond the allowed size")
+        hasher.update(chunk)
     return hasher.hexdigest(), bytes(content)
 
 
@@ -83,14 +114,17 @@ def validate_artifact(
             opened.append(directory_fd)
         descriptor = os.open(relative.name, flags, dir_fd=directory_fd)
         opened.append(descriptor)
-        metadata = os.fstat(descriptor)
-        if not stat.S_ISREG(metadata.st_mode):
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
             raise ValidationError("artifact is not a regular file")
-        if metadata.st_size <= 0 or metadata.st_size > MAX_ARTIFACT_BYTES:
+        if before.st_size <= 0 or before.st_size > MAX_ARTIFACT_BYTES:
             raise ValidationError("artifact size is outside the allowed range")
-        if metadata.st_mtime < earliest_mtime:
+        if before.st_mtime < earliest_mtime:
             raise ValidationError("artifact predates this collection run")
         actual_hash, content = digest_fd(descriptor)
+        after = os.fstat(descriptor)
+        if file_identity(before) != file_identity(after) or len(content) != before.st_size:
+            raise ValidationError("artifact changed while it was read")
         if actual_hash != expected_hash:
             raise ValidationError("artifact SHA-256 mismatch")
         try:
@@ -124,9 +158,291 @@ def validate_advisory_reference(
         raise ValidationError("advisory contains a machine-specific path")
 
 
-def load_source_catalog(path: Path) -> dict[str, dict[str, object]]:
-    """Load the reviewed source names and tiers used by this runtime."""
-    payload = json.loads(path.read_text(encoding="utf-8"))
+def read_regular_nofollow(path: Path, label: str) -> bytes:
+    """Read one stable bounded regular file without following its final component."""
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_size <= 0
+            or before.st_size > MAX_ARTIFACT_BYTES
+        ):
+            raise ValidationError(f"{label} is not a bounded regular file")
+        content = bytearray()
+        while chunk := os.read(descriptor, 65536):
+            content.extend(chunk)
+            if len(content) > MAX_ARTIFACT_BYTES:
+                raise ValidationError(f"{label} exceeds its size bound")
+        after = os.fstat(descriptor)
+        if file_identity(before) != file_identity(after) or len(content) != before.st_size:
+            raise ValidationError(f"{label} changed while it was read")
+        return bytes(content)
+    finally:
+        os.close(descriptor)
+
+
+def write_exclusive_bytes(
+    directory_fd: int, name: str, content: bytes, label: str
+) -> None:
+    """Create one private immutable-by-contract output in a bound directory."""
+    if (
+        not name
+        or "/" in name
+        or "\\" in name
+        or any(ord(character) < 0x20 or ord(character) == 0x7F for character in name)
+    ):
+        raise ValidationError(f"{label} filename is invalid")
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            name,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=directory_fd,
+        )
+        os.fchmod(descriptor, 0o600)
+        view = memoryview(content)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise ValidationError(f"could not write {label}")
+            view = view[written:]
+        os.fsync(descriptor)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def canonical_json_bytes(value: object) -> bytes:
+    """Encode one deterministic JSON audit artifact."""
+    return (
+        json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        + "\n"
+    ).encode("utf-8")
+
+
+def sealed_coverage_authority(
+    catalog_path: Path, manifest_path: Path, resolutions_path: Path
+) -> tuple[dict[str, str], set[str], dict[str, dict[str, str]]]:
+    """Return sealed row classes and the exact evidence bytes consumed."""
+    catalog, catalog_bytes = load_source_catalog_snapshot(catalog_path)
+    evidence, manifest_bytes = load_source_manifest_snapshot(
+        manifest_path, catalog_bytes
+    )
+    resolutions, _, resolutions_bytes = load_verified_resolutions_snapshot(
+        resolutions_path
+    )
+    if set(evidence) != set(catalog):
+        raise ValidationError("source manifest does not match the catalog")
+    unresolved = {
+        name
+        for name, item in evidence.items()
+        if item.get("status") == "needs_search_fallback"
+    }
+    if not set(resolutions).issubset(unresolved):
+        raise ValidationError("verified fallback evidence is outside unresolved scope")
+    constraints: dict[str, str] = {}
+    retrieved: set[str] = set()
+    for name, item in evidence.items():
+        source_status = item.get("status")
+        if source_status == "fetched":
+            retrieved.add(name)
+            continue
+        if source_status == "access_constraint":
+            constraint = item.get("constraint")
+            if constraint not in CONSTRAINT_REASON:
+                raise ValidationError("source constraint evidence is invalid")
+            constraints[name] = str(constraint)
+            continue
+        resolution = resolutions.get(name)
+        if source_status != "needs_search_fallback" or not resolution:
+            raise ValidationError("source lacks a verified coverage resolution")
+        if resolution.get("status") == "verified_access_constraint":
+            constraint = resolution.get("constraint")
+            if constraint not in CONSTRAINT_REASON:
+                raise ValidationError("verified fallback constraint is invalid")
+            constraints[name] = str(constraint)
+        elif resolution.get("status") == "verified_fallback":
+            retrieved.add(name)
+        else:
+            raise ValidationError("verified fallback status is invalid")
+    if set(constraints) & retrieved or set(constraints) | retrieved != set(catalog):
+        raise ValidationError("sealed source coverage authority is incomplete")
+    bindings = {
+        "catalog": {
+            "path": str(catalog_path),
+            "sha256": hashlib.sha256(catalog_bytes).hexdigest(),
+        },
+        "manifest": {
+            "path": str(manifest_path),
+            "sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+        },
+        "verified_resolutions": {
+            "path": str(resolutions_path),
+            "sha256": hashlib.sha256(resolutions_bytes).hexdigest(),
+        },
+    }
+    return constraints, retrieved, bindings
+
+
+def sealed_constraint_reasons(
+    catalog_path: Path, manifest_path: Path, resolutions_path: Path
+) -> tuple[dict[str, str], dict[str, dict[str, str]]]:
+    """Compatibility wrapper returning only sealed constraint reasons."""
+    constraints, _, bindings = sealed_coverage_authority(
+        catalog_path, manifest_path, resolutions_path
+    )
+    return constraints, bindings
+
+
+def project_table_cell(body: str, cell_index: int, replacement: str) -> str:
+    """Replace one Markdown table cell while preserving its surrounding spacing."""
+    delimiters = [
+        position for position, character in enumerate(body) if character == "|"
+    ]
+    if len(delimiters) != 8 or not 0 <= cell_index < 7:
+        raise ValidationError("source coverage row is malformed")
+    cell_start = delimiters[cell_index] + 1
+    cell_end = delimiters[cell_index + 1]
+    raw_cell = body[cell_start:cell_end]
+    leading_length = len(raw_cell) - len(raw_cell.lstrip())
+    trailing_length = len(raw_cell) - len(raw_cell.rstrip())
+    leading = raw_cell[:leading_length]
+    trailing = raw_cell[len(raw_cell) - trailing_length:] if trailing_length else ""
+    projected = leading + replacement + trailing
+    return body[:cell_start] + projected + body[cell_end:]
+
+
+def canonicalize_summary_coverage(
+    summary: str, constraints: dict[str, str], retrieved: set[str]
+) -> tuple[str, list[dict[str, str]], list[dict[str, object]]]:
+    """Project only sealed constraint reasons and count-implied normal statuses."""
+    heading = "## 確認済みサイト一覧"
+    lines = summary.splitlines(keepends=True)
+    heading_indexes = [
+        index for index, line in enumerate(lines) if line.rstrip("\r\n") == heading
+    ]
+    if len(heading_indexes) != 1:
+        raise ValidationError("summary source coverage section is missing or duplicated")
+    start = heading_indexes[0] + 1
+    end = len(lines)
+    for index in range(start, len(lines)):
+        if lines[index].rstrip("\r\n").startswith("## "):
+            end = index
+            break
+    authority = set(constraints) | retrieved
+    if set(constraints) & retrieved:
+        raise ValidationError("source coverage projection authority overlaps")
+    seen: set[str] = set()
+    reason_corrections: list[dict[str, str]] = []
+    status_corrections: list[dict[str, object]] = []
+    for index in range(start, end):
+        body = lines[index].rstrip("\r\n")
+        line_ending = lines[index][len(body):]
+        if not body.startswith("|") or not body.endswith("|"):
+            continue
+        cells = [cell.strip() for cell in body.strip("|").split("|")]
+        if len(cells) != 7:
+            continue
+        name = cells[0]
+        if name not in authority:
+            continue
+        if name in seen:
+            raise ValidationError("summary contains a duplicate authorized source row")
+        seen.add(name)
+        if name in constraints:
+            if cells[2] != "アクセス制約":
+                raise ValidationError("constrained source row has a non-constraint status")
+            sealed_reason = constraints[name]
+            supplied_reason = cells[6]
+            if supplied_reason != sealed_reason:
+                body = project_table_cell(body, 6, sealed_reason)
+                lines[index] = body + line_ending
+                reason_corrections.append(
+                    {
+                        "source": name,
+                        "supplied": supplied_reason,
+                        "sealed": sealed_reason,
+                    }
+                )
+            continue
+        supplied_status = cells[2]
+        if supplied_status not in {"取得済み", "対象期間記事なし"}:
+            raise ValidationError("retrieved source row has an unauthorized status")
+        try:
+            item_count = int(cells[5])
+        except ValueError as exc:
+            raise ValidationError("retrieved source row has an invalid item count") from exc
+        if item_count < 0:
+            raise ValidationError("retrieved source row has an invalid item count")
+        sealed_status = "取得済み" if item_count > 0 else "対象期間記事なし"
+        if supplied_status != sealed_status:
+            body = project_table_cell(body, 2, sealed_status)
+            lines[index] = body + line_ending
+            status_corrections.append(
+                {
+                    "source": name,
+                    "supplied": supplied_status,
+                    "sealed": sealed_status,
+                    "item_count": item_count,
+                }
+            )
+    if seen != authority:
+        raise ValidationError("summary lacks an authorized source coverage row")
+    return "".join(lines), reason_corrections, status_corrections
+
+
+def canonicalize_summary_constraint_reasons(
+    summary: str, constraints: dict[str, str]
+) -> tuple[str, list[dict[str, str]]]:
+    """Compatibility wrapper for the original constraint-only projection."""
+    projected, corrections, _ = canonicalize_summary_coverage(
+        summary, constraints, set()
+    )
+    return projected, corrections
+
+
+def update_advisory_summary_reference(
+    advisory: str,
+    summary_name: str,
+    raw_summary_sha256: str,
+    canonical_summary_sha256: str,
+) -> str:
+    """Update exactly one already-validated same-run summary digest reference."""
+    old_reference = (
+        f"- 入力ニュース: {summary_name} "
+        f"(same-run SHA-256: {raw_summary_sha256})"
+    )
+    new_reference = (
+        f"- 入力ニュース: {summary_name} "
+        f"(same-run SHA-256: {canonical_summary_sha256})"
+    )
+    lines = advisory.splitlines(keepends=True)
+    matches = [
+        index
+        for index, line in enumerate(lines)
+        if line.rstrip("\r\n") == old_reference
+    ]
+    if len(matches) != 1:
+        raise ValidationError("advisory summary reference cannot be canonicalized")
+    index = matches[0]
+    line_ending = lines[index][len(lines[index].rstrip("\r\n")):]
+    lines[index] = new_reference + line_ending
+    return "".join(lines)
+
+
+def load_source_catalog_snapshot(
+    path: Path,
+) -> tuple[dict[str, dict[str, object]], bytes]:
+    """Load one stable catalog snapshot and retain the exact consumed bytes."""
+    content = read_regular_nofollow(path, "source catalog")
+    payload = json.loads(content.decode("utf-8"))
+    if not isinstance(payload, dict):
+        raise ValidationError("source catalog is invalid")
     sources = payload.get("sources")
     if payload.get("version") != 1 or not isinstance(sources, list) or not sources:
         raise ValidationError("source catalog is invalid")
@@ -139,16 +455,23 @@ def load_source_catalog(path: Path) -> dict[str, dict[str, object]]:
         if not isinstance(name, str) or not name or name in expected or tier not in (1, 2):
             raise ValidationError("source catalog entry is invalid")
         expected[name] = source
-    return expected
+    return expected, content
 
 
-def load_source_manifest(path: Path, catalog_path: Path) -> dict[str, dict[str, object]]:
-    """Bind source evidence to the exact reviewed catalog used by the collector."""
-    metadata = path.lstat()
-    if not stat.S_ISREG(metadata.st_mode) or metadata.st_size <= 0 or metadata.st_size > MAX_ARTIFACT_BYTES:
-        raise ValidationError("source manifest is not a bounded regular file")
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    if payload.get("catalog_sha256") != hashlib.sha256(catalog_path.read_bytes()).hexdigest():
+def load_source_catalog(path: Path) -> dict[str, dict[str, object]]:
+    """Load the reviewed source names and tiers used by this runtime."""
+    return load_source_catalog_snapshot(path)[0]
+
+
+def load_source_manifest_snapshot(
+    path: Path, catalog_bytes: bytes
+) -> tuple[dict[str, dict[str, object]], bytes]:
+    """Bind one stable manifest snapshot to exact consumed catalog bytes."""
+    content = read_regular_nofollow(path, "source manifest")
+    payload = json.loads(content.decode("utf-8"))
+    if not isinstance(payload, dict):
+        raise ValidationError("source manifest is invalid")
+    if payload.get("catalog_sha256") != hashlib.sha256(catalog_bytes).hexdigest():
         raise ValidationError("source manifest catalog digest mismatch")
     sources = payload.get("sources")
     if not isinstance(sources, list):
@@ -161,15 +484,23 @@ def load_source_manifest(path: Path, catalog_path: Path) -> dict[str, dict[str, 
         if name in evidence:
             raise ValidationError("source manifest contains a duplicate source")
         evidence[name] = source
-    return evidence
+    return evidence, content
 
 
-def load_verified_resolutions(path: Path) -> dict[str, dict[str, object]]:
-    """Load fallback URLs that the trusted helper independently fetched."""
-    metadata = path.lstat()
-    if not stat.S_ISREG(metadata.st_mode) or metadata.st_size <= 0 or metadata.st_size > MAX_ARTIFACT_BYTES:
-        raise ValidationError("verified fallback evidence is not a bounded regular file")
-    payload = json.loads(path.read_text(encoding="utf-8"))
+def load_source_manifest(path: Path, catalog_path: Path) -> dict[str, dict[str, object]]:
+    """Bind source evidence to one stable catalog and manifest snapshot."""
+    _, catalog_bytes = load_source_catalog_snapshot(catalog_path)
+    return load_source_manifest_snapshot(path, catalog_bytes)[0]
+
+
+def load_verified_resolutions_snapshot(
+    path: Path,
+) -> tuple[dict[str, dict[str, object]], dict[str, object], bytes]:
+    """Load one stable verified-resolution snapshot and its parsed payload."""
+    content = read_regular_nofollow(path, "verified fallback evidence")
+    payload = json.loads(content.decode("utf-8"))
+    if not isinstance(payload, dict):
+        raise ValidationError("verified fallback evidence is invalid")
     resolutions = payload.get("resolutions")
     if payload.get("version") != 1 or not isinstance(resolutions, list):
         raise ValidationError("verified fallback evidence is invalid")
@@ -180,12 +511,18 @@ def load_verified_resolutions(path: Path) -> dict[str, dict[str, object]]:
         if item["name"] in result:
             raise ValidationError("verified fallback evidence contains a duplicate source")
         result[item["name"]] = item
-    return result
+    return result, payload, content
 
 
-def load_verified_date_evidence(path: Path) -> dict[str, list[dict[str, object]]]:
-    """Group trusted article-date evidence by catalog source."""
-    payload = json.loads(path.read_text(encoding="utf-8"))
+def load_verified_resolutions(path: Path) -> dict[str, dict[str, object]]:
+    """Load fallback URLs that the trusted helper independently fetched."""
+    return load_verified_resolutions_snapshot(path)[0]
+
+
+def load_verified_date_evidence_payload(
+    payload: dict[str, object],
+) -> dict[str, list[dict[str, object]]]:
+    """Group trusted article-date evidence from an already-bound snapshot."""
     items = payload.get("date_evidence")
     if not isinstance(items, list):
         raise ValidationError("verified publication-date evidence is invalid")
@@ -200,33 +537,92 @@ def load_verified_date_evidence(path: Path) -> dict[str, list[dict[str, object]]
     return grouped
 
 
+def load_verified_date_evidence(path: Path) -> dict[str, list[dict[str, object]]]:
+    """Group trusted article-date evidence by catalog source."""
+    _, payload, _ = load_verified_resolutions_snapshot(path)
+    return load_verified_date_evidence_payload(payload)
+
+
 def parse_publication_date(value: object) -> Optional[date]:
-    """Parse common RSS/Atom/HTML publication timestamps into a JST date."""
-    if not isinstance(value, str) or not value.strip():
+    """Parse only complete collector-approved publication date strings."""
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip()
+    if not cleaned or len(cleaned) > 200 or cleaned != value:
         return None
     try:
-        parsed = parsedate_to_datetime(value)
+        if ISO_PUBLICATION_DATE.fullmatch(cleaned):
+            parsed = datetime.fromisoformat(cleaned.replace("Z", "+00:00").replace("z", "+00:00"))
+        elif RFC_PUBLICATION_DATE.fullmatch(cleaned):
+            parsed = parsedate_to_datetime(cleaned)
+        else:
+            numeric = re.fullmatch(r"(20\d{2})[./-](\d{1,2})[./-](\d{1,2})", cleaned)
+            if numeric is None:
+                return None
+            return date(*(int(part) for part in numeric.groups()))
     except (TypeError, ValueError, OverflowError):
-        try:
-            parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
-        except ValueError:
-            match = re.search(r"\d{4}-\d{2}-\d{2}", value)
-            return date.fromisoformat(match.group(0)) if match else None
+        return None
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone(timedelta(hours=9))).date()
 
 
+def parsed_public_url(value: object) -> Optional[urllib.parse.SplitResult]:
+    """Strictly parse one absolute public HTTP(S) URL without network access."""
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > 4096
+        or any(
+            character.isspace()
+            or ord(character) < 0x20
+            or ord(character) == 0x7F
+            or character == "\\"
+            for character in value
+        )
+    ):
+        return None
+    try:
+        parsed = urllib.parse.urlsplit(value)
+        hostname = parsed.hostname
+        port = parsed.port
+    except (UnicodeError, ValueError):
+        return None
+    if (
+        parsed.scheme.lower() not in {"http", "https"}
+        or not hostname
+        or port == 0
+        or parsed.username is not None
+        or parsed.password is not None
+        or (port is None and parsed.netloc.endswith(":"))
+        or "%" in hostname
+    ):
+        return None
+    try:
+        ipaddress.ip_address(hostname)
+    except ValueError:
+        try:
+            ascii_hostname = hostname.encode("idna").decode("ascii")
+        except UnicodeError:
+            return None
+        labels = ascii_hostname.split(".")
+        if (
+            len(ascii_hostname) > 253
+            or any(not PUBLIC_HOST_LABEL.fullmatch(label) for label in labels)
+        ):
+            return None
+    return parsed
+
+
 def canonical_url(value: str) -> str:
-    """Normalize an article URL for evidence deduplication."""
-    parsed = urllib.parse.urlsplit(value)
+    """Normalize one independently validated article URL for deduplication."""
+    parsed = parsed_public_url(value)
+    if parsed is None:
+        raise ValidationError("article URL is invalid")
     path = parsed.path.rstrip("/") or "/"
     host = (parsed.hostname or "").lower()
     host = f"[{host}]" if ":" in host else host
-    try:
-        port = parsed.port
-    except ValueError:
-        port = None
+    port = parsed.port
     default_port = (parsed.scheme.lower() == "https" and port == 443) or (
         parsed.scheme.lower() == "http" and port == 80
     )
@@ -252,25 +648,31 @@ def source_hosts(source: dict[str, object]) -> set[str]:
 
 def is_allowed_source_url(value: object, hosts: set[str]) -> bool:
     """Apply the collector's transport restrictions to sealed final URLs."""
-    if not isinstance(value, str):
-        return False
-    parsed = urllib.parse.urlsplit(value)
-    try:
-        port = parsed.port
-    except ValueError:
+    parsed = parsed_public_url(value)
+    if parsed is None:
         return False
     return (
-        parsed.scheme == "https"
+        parsed.scheme.lower() == "https"
         and parsed.hostname in hosts
-        and parsed.username is None
-        and parsed.password is None
-        and port in (None, 443)
+        and parsed.port in (None, 443)
         and not parsed.fragment
     )
 
 
+def is_allowed_extract_url(value: object, hosts: set[str]) -> bool:
+    """Bind sealed feed/HTML candidates to a catalog source host."""
+    parsed = parsed_public_url(value)
+    if parsed is None or parsed.hostname not in hosts or parsed.fragment:
+        return False
+    return (
+        parsed.scheme.lower() == "https" and parsed.port in (None, 443)
+    ) or (
+        parsed.scheme.lower() == "http" and parsed.port in (None, 80)
+    )
+
+
 def sealed_extract_entries(
-    manifest_path: Path, source_evidence: dict[str, object]
+    manifest_path: Path, source_evidence: dict[str, object], hosts: set[str]
 ) -> tuple[str, dict[str, Optional[date]]]:
     """Load every canonical article entry and optional date from a sealed extract."""
     filename = source_evidence.get("extract_file")
@@ -279,10 +681,10 @@ def sealed_extract_entries(
     if Path(filename).name != filename:
         raise ValidationError("source extract filename is invalid")
     path = manifest_path.parent / filename
-    metadata = path.lstat()
-    if not stat.S_ISREG(metadata.st_mode) or metadata.st_size <= 0 or metadata.st_size > MAX_ARTIFACT_BYTES:
-        raise ValidationError("source extract is not a bounded regular file")
-    payload = json.loads(path.read_text(encoding="utf-8"))
+    content = read_regular_nofollow(path, "source extract")
+    payload = json.loads(content.decode("utf-8"))
+    if not isinstance(payload, dict):
+        raise ValidationError("source extract format is invalid")
     extract_format = payload.get("format")
     if extract_format not in {"feed", "html_links"}:
         raise ValidationError("source extract format is invalid")
@@ -295,7 +697,12 @@ def sealed_extract_entries(
             raise ValidationError("source extract entry is invalid")
         published = parse_publication_date(item.get("published"))
         url = item.get("url")
-        key = canonical_url(url) if isinstance(url, str) else f"undirected:{index}"
+        if isinstance(url, str):
+            if not is_allowed_extract_url(url, hosts):
+                raise ValidationError("source extract entry URL is invalid")
+            key = canonical_url(url)
+        else:
+            key = f"undirected:{index}"
         if key in sealed:
             raise ValidationError("source extract contains a duplicate article URL")
         sealed[key] = published
@@ -307,10 +714,12 @@ def validate_source_coverage(
     run_date: date,
 ) -> None:
     """Require every audit row to match deterministic collector evidence."""
-    expected = load_source_catalog(catalog_path)
-    evidence = load_source_manifest(manifest_path, catalog_path)
-    resolutions = load_verified_resolutions(resolutions_path)
-    supplemental_dates = load_verified_date_evidence(resolutions_path)
+    expected, catalog_bytes = load_source_catalog_snapshot(catalog_path)
+    evidence, _ = load_source_manifest_snapshot(manifest_path, catalog_bytes)
+    resolutions, resolutions_payload, _ = load_verified_resolutions_snapshot(
+        resolutions_path
+    )
+    supplemental_dates = load_verified_date_evidence_payload(resolutions_payload)
     if set(evidence) != set(expected):
         raise ValidationError("source manifest does not match the catalog")
     unresolved = {
@@ -347,8 +756,8 @@ def validate_source_coverage(
             raise ValidationError("summary source coverage row is invalid")
         if method not in {"RSS", "公開ページ", "サイト限定検索", "公式代替URL"}:
             raise ValidationError("summary source acquisition method is invalid")
-        parsed = urllib.parse.urlsplit(confirmed_url)
-        if parsed.scheme != "https" or not parsed.hostname:
+        hosts = source_hosts(source)
+        if not is_allowed_source_url(confirmed_url, hosts):
             raise ValidationError("summary source confirmation URL is invalid")
         try:
             item_count = int(recent_items)
@@ -363,7 +772,7 @@ def validate_source_coverage(
             if status == "アクセス制約":
                 raise ValidationError("fetched source cannot be an access constraint")
             extract_format, sealed_entries = sealed_extract_entries(
-                manifest_path, source_evidence
+                manifest_path, source_evidence, hosts
             )
             extracted_count = source_evidence.get("extracted_entry_count")
             if (
@@ -380,6 +789,8 @@ def validate_source_coverage(
                     not isinstance(requested_url, str)
                     or not isinstance(final_url, str)
                     or not published
+                    or not is_allowed_source_url(requested_url, hosts)
+                    or not is_allowed_source_url(final_url, hosts)
                 ):
                     raise ValidationError("verified publication-date entry is invalid")
                 key = canonical_url(requested_url)
@@ -553,16 +964,22 @@ def validate_source_coverage(
                 candidate_urls: set[str] = set()
                 for index, item in enumerate(candidate_evidence):
                     candidate_url = item.get("url") if isinstance(item, dict) else None
-                    candidate_key = (
-                        canonical_url(candidate_url) if isinstance(candidate_url, str) else ""
-                    )
                     if (
                         not isinstance(item, dict)
-                        or not is_allowed_source_url(candidate_url, source_hosts(source))
-                        or candidate_key in candidate_urls
-                        or item.get("provenance") not in {"feed_entry", "article", "json_ld"}
+                        or not is_allowed_extract_url(candidate_url, hosts)
+                        or item.get("provenance") not in {
+                            "feed_entry",
+                            "article",
+                            "json_ld",
+                            "html_meta",
+                        }
                         or parse_publication_date(item.get("published")) != parsed_dates[index]
                     ):
+                        raise ValidationError(
+                            "verified fallback candidate evidence is invalid"
+                        )
+                    candidate_key = canonical_url(str(candidate_url))
+                    if candidate_key in candidate_urls:
                         raise ValidationError(
                             "verified fallback candidate evidence is invalid"
                         )
@@ -593,8 +1010,212 @@ def validate_source_coverage(
             raise ValidationError("summary source item count contradicts status")
 
 
+def canonicalize_constraints_main(argv: list[str]) -> int:
+    """Preserve raw artifacts and write a minimal sealed coverage-cell projection."""
+    if len(argv) != 11:
+        print(
+            "usage: validate-collection-result.py --canonicalize-constraints "
+            "RAW_RESULT STAGING_ROOT RUN_ID START_EPOCH SOURCE_CATALOG "
+            "SOURCE_MANIFEST VERIFIED_RESOLUTIONS OUTPUT RECEIPT",
+            file=sys.stderr,
+        )
+        return 64
+    try:
+        raw_result_path = Path(argv[2])
+        staging_root = Path(os.path.abspath(argv[3]))
+        output_path = Path(argv[9])
+        receipt_path = Path(argv[10])
+        if not (
+            raw_result_path.is_absolute()
+            and staging_root.is_absolute()
+            and output_path.is_absolute()
+            and receipt_path.is_absolute()
+            and raw_result_path.parent == output_path.parent == receipt_path.parent
+            and staging_root.parent == raw_result_path.parent
+            and len(
+                {raw_result_path.name, output_path.name, receipt_path.name}
+            ) == 3
+        ):
+            raise ValidationError("collection normalization path layout is invalid")
+        raw_result_bytes = read_regular_nofollow(
+            raw_result_path, "raw collection result"
+        )
+        raw_result = json.loads(raw_result_bytes.decode("utf-8"))
+        if raw_result.get("daily_pipeline_status") != "complete":
+            raise ValidationError("daily pipeline is not complete")
+        if raw_result.get("vault_artifacts_complete") is not True:
+            raise ValidationError("artifact set is incomplete")
+        if raw_result.get("run_id") != argv[4]:
+            raise ValidationError("run ID mismatch")
+        run_match = re.match(r"^(\d{4})(\d{2})(\d{2})T", argv[4])
+        if not run_match:
+            raise ValidationError("run ID does not contain a JST date")
+        expected_date = "-".join(run_match.groups())
+        earliest_mtime = int(argv[5])
+        raw_summary = validate_artifact(
+            raw_result["summary_path"],
+            raw_result["summary_sha256"],
+            staging_root,
+            earliest_mtime,
+            expected_date,
+            "summary",
+        )
+        raw_advisory = validate_artifact(
+            raw_result["advisory_path"],
+            raw_result["advisory_sha256"],
+            staging_root,
+            earliest_mtime,
+            expected_date,
+            "advisory",
+        )
+        private_paths = {str(staging_root), str(Path.home())}
+        if any(private_path in raw_summary for private_path in private_paths):
+            raise ValidationError("summary contains a machine-specific path")
+        raw_summary_path = Path(raw_result["summary_path"])
+        validate_advisory_reference(
+            raw_advisory,
+            raw_summary_path.name,
+            raw_result["summary_sha256"],
+            staging_root,
+        )
+        constraints, retrieved, source_evidence_bindings = sealed_coverage_authority(
+            Path(argv[6]), Path(argv[7]), Path(argv[8])
+        )
+        canonical_summary, reason_corrections, status_corrections = (
+            canonicalize_summary_coverage(raw_summary, constraints, retrieved)
+        )
+        canonical_summary_bytes = canonical_summary.encode("utf-8")
+        canonical_summary_sha256 = hashlib.sha256(
+            canonical_summary_bytes
+        ).hexdigest()
+        canonical_advisory = update_advisory_summary_reference(
+            raw_advisory,
+            raw_summary_path.name,
+            raw_result["summary_sha256"],
+            canonical_summary_sha256,
+        )
+        canonical_advisory_bytes = canonical_advisory.encode("utf-8")
+        canonical_advisory_sha256 = hashlib.sha256(
+            canonical_advisory_bytes
+        ).hexdigest()
+
+        directory_flags = (
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        staging_fd = os.open(staging_root, directory_flags)
+        canonical_fd = -1
+        canonical_directory_name = "canonical-artifacts"
+        try:
+            previous_umask = os.umask(0)
+            try:
+                os.mkdir(canonical_directory_name, 0o700, dir_fd=staging_fd)
+            finally:
+                os.umask(previous_umask)
+            os.fsync(staging_fd)
+            canonical_fd = os.open(
+                canonical_directory_name, directory_flags, dir_fd=staging_fd
+            )
+            os.fchmod(canonical_fd, 0o700)
+            write_exclusive_bytes(
+                canonical_fd,
+                raw_summary_path.name,
+                canonical_summary_bytes,
+                "canonical summary",
+            )
+            raw_advisory_path = Path(raw_result["advisory_path"])
+            write_exclusive_bytes(
+                canonical_fd,
+                raw_advisory_path.name,
+                canonical_advisory_bytes,
+                "canonical advisory",
+            )
+            os.fsync(canonical_fd)
+        finally:
+            if canonical_fd >= 0:
+                os.close(canonical_fd)
+            os.close(staging_fd)
+
+        canonical_root = staging_root / canonical_directory_name
+        canonical_result = deepcopy(raw_result)
+        canonical_result.update(
+            {
+                "summary_path": str(canonical_root / raw_summary_path.name),
+                "summary_sha256": canonical_summary_sha256,
+                "advisory_path": str(
+                    canonical_root / Path(raw_result["advisory_path"]).name
+                ),
+                "advisory_sha256": canonical_advisory_sha256,
+            }
+        )
+        canonical_result_bytes = canonical_json_bytes(canonical_result)
+        receipt = {
+            "version": 1,
+            "projection": "sealed_source_coverage_cells_v1",
+            "raw_collection_result_sha256": hashlib.sha256(
+                raw_result_bytes
+            ).hexdigest(),
+            "canonical_collection_result_sha256": hashlib.sha256(
+                canonical_result_bytes
+            ).hexdigest(),
+            "raw_summary": {
+                "path": str(raw_summary_path),
+                "sha256": raw_result["summary_sha256"],
+            },
+            "canonical_summary": {
+                "path": canonical_result["summary_path"],
+                "sha256": canonical_summary_sha256,
+            },
+            "raw_advisory": {
+                "path": raw_result["advisory_path"],
+                "sha256": raw_result["advisory_sha256"],
+            },
+            "canonical_advisory": {
+                "path": canonical_result["advisory_path"],
+                "sha256": canonical_advisory_sha256,
+            },
+            "source_evidence": source_evidence_bindings,
+            "corrected_reason_count": len(reason_corrections),
+            "corrections": reason_corrections,
+            "corrected_status_count": len(status_corrections),
+            "status_corrections": status_corrections,
+        }
+        output_directory_fd = os.open(output_path.parent, directory_flags)
+        try:
+            write_exclusive_bytes(
+                output_directory_fd,
+                output_path.name,
+                canonical_result_bytes,
+                "canonical collection result",
+            )
+            write_exclusive_bytes(
+                output_directory_fd,
+                receipt_path.name,
+                canonical_json_bytes(receipt),
+                "collection normalization receipt",
+            )
+            os.fsync(output_directory_fd)
+        finally:
+            os.close(output_directory_fd)
+    except (
+        KeyError,
+        OSError,
+        TypeError,
+        ValueError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        ValidationError,
+    ) as exc:
+        print(f"collection normalization failed:{exc}", file=sys.stderr)
+        return 75
+    return 0
+
+
 def main(argv: list[str]) -> int:
     """Validate one collection result and return a fail-closed status."""
+    if len(argv) > 1 and argv[1] == "--canonicalize-constraints":
+        return canonicalize_constraints_main(argv)
     if len(argv) != 8:
         print(
             "usage: validate-collection-result.py RESULT STAGING_ROOT RUN_ID START_EPOCH SOURCE_CATALOG SOURCE_MANIFEST VERIFIED_RESOLUTIONS",
