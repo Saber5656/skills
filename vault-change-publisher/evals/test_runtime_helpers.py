@@ -7385,6 +7385,46 @@ def load_environment(*, checkout_root, environ, require_catalog):
                 summary, catalog, manifest, verified, date(2026, 7, 31)
             )
 
+    def test_collection_validator_accepts_http_fallback_candidate(self) -> None:
+        """Use the collector's HTTP-or-HTTPS candidate policy for fallback evidence."""
+        root = self.workdir / "fallback-http-candidate"
+        root.mkdir()
+        summary, catalog, manifest, verified = write_minimal_coverage_fixture(
+            root,
+            extract_entries=[],
+            evidence_updates={
+                "status": "needs_search_fallback",
+                "method": None,
+                "final_url": None,
+                "extract_file": None,
+                "extracted_entry_count": 0,
+                "attempts": [{"method": "rss", "status": "failed", "reason": "fixture"}],
+            },
+            resolutions=[{
+                "name": "Fixture News",
+                "status": "verified_fallback",
+                "method": "site_search",
+                "requested_url": "https://example.test/search",
+                "final_url": "https://example.test/search",
+                "extracted_entry_count": 1,
+                "candidate_entry_count": 1,
+                "date_evidence_count": 1,
+                "published_dates": ["2026-07-31"],
+                "candidate_evidence": [{
+                    "url": "http://example.test/article",
+                    "provenance": "article",
+                    "published": "2026-07-31",
+                }],
+            }],
+            status="取得済み",
+            method="サイト限定検索",
+            count=1,
+            confirmed_url="https://example.test/search",
+        )
+        COLLECTION_VALIDATOR_MODULE.validate_source_coverage(
+            summary, catalog, manifest, verified, date(2026, 7, 31)
+        )
+
     def test_collection_validator_rejects_mixed_robots_attempts_without_fallback(self) -> None:
         """One robots denial must not hide a generic failure on another endpoint."""
         root = self.workdir / "mixed-robots"

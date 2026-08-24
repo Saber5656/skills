@@ -966,7 +966,7 @@ def validate_source_coverage(
                     candidate_url = item.get("url") if isinstance(item, dict) else None
                     if (
                         not isinstance(item, dict)
-                        or not is_allowed_source_url(candidate_url, hosts)
+                        or not is_allowed_extract_url(candidate_url, hosts)
                         or item.get("provenance") not in {
                             "feed_entry",
                             "article",
