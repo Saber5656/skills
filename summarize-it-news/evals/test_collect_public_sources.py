@@ -1594,6 +1594,25 @@ class PublicSourceCollectorTests(unittest.TestCase):
         self.assertEqual(extracted["entries"][0]["title"], "Canonical headline")
         self.assertEqual(extracted["entries"][0]["published"], "2026-08-18")
 
+    def test_html_extract_preserves_headline_across_reused_url_article_scopes(self) -> None:
+        """Do not let a later control label overwrite an earlier headline."""
+        content = (
+            b'<article><h2><a href="/story">Canonical headline</a></h2>'
+            b'<time datetime="2026-08-18"></time></article>'
+            b'<article><a href="/story">Copy link</a>'
+            b'<time datetime="2026-08-18"></time></article>'
+        )
+        extracted = MODULE.extract_content(
+            content, "text/html", "https://example.test/news"
+        )
+        candidates = [
+            entry for entry in extracted["entries"]
+            if entry.get("candidate_provenance") == "article"
+        ]
+        self.assertEqual(extracted["candidate_entry_count"], 1)
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0]["title"], "Canonical headline")
+
     def test_html_extract_upgrades_existing_headline_at_entry_cap(self) -> None:
         """Keep title arbitration active when the bounded entry set reaches 400."""
         navigation = "".join(

@@ -1552,8 +1552,9 @@ class LinkExtractor(HTMLParser):
                     ),
                 )
                 if selected is not None:
-                    candidate, article_title, _is_headline = selected
-                    candidate["title"] = article_title
+                    candidate, article_title, is_headline = selected
+                    if is_headline or not candidate["title"]:
+                        candidate["title"] = article_title
                     candidate["candidate_provenance"] = "article"
                     candidate["published"] = (
                         candidate["published"] or self.article_published
@@ -1620,6 +1621,14 @@ class LinkExtractor(HTMLParser):
                 # article headline replace that control label deterministically.
                 entry["title"] = title
             if self.article_depth == 1:
+                if (
+                    not self.current_article_headline
+                    and entry["candidate_provenance"] is None
+                ):
+                    # A URL first seen in generic navigation has no trusted
+                    # article title.  Clear that label so the unambiguous
+                    # article occurrence can fill it at the article boundary.
+                    entry["title"] = None
                 self.article_link_occurrences.append(
                     (entry, title, self.current_article_headline)
                 )
