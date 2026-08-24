@@ -40,6 +40,14 @@ class CollectionPromptPrivacyTests(unittest.TestCase):
         self.assertIn("must not contain", prompt)
         self.assertIn("absolute staging path", prompt)
 
+    def test_vault_publisher_forbids_every_force_push_variant(self) -> None:
+        """Keep the publication policy unambiguous about all force-push forms."""
+        skill = (ROOT / "vault-change-publisher/SKILL.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("`--force`、`--force-with-lease`、`+` refspec", skill)
+        self.assertNotIn("期待OIDなしlease", skill)
+
     def test_pva_report_contract_uses_basename_and_digest(self) -> None:
         skill = (ROOT / "personal-vulnerability-advisor/SKILL.md").read_text(
             encoding="utf-8"
