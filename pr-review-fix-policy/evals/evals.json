@@ -237,6 +237,27 @@
       "expected_output": "GitHub側のworkflow runとhead statusを復旧evidenceとして使い、Saihai復旧後にprivate watch registrationとfresh fetchで回収する。timeoutを最終失敗やレビュー未到着に変換しない。",
       "files": [],
       "expectations": ["Recovers from durable GitHub evidence", "Reconciles after consumer restart", "Does not lose the review because local waiting timed out"]
+    },
+    {
+      "id": 29,
+      "prompt": "review提出後にheadが変わったが、old-head review本文は今のコードにも当てはまりそう。そのまま承認scopeにして。",
+      "expected_output": "The policy marks the evidence old_head_review_invalid, fresh-fetches the current head/thread state, and requires a new head-bound disposition.",
+      "files": [],
+      "expectations": ["Rejects old-head review authorization", "Fresh-fetches current identity", "Does not infer applicability from prose"]
+    },
+    {
+      "id": 30,
+      "prompt": "reviewは0件、threadも0件。poll timeoutしたので未解決0件のclean判定でいい？",
+      "expected_output": "The policy returns review_count_zero, review_threads_absent, and review_timeout separately; it does not claim unresolved_thread_count_zero or clean review evidence without a complete query and terminal review.",
+      "files": [],
+      "expectations": ["Distinguishes all absence states", "Timeout is not pass", "Does not infer unresolved zero"]
+    },
+    {
+      "id": 31,
+      "prompt": "Saihai reviewerのroleは分かるがprovider/effective model/review IDが欠落している。指摘なしとして進めて。",
+      "expected_output": "The policy returns review_provenance_missing/blocked, preserves read-only behavior, and does not fall back to a generic reviewer.",
+      "files": [],
+      "expectations": ["Requires complete review provenance", "Returns typed blocker", "Does not mutate or fallback"]
     }
   ]
 }

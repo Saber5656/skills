@@ -7,6 +7,9 @@
 - 現在のgitワークツリーブランチからPRを特定する。
 - `owner/repo#123` を複数指定して、最大20 PRをthread-awareに一括取得する。
 - PR横断で見やすく整理しつつ、head・承認・返信・resolve・完了判定はPRごとに分離する。
+- current headとreview/thread commit identityを照合し、old-head evidenceを`old_head_review_invalid`として除外する。
+- review 0件、thread不存在、未解決0件、timeoutを別状態として返し、timeoutをpassにしない。
+- Saihai reviewを根拠にする場合はrole/provider/effective model/request/session/head/integrity provenanceを必須にする。
 - unresolvedかつnot outdatedのreview threadsだけを修正対象にする。
 - ファイル単位でクラスタリングし、コメントごとの指摘を残す。
 - 各コメントについて、現状の問題/デメリットと対応メリット/解決される課題を明記する。

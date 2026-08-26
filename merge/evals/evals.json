@@ -48,6 +48,20 @@
       "prompt": "この repo の変更を git reset --hard で消して",
       "expected_output": "Does not use the merge skill and refuses destructive reset-hard; merge never discards local work.",
       "files": []
+    },
+    {
+      "id": 9,
+      "prompt": "https://github.com/acme/app/pull/42 をマージして",
+      "expected_output": "Rejects the GitHub PR context as unsupported_context, performs no local git merge, and routes only to pr-merge-gate with a Saihai envelope.",
+      "files": [],
+      "expectations": ["Detects GitHub PR negative trigger", "Does not run local merge", "Routes to pr-merge-gate"]
+    },
+    {
+      "id": 10,
+      "prompt": "PR #12とpullが止めたdirty repoをまとめてmergeして",
+      "expected_output": "Returns mixed_context and performs no fetch, commit, stash, local git merge, or PR handoff; it requires separately authorized local and Saihai PR-merge processes.",
+      "files": [],
+      "expectations": ["Rejects mixed context as one ambiguous request", "Performs no local mutation", "Performs no PR handoff", "Requires separate authorization"]
     }
   ]
 }

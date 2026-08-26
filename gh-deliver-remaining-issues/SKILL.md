@@ -1,6 +1,14 @@
 ---
 name: gh-deliver-remaining-issues
 description: Orchestrate delivery of a GitHub repository's remaining actionable issues by routing unresolved requirements through the declared decision owner, building dependency- and conflict-safe execution waves, isolating each issue in its own git worktree and branch, using separate implementers and caller-assigned content-matched reviewers for every smallest meaningful change, creating atomic reviewed commits, and opening one ready PR per issue. Use when the user asks to implement, finish, clear, or parallelize multiple remaining GitHub issues; split issue work across worktrees or agents; or turn an issue backlog into reviewed PRs. Do not use for one issue, planning-only backlog triage, summarizing issues or PRs, fixing existing PR review comments, merging, or releasing.
+user-invocable: true
+allowed-tools: Read, Grep, Glob, Bash, Agent
+category: Dev
+created: 2026-07-16
+updated: 2026-08-26
+status: active
+purpose: 残Issueを依存安全なwaveで分離実装し、検証済みready PRとcurrent-head review intakeまで届ける
+argument-hint: "[owner/repo、issue集合またはparent/milestone/project selector]"
 ---
 
 # Deliver Remaining GitHub Issues
@@ -17,9 +25,11 @@ Read [references/execution-contract.md](references/execution-contract.md) before
 4. Use caller-supplied Saihai task context or an equivalent typed context for role assignment, technical and security review providers, ambiguity/approval owners, routing, and publication ownership. Do not select them inside this skill.
 5. Derive a narrow `review_focus` from the change when helpful, then require the caller or user to confirm the actual reviewer role and provider if they are missing.
 6. Review each smallest meaningful diff snapshot before committing it. Invalidate the review when that snapshot changes.
-7. Require agreement from the manifest's `approval_owner` on the response to every actionable review finding before editing the affected diff.
-8. Never push the default branch directly, force-push, merge, release, weaken tests, bypass hooks, delete existing worktrees, or discard another worker's state.
-9. Keep a coordinator-owned task record and update the required Vault evidence serially. Workers return evidence; they do not concurrently edit the shared record.
+7. Accept technical, security, cumulative, and recovery review evidence only through the execution contract's canonical provenance carrier. Missing provider, effective model, reviewer role, request/session identity, reviewed head/snapshot binding, terminal result, or integrity evidence returns `review_provenance_incomplete`; never infer it or continue to commit/publication.
+8. Require agreement from the manifest's `approval_owner` on the response to every actionable review finding before editing the affected diff.
+9. Never push the default branch directly, force-push, merge, release, weaken tests, bypass hooks, delete existing worktrees, or discard another worker's state.
+10. Keep a coordinator-owned task record and update the required Vault evidence serially. Workers return evidence; they do not concurrently edit the shared record.
+11. GitHub `mergeable` / `CLEAN` is never `policy_merge_ready` and never merge authorization. This skill owns no PR merge path.
 
 ## 1. Establish execution context
 
@@ -96,9 +106,10 @@ For every unit, run this loop:
 4. Send the raw issue context, acceptance criteria, repository guidance, diff snapshot, and check output to a separate read-only reviewer.
 5. Use the caller-assigned reviewer role/provider whose scope matches the recorded `review_focus`; never leak the desired verdict or implementer's conclusions.
 6. If technical review returns `approved`, run the caller-assigned Security Commit Review against the same snapshot digest.
-7. If either review returns actionable findings or `insufficient_input`, do not commit. Pause the unit and route the typed finding policy to `approval_owner`; ask the user only when that owner is `user`.
-8. After owner-approved fixes, revalidate, create a new snapshot, and rerun both required reviews before committing.
-9. Only when technical review is `approved` and security review is `security_clear` or permitted `security_notes` for the identical digest, build the unit's `Task Change Manifest` and append its handoff event to the issue-level Git Publication Manifest defined by the execution contract. Bind both artifacts to the same unit, issue, Branch Plan, approved scope, and snapshot, then pass both artifacts to `commit`.
+7. Validate the complete canonical review-evidence carrier for both reviews. Return `review_provenance_incomplete` without commit or publication when any identity, provenance, terminal-state, or integrity field is absent or inconsistent.
+8. If either review returns actionable findings or `insufficient_input`, do not commit. Pause the unit and route the typed finding policy to `approval_owner`; ask the user only when that owner is `user`.
+9. After owner-approved fixes, revalidate, create a new snapshot, and rerun both required reviews before committing.
+10. Only when technical review is `approved` and security review is `security_clear` or permitted `security_notes` for the identical digest, build the unit's `Task Change Manifest` and append its handoff event to the issue-level Git Publication Manifest defined by the execution contract. Bind both artifacts to the same unit, issue, Branch Plan, approved scope, snapshot, and complete review provenance, then pass both artifacts to `commit`.
 
 Use a cumulative integration/regression review in addition to unit reviews when an issue has interacting units or touches a high-risk boundary. Apply the same caller-assigned separate reviewer, read-only restriction, canonical snapshot digest, raw evidence inputs, typed verdict, `approval_owner` finding policy, and rereview-on-change rules. Self-review or an unfixed cumulative diff cannot satisfy this gate. A PR-platform review after publication is another integration gate; it never replaces unit or cumulative review.
 
@@ -131,9 +142,19 @@ Hand an issue to `pr` only after:
 - the worktree is clean and its commits/paths are issue-owned;
 - no duplicate PR exists for the issue or branch.
 
+The finalized handoff to `pr` must include trusted `expected_assignees`, authoritative required-check
+inventory/source, and `external_reviewers` policy. When CodeRabbit is required, include
+`external_reviewers.coderabbit.required: true` and its trusted policy source; `pr` owns exact
+`@coderabbitai review` per-head delivery and current-head intake. This coordinator must not post a second
+trigger or infer reviewer policy from repository comments.
+
 Create a ready, non-draft PR. Link the issue with `Closes #N` only when the PR fully resolves it; otherwise use `Refs #N`. Include scope/non-goals, atomic commit summary, validation, independent review evidence, limitations, and dependency/merge order. Verify the pushed remote head matches the intended local commit.
 
-Stop after PR creation and its configured review intake. Do not merge or release. If PR review reports an actionable finding, use `pr-review-fix-policy` and obtain `approval_owner` agreement before any fix.
+Stop after PR creation and its configured review intake. Do not merge or release. A PR can be published while
+checks/reviews are pending, but the issue remains `pr_created_review_pending` or a typed blocked state rather
+than complete. `review_count_zero`, `review_timeout`, unknown required-check inventory, failed CI, Assignee
+set mismatch, or stale-head review must not become `pr_created`. If PR review reports an actionable finding,
+use `pr-review-fix-policy` and obtain `approval_owner` agreement before any fix.
 
 ## 8. Recover without destroying state
 
@@ -156,4 +177,7 @@ Report every scoped issue and its disposition. Completion requires:
 - no silent exclusions, skipped reviews, default-branch pushes, force pushes, merges, releases, or worktree deletion;
 - the coordinator's Vault record updated with plans, evidence, decisions, validation, review results, commits, PRs, blockers, and handoff.
 
-Archive the task record only when every scoped issue is `pr_created` or explicitly excluded by the user. Keep it active when any issue is waiting for clarification, review policy, dependency merge, publication, or external state.
+Archive the task record only when every scoped issue is `pr_created` with exact Assignee, current-head checks,
+and configured review intake proven, or explicitly excluded by the user. Keep it active when any issue is
+`pr_created_review_pending` or waiting for clarification, review policy, dependency merge, publication, or
+external state.

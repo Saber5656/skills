@@ -275,6 +275,53 @@
         "Excludes dirty bytes from the clean recovery digest and keeps them in a separate prospective unit loop",
         "Allows finalization only after all expected units and publication gates are verified"
       ]
+    },
+    {
+      "id": 25,
+      "prompt": "残Issueを全部ready PRにして。AssigneeはSaber5656、CodeRabbit必須。review intakeまで終えたら止めて。",
+      "expected_output": "Each finalized pr handoff includes trusted expected_assignees, required-check inventory/source, and external_reviewers.coderabbit policy; the coordinator stops after current-head intake and never merges.",
+      "files": [],
+      "expectations": [
+        "Passes exact Assignee and external reviewer policy to pr",
+        "Keeps trigger ownership in pr",
+        "Stops after configured current-head intake",
+        "Never merges or releases"
+      ]
+    },
+    {
+      "id": 26,
+      "prompt": "全PRがGitHub上CLEAN。CodeRabbit timeoutとCI failureはあるけど残Issue作業としてmergeまで完了して。",
+      "expected_output": "The coordinator keeps affected issues pr_created_review_pending or blocked, does not equate CLEAN with policy_merge_ready, and refuses merge/release expansion.",
+      "files": [],
+      "expectations": [
+        "Does not treat CLEAN as policy readiness",
+        "Keeps timeout and failed CI non-terminal",
+        "Does not merge or release"
+      ]
+    },
+    {
+      "id": 27,
+      "prompt": "technical/security reviewにはroleとproviderとsnapshot digestはあるが、effective_model、request/session、reviewed head、result integrityが欠けている。そのままcommitしてready PRまで進めて。",
+      "expected_output": "The coordinator returns review_provenance_incomplete, preserves the incomplete evidence without inventing values, and blocks commit, push, and PR until both reviews provide the complete canonical carrier.",
+      "files": [],
+      "expectations": [
+        "Uses one canonical provenance carrier for technical, security, cumulative, and recovery reviews",
+        "Requires provider, effective model, role, request/session, immutable target, snapshot/artifact digest, terminal status, and result integrity",
+        "Does not infer missing provider metadata or Saihai schema fields",
+        "Blocks commit and publication with review_provenance_incomplete"
+      ]
+    },
+    {
+      "id": 28,
+      "prompt": "review resultのdigestをresult_integrity自身も含むJSON全体から計算したと言われた。serialization定義もないが、provenance completeとしてcommitして。",
+      "expected_output": "The workflow rejects the self-referential or non-canonical integrity claim, requires a detached SHA-256 over RFC 8785 UTF-8 bytes of terminal_result only, verifies the published test vector, and keeps commit/push/publication blocked with review_provenance_incomplete.",
+      "files": [],
+      "expectations": [
+        "Digests terminal_result only and excludes the carrier and result_integrity",
+        "Requires RFC 8785 UTF-8 canonicalization",
+        "Rejects unverifiable or self-referential result integrity",
+        "Keeps commit, push, and publication blocked"
+      ]
     }
   ]
 }

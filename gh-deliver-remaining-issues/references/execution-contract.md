@@ -323,6 +323,56 @@ C. Pause this unit — no reviewer is assigned.
 Recommended: A
 ```
 
+## Canonical review evidence carrier
+
+Technical, security, cumulative, and recovery reviews use one common provenance carrier. Preserve the
+caller/Saihai dispatcher values exactly; this coordinator does not select, infer, translate, or invent them.
+Bind a pre-commit review to both the immutable current parent HEAD and the canonical intended-tree snapshot.
+Bind a post-commit/recovery review to the exact reviewed commit/range and its snapshot digest.
+
+```yaml
+review_evidence_version: "1"
+review_id: "<opaque review id>"
+request_id: "<opaque dispatch request id>"
+session_id: "<opaque provider session id>"
+reviewer_role: "<caller-assigned role>"
+provider: "<actual provider>"
+effective_model: "<actual effective model>"
+dispatch_facade: "<trusted caller/Saihai facade identity and version>"
+review_target:
+  repository: "owner/repo"
+  base_sha: "<immutable base SHA>"
+  reviewed_head_sha: "<immutable HEAD at dispatch>"
+  target_kind: "intended_tree | commit | committed_range"
+  target_identity: "<snapshot digest, commit SHA, or range digest>"
+  snapshot_digest: "sha256:<canonical snapshot digest>"
+  artifact_digest: "sha256:<digest of the complete reviewable artifact bundle>"
+terminal_status: "success | findings | insufficient_input | error"
+terminal_result:
+  schema_version: "1"
+  status: "<same terminal status>"
+  verdict: "<typed role verdict>"
+  findings: []
+result_integrity:
+  algorithm: "sha256"
+  payload: "terminal_result"
+  canonicalization: "RFC 8785 JSON Canonicalization Scheme (JCS), UTF-8"
+  digest: "<digest of canonical terminal_result bytes only>"
+```
+
+`terminal_result` must contain only JSON-compatible values accepted by RFC 8785; reject duplicate keys,
+non-finite numbers, or values that cannot be represented canonically. Compute SHA-256 over the RFC 8785 UTF-8
+bytes of `terminal_result` alone. Every carrier field, including `result_integrity`, is outside that digest
+payload, so the construction is detached and never self-referential. A verifier reconstructs those same bytes
+and compares the digest before interpreting the verdict. Test vector: the canonical payload
+`{"findings":[],"status":"success","verdict":"approved"}` has SHA-256
+`b84a8ab8c6b071531408bbcdd7253ce51025fcbb9d7d8ab51cdaf92b244ad800`.
+
+Every field is required. An unavailable request/session ID, effective model, immutable target identity,
+artifact digest, terminal result, or result-integrity digest is not a reason to substitute a local value.
+Return `review_provenance_incomplete` and block commit, push, and PR publication. Any target bytes, base/head,
+role/provider/model, dispatcher policy, or result change invalidates the carrier and requires a fresh review.
+
 ## Reviewer input and output
 
 Give the reviewer raw evidence, not the intended answer:
@@ -337,9 +387,7 @@ Require read-only output:
 
 ```yaml
 unit_id: "issue-123-u1"
-reviewer_role: "<assigned role>"
-reviewer_provider: "<assigned provider>"
-snapshot_digest: "<canonical snapshot digest>"
+review_evidence: "<complete canonical review evidence carrier>"
 verdict: "approved | findings | insufficient_input"
 scope_ok: true
 acceptance_criteria_ok: true
@@ -360,22 +408,20 @@ Require a caller/user-confirmed security role and provider for every unit before
 
 ```yaml
 unit_id: "issue-123-u1"
-security_reviewer_role: "<assigned role>"
-security_reviewer_provider: "<assigned provider>"
-snapshot_digest: "<canonical snapshot digest>"
+review_evidence: "<complete canonical review evidence carrier>"
 max_priority: "P0 | P1 | P2 | P3 | none"
 commit_blocking: false # Set true iff max_priority is P0.
 verdict: "security_clear | security_notes | security_blocked | security_insufficient_input"
 findings: []
 ```
 
-`commit_blocking` is required. It must be `true` exactly when `max_priority` is `P0`, and `false` for `P1`, `P2`, `P3`, or `none`. A missing or inconsistent value makes the review contract invalid; return `security_review_invalid` and do not invoke `commit`.
+`commit_blocking` is required. It must be `true` exactly when `max_priority` is `P0`, and `false` for `P1`, `P2`, `P3`, or `none`. A missing or inconsistent value makes the review contract invalid; return `security_review_invalid` and do not invoke `commit`. A missing or inconsistent canonical carrier returns `review_provenance_incomplete` before this verdict is considered.
 
 Route every actionable security finding through `approval_owner`. Do not commit on `security_blocked`, `security_insufficient_input`, a P0 finding, a missing assignment, an invalid review contract, or a digest mismatch. After any approved fix, generate a new digest and rerun technical and security review.
 
 ## Cumulative integration review
 
-When interacting units or high-risk boundaries require a cumulative review, create an issue-level contract with a caller/user-confirmed separate reviewer assignment, the canonical digest of the full issue diff, raw unit/validation evidence, and the same read-only verdict schema. Route findings through `approval_owner`; invalidate and rerun the cumulative review whenever the issue diff changes. Self-review, a unit reviewer operating as implementer, or review of an unfixed/mismatched digest cannot satisfy this gate.
+When interacting units or high-risk boundaries require a cumulative review, create an issue-level contract with a caller/user-confirmed separate reviewer assignment, the canonical digest of the full issue diff, raw unit/validation evidence, the complete canonical review evidence carrier, and the same read-only verdict schema. Recovery reviews use that carrier too and bind the exact committed range, every mapped commit, and the clean range snapshot. Route findings through `approval_owner`; invalidate and rerun the cumulative or recovery review whenever its target changes. Self-review, a unit reviewer operating as implementer, missing provenance, or review of an unfixed/mismatched digest cannot satisfy this gate.
 
 ## Finding policy handoff
 

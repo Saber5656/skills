@@ -7,11 +7,14 @@ description: >
   "commit してからマージして", "pull がブロックした repo をマージして", or asks to
   resolve dirty/diverged managed repos. It preserves local work commit-first (default)
   or by stash, then merges upstream with --no-edit. It must not push, force, reset hard,
-  delete files, or auto-resolve conflicts; on conflict it aborts and reports.
+  delete files, or auto-resolve conflicts; on conflict it aborts and reports. DO NOT TRIGGER for a
+  GitHub PR URL, `pull/NUMBER`, `PR #Nをマージ`, merge queue, or any GitHub PR merge request;
+  those require the Saihai-authorized `pr-merge-gate` path.
 user-invocable: true
 allowed-tools: Bash, Read, Grep
 category: Dev
 created: 2026-06-11
+updated: 2026-08-26
 status: active
 purpose: pull がブロックした dirty/diverged な管理 repo を commit-first で安全に merge する
 argument-hint: "[--dry-run | --execute] [--stash] [--message <text>]"
@@ -54,6 +57,23 @@ task context がない場合は、git 操作をせず `task_scope_missing` と�
 - ユーザーが「dirty な repo をマージして」「commit してからマージして」と言ったとき。
 - ユーザーが「pull がブロックした repo をマージして」と依頼したとき。
 - `pull` skill が `dirty_worktree` でブロックした repo の解消を明示されたとき。
+
+## Explicit Negative Triggers
+
+This skill is only for a local managed repository. GitHub PR merge is対象外であり、次を検出したら
+fetch、commit、stash、`git merge`を実行しない。つまり、git mergeを実行しない。
+
+- GitHub pull request URL（`github.com/.../pull/<number>`または`pull/`を含む入力）
+- `PR #12をマージ`、`pull requestをmerge`、merge queue、auto-mergeなどのGitHub PR context
+- repositoryとPR番号/head/candidateを持つSaihai merge-readiness envelope
+
+この場合は`context_status: unsupported_context`を返し、`pr-merge-gate`へhandoffする。単なる
+「mergeして」という語をPR merge authorizationとして扱うことはneverである。
+
+local managed repositoryとGitHub PR mergeが同じ依頼に含まれる場合は`mixed_context`としてfail closedし、
+local側を候補化せず、fetch、commit、stash、`git merge`を含む全mutationを実行しない。Local mergeと
+Saihai PR mergeをそれぞれ独立したtask/processとして明示的に再承認・再依頼するよう返す。PR側にfinalized
+manifestとone-shot authorizationがある場合でも、このmixed requestから直接handoffしない。
 
 ## What I Do
 
@@ -121,6 +141,7 @@ python3 skills/merge/scripts/merge_managed_repos.py --execute --json
 | `ahead` / `behind` | post-fetch relationship to upstream |
 | `conflict_files` | files in conflict when a merge or stash pop was aborted |
 | `reason` | block, conflict, or failure reason |
+| `context_status` | `local_managed_repository`, `unsupported_context`, or `mixed_context` |
 
 ## Relationship to `pull`
 
@@ -128,6 +149,7 @@ python3 skills/merge/scripts/merge_managed_repos.py --execute --json
 |---|---|
 | `pull` | fetch + safe merge for clean repos; blocks dirty repos with remote updates |
 | `merge` | resolves the repos `pull` blocked: commit-first (or stash) then merge |
+| `pr-merge-gate` | validates a Saihai-finalized GitHub PR merge handoff; never owned by this local merge skill |
 
 Run `pull` first; if it reports `dirty_worktree` blockers, run `merge` to resolve them.
 
