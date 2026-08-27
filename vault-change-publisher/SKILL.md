@@ -38,7 +38,7 @@ Web入力を扱う収集phaseからプロセスとsandbox権限を分離し、�
 Gitleaksは`git` / `dir` / `stdin`コマンドを備えた8.19.0以上のv8に限定する。
 
 publication review processはread-only/no-networkで実行し、artifact配置やGit mutationより前にdigest-bound Task Change Manifestを完成させる。review inputをsealedする際、deterministic residual guardがHEADとの差分へ新規machine-home path、`.obsidian/`、pinned gitleaksを検査し、不合格entryをbytes非公開の`deferred`へ変換して当該Vaultのmode hintを`own_only`へ固定する。全Gitleaks scanはdigest固定した`[extend] useDefault = true` config bytesを匿名file descriptorへ封印し、そのfdをscanner processへ継承して`/dev/fd/N`から読む。検証後のpathname再lookupやVault内`.gitleaks.toml`をconfig sourceにしない。reviewerが誤って`sweep`へ戻すことはvalidatorが拒否する。local publication processにはVault working treeと対応gitdirだけを与え、networkを無効にし、承認済みManifestを変更させない。初回固定push後のevidence hunkは別のread-only/no-network processで再レビューする。いずれにも`--search`を付けず、収集phaseと同じCodex processを再利用しない。pushはagent外の検証済みrunnerが、review、local result、実history、blob hash、Git control-plane digestを照合して固定refspecだけで行う。
-Codexへ渡すpublication/evidence review requestは`prepare-publication-review-context.py`で決定論的に生成する。完全なpublication contextはdigest-bound fileとして保持し、モデル向けprojectionでは`index_entries`を常に省略し、dirty/history residual配列が上限を超える場合はcount・SHA-256・bounded sampleへ置換する。projectionがresidualを省略したVaultは`sweep`を承認せず`own_only`へ、local-ahead historyを省略したVaultは`blocked`へ切り替える。このmode floorはmetricsのSHA-256とpublication context digestを`validate-publication-review.py`が再検証し、reviewerの`sweep`への弱体化を拒否する。prompt、projection、requestの文字数・UTF-8 bytes・構成要素別サイズと省略fieldはrun rootのmetricsへ記録し、request全体をCodexの1 MiB上限より十分下に固定する。入力準備またはCodexが入力上限を拒否した場合は、raw result欠落と混同せず具体的な`input_too_large`診断をstatusへ残す。contextのbounded projectionはreview判断専用であり、deterministic validatorは従来どおり完全なsealed contextからexact path・hash・CAS条件を再検証する。
+Codexへ渡すpublication/evidence review requestは`prepare-publication-review-context.py`で決定論的に生成する。完全なpublication contextはdigest-bound fileとして保持し、モデル向けprojectionでは`index_entries`を常に省略し、dirty/history residual配列が上限を超える場合はcount・SHA-256・bounded sampleへ置換する。projectionがresidualを省略したVaultは`sweep`を承認せず`own_only`へ、local-ahead historyを省略したVaultは`blocked`へ切り替える。このmode floorはmetricsのSHA-256とpublication context digestを`validate-publication-review.py`が再検証し、reviewerの`sweep`への弱体化を拒否する。prompt、projection、requestの文字数・UTF-8 bytes・構成要素別サイズと省略fieldはrun rootのmetricsへ記録し、request全体をCodexの1 MiB上限より十分下に固定する。Codexの実行は`run-pinned-review.py`を経由し、requestを一度だけno-follow descriptorで安定読込してmetricsのrequest SHA-256・文字数・bytesと照合し、その同一bytesをpipeで子processへ渡す。これによりmetrics計測後のpathname差替えや再読込で、監査対象と異なるpromptを実行することを防ぐ。入力準備またはCodexが入力上限を拒否した場合は、raw result欠落と混同せず具体的な`input_too_large`診断をstatusとevidence finalizationへ残す。contextのbounded projectionはreview判断専用であり、deterministic validatorは従来どおり完全なsealed contextからexact path・hash・CAS条件を再検証する。bounded omissionで省略されたlocal history/changed pathsとblocked residual pathは、mode floorを満たす場合に限り、raw reviewを変更せずsealed snapshotからcanonical resultへ復元する。
 
 収集phaseはrun専用stagingだけに書き込み、Vault working treeやgitdirへ書き込めないことをrunner側で保証する。
 
@@ -78,7 +78,7 @@ local-aheadの場合は各commitのhash、parents、tree、message、changed pat
 
 Agents/Userのmodeは独立でよい。residual review失敗は`sweep`から`own_only`への切替理由であり、core artifact失敗ではない。
 
-publication reviewerのraw JSONは監査用にrun rootへ保持する。reviewerが`own_only`、core `quality_ok`、residual `deferred`を選んだ後に限り、deterministic validatorは`excluded_paths`、`unrelated_dirty_paths`、`deferred_cleanup`の大量列挙を封印済みdirty snapshotのexact path setへcanonicalizeする。modelが返したdirty-path内のunique/nonempty reasonは保持し、不足理由だけをsealed `materialization_reason`またはown-only defer理由で補完する。foreign path、duplicate、context/pre-state/manifest digest不一致はfail closedにする。この処理はcore status、publication mode、owned paths、commit groups、artifact/history binding、local-ahead判断を変更せず、canonical schemaと既存semantic validatorの両方を通ったresultだけをcommitterへ渡す。
+publication reviewerのraw JSONは監査用にrun rootへ保持する。reviewerが`own_only`、core `quality_ok`、residual `deferred`を選んだ後、またはbounded mode floor下で`blocked`を選んだ後に限り、deterministic validatorは`excluded_paths`、`unrelated_dirty_paths`、`deferred_cleanup`の大量列挙を封印済みdirty snapshotのexact path setへcanonicalizeする。local-aheadの`approved_existing_commits`（nested `changed_paths`を含む）も、floorが`own_only`/`blocked`の場合はsealed version-4 snapshotの完全なcommit identityとpatch digestへ復元する。modelが返したdirty-path内のunique/nonempty reasonは保持し、不足理由だけをsealed `materialization_reason`またはmode-floor defer理由で補完する。foreign path、duplicate、context/pre-state/manifest digest不一致はfail closedにする。この処理はcore status、publication mode、owned paths、commit groups、artifact/history判断を変更せず、canonical schemaと既存semantic validatorの両方を通ったresultだけをcommitterへ渡す。
 
 ## Artifact Install
 
@@ -163,6 +163,18 @@ review前のstanding-task candidate生成で既存fileを更新する必要が�
 全resultはVaultごとの`publication_mode`と`deferred_cleanup`を返す。`own_only`成功では`clean:false`を許容し、deferred情報は`next_action`ではなくstructured fieldへ置く。停止時だけnon-empty`next_action`を返す。`commit_status: complete`なら`commit_hashes`を1件以上返す。
 
 evidence finalizationの`success` resultはshared-index candidateのno-replace retentionと保持先contract検証が完了した後だけ公開する。runnerはresult pathの存在を理由にfinalizerのprocess statusを0へ置換せず、terminal interpreterへ実statusを渡す。非0 processと`success` resultの組合せは`process_error`として非0にし、validな`partial_publication` resultは構造を保持したまま非0として解釈する。
+
+evidence reviewの失敗診断は`evidence_review`構造体（`reason_code`、process/status、result有無、stderr/result SHA-256）としてfinal resultへ保存する。raw stderrはrun rootの0600 private logに限定し、status・`next_action`・task evidenceへ本文をコピーしない。runner起動時は`umask 077`とdirect-execution helperのmodeを検査し、FIFO/device差替えはnon-blocking no-follow readで即時拒否する。
+
+## Pull Request監視登録の事前確認
+
+Codex Workの「Pull Requestを監視して修正する」は、PR作成後のレビュー検知・修正継続を担う外部設定であり、GitHubの`mergeable`や自動マージ設定だけから有効とは推定しない。PRを作成または更新した後、次のidentityを結び付けた認証済みregistration evidenceを取得する。
+
+- repository、PR number、現在のbase/head SHA
+- レビューコメント・レビュー状態をトリガーにする監視条件
+- 「マージされるまで監視を続ける」状態と、設定が対象PRへ実際に関連付いていること
+
+registrationを確認できない場合は`pr_monitor_registration=unverified`としてtask evidenceへ記録し、「監視済み」「自動修正される」と報告してはならない。確認不能を理由にPRのmerge authorizationを緩めず、レビュー指摘は通常どおりthread単位で取得・独立検証・個別返信・解決確認する。監視設定の自動マージtoggleはmerge動作だけを制御し、レビュー修正の完了証明にはならない。GitHub CLIの認証が利用できない場合はGitHub Connectorでregistration、コメント、thread状態を取得・更新し、認証情報をリポジトリへ保存しない。
 
 ## Forbidden Actions
 
