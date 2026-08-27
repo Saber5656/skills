@@ -142,9 +142,20 @@ class ProjectionState:
 
     def omit(self, path: str, key: str, vault: Optional[str]) -> None:
         self.omitted_fields.append(path)
-        if key in RESIDUAL_ARRAY_KEYS and vault in {"agents_vault", "user_vault"}:
+        # A commit's changed_paths is part of the local-ahead history identity,
+        # not an ordinary dirty residual.  Treating it as residual would allow
+        # an omitted ancestor boundary to fall back only to own_only.
+        history_identity = key in HISTORY_ARRAY_KEYS or (
+            key == "changed_paths"
+            and (".local_commits[" in path or ".approved_existing_commits[" in path)
+        )
+        if (
+            key in RESIDUAL_ARRAY_KEYS
+            and not history_identity
+            and vault in {"agents_vault", "user_vault"}
+        ):
             self.residual_vaults.add(vault)
-        if key in HISTORY_ARRAY_KEYS and vault in {"agents_vault", "user_vault"}:
+        if history_identity and vault in {"agents_vault", "user_vault"}:
             self.history_vaults.add(vault)
 
     def mode_floor(self) -> dict[str, str]:
@@ -230,6 +241,15 @@ def project_value(
                 state.omitted_fields.append(child_path)
                 continue
             if isinstance(child, str) and key == "message":
+                if len(child) > MAX_COMMIT_MESSAGE_CHARS and (
+                    ".local_commits[" in child_path
+                    or ".approved_existing_commits[" in child_path
+                ):
+                    # The review result schema requires a string message.  A
+                    # bounded object would be schema-invalid, so mark the
+                    # enclosing history as omitted and let the canonicalizer
+                    # restore the exact sealed commit identity.
+                    state.omit(child_path, "local_commits", vault_from_path(child_path))
                 projected[key] = bounded_text(child, MAX_COMMIT_MESSAGE_CHARS)
                 continue
             if isinstance(child, list):

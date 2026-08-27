@@ -302,33 +302,50 @@ def normalize_own_only_residuals(
     context: dict[str, object],
     pre: dict[str, object],
     materialization: dict[str, object],
+    mode_floor: Optional[dict[str, str]] = None,
 ) -> tuple[dict[str, object], dict[str, object]]:
-    """Complete only own-only residual structure from sealed snapshot identity.
+    """Complete deferred residual structure from sealed snapshot identity.
 
     The model still owns the core-quality and publication-mode decisions.  This
     projection prevents a large dirty-path set from becoming a model copying
-    task after it has already selected ``own_only`` with a deferred residual
-    review.  Supplied reasons are retained only for exact captured paths.
+    task after it has already selected ``own_only`` or ``blocked`` with a
+    deferred residual review.  Supplied reasons are retained only for exact
+    captured paths. ``mode_floor`` is derived from bounded-input metrics and
+    never weakens the selected publication mode.
     """
     result = deepcopy(review)
     receipt: dict[str, object] = {}
     generic_reason = (
         "pre-existing dirty path excluded unchanged because "
-        "publication_mode_hint requires own_only"
+        "publication_mode_hint requires deferred residual handling"
     )
     for key in ("agents_vault", "user_vault"):
         manifest = result.get(key)
         state = pre.get(key)
         if not isinstance(manifest, dict) or not isinstance(state, dict):
             raise ReviewError("own-only normalization input is malformed")
+        declared_mode = manifest.get("publication_mode")
+        floor = (mode_floor or {}).get(key, "sweep")
         should_normalize = (
-            manifest.get("publication_mode") == "own_only"
-            and manifest.get("core_review_status") == "quality_ok"
-            and manifest.get("review_or_validation_status") == "quality_ok"
-            and manifest.get("residual_review_status") == "deferred"
+            (
+                declared_mode == "own_only"
+                and manifest.get("core_review_status") == "quality_ok"
+                and manifest.get("review_or_validation_status") == "quality_ok"
+                and manifest.get("residual_review_status") == "deferred"
+            )
+            or (
+                floor in {"own_only", "blocked"}
+                and declared_mode == "blocked"
+                and manifest.get("residual_review_status") in {"deferred", "blocked"}
+            )
         )
         if not should_normalize:
-            receipt[key] = {"normalized": False, "dirty_path_count": 0}
+            receipt[key] = {
+                "normalized": False,
+                "dirty_path_count": 0,
+                "mode": declared_mode,
+                "mode_floor": floor,
+            }
             continue
 
         dirty_paths = state.get("dirty_paths")
@@ -412,6 +429,8 @@ def normalize_own_only_residuals(
         ]
         receipt[key] = {
             "normalized": True,
+            "mode": declared_mode,
+            "mode_floor": floor,
             "dirty_path_count": len(ordered_paths),
             "supplied_excluded_count": len(supplied_lists["excluded_paths"]),
             "supplied_unrelated_count": len(
@@ -419,6 +438,76 @@ def normalize_own_only_residuals(
             ),
             "supplied_reason_count": original_reason_count,
             "filled_reason_count": len(ordered_paths) - original_reason_count,
+        }
+    return result, receipt
+
+
+def normalize_sealed_local_history(
+    review: dict[str, object],
+    pre: dict[str, object],
+    materialization: dict[str, object],
+    mode_floor: dict[str, str],
+) -> tuple[dict[str, object], dict[str, object]]:
+    """Restore exact local-ahead commit identity omitted from the projection.
+
+    ``approved_existing_commits`` is a copy-only binding, not a reviewer
+    judgment.  When a bounded projection omitted ``local_commits`` or a
+    nested ``changed_paths`` array, the reviewer can still choose the required
+    ``own_only``/``blocked`` mode without reproducing an unbounded history.
+    The complete version-4 snapshot is the sole source for the restored
+    identity; the final validator continues to compare it with the pre-state.
+    """
+    result = deepcopy(review)
+    receipt: dict[str, object] = {}
+    materialized_commits = materialization.get("local_commits")
+    if not isinstance(materialized_commits, dict):
+        raise ReviewError("local history materialization manifest is malformed")
+    for key in ("agents_vault", "user_vault"):
+        manifest = result.get(key)
+        state = pre.get(key)
+        floor = mode_floor.get(key)
+        if not isinstance(manifest, dict) or not isinstance(state, dict):
+            raise ReviewError("local history normalization input is malformed")
+        declared_mode = manifest.get("publication_mode")
+        source = state.get("local_commits", [])
+        materialized = materialized_commits.get(key)
+        if (
+            not isinstance(source, list)
+            or not isinstance(materialized, list)
+            or len(source) != len(materialized)
+        ):
+            raise ReviewError("local history normalization count mismatch")
+
+        should_normalize = (
+            floor in {"own_only", "blocked"}
+            and declared_mode in {"own_only", "blocked"}
+        )
+        supplied = manifest.get("approved_existing_commits")
+        if not isinstance(supplied, list):
+            raise ReviewError("approved existing commits are not a list")
+        if not should_normalize:
+            receipt[key] = {
+                "normalized": False,
+                "mode": declared_mode,
+                "mode_floor": floor,
+                "supplied_count": len(supplied),
+                "restored_count": 0,
+            }
+            continue
+
+        expected: list[dict[str, object]] = []
+        for commit, material in zip(source, materialized):
+            if not isinstance(commit, dict) or not isinstance(material, dict):
+                raise ReviewError("local history normalization entry is malformed")
+            expected.append({**commit, "patch_sha256": material.get("patch_sha256")})
+        manifest["approved_existing_commits"] = expected
+        receipt[key] = {
+            "normalized": supplied != expected,
+            "mode": declared_mode,
+            "mode_floor": floor,
+            "supplied_count": len(supplied),
+            "restored_count": len(expected),
+            "source": "sealed_version4_snapshot",
         }
     return result, receipt
 
@@ -524,10 +613,10 @@ def write_exclusive_json(path: Path, value: object) -> bytes:
 
 def canonicalize_own_only_main(argv: list[str]) -> int:
     """Write a sealed structural projection while preserving the raw review."""
-    if len(argv) != 7:
+    if len(argv) != 9:
         print(
             "usage: validate-publication-review.py --canonicalize-own-only "
-            "RAW_REVIEW CONTEXT PRE_STATE OUTPUT RECEIPT",
+            "RAW_REVIEW CONTEXT PRE_STATE OUTPUT RECEIPT METRICS METRICS_SHA",
             file=sys.stderr,
         )
         return 64
@@ -537,6 +626,8 @@ def canonicalize_own_only_main(argv: list[str]) -> int:
         pre_path = Path(argv[4])
         output_path = Path(argv[5])
         receipt_path = Path(argv[6])
+        metrics_path = Path(argv[7])
+        metrics_digest = argv[8]
         if not (
             raw_path.parent == output_path.parent == receipt_path.parent
             and len({raw_path.name, output_path.name, receipt_path.name}) == 3
@@ -553,9 +644,15 @@ def canonicalize_own_only_main(argv: list[str]) -> int:
             raise ReviewError("raw review context digest mismatch")
         if pre != context.get("pre_collection_state"):
             raise ReviewError("normalization pre-state differs from reviewed context")
+        mode_floor = validate_review_input_contract(
+            metrics_path, metrics_digest, context_path
+        )
         materialization = validate_dirty_snapshots(context, pre)
+        normalized, history_normalization = normalize_sealed_local_history(
+            raw, pre, materialization, mode_floor
+        )
         normalized, residual_normalization = normalize_own_only_residuals(
-            raw, context, pre, materialization
+            normalized, context, pre, materialization, mode_floor
         )
         normalized, evidence_normalization = normalize_sealed_validation_evidence(
             normalized, context, pre
@@ -574,6 +671,7 @@ def canonicalize_own_only_main(argv: list[str]) -> int:
             "raw_review_sha256": hashlib.sha256(raw_bytes).hexdigest(),
             "canonical_review_sha256": hashlib.sha256(normalized_bytes).hexdigest(),
             "publication_context_sha256": context_digest,
+            "local_history": history_normalization,
             "vaults": residual_normalization,
             "validation_evidence": evidence_normalization,
         }

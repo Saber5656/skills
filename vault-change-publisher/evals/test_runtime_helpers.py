@@ -10672,6 +10672,88 @@ def load_environment(*, checkout_root, environ, require_catalog):
         self.assertTrue(projected_history["omitted"])
         self.assertEqual(projected_history["count"], 200)
 
+    def test_review_context_marks_nested_history_paths_blocked(self) -> None:
+        """Nested changed_paths omission must never downgrade history to own_only."""
+        state = {
+            "history_relation": "local_ahead",
+            "local_commits": [{
+                "commit": "a" * 40,
+                "parents": ["b" * 40],
+                "tree": "c" * 40,
+                "message": "fixture commit",
+                "changed_paths": [f"path-{index:04d}.md" for index in range(200)],
+            }],
+            "index_entries": [],
+        }
+        envelope = {
+            "publication_context_sha256": "d" * 64,
+            "publication_context_projection": "review_bounded_v2",
+            "publication_context": {"pre_collection_state": {
+                "agents_vault": state,
+                "user_vault": {"history_relation": "equal", "local_commits": []},
+            }},
+        }
+        paths = {
+            "envelope": self.workdir / "nested-history-envelope.json",
+            "prompt": self.workdir / "nested-history.prompt.md",
+            "context": self.workdir / "nested-history-context.json",
+            "request": self.workdir / "nested-history-request.txt",
+            "metrics": self.workdir / "nested-history-metrics.json",
+        }
+        paths["envelope"].write_text(json.dumps(envelope), encoding="utf-8")
+        paths["prompt"].write_text("Review.", encoding="utf-8")
+        REVIEW_CONTEXT_MODULE.prepare(
+            paths["envelope"], paths["prompt"], paths["context"],
+            paths["request"], paths["metrics"],
+        )
+        metrics = json.loads(paths["metrics"].read_text(encoding="utf-8"))
+        projected = json.loads(paths["context"].read_text(encoding="utf-8"))
+        projected_paths = projected["publication_context"]["pre_collection_state"][
+            "agents_vault"
+        ]["local_commits"][0]["changed_paths"]
+        self.assertTrue(projected_paths["omitted"])
+        self.assertEqual(metrics["mode_floor"]["agents_vault"], "blocked")
+        self.assertIn("agents_vault", metrics["history_review_budget_vaults"])
+
+    def test_review_context_marks_long_history_message_blocked(self) -> None:
+        """A clipped commit message is sealed history, not a schema-shaped dict."""
+        state = {
+            "history_relation": "local_ahead",
+            "local_commits": [{
+                "commit": "a" * 40,
+                "parents": ["b" * 40],
+                "tree": "c" * 40,
+                "message": "x" * (REVIEW_CONTEXT_MODULE.MAX_COMMIT_MESSAGE_CHARS + 1),
+                "changed_paths": ["path.md"],
+            }],
+            "index_entries": [],
+        }
+        envelope = {
+            "publication_context_sha256": "e" * 64,
+            "publication_context_projection": "review_bounded_v2",
+            "publication_context": {"pre_collection_state": {
+                "agents_vault": state,
+                "user_vault": {"history_relation": "equal", "local_commits": []},
+            }},
+        }
+        envelope_path = self.workdir / "long-message-envelope.json"
+        prompt_path = self.workdir / "long-message.prompt.md"
+        context_path = self.workdir / "long-message-context.json"
+        request_path = self.workdir / "long-message-request.txt"
+        metrics_path = self.workdir / "long-message-metrics.json"
+        envelope_path.write_text(json.dumps(envelope), encoding="utf-8")
+        prompt_path.write_text("Review.", encoding="utf-8")
+        REVIEW_CONTEXT_MODULE.prepare(
+            envelope_path, prompt_path, context_path, request_path, metrics_path
+        )
+        metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+        projected_commit = json.loads(context_path.read_text(encoding="utf-8"))["publication_context"][
+            "pre_collection_state"
+        ]["agents_vault"]["local_commits"][0]
+        self.assertIsInstance(projected_commit["message"], dict)
+        self.assertEqual(metrics["mode_floor"]["agents_vault"], "blocked")
+        self.assertIn("agents_vault", metrics["history_review_budget_vaults"])
+
     def test_review_input_mode_floor_is_enforced_by_validator(self) -> None:
         """A bounded residual projection cannot be approved as an unsafe sweep."""
         context_path = self.workdir / "floor-context.json"
@@ -10804,6 +10886,7 @@ def load_environment(*, checkout_root, environ, require_catalog):
             SCRIPTS / "stage-standing-task.py",
             SCRIPTS / "stage-dirty-review-inputs.py",
             SCRIPTS / "prepare-publication-review-context.py",
+            SCRIPTS / "run-pinned-review.py",
             SCRIPTS / "interpret-automation-result.sh",
             REPO_ROOT / "summarize-it-news" / "scripts" / "collect-public-sources.py",
             SOURCE_CATALOG,
@@ -10973,6 +11056,9 @@ if stage=="review":
     log_path=Path(context["publication_context_file"]).parent.parent/"invocations.log"
 with log_path.open("a") as log:
     log.write(stage+"\\n")
+if stage=="evidence_review" and os.environ.get("FAKE_EVIDENCE_REVIEW_INPUT_TOO_LARGE") == "1":
+    print("input exceeds maximum length", file=sys.stderr)
+    raise SystemExit(75)
 if "--search" in args:
     staging=Path(context["collection_output_root"])
     standing=Path(context["standing_task"])
@@ -11416,6 +11502,16 @@ if stage=="collection" and os.environ.get("FAKE_SNAPSHOT_RAW_COLLECTION") == "1"
         publication_results = list(runtime.glob("logs/**/publication-result.json"))
         self.assertEqual(len(publication_results), 1)
         publication_result = json.loads(publication_results[0].read_text())
+        self.assertEqual(
+            publication_result["evidence_review"]["reason_code"], "approved"
+        )
+        self.assertEqual(publication_result["evidence_review"]["process_status"], 0)
+        self.assertEqual(publication_result["evidence_review"]["status"], 0)
+        self.assertTrue(publication_result["evidence_review"]["result_present"])
+        self.assertRegex(
+            publication_result["evidence_review"]["stderr_sha256"],
+            r"^[0-9a-f]{64}$",
+        )
         self.assertIn(
             local_ahead_commit, publication_result["user_vault"]["commit_hashes"]
         )
@@ -11723,6 +11819,37 @@ if stage=="collection" and os.environ.get("FAKE_SNAPSHOT_RAW_COLLECTION") == "1"
         subprocess.run(["chmod", "-R", "u+w", str(runtime / "logs")], check=True)
         shutil.rmtree(runtime / "logs")
         (runtime / "last-status.txt").unlink()
+        oversized_evidence_before = standing.read_bytes()
+        oversized_evidence_stat = standing.stat()
+        oversized_evidence = subprocess.run(
+            [str(runtime / "run-daily-it-news-vulnerability-check.sh")],
+            check=False,
+            env={
+                **os.environ,
+                "PATH": os.environ["PATH"],
+                "FAKE_EVIDENCE_REVIEW_INPUT_TOO_LARGE": "1",
+            },
+        )
+        self.assertEqual(oversized_evidence.returncode, 75)
+        oversized_results = list(runtime.glob("logs/**/publication-result.json"))
+        self.assertEqual(len(oversized_results), 1)
+        oversized_result = json.loads(
+            oversized_results[0].read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            oversized_result["evidence_review"]["reason_code"], "input_too_large"
+        )
+        self.assertEqual(oversized_result["evidence_review"]["process_status"], 75)
+        self.assertEqual(oversized_result["evidence_review"]["status"], 75)
+        self.assertFalse(oversized_result["evidence_review"]["result_present"])
+        self.assertIsNone(oversized_result["evidence_review"]["result_sha256"])
+        self.assertEqual(standing.read_bytes(), oversized_evidence_before)
+        self.assertEqual(standing.stat().st_mode, oversized_evidence_stat.st_mode)
+        self.assertEqual(standing.stat().st_mtime_ns, oversized_evidence_stat.st_mtime_ns)
+
+        subprocess.run(["chmod", "-R", "u+w", str(runtime / "logs")], check=True)
+        shutil.rmtree(runtime / "logs")
+        (runtime / "last-status.txt").unlink()
         evidence_rejection_before = standing.read_bytes()
         evidence_rejection_stat = standing.stat()
         rejected_evidence = subprocess.run(
@@ -11735,6 +11862,14 @@ if stage=="collection" and os.environ.get("FAKE_SNAPSHOT_RAW_COLLECTION") == "1"
             },
         )
         self.assertEqual(rejected_evidence.returncode, 75)
+        rejected_results = list(runtime.glob("logs/**/publication-result.json"))
+        self.assertEqual(len(rejected_results), 1)
+        rejected_result = json.loads(rejected_results[0].read_text(encoding="utf-8"))
+        self.assertEqual(
+            rejected_result["evidence_review"]["reason_code"], "result_rejected"
+        )
+        self.assertEqual(rejected_result["evidence_review"]["status"], 75)
+        self.assertTrue(rejected_result["evidence_review"]["result_present"])
         self.assertEqual(standing.read_bytes(), evidence_rejection_before)
         self.assertEqual(standing.stat().st_mode, evidence_rejection_stat.st_mode)
         self.assertEqual(
