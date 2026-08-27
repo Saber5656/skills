@@ -62,6 +62,7 @@ launchd 04:00
 | `scripts/validate-canonical-result.py` | same workdir |
 | `scripts/stage-standing-task.py` | same workdir |
 | `scripts/stage-dirty-review-inputs.py` | same workdir |
+| `scripts/prepare-publication-review-context.py` | same workdir |
 | `scripts/interpret-automation-result.sh` | same workdir |
 
 配備はPR前受入とmerge後releaseの二段階で行う。PR前受入では、独立review済みのfrozen task-branch sourceをbackup付きでcanonical production runtimeへcopyし、各source/destinationのSHA-256とfile mode一致を確認する。task worktreeをproduction runtime pathとして参照しない。実環境E2E成功後だけsource commit/push/PRへ進み、merge後は最新mainの同一filesを再配備する。特にdirect executionされる`collect-public-sources.py`は、両段階でtracked sourceとruntimeの双方がexecutableであることをgateで検証する。
@@ -76,7 +77,7 @@ collection agent出力は`collection-agent-result.json`、元summary、元adviso
 
 authorization taskはnetwork-enabled collection終了後に別のreview input directoryへ0600・exclusive createし、no-network publication phaseへsnapshot pathだけを渡す。collection processからauthorization evidenceを参照可能にしない。
 
-Codexへ渡すpromptはCLI引数へ展開せずstdinから供給し、macOSのargument-size上限に依存しない。publication/evidence reviewへinlineするcontextは、deterministic helperが使用する完全なcontext fileのSHA-256を保持したまま、review判断に不要な全tracked pathの`index_entries`列だけを除いたbounded projectionとする。reviewは`index_sha256`、staged path、dirty/history metadata、sealed snapshotを使い、完全なindex列をLLM contextへ複製しない。`index_sha256`と`index_identity`はatomic shared-index CASのraw file contractとして保持するが、Gitのread-only commandが更新し得るstat-cache serializationなので、carry/replan時のsemantic staged-state identityには使わない。semantic staged-stateは`staged_paths`とcanonical `index_entries`で比較する。
+Codexへ渡すpromptはCLI引数へ展開せずstdinから供給し、macOSのargument-size上限に依存しない。publication/evidence reviewへinlineするcontextは、完全なdigest-bound context fileを保持したまま、`prepare-publication-review-context.py`が上限付きprojectionへ変換する。`index_entries`は常に省略し、dirty/history residual配列が大きい場合はcount・SHA-256・bounded sampleへ縮約する。省略対象とrequestの文字数・bytes・prompt/projection内訳はrun rootのmetricsへ記録し、projectionがresidualを省略したVaultはreviewerが`sweep`を承認せず`own_only`へ切り替える。local-ahead historyの省略は安全なancestor検証ができないため当該Vaultを`blocked`にする。metricsのSHA-256とpublication context digestは`validate-publication-review.py`が再検証し、このmode floorを弱めるreview resultを拒否する。reviewは`index_sha256`、staged path、dirty/history digest、sealed snapshotを使い、完全なindex/residual列をLLM contextへ複製しない。`index_sha256`と`index_identity`はatomic shared-index CASのraw file contractとして保持するが、Gitのread-only commandが更新し得るstat-cache serializationなので、carry/replan時のsemantic staged-state identityには使わない。semantic staged-stateは`staged_paths`とcanonical `index_entries`で比較する。
 
 publication reviewのagent出力は`publication-review-agent-result.json`として不変保持し、canonical resultとSHA-256 normalization receiptを別fileへexclusive createする。agentが`own_only + quality_ok/deferred`を選んだVaultだけ、runnerは封印済みpre-stateとdirty snapshot manifestから全dirty pathを復元し、residual三配列の不足列挙を決定論的に補完する。既存reasonはexact dirty path、unique、nonemptyの場合だけ採用し、guardがdeferしたentryはsealed `materialization_reason`を優先する。外部path、重複、snapshot/context driftでは補完せず停止する。core review、mode、owned/commit/history/artifact bindingは変更対象外であり、canonical schemaとsemantic validatorを再通過したresultだけがpublication authorityになる。
 

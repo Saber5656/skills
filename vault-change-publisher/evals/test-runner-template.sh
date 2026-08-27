@@ -10,6 +10,7 @@ REPO_ROOT="$SCRIPT_DIR/../.."
 /usr/bin/grep -F -- 'daily-it-news.review.prompt.md' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- 'commit-reviewed-publication.py' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- 'daily-it-news.evidence-review.prompt.md' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- 'prepare-publication-review-context.py' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- '--add-dir "$STAGING_ROOT"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- 'COLLECTION_FETCHER="$WORKDIR/collect-public-sources.py"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- 'SOURCE_CATALOG="$WORKDIR/it-news-sources.json"' "$RUNNER" >/dev/null
@@ -49,7 +50,7 @@ for required_name in \
   commit-push-publication-evidence.py evidence_hunk.py git_diff_digest.py \
   isolated_git_transport.py atomic_file_ops.py trusted_gitleaks.py gitleaks-default.toml \
   prepare-codex-output-schema.py validate-canonical-result.py \
-  stage-standing-task.py stage-dirty-review-inputs.py \
+  stage-standing-task.py stage-dirty-review-inputs.py prepare-publication-review-context.py \
   daily-it-news.collect.prompt.md daily-it-news.review.prompt.md \
   daily-it-news.evidence-review.prompt.md collection-result.schema.json \
   publication-review-result.schema.json publication-commit-result.schema.json \
@@ -80,7 +81,7 @@ fi
 COLLECTION_BLOCK="$(sed -n '/CODEX_BIN.*--search/,/COLLECTION_STATUS=/p' "$RUNNER")"
 REVIEW_BLOCK="$(sed -n '/^"\$CODEX_BIN" -a never exec/,/REVIEW_STATUS=/p' "$RUNNER" | sed -n '1,/REVIEW_STATUS=/p')"
 PUBLICATION_BLOCK="$(sed -n '/^"\$LOCAL_COMMITTER"/,/PUBLICATION_STATUS=/p' "$RUNNER")"
-EVIDENCE_REVIEW_BLOCK="$(sed -n '/EVIDENCE_REVIEW_PROMPT_CONTENT=/,/EVIDENCE_REVIEW_STATUS=/p' "$RUNNER")"
+EVIDENCE_REVIEW_BLOCK="$(sed -n '/EVIDENCE_REVIEW_ENVELOPE=/,/EVIDENCE_REVIEW_STATUS=/p' "$RUNNER")"
 
 if print -r -- "$COLLECTION_BLOCK" | /usr/bin/grep -E 'AGENTS_GIT_DIR|USER_GIT_DIR|AGENTS_ROOT|USER_ROOT' >/dev/null; then
   echo "collection block contains Vault publication privileges" >&2
@@ -114,8 +115,8 @@ if ! print -r -- "$REVIEW_BLOCK" | /usr/bin/grep -F -- '--sandbox read-only' >/d
   echo "publication review must be read-only" >&2
   exit 1
 fi
-if ! print -r -- "$REVIEW_BLOCK" | /usr/bin/grep -F -- '<<< "$REVIEW_PROMPT_CONTENT"' >/dev/null; then
-  echo "publication review prompt must use stdin instead of argv" >&2
+if ! print -r -- "$REVIEW_BLOCK" | /usr/bin/grep -F -- '< "$REVIEW_REQUEST_FILE"' >/dev/null; then
+  echo "publication review prompt must use a bounded stdin request file" >&2
   exit 1
 fi
 if ! print -r -- "$REVIEW_BLOCK" | /usr/bin/grep -F -- '--output-last-message "$REVIEW_AGENT_RESULT"' >/dev/null; then
@@ -134,14 +135,17 @@ if ! print -r -- "$EVIDENCE_REVIEW_BLOCK" | /usr/bin/grep -F -- '--sandbox read-
   echo "evidence finalization review must be read-only" >&2
   exit 1
 fi
-if ! print -r -- "$EVIDENCE_REVIEW_BLOCK" | /usr/bin/grep -F -- '<<< "$EVIDENCE_REVIEW_PROMPT_CONTENT"' >/dev/null; then
-  echo "evidence review prompt must use stdin instead of argv" >&2
+if ! print -r -- "$EVIDENCE_REVIEW_BLOCK" | /usr/bin/grep -F -- '< "$EVIDENCE_REVIEW_REQUEST_FILE"' >/dev/null; then
+  echo "evidence review prompt must use a bounded stdin request file" >&2
   exit 1
 fi
 /usr/bin/grep -F -- '"$REVIEW_RESULT"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- '"$REVIEW_RESULT_SHA256"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- '"$REVIEW_AGENT_RESULT"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- '"$REVIEW_NORMALIZATION_RECEIPT"' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- 'REVIEW_INPUT_METRICS_FILE' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- 'REVIEW_INPUT_METRICS_SHA256' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- 'EVIDENCE_REVIEW_INPUT_METRICS_SHA256' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- '"$REVIEW_VALIDATOR" --canonicalize-own-only' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- '"$COLLECTION_VALIDATOR" --canonicalize-constraints' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- '"$PUBLICATION_CONTEXT_FILE"' "$RUNNER" >/dev/null

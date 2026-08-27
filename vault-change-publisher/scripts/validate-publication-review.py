@@ -20,6 +20,10 @@ class ReviewError(RuntimeError):
 
 
 VOLATILE_INDEX_FIELDS = frozenset({"index_sha256", "index_identity"})
+REVIEW_REQUEST_LIMIT_CHARS = 900_000
+REVIEW_REQUEST_LIMIT_BYTES = 900_000
+REVIEW_VAULTS = frozenset({"agents_vault", "user_vault"})
+REVIEW_MODE_RANK = {"sweep": 0, "own_only": 1, "blocked": 2}
 
 
 def same_semantic_vault_state(
@@ -73,6 +77,70 @@ def read_regular_nofollow(path: Path) -> bytes:
 def sha256_regular_nofollow(path: Path) -> str:
     """Hash one stable regular snapshot."""
     return hashlib.sha256(read_regular_nofollow(path)).hexdigest()
+
+
+def validate_review_input_contract(
+    metrics_path: Path,
+    expected_metrics_digest: str,
+    context_path: Path,
+) -> dict[str, str]:
+    """Verify bounded review metrics and derive its deterministic mode floor."""
+    metrics_bytes = read_regular_nofollow(metrics_path)
+    if hashlib.sha256(metrics_bytes).hexdigest() != expected_metrics_digest:
+        raise ReviewError("review input metrics digest mismatch")
+    try:
+        metrics = json.loads(metrics_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ReviewError("review input metrics are unreadable") from exc
+    if not isinstance(metrics, dict) or metrics.get("status") != "ready":
+        raise ReviewError("review input metrics are not ready")
+    if metrics.get("publication_context_projection") != "review_bounded_v2":
+        raise ReviewError("review input projection version is invalid")
+    if metrics.get("publication_context_sha256") != sha256_regular_nofollow(
+        context_path
+    ):
+        raise ReviewError("review input metrics context digest mismatch")
+    for field in ("request_chars", "request_bytes"):
+        value = metrics.get(field)
+        if type(value) is not int or value < 0:
+            raise ReviewError("review input metrics size is invalid")
+    if (
+        metrics["request_chars"] > REVIEW_REQUEST_LIMIT_CHARS
+        or metrics["request_bytes"] > REVIEW_REQUEST_LIMIT_BYTES
+    ):
+        raise ReviewError("review input metrics exceed the configured request limit")
+
+    def bounded_vault_list(field: str) -> list[str]:
+        values = metrics.get(field)
+        if (
+            not isinstance(values, list)
+            or any(not isinstance(value, str) or value not in REVIEW_VAULTS for value in values)
+            or values != sorted(set(values))
+        ):
+            raise ReviewError(f"review input metrics {field} is invalid")
+        return values
+
+    residual_vaults = bounded_vault_list("residual_review_budget_vaults")
+    history_vaults = bounded_vault_list("history_review_budget_vaults")
+    expected_floor = {"agents_vault": "sweep", "user_vault": "sweep"}
+    for vault in history_vaults:
+        expected_floor[vault] = "blocked"
+    for vault in residual_vaults:
+        if expected_floor[vault] == "sweep":
+            expected_floor[vault] = "own_only"
+    mode_floor = metrics.get("mode_floor")
+    if mode_floor != expected_floor:
+        raise ReviewError("review input metrics mode floor is inconsistent")
+    if any(mode not in REVIEW_MODE_RANK for mode in mode_floor.values()):
+        raise ReviewError("review input metrics mode floor is invalid")
+    omitted_fields = metrics.get("omitted_fields")
+    if (
+        not isinstance(omitted_fields, list)
+        or any(not isinstance(field, str) or not field for field in omitted_fields)
+        or omitted_fields != sorted(set(omitted_fields))
+    ):
+        raise ReviewError("review input metrics omitted fields are invalid")
+    return mode_floor
 
 
 def read_regular_beneath(root: Path, relative: PurePosixPath) -> bytes:
@@ -640,6 +708,7 @@ def validate_manifest(
     materialized_dirty: Optional[list[dict[str, object]]] = None,
     materialized_commits: Optional[list[dict[str, object]]] = None,
     carried: bool = False,
+    mode_floor: str = "sweep",
 ) -> None:
     """Bind one layered review manifest to state and one planned artifact."""
     if manifest["repo_root"] != repo_root or manifest["task_id"] != task_id:
@@ -734,8 +803,17 @@ def validate_manifest(
         raise ReviewError("carried artifact hint is inconsistent")
     if carried and (mode != "own_only" or required_mode != "own_only"):
         raise ReviewError("carried artifact must remain in own_only mode")
-    rank = {"sweep": 0, "own_only": 1, "blocked": 2}
-    if mode not in rank or required_mode not in rank or rank[mode] < rank[required_mode]:
+    if mode_floor not in REVIEW_MODE_RANK:
+        raise ReviewError("review input mode floor is invalid")
+    effective_required_mode = max(
+        (required_mode, mode_floor),
+        key=lambda candidate: REVIEW_MODE_RANK.get(candidate, 99),
+    )
+    if (
+        mode not in REVIEW_MODE_RANK
+        or required_mode not in REVIEW_MODE_RANK
+        or REVIEW_MODE_RANK[mode] < REVIEW_MODE_RANK[effective_required_mode]
+    ):
         raise ReviewError("review mode weakens the deterministic mode hint")
     if materialized_dirty is None:
         materialized_dirty = [
@@ -877,9 +955,9 @@ def main(argv: list[str]) -> int:
     """Validate the approved review and return a fail-closed status."""
     if len(argv) > 1 and argv[1] == "--canonicalize-own-only":
         return canonicalize_own_only_main(argv)
-    if len(argv) != 7:
+    if len(argv) != 9:
         print(
-            "usage: validate-publication-review.py REVIEW CONTEXT PRE_STATE PLAN AUTH_SHA REVIEW_SHA",
+            "usage: validate-publication-review.py REVIEW CONTEXT PRE_STATE PLAN AUTH_SHA REVIEW_SHA METRICS METRICS_SHA",
             file=sys.stderr,
         )
         return 64
@@ -901,6 +979,9 @@ def main(argv: list[str]) -> int:
             raise ReviewError("authorization evidence digest mismatch")
         if sha256_regular_nofollow(Path(context["authorization_task"])) != argv[5]:
             raise ReviewError("authorization snapshot digest mismatch")
+        mode_floor = validate_review_input_contract(
+            Path(argv[7]), argv[8], Path(argv[2])
+        )
         materialization = validate_dirty_snapshots(context, pre)
         carried_vaults = validate_carried_commit_result(context, pre, plan)
         manifest = context["publication_manifest"]["artifact_manifest"]
@@ -921,6 +1002,7 @@ def main(argv: list[str]) -> int:
             materialization["vaults"]["agents_vault"],
             materialization["local_commits"]["agents_vault"],
             "agents_vault" in carried_vaults,
+            mode_floor["agents_vault"],
         )
         validate_manifest(
             review["user_vault"],
@@ -938,6 +1020,7 @@ def main(argv: list[str]) -> int:
             materialization["vaults"]["user_vault"],
             materialization["local_commits"]["user_vault"],
             "user_vault" in carried_vaults,
+            mode_floor["user_vault"],
         )
         validate_root_contract(review)
     except (

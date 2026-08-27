@@ -664,6 +664,22 @@
       "expected_output": "raw result、summary、advisoryを不変の監査証拠として保持する。trusted verifier後、sealed evidenceがfetchedまたはverified fallbackで、raw statusが`取得済み`/`対象期間記事なし`のどちらかであるrowだけを対象に、件数cellを変更せず0件を`対象期間記事なし`、正数を`取得済み`へ決定論的に投影する。アクセス制約との相互変換や件数・method・URL・reason・記事内容は補正しない。status correctionをreceiptへdigest-bound記録し、canonical summary hashに合わせて検証済みadvisory参照hashだけを更新する。件数はsealed date evidenceで再照合し、不一致ならfail closedする。完全semantic validation通過後にpublicationを続行する。",
       "files": [],
       "expectations": ["preserves raw collection result summary and advisory bytes mode and mtime", "runs only after raw schema and trusted resolution verification", "authorizes status projection only for fetched or verified fallback sources", "maps zero to no-period-article and positive counts to fetched without changing the count", "never converts to or from access constraint status", "does not change method URL reason article content or any other cell", "records exact status corrections and sealed evidence bindings in the receipt", "updates exactly one already-validated advisory same-run summary digest reference", "keeps sealed date evidence authoritative for the unchanged item count", "rejects missing duplicate foreign unauthorized-status or malformed-count rows", "passes canonical schema and full semantic validation before publication", "allows publication to continue after the minimal status projection"]
+    },
+    {
+      "id": 88,
+      "name": "bounded_review_input_survives_large_dirty_snapshot",
+      "prompt": "Agents Vaultのdirty path・metadata・indexが大きく、publication review requestがCodexの1 MiB入力上限を超えそうです。完全なdigest-bound contextとsealed evidenceを保持したまま、reviewを実行可能な入力へ変換してください。",
+      "expected_output": "完全contextはvalidator用に不変保持し、model向けrequestだけをdeterministic bounded projectionへ縮約する。index_entriesは常に省略し、large residualはcount・SHA-256・bounded sampleへ置換してown_only/blockedの判断境界を明示し、prompt・projection・requestの文字数とbytesをmetricsへ記録する。",
+      "files": [],
+      "expectations": ["keeps the complete digest-bound context outside the model prompt", "keeps the review request below the configured character and byte limits", "omits exhaustive index_entries without omitting its digest binding", "summarizes large dirty residuals with count digest and bounded sample", "marks omitted local-ahead history as blocked rather than silently approving sweep", "records component sizes and omitted fields in immutable metrics", "passes the request through stdin instead of argv"]
+    },
+    {
+      "id": 89,
+      "name": "small_review_residuals_remain_exact",
+      "prompt": "dirty residualが少ない通常runのpublication reviewを実行してください。既存のsweep/own_only判定とpublication manifestのidentity bindingを維持しながら、review用projectionを作成してください。",
+      "expected_output": "小さなdirty/history配列は完全にinlineされ、index_entriesだけが省略される。publication manifestのpre-state重複は参照へ置き換え、full contextのSHA-256とartifact planはそのままreviewへ渡す。",
+      "files": [],
+      "expectations": ["preserves small residual arrays exactly", "omits index_entries in every Vault state", "retains publication context and artifact-plan digest bindings", "removes duplicated publication-manifest pre-state without changing the full context file", "uses the same bounded stdin request path as the large-snapshot case"]
     }
   ]
 }

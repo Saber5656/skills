@@ -97,6 +97,13 @@ MODE_SPEC = importlib.util.spec_from_file_location(
 assert MODE_SPEC and MODE_SPEC.loader
 MODE_MODULE = importlib.util.module_from_spec(MODE_SPEC)
 MODE_SPEC.loader.exec_module(MODE_MODULE)
+REVIEW_CONTEXT_SPEC = importlib.util.spec_from_file_location(
+    "prepare_publication_review_context",
+    SCRIPTS / "prepare-publication-review-context.py",
+)
+assert REVIEW_CONTEXT_SPEC and REVIEW_CONTEXT_SPEC.loader
+REVIEW_CONTEXT_MODULE = importlib.util.module_from_spec(REVIEW_CONTEXT_SPEC)
+REVIEW_CONTEXT_SPEC.loader.exec_module(REVIEW_CONTEXT_MODULE)
 COLLECTION_VALIDATOR_SPEC = importlib.util.spec_from_file_location(
     "validate_collection_result", SCRIPTS / "validate-collection-result.py"
 )
@@ -10449,6 +10456,317 @@ def load_environment(*, checkout_root, environ, require_catalog):
                 dirty_manifest,
             )
 
+    def test_review_context_bounds_large_residual_snapshot(self) -> None:
+        """Large residual state must not exceed the model request boundary."""
+        def state(dirty_count: int, include_history: bool = False) -> dict[str, object]:
+            paths = [f"01-Projects/task-{index:05d}.md" for index in range(dirty_count)]
+            entries = [
+                {
+                    "path": path,
+                    "git_blob_oid": f"{index:040x}",
+                    "mode": "100644",
+                }
+                for index, path in enumerate(paths)
+            ]
+            metadata = [
+                {
+                    "path": path,
+                    "exists": True,
+                    "size": index,
+                    "mtime_ns": index,
+                    "st_mode": 33188,
+                }
+                for index, path in enumerate(paths)
+            ]
+            return {
+                "capture_status": "available",
+                "capture_reason": None,
+                "repo_root": str(self.agents),
+                "branch": "main",
+                "upstream": "origin/main",
+                "local_head": "a" * 40,
+                "remote_head": "a" * 40,
+                "history_relation": "local_ahead" if include_history else "equal",
+                "local_commits": (
+                    [
+                        {
+                            "commit": "b" * 40,
+                            "parents": ["a" * 40],
+                            "tree": "c" * 40,
+                            "message": "fixture history",
+                            "changed_paths": paths,
+                        }
+                    ]
+                    if include_history
+                    else []
+                ),
+                "history_capture_status": "available",
+                "history_capture_reason": None,
+                "history_snapshot_sha256": "d" * 64,
+                "operation_in_progress": False,
+                "git_control_sha256": "e" * 64,
+                "dirty_lines": [f" M {path}" for path in paths],
+                "dirty_paths": paths,
+                "dirty_entries": entries,
+                "dirty_metadata": metadata,
+                "staged_paths": [],
+                "index_entries": [
+                    {"path": f"tracked-{index:05d}.md", "mode": "100644", "git_blob_oid": "f" * 40, "stage": 0}
+                    for index in range(dirty_count * 2)
+                ],
+                "index_sha256": "1" * 64,
+                "index_identity": [1, 2, 3, 4, 5, 6],
+                "dirty_worktree_sha256": "2" * 64,
+                "dirty_digest": "3" * 64,
+                "diff_snapshot_sha256": "4" * 64,
+            }
+
+        agents_state = state(2_000)
+        user_state = state(2)
+        full_context = {
+            "pre_collection_state": {
+                "agents_vault": agents_state,
+                "user_vault": user_state,
+            },
+            "artifact_plan": {"summary_target": "/tmp/summary.md", "advisory_target": "/tmp/advisory.md"},
+            "publication_manifest": {
+                "artifact_manifest": {
+                    "summary": {"role": "user_it_news_summary", "sha256": "5" * 64},
+                    "advisory": {"role": "agents_security_advisory", "sha256": "6" * 64},
+                },
+                "pre_collection_state": {
+                    "agents_vault": agents_state,
+                    "user_vault": user_state,
+                },
+            },
+            "carried_commit_result": None,
+        }
+        envelope = {
+            "publication_context_file": str(self.workdir / "publication-context.json"),
+            "publication_context_sha256": "7" * 64,
+            "publication_context_projection": "review_bounded_v2",
+            "publication_context": full_context,
+            "artifact_plan": full_context["artifact_plan"],
+            "review_schema": "publication-review-result.schema.json",
+        }
+        envelope_path = self.workdir / "review-envelope.json"
+        prompt_path = self.workdir / "review.prompt.md"
+        context_path = self.workdir / "review-context.json"
+        request_path = self.workdir / "review-request.txt"
+        metrics_path = self.workdir / "review-metrics.json"
+        envelope_path.write_text(json.dumps(envelope, ensure_ascii=False), encoding="utf-8")
+        prompt_path.write_text("Review the bounded context.", encoding="utf-8")
+        original_digest = hashlib.sha256(envelope_path.read_bytes()).hexdigest()
+
+        REVIEW_CONTEXT_MODULE.prepare(
+            envelope_path, prompt_path, context_path, request_path, metrics_path
+        )
+        metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+        projected = json.loads(context_path.read_text(encoding="utf-8"))
+        request = request_path.read_text(encoding="utf-8")
+
+        def assert_no_key(value: object, key: str) -> None:
+            if isinstance(value, dict):
+                self.assertNotIn(key, value)
+                for child in value.values():
+                    assert_no_key(child, key)
+            elif isinstance(value, list):
+                for child in value:
+                    assert_no_key(child, key)
+
+        assert_no_key(projected, "index_entries")
+        projected_agents = projected["publication_context"]["pre_collection_state"]["agents_vault"]
+        self.assertTrue(projected_agents["dirty_paths"]["omitted"])
+        self.assertEqual(projected_agents["dirty_paths"]["count"], 2_000)
+        self.assertIn("agents_vault", metrics["residual_review_budget_vaults"])
+        self.assertEqual(metrics["mode_floor"]["agents_vault"], "own_only")
+        self.assertEqual(metrics["mode_floor"]["user_vault"], "sweep")
+        self.assertEqual(metrics["status"], "ready")
+        self.assertLessEqual(metrics["request_chars"], REVIEW_CONTEXT_MODULE.MAX_REQUEST_CHARS)
+        self.assertLessEqual(metrics["request_bytes"], REVIEW_CONTEXT_MODULE.MAX_REQUEST_BYTES)
+        self.assertEqual(original_digest, hashlib.sha256(envelope_path.read_bytes()).hexdigest())
+        self.assertEqual(request.split("Runtime context JSON:\n", 1)[1].strip(), context_path.read_text(encoding="utf-8").strip())
+
+    def test_review_context_keeps_small_residuals_exact(self) -> None:
+        """Small residual arrays stay exact while the tracked index is omitted."""
+        state = {
+            "dirty_paths": ["tasks/standing.md"],
+            "dirty_entries": [{"path": "tasks/standing.md", "git_blob_oid": "a" * 40, "mode": "100644"}],
+            "dirty_metadata": [{"path": "tasks/standing.md", "exists": True, "size": 8, "mtime_ns": 1, "st_mode": 33188}],
+            "dirty_lines": [" M tasks/standing.md"],
+            "staged_paths": [],
+            "local_commits": [],
+            "index_entries": [{"path": "tracked.md", "mode": "100644", "git_blob_oid": "b" * 40, "stage": 0}],
+            "index_sha256": "c" * 64,
+        }
+        envelope = {
+            "publication_context_sha256": "d" * 64,
+            "publication_context_projection": "review_bounded_v2",
+            "publication_context": {
+                "pre_collection_state": {"agents_vault": state, "user_vault": state},
+                "publication_manifest": {"pre_collection_state": {"agents_vault": state, "user_vault": state}},
+            },
+        }
+        envelope_path = self.workdir / "small-envelope.json"
+        prompt_path = self.workdir / "small.prompt.md"
+        context_path = self.workdir / "small-context.json"
+        request_path = self.workdir / "small-request.txt"
+        metrics_path = self.workdir / "small-metrics.json"
+        envelope_path.write_text(json.dumps(envelope), encoding="utf-8")
+        prompt_path.write_text("Review.", encoding="utf-8")
+        REVIEW_CONTEXT_MODULE.prepare(
+            envelope_path, prompt_path, context_path, request_path, metrics_path
+        )
+        projected = json.loads(context_path.read_text(encoding="utf-8"))
+        projected_state = projected["publication_context"]["pre_collection_state"]["agents_vault"]
+        self.assertEqual(projected_state["dirty_paths"], ["tasks/standing.md"])
+        self.assertNotIn("index_entries", projected_state)
+        self.assertEqual(
+            projected["publication_context"]["publication_manifest"]["pre_collection_state"]["$ref"],
+            "publication_context.pre_collection_state",
+        )
+        self.assertEqual(json.loads(metrics_path.read_text())["projection_mode"], "inline_residuals_v1")
+
+    def test_review_context_marks_omitted_local_history_blocked(self) -> None:
+        """A local-ahead history budget must force blocked mode for that Vault."""
+        state = {
+            "history_relation": "local_ahead",
+            "local_commits": [
+                {
+                    "commit": f"{index:040x}",
+                    "parents": ["a" * 40],
+                    "tree": "b" * 40,
+                    "message": f"fixture commit {index}",
+                    "changed_paths": [f"path-{index:04d}.md"],
+                }
+                for index in range(200)
+            ],
+            "index_entries": [],
+        }
+        envelope = {
+            "publication_context_sha256": "e" * 64,
+            "publication_context_projection": "review_bounded_v2",
+            "publication_context": {
+                "pre_collection_state": {
+                    "agents_vault": state,
+                    "user_vault": {"history_relation": "equal", "local_commits": []},
+                }
+            },
+        }
+        envelope_path = self.workdir / "history-envelope.json"
+        prompt_path = self.workdir / "history.prompt.md"
+        context_path = self.workdir / "history-context.json"
+        request_path = self.workdir / "history-request.txt"
+        metrics_path = self.workdir / "history-metrics.json"
+        envelope_path.write_text(json.dumps(envelope), encoding="utf-8")
+        prompt_path.write_text("Review.", encoding="utf-8")
+        REVIEW_CONTEXT_MODULE.prepare(
+            envelope_path, prompt_path, context_path, request_path, metrics_path
+        )
+        metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+        self.assertIn("agents_vault", metrics["history_review_budget_vaults"])
+        self.assertEqual(metrics["mode_floor"]["agents_vault"], "blocked")
+        projected_history = json.loads(context_path.read_text(encoding="utf-8"))["publication_context"][
+            "pre_collection_state"
+        ]["agents_vault"]["local_commits"]
+        self.assertTrue(projected_history["omitted"])
+        self.assertEqual(projected_history["count"], 200)
+
+    def test_review_input_mode_floor_is_enforced_by_validator(self) -> None:
+        """A bounded residual projection cannot be approved as an unsafe sweep."""
+        context_path = self.workdir / "floor-context.json"
+        context_path.write_text(json.dumps({"context": "fixture"}), encoding="utf-8")
+        context_digest = hashlib.sha256(context_path.read_bytes()).hexdigest()
+        metrics = {
+            "version": 1,
+            "status": "ready",
+            "publication_context_projection": "review_bounded_v2",
+            "publication_context_sha256": context_digest,
+            "request_chars": 100,
+            "request_bytes": 100,
+            "residual_review_budget_vaults": ["agents_vault"],
+            "history_review_budget_vaults": [],
+            "mode_floor": {"agents_vault": "own_only", "user_vault": "sweep"},
+            "omitted_fields": [
+                "publication_context.pre_collection_state.agents_vault.dirty_paths"
+            ],
+        }
+        metrics_path = self.workdir / "floor-metrics.json"
+        metrics_path.write_text(json.dumps(metrics), encoding="utf-8")
+        metrics_digest = hashlib.sha256(metrics_path.read_bytes()).hexdigest()
+        self.assertEqual(
+            REVIEW_MODULE.validate_review_input_contract(
+                metrics_path, metrics_digest, context_path
+            ),
+            {"agents_vault": "own_only", "user_vault": "sweep"},
+        )
+
+        state = {
+            "repo_root": str(self.agents),
+            "history_relation": "equal",
+            "local_commits": [],
+            "history_capture_status": "available",
+            "dirty_paths": [],
+            "dirty_entries": [],
+            "diff_snapshot_sha256": "a" * 64,
+            "history_snapshot_sha256": "b" * 64,
+        }
+        manifest = {
+            "repo_root": str(self.agents),
+            "task_id": "TSK-FLOOR",
+            "publication_mode": "sweep",
+            "approved_diff_snapshot_sha256": state["diff_snapshot_sha256"],
+            "approved_existing_commits": [],
+            "reviewed_artifacts": [
+                {
+                    "role": "agents_security_advisory",
+                    "source_sha256": "c" * 64,
+                    "target_path": "artifact.md",
+                }
+            ],
+            "validation_evidence": {
+                "file_guard": "passed",
+                "secret_scan": "passed",
+                "secret_scan_tool": "gitleaks",
+                "secret_scan_tool_version": "fixture",
+                "reviewed_snapshot_sha256": state["diff_snapshot_sha256"],
+                "reviewed_history_sha256": state["history_snapshot_sha256"],
+            },
+            "core_review_status": "quality_ok",
+            "review_or_validation_status": "quality_ok",
+            "residual_review_status": "quality_ok",
+            "owned_paths": ["artifact.md"],
+            "excluded_paths": [],
+            "unrelated_dirty_paths": [],
+            "deferred_cleanup": [],
+            "approved_dirty_entries": [],
+            "commit_groups": [{"message": "publish", "paths": ["artifact.md"]}],
+            "commit_required": True,
+            "evidence_finalization": None,
+        }
+        with self.assertRaisesRegex(
+            REVIEW_MODULE.ReviewError,
+            "review mode weakens the deterministic mode hint",
+        ):
+            REVIEW_MODULE.validate_manifest(
+                manifest,
+                state,
+                str(self.agents),
+                "TSK-FLOOR",
+                {
+                    "role": "agents_security_advisory",
+                    "source_sha256": "c" * 64,
+                    "target_path": str(self.agents / "artifact.md"),
+                },
+                None,
+                "fixture",
+                {"required_mode": "sweep"},
+                [],
+                [],
+                False,
+                "own_only",
+            )
+
     def test_dedicated_runner_completes_separated_publication(self) -> None:
         """Complete collection, two reviews, local commits, and fixed pushes."""
         runtime = self.root / "runtime"
@@ -10485,6 +10803,7 @@ def load_environment(*, checkout_root, environ, require_catalog):
             SCRIPTS / "validate-canonical-result.py",
             SCRIPTS / "stage-standing-task.py",
             SCRIPTS / "stage-dirty-review-inputs.py",
+            SCRIPTS / "prepare-publication-review-context.py",
             SCRIPTS / "interpret-automation-result.sh",
             REPO_ROOT / "summarize-it-news" / "scripts" / "collect-public-sources.py",
             SOURCE_CATALOG,
@@ -10686,7 +11005,7 @@ if "--search" in args:
     if os.environ.get("FAKE_CANONICAL_INVALID_COLLECTION") == "1":
         result["next_action"]="must be null for a complete result"
 elif stage=="review":
-    assert context["publication_context_projection"] == "review_without_index_entries_v1"
+    assert context["publication_context_projection"] == "review_bounded_v2"
     assert not contains_key(context,"index_entries")
     publication=context["publication_context"]
     authorization=Path(publication["authorization_task"])
@@ -10764,7 +11083,7 @@ elif stage=="publication":
     verified=publication["verified_collection"]
     result={"outcome":"ready_to_push","phase":"local_commit","daily_pipeline_status":"complete","summary_path":installed["summary_target"],"advisory_path":installed["advisory_target"],"notification_result":"none","agents_vault":publish("agents_vault",runtime_context["agents_vault_root"]),"user_vault":publish("user_vault",runtime_context["user_vault_root"]),"evidence_finalization_commit":None,"next_action":None}
 else:
-    assert context["publication_context_projection"] == "review_without_index_entries_v1"
+    assert context["publication_context_projection"] == "review_bounded_v2"
     assert not contains_key(context,"index_entries")
     plan=context["evidence_plan"]
     publication=context["publication_context"]
