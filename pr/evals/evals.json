@@ -282,6 +282,21 @@
         "Asks the user for labels when no safe label set is available",
         "Does not report label application success until labels are verified"
       ]
+    },
+    {
+      "id": 24,
+      "prompt": "Codex Workの「Pull Requestを監視して修正する」を有効にしたPRを作成し、マージまで指摘を自動追跡して。",
+      "expected_output": "PRのrepository、番号、base/head SHA、review/comment trigger、「マージまで継続」のregistration evidenceを認証済み経路で確認する。確認できない場合はpr_monitor_registration: unverifiedと明示し、mergeableや自動マージtoggleだけで監視済みと報告せず、コメントtriggerを代替として投稿しない。",
+      "files": ["SKILL.md"],
+      "expectations": [
+        "Treats the Codex Work watcher as external state rather than inferring it from mergeable",
+        "Verifies the exact repository, PR number, base SHA, and head SHA",
+        "Verifies the review/comment trigger and continue-until-merged state",
+        "Reports pr_monitor_registration: unverified when the connector cannot expose registration",
+        "Does not use a silent comment trigger as a watcher fallback",
+        "Distinguishes automatic merge behavior from review-completion evidence",
+        "Uses the GitHub Connector when gh authentication is unavailable"
+      ]
     }
   ]
 }
