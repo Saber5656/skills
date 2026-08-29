@@ -34,5 +34,9 @@ class GhDeliverContractTests(unittest.TestCase):
         ):
             self.assertIn(field, CONTRACT_TEXT)
 
+    def test_explicit_organization_assignments_are_scoped_and_routed(self) -> None:
+        self.assertIn("organization assignments explicitly supplied by the user", CONTRACT_TEXT)
+        self.assertIn("preserve both provenance objects and route the conflict", CONTRACT_TEXT)
+
 if __name__ == "__main__":
     unittest.main()

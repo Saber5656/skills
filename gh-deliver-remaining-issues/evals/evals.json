@@ -386,6 +386,18 @@
         "Routes a conflict with the Vault v1 boundary to the declared decision owner",
         "Keeps excluded_with_reason for broad-selector post-v1 candidates only"
       ]
+    },
+    {
+      "id": 34,
+      "prompt": "ユーザーがIssue scopeに加えてtech reviewer、security reviewer、provider、decision owner、concurrency、publication routeを明示指定した。指定値をtrusted contextとして保持し、Vaultの別値と競合する場合は declared decision ownerへrouteして。",
+      "expected_output": "The workflow accepts exact organization assignments supplied by the user as trusted explicit context, records field-level provenance for each assignment, and routes conflicts with Vault context to the declared decision owner without silently selecting a value.",
+      "files": [],
+      "expectations": [
+        "Accepts exact user-supplied role, provider, owner, concurrency, reviewer reservation, and publication route assignments",
+        "Binds provenance to each explicit organization assignment",
+        "Detects conflicts with other trusted context and routes them to the declared decision owner",
+        "Does not silently select a role, provider, owner, or route"
+      ]
     }
   ]
 }
