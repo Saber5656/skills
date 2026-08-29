@@ -373,6 +373,18 @@
         "Does not ask the user to choose internal roles, providers, owners, or concurrency",
         "Pauses the affected Issue while independent fully specified Issues can continue"
       ]
+    },
+    {
+      "id": 33,
+      "prompt": "ユーザーがIssue #99を明示的に実装対象として指定したが、Vaultのv1 completion scopeでは#99がpost-v1。明示指定を黙って除外せず、scope conflictとして扱って。",
+      "expected_output": "The workflow preserves Issue #99 in the explicitly requested scope, records the post-v1 conflict, and routes the material scope decision to the declared decision owner instead of marking it excluded_with_reason. Automatic post-v1 exclusion applies only to broad Vault or repository discovery.",
+      "files": [],
+      "expectations": [
+        "Treats an explicit Issue selector as authoritative for requested scope",
+        "Does not silently exclude an explicitly named post-v1 Issue",
+        "Routes a conflict with the Vault v1 boundary to the declared decision owner",
+        "Keeps excluded_with_reason for broad-selector post-v1 candidates only"
+      ]
     }
   ]
 }
