@@ -10,10 +10,14 @@ REPO_ROOT="$SCRIPT_DIR/../.."
 /usr/bin/grep -F -- 'daily-it-news.review.prompt.md' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- 'commit-reviewed-publication.py' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- 'daily-it-news.evidence-review.prompt.md' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- 'prepare-publication-review-context.py' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- 'PINNED_REVIEW_RUNNER="$WORKDIR/run-pinned-review.py"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- '--add-dir "$STAGING_ROOT"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- 'COLLECTION_FETCHER="$WORKDIR/collect-public-sources.py"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- 'SOURCE_CATALOG="$WORKDIR/it-news-sources.json"' "$RUNNER" >/dev/null
-/usr/bin/grep -F -- '[[ ! -x "$COLLECTION_FETCHER" ]]' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- 'for executable in "$COLLECTION_FETCHER" "$PINNED_REVIEW_RUNNER"; do' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- '[[ ! -x "$executable" ]]' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- '"$PINNED_REVIEW_RUNNER"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- 'required daily automation asset is not executable' "$RUNNER" >/dev/null
 COLLECTOR_SOURCE="$REPO_ROOT/summarize-it-news/scripts/collect-public-sources.py"
 TRACKED_COLLECTOR_MODE="$(/usr/bin/git -C "$REPO_ROOT" ls-files -s \
@@ -49,7 +53,7 @@ for required_name in \
   commit-push-publication-evidence.py evidence_hunk.py git_diff_digest.py \
   isolated_git_transport.py atomic_file_ops.py trusted_gitleaks.py gitleaks-default.toml \
   prepare-codex-output-schema.py validate-canonical-result.py \
-  stage-standing-task.py stage-dirty-review-inputs.py \
+  stage-standing-task.py stage-dirty-review-inputs.py prepare-publication-review-context.py run-pinned-review.py \
   daily-it-news.collect.prompt.md daily-it-news.review.prompt.md \
   daily-it-news.evidence-review.prompt.md collection-result.schema.json \
   publication-review-result.schema.json publication-commit-result.schema.json \
@@ -76,11 +80,28 @@ if ! /usr/bin/grep -F -- 'required daily automation asset is not executable:' \
   echo "non-executable collector must fail preflight with status 66" >&2
   exit 1
 fi
+/bin/chmod 0755 "$MODE_FIXTURE_ROOT/collect-public-sources.py"
+/bin/chmod 0644 "$MODE_FIXTURE_ROOT/run-pinned-review.py"
+set +e
+/bin/zsh "$MODE_FIXTURE_ROOT/run-daily-it-news-vulnerability-check.sh" \
+  >"$MODE_FIXTURE_ROOT/pinned-stdout.log" 2>"$MODE_FIXTURE_ROOT/pinned-stderr.log"
+PINNED_MODE_FIXTURE_STATUS=$?
+set -e
+if [[ "$PINNED_MODE_FIXTURE_STATUS" -ne 66 ]] \
+  || ! /usr/bin/grep -F -- 'required daily automation asset is not executable:' \
+    "$MODE_FIXTURE_ROOT/pinned-stderr.log" >/dev/null \
+  || ! /usr/bin/grep -F -- "$MODE_FIXTURE_ROOT/run-pinned-review.py" \
+    "$MODE_FIXTURE_ROOT/pinned-stderr.log" >/dev/null \
+  || [[ -d "$MODE_FIXTURE_ROOT/logs" ]]; then
+  echo "non-executable pinned review runner must fail preflight with status 66" >&2
+  exit 1
+fi
+/bin/chmod 0755 "$MODE_FIXTURE_ROOT/run-pinned-review.py"
 
 COLLECTION_BLOCK="$(sed -n '/CODEX_BIN.*--search/,/COLLECTION_STATUS=/p' "$RUNNER")"
-REVIEW_BLOCK="$(sed -n '/^"\$CODEX_BIN" -a never exec/,/REVIEW_STATUS=/p' "$RUNNER" | sed -n '1,/REVIEW_STATUS=/p')"
+REVIEW_BLOCK="$(sed -n '/^"\$PINNED_REVIEW_RUNNER"/,/REVIEW_STATUS=/p' "$RUNNER" | sed -n '1,/REVIEW_STATUS=/p')"
 PUBLICATION_BLOCK="$(sed -n '/^"\$LOCAL_COMMITTER"/,/PUBLICATION_STATUS=/p' "$RUNNER")"
-EVIDENCE_REVIEW_BLOCK="$(sed -n '/EVIDENCE_REVIEW_PROMPT_CONTENT=/,/EVIDENCE_REVIEW_STATUS=/p' "$RUNNER")"
+EVIDENCE_REVIEW_BLOCK="$(sed -n '/EVIDENCE_REVIEW_ENVELOPE=/,/^  "\$EVIDENCE_FINALIZER"/p' "$RUNNER")"
 
 if print -r -- "$COLLECTION_BLOCK" | /usr/bin/grep -E 'AGENTS_GIT_DIR|USER_GIT_DIR|AGENTS_ROOT|USER_ROOT' >/dev/null; then
   echo "collection block contains Vault publication privileges" >&2
@@ -114,8 +135,8 @@ if ! print -r -- "$REVIEW_BLOCK" | /usr/bin/grep -F -- '--sandbox read-only' >/d
   echo "publication review must be read-only" >&2
   exit 1
 fi
-if ! print -r -- "$REVIEW_BLOCK" | /usr/bin/grep -F -- '<<< "$REVIEW_PROMPT_CONTENT"' >/dev/null; then
-  echo "publication review prompt must use stdin instead of argv" >&2
+if ! print -r -- "$REVIEW_BLOCK" | /usr/bin/grep -F -- 'PINNED_REVIEW_RUNNER' >/dev/null; then
+  echo "publication review must use the pinned stdin executor" >&2
   exit 1
 fi
 if ! print -r -- "$REVIEW_BLOCK" | /usr/bin/grep -F -- '--output-last-message "$REVIEW_AGENT_RESULT"' >/dev/null; then
@@ -134,14 +155,33 @@ if ! print -r -- "$EVIDENCE_REVIEW_BLOCK" | /usr/bin/grep -F -- '--sandbox read-
   echo "evidence finalization review must be read-only" >&2
   exit 1
 fi
-if ! print -r -- "$EVIDENCE_REVIEW_BLOCK" | /usr/bin/grep -F -- '<<< "$EVIDENCE_REVIEW_PROMPT_CONTENT"' >/dev/null; then
-  echo "evidence review prompt must use stdin instead of argv" >&2
+if ! print -r -- "$EVIDENCE_REVIEW_BLOCK" | /usr/bin/grep -F -- 'PINNED_REVIEW_RUNNER' >/dev/null; then
+  echo "evidence review must use the pinned stdin executor" >&2
+  exit 1
+fi
+if /usr/bin/grep -F -- '< "$REVIEW_REQUEST_FILE"' "$RUNNER" >/dev/null \
+  || /usr/bin/grep -F -- '< "$EVIDENCE_REVIEW_REQUEST_FILE"' "$RUNNER" >/dev/null; then
+  echo "review requests must not be reopened by pathname" >&2
   exit 1
 fi
 /usr/bin/grep -F -- '"$REVIEW_RESULT"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- '"$REVIEW_RESULT_SHA256"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- '"$REVIEW_AGENT_RESULT"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- '"$REVIEW_NORMALIZATION_RECEIPT"' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- 'REVIEW_INPUT_METRICS_FILE' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- 'REVIEW_INPUT_METRICS_SHA256' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- 'EVIDENCE_REVIEW_INPUT_METRICS_SHA256' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- 'EVIDENCE_REVIEW_REASON=' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- 'EVIDENCE_REVIEW_REASON_CODE=' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- 'EVIDENCE_REVIEW_STDERR_SHA256=' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- 'write_evidence_review_diagnostic() {' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- 'evidence-review-diagnostic.json' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- 'EVIDENCE_REVIEW_PROCESS_STATUS="$process_status"' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- 'classify_evidence_review() {' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- 'classify_evidence_review \' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- '"$EVIDENCE_REVIEW_REASON"' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- '"$EVIDENCE_REVIEW_DIAGNOSTIC_FILE"' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- 'evidence_review' "$SCRIPT_DIR/../references/automation-result.schema.json" >/dev/null
 /usr/bin/grep -F -- '"$REVIEW_VALIDATOR" --canonicalize-own-only' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- '"$COLLECTION_VALIDATOR" --canonicalize-constraints' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- '"$PUBLICATION_CONTEXT_FILE"' "$RUNNER" >/dev/null
@@ -455,6 +495,7 @@ fi
 /usr/bin/grep -F -- '--arg dirty_snapshot_manifest_file "$DIRTY_SNAPSHOT_MANIFEST"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- '--output-schema "$CODEX_COLLECTION_SCHEMA"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- 'INTERPRETER_PROCESS_STATUS="$FINALIZATION_STATUS"' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- 'evidence_review_reason=$EVIDENCE_REVIEW_REASON' "$RUNNER" >/dev/null
 if /usr/bin/grep -F -- 'INTERPRETER_PROCESS_STATUS=0' "$RUNNER" >/dev/null; then
   echo "runner must not erase a nonzero finalizer status when a result file exists" >&2
   exit 1
@@ -468,7 +509,17 @@ if /usr/bin/grep -F -- 'local status="$1"' "$RUNNER" >/dev/null; then
   exit 1
 fi
 FAIL_RUN_FUNCTION="$(sed -n '/^fail_run() {/,/^}/p' "$RUNNER")"
+CLASSIFY_EVIDENCE_FUNCTION="$(sed -n '/^classify_evidence_review() {/,/^}/p' "$RUNNER")"
+WRITE_EVIDENCE_DIAGNOSTIC_FUNCTION="$(sed -n '/^write_evidence_review_diagnostic() {/,/^}/p' "$RUNNER")"
 LOCK_RELEASE_FUNCTION="$(sed -n '/^release_publication_lock() {/,/^}/p' "$RUNNER")"
+[[ -n "$CLASSIFY_EVIDENCE_FUNCTION" ]] || {
+  echo "evidence review classification function extraction was empty" >&2
+  exit 1
+}
+[[ -n "$WRITE_EVIDENCE_DIAGNOSTIC_FUNCTION" ]] || {
+  echo "evidence review diagnostic function extraction was empty" >&2
+  exit 1
+}
 for audit_pointer in \
   'collection_agent_result=' \
   'collection_result=' \
@@ -536,6 +587,55 @@ fi
   echo "owned publication lock was not released" >&2
   exit 1
 }
+EVIDENCE_DIAGNOSTIC_ROOT="$FAIL_RUN_ROOT/evidence-diagnostic"
+/bin/mkdir "$EVIDENCE_DIAGNOSTIC_ROOT"
+print -r -- $'\033[31msecret-token\033[0m input exceeds maximum length' > "$EVIDENCE_DIAGNOSTIC_ROOT/stderr.log"
+/bin/zsh -c '
+  set -u
+  CANONICAL_VALIDATOR=/usr/bin/false
+  eval "$1"
+  classify_evidence_review 17 "$2/missing-result.json" "$2/stderr.log" "$2/schema.json"
+  [[ "$EVIDENCE_REVIEW_PROCESS_STATUS" -eq 17 ]]
+  [[ "$EVIDENCE_REVIEW_STATUS" -eq 75 ]]
+  [[ "$EVIDENCE_REVIEW_REASON_CODE" == "input_too_large" ]]
+  [[ "$EVIDENCE_REVIEW_REASON" == "reason_code=input_too_large;process_status=17;status=75;stderr_sha256="* ]]
+  [[ "$EVIDENCE_REVIEW_REASON" != *secret-token* ]]
+' -- "$CLASSIFY_EVIDENCE_FUNCTION" "$EVIDENCE_DIAGNOSTIC_ROOT" || {
+  echo "evidence input-limit diagnostics were not preserved before finalization" >&2
+  exit 1
+}
+/bin/zsh -c '
+  set -u
+  CANONICAL_VALIDATOR=/usr/bin/false
+  eval "$1"
+  : > "$2/empty.stderr"
+  classify_evidence_review 0 "$2/missing-result.json" "$2/empty.stderr" "$2/schema.json"
+  [[ "$EVIDENCE_REVIEW_STATUS" -eq 75 ]]
+  [[ "$EVIDENCE_REVIEW_REASON_CODE" == "result_missing" ]]
+' -- "$CLASSIFY_EVIDENCE_FUNCTION" "$EVIDENCE_DIAGNOSTIC_ROOT" || {
+  echo "missing evidence result was misclassified as a process error" >&2
+  exit 1
+}
+/bin/zsh -c '
+  set -u
+  EVIDENCE_REVIEW_PROCESS_STATUS=17
+  EVIDENCE_REVIEW_STATUS=75
+  EVIDENCE_REVIEW_REASON_CODE=input_too_large
+  EVIDENCE_REVIEW_RESULT_PRESENT=false
+  EVIDENCE_REVIEW_RESULT_SHA256=""
+  EVIDENCE_REVIEW_STDERR_SHA256="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  eval "$1"
+  EVIDENCE_REVIEW_DIAGNOSTIC_FILE="$2/diagnostic.json"
+  write_evidence_review_diagnostic "$EVIDENCE_REVIEW_DIAGNOSTIC_FILE"
+  /usr/bin/grep -F -- "\"reason_code\": \"input_too_large\"" "$EVIDENCE_REVIEW_DIAGNOSTIC_FILE" >/dev/null
+  /usr/bin/grep -F -- "\"process_status\": 17" "$EVIDENCE_REVIEW_DIAGNOSTIC_FILE" >/dev/null
+  /usr/bin/grep -F -- "\"status\": 75" "$EVIDENCE_REVIEW_DIAGNOSTIC_FILE" >/dev/null
+  /usr/bin/grep -F -- "\"result_present\": false" "$EVIDENCE_REVIEW_DIAGNOSTIC_FILE" >/dev/null
+  /usr/bin/grep -F -- "\"result_sha256\": null" "$EVIDENCE_REVIEW_DIAGNOSTIC_FILE" >/dev/null
+' -- "$WRITE_EVIDENCE_DIAGNOSTIC_FUNCTION" "$EVIDENCE_DIAGNOSTIC_ROOT" || {
+  echo "evidence diagnostics leaked raw stderr or lost structured fields" >&2
+  exit 1
+}
 rm -rf "$FAIL_RUN_ROOT"
 for forbidden in "/""Users/" "Library/Mobile"" Documents" "Yasu""'s Vault"; do
   if /usr/bin/grep -F -- "$forbidden" "$RUNNER" >/dev/null; then
@@ -544,4 +644,4 @@ for forbidden in "/""Users/" "Library/Mobile"" Documents" "Yasu""'s Vault"; do
   fi
 done
 
-echo "runner isolation contract: 53/53 passed"
+echo "runner isolation contract: 62/62 passed"

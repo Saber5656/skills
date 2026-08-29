@@ -468,6 +468,77 @@ def stable_regular_bytes(path: Path) -> bytes:
         os.close(descriptor)
 
 
+EVIDENCE_REVIEW_REASON_CODES = frozenset(
+    {
+        "approved",
+        "input_preparation_failed",
+        "input_too_large",
+        "process_failed",
+        "result_missing",
+        "canonical_validation_failed",
+        "result_rejected",
+        "legacy_failure",
+    }
+)
+
+
+def read_evidence_review_diagnostic(
+    path: Path | None,
+    review_status: int,
+    legacy_reason: str = "",
+) -> dict[str, object]:
+    """Load a bounded, structured review diagnostic without importing stderr."""
+    empty_stderr_sha256 = hashlib.sha256(b"").hexdigest()
+    if path is None:
+        return {
+            "process_status": review_status,
+            "status": review_status,
+            "reason_code": "approved" if review_status == 0 else "legacy_failure",
+            "result_present": review_status == 0,
+            "stderr_sha256": empty_stderr_sha256,
+            "result_sha256": None,
+        }
+    try:
+        diagnostic = json.loads(stable_regular_bytes(path))
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        raise FinalizationError("evidence review diagnostic is unreadable") from exc
+    if not isinstance(diagnostic, dict):
+        raise FinalizationError("evidence review diagnostic is not an object")
+    process_status = diagnostic.get("process_status")
+    status = diagnostic.get("status")
+    reason_code = diagnostic.get("reason_code")
+    result_present = diagnostic.get("result_present")
+    stderr_sha256 = diagnostic.get("stderr_sha256")
+    result_sha256 = diagnostic.get("result_sha256")
+    if (
+        type(process_status) is not int
+        or type(status) is not int
+        or status != review_status
+        or reason_code not in EVIDENCE_REVIEW_REASON_CODES
+        or type(result_present) is not bool
+        or not isinstance(stderr_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", stderr_sha256) is None
+        or (
+            result_sha256 is not None
+            and (
+                not isinstance(result_sha256, str)
+                or re.fullmatch(r"[0-9a-f]{64}", result_sha256) is None
+            )
+        )
+        or (result_present and not isinstance(result_sha256, str))
+        or (not result_present and result_sha256 is not None)
+    ):
+        raise FinalizationError("evidence review diagnostic contract is invalid")
+    return {
+        "process_status": process_status,
+        "status": status,
+        "reason_code": reason_code,
+        "result_present": result_present,
+        "stderr_sha256": stderr_sha256,
+        "result_sha256": result_sha256,
+    }
+
+
 def index_file_contract(path: Path) -> tuple[bytes, list[int]]:
     """Read one stable no-follow shared index and seal its inode contract."""
     descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
@@ -1658,6 +1729,7 @@ def partial_result(
     receipt: dict[str, object] | None = None,
     head_updated: bool = False,
     index_updated: bool = False,
+    evidence_review: dict[str, object] | None = None,
 ) -> dict[str, object]:
     """Capture actual local/remote evidence state after any failure."""
     finalization_commits: list[str] = []
@@ -1744,6 +1816,8 @@ def partial_result(
         result["evidence_recovery"] = evidence_recovery(
             receipt, head_updated, index_updated
         )
+    if evidence_review is not None:
+        result["evidence_review"] = evidence_review
     return result
 
 
@@ -1764,14 +1838,17 @@ def publish_success_result_after_cleanup(
 
 def main(argv: list[str]) -> int:
     """Finalize reviewed evidence and emit the final automation result."""
-    if len(argv) != 9:
+    if len(argv) not in {9, 10, 11}:
         print(
             "usage: commit-push-publication-evidence.py RUNTIME PRE INITIAL "
-            "EVIDENCE_PLAN EVIDENCE_REVIEW FINAL REVIEW_STATUS CONTEXT",
+            "EVIDENCE_PLAN EVIDENCE_REVIEW FINAL REVIEW_STATUS CONTEXT "
+            "[REVIEW_FAILURE_REASON] [EVIDENCE_REVIEW_DIAGNOSTIC]",
             file=sys.stderr,
         )
         return 64
     output = Path(argv[6])
+    review_failure_reason = argv[9] if len(argv) == 10 else ""
+    evidence_review_diagnostic: dict[str, object] | None = None
     runtime: dict[str, str] = {}
     pre: dict[str, object] = {}
     initial: dict[str, object] = {}
@@ -1792,8 +1869,29 @@ def main(argv: list[str]) -> int:
             plan["publication_context_sha256"],
         )
         publisher_identity = validated_publisher_identity(runtime)
+        review_status = int(argv[7])
+        evidence_review_diagnostic = read_evidence_review_diagnostic(
+            Path(argv[10]) if len(argv) == 11 else None,
+            review_status,
+            review_failure_reason,
+        )
+        if len(argv) == 11 and evidence_review_diagnostic["result_present"]:
+            review_result_sha256 = evidence_review_diagnostic["result_sha256"]
+            actual_review_sha256 = hashlib.sha256(
+                stable_regular_bytes(Path(argv[5]))
+            ).hexdigest()
+            if review_result_sha256 != actual_review_sha256:
+                raise FinalizationError("evidence review result digest differs from diagnostic")
+        if review_status != 0:
+            raise FinalizationError(
+                review_failure_reason
+                or (
+                    "evidence review is not approved and digest-bound: "
+                    f"{evidence_review_diagnostic['reason_code']}"
+                )
+            )
         review = json.loads(stable_regular_bytes(Path(argv[5])))
-        if int(argv[7]) != 0 or review != {
+        if review != {
             "outcome": "approved",
             "target_path": plan["target_path"],
             "evidence_diff_sha256": plan["evidence_diff_sha256"],
@@ -1932,6 +2030,7 @@ def main(argv: list[str]) -> int:
                 "evidence_recovery": evidence_recovery(
                     worktree_receipt, head_updated, index_updated
                 ),
+                "evidence_review": evidence_review_diagnostic,
                 "next_action": None,
             }
         )
@@ -1991,6 +2090,7 @@ def main(argv: list[str]) -> int:
                             recovery_receipt,
                             head_updated,
                             index_updated,
+                            evidence_review_diagnostic,
                         ),
                         ensure_ascii=False,
                     ),
