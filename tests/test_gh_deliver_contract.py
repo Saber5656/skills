@@ -1,0 +1,28 @@
+from pathlib import Path
+import unittest
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+SKILL_TEXT = (REPO_ROOT / "gh-deliver-remaining-issues" / "SKILL.md").read_text(
+    encoding="utf-8"
+)
+CONTRACT_TEXT = (
+    REPO_ROOT
+    / "gh-deliver-remaining-issues"
+    / "references"
+    / "execution-contract.md"
+).read_text(encoding="utf-8")
+
+
+class GhDeliverContractTests(unittest.TestCase):
+    def test_catalog_mapping_is_retained_in_skill_and_contract(self) -> None:
+        for text in (SKILL_TEXT, CONTRACT_TEXT):
+            self.assertIn("catalog_env = {}", text)
+            self.assertIn("environ=catalog_env", text)
+            self.assertIn('catalog_result["status"] == "loaded"', text)
+            self.assertIn('catalog_env["AGENTS_VAULT_ROOT"]', text)
+            self.assertNotIn("environ={}", text)
+            self.assertNotIn("returned catalog values", text)
+
+if __name__ == "__main__":
+    unittest.main()

@@ -12,7 +12,8 @@
         "Requires independent review of each atomic diff before commit",
         "Passes both the Task Change Manifest and Git Publication Manifest to commit",
         "Finalizes one issue-level publication manifest only after every unit has a verified commit result",
-        "Creates ready PRs but does not merge or release"
+        "Creates ready PRs but does not merge or release",
+        "Retains the catalog mapping and validates loader status before using AGENTS_VAULT_ROOT"
       ]
     },
     {
