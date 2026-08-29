@@ -65,8 +65,8 @@ It does not merge PRs, bypass GitHub rulesets, implement review feedback without
 
 | Check | Required action |
 |---|---|
-| GitHub CLI | Run `gh --version`; stop if unavailable |
-| GitHub auth | Run `gh auth status`; stop if unauthenticated |
+| GitHub CLI | Run `gh --version` when available; use the GitHub Connector for supported operations when CLI is unavailable |
+| GitHub auth | Run `gh auth status`; if unavailable, use the GitHub Connector for supported read/write operations and stop only when the requested operation is not connector-supported |
 | Repository | Resolve `owner/repo` from `origin` or user-provided repo |
 | Base branch | Use user-provided base, otherwise remote default branch |
 | Worktree scope | Inspect `git status -sb` and staged/unstaged/untracked files before staging |
@@ -271,6 +271,12 @@ Verify:
 - `reviews` contains a submitted, non-diagnostic `chatgpt-codex-connector[bot]` review for the current `headRefOid`, or the workflow clearly reports `review_pending` / `review_timeout` without posting a trigger comment.
 - No PR comment was used to trigger Codex review; a reviewer request, when explicitly used for compatibility, is not treated as review success.
 
+### Codex Work PR monitor registration
+
+The Codex Work setting “Pull Requestを監視して修正する” is an external watcher, not a property that can be inferred from GitHub `mergeable` or the automatic-merge toggle. After creating the PR or pushing a fix, verify an authenticated registration for the exact repository, PR number, current base/head SHA, review/comment trigger, and “continue until merged” state. Record the registration evidence with the task.
+
+If the registration cannot be read through the available connector, report `pr_monitor_registration: unverified` and do not claim that the PR is being monitored or will be auto-remediated. Continue only with bounded, explicitly reported review observation; do not silently replace the missing watcher with a comment trigger. The automatic-merge toggle controls merge behavior only and is not review-completion evidence. When `gh` authentication is unavailable, use the GitHub Connector for the PR/review/thread state and report any watcher-registration limitation rather than storing credentials in the repository.
+
 ## Codex Review Feedback Intake
 
 The Codex review may arrive asynchronously. Treat waiting as a resumable stage rather than an infinite block.
@@ -349,7 +355,7 @@ Rules:
 
 | Failure | Required response |
 |---|---|
-| `gh` missing or unauthenticated | Stop and provide the exact prerequisite |
+| `gh` missing or unauthenticated | Use the GitHub Connector for supported PR/review/thread operations; report a blocker only for an operation unavailable through either path |
 | No GitHub remote | Stop and ask for repo or remote setup |
 | Worktree ownership ambiguous | Ask which paths belong in the PR |
 | Commit/push rejected | Report exact error and do not create a misleading PR or post addressed/fixed review replies |
@@ -377,6 +383,7 @@ Final response must include:
 | Label status | Applied labels for PR and primary issue, skipped only with reason, or blocked |
 | Codex review status | current-head review observed, review pending, timed out, or not requested |
 | Codex review intake status | Responded, timed out, or not requested |
+| PR monitor registration | `pr_monitor_registration=verified` for exact PR/head and continue-until-merged state, or `pr_monitor_registration=unverified` with the connector limitation |
 | Checks run | Yes |
 | Fix push status | Required when review feedback was implemented |
 | Review reply status | Required when posting replies after pushed fixes |

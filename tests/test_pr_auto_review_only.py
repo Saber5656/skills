@@ -64,6 +64,17 @@ class PrAutomaticReviewOnlyTests(unittest.TestCase):
             reviewer_eval["expectations"],
         )
 
+    def test_codex_work_monitor_registration_is_explicit(self) -> None:
+        self.assertIn("Codex Work PR monitor registration", SKILL_TEXT)
+        self.assertIn("pr_monitor_registration: unverified", SKILL_TEXT)
+        self.assertIn("continue until merged", SKILL_TEXT)
+        self.assertIn("automatic-merge toggle controls merge behavior only", SKILL_TEXT)
+        monitor_eval = next(item for item in EVALS["evals"] if item["id"] == 24)
+        self.assertIn(
+            "Reports pr_monitor_registration: unverified",
+            " ".join(monitor_eval["expectations"]),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

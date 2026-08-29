@@ -4,14 +4,19 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import stat
 import sys
-from pathlib import Path
 from typing import Any
 
 
 class CanonicalValidationError(RuntimeError):
     """Raised when a result violates the canonical contract."""
+
+
+MAX_CANONICAL_FILE_BYTES = 16 * 1024 * 1024
+HEX_OBJECT_ID = re.compile(r"^[0-9a-f]{40}$")
 
 
 SUPPORTED_KEYWORDS = frozenset(
@@ -147,17 +152,154 @@ def is_valid(value: Any, schema: dict[str, Any], root: dict[str, Any], path: str
     return True
 
 
-def main(argv: list[str]) -> int:
-    if len(argv) != 3:
-        print("usage: validate-canonical-result.py SCHEMA RESULT", file=sys.stderr)
-        return 64
+def stable_json_file(path: str) -> Any:
+    """Read one regular JSON file through a stable no-follow descriptor snapshot."""
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     try:
-        schema = json.loads(Path(argv[1]).read_text(encoding="utf-8"))
-        result = json.loads(Path(argv[2]).read_text(encoding="utf-8"))
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise CanonicalValidationError("canonical input is not a regular file")
+        if before.st_size > MAX_CANONICAL_FILE_BYTES:
+            raise CanonicalValidationError("canonical input exceeds the size limit")
+        content = bytearray()
+        while chunk := os.read(descriptor, min(1024 * 1024, MAX_CANONICAL_FILE_BYTES + 1)):
+            content.extend(chunk)
+            if len(content) > MAX_CANONICAL_FILE_BYTES:
+                raise CanonicalValidationError("canonical input exceeds the size limit")
+        after = os.fstat(descriptor)
+        identity = lambda item: (
+            item.st_dev,
+            item.st_ino,
+            item.st_size,
+            item.st_mode,
+            item.st_mtime_ns,
+            item.st_ctime_ns,
+        )
+        if identity(before) != identity(after) or len(content) != before.st_size:
+            raise CanonicalValidationError("canonical input changed while it was read")
+        return json.loads(bytes(content).decode("utf-8"))
+    finally:
+        os.close(descriptor)
+
+
+def valid_object_id(value: Any) -> bool:
+    """Return whether a value is one canonical SHA-1 Git object id."""
+    return isinstance(value, str) and HEX_OBJECT_ID.fullmatch(value) is not None
+
+
+def validate_terminal_semantics(result: Any) -> str:
+    """Enforce cross-field terminal invariants that JSON Schema cannot express."""
+    if not isinstance(result, dict):
+        raise CanonicalValidationError("terminal result root must be an object")
+    agents = result.get("agents_vault")
+    user = result.get("user_vault")
+    mode_map = result.get("publication_mode")
+    deferred_map = result.get("deferred_cleanup")
+    if not all(isinstance(value, dict) for value in (agents, user, mode_map, deferred_map)):
+        raise CanonicalValidationError("terminal result maps are malformed")
+    vaults = {"agents_vault": agents, "user_vault": user}
+    for key, vault in vaults.items():
+        hashes = vault.get("commit_hashes")
+        if not isinstance(hashes, list) or not all(valid_object_id(item) for item in hashes):
+            raise CanonicalValidationError(f"{key}: commit hashes are invalid")
+        if vault.get("commit_status") == "complete":
+            if not hashes:
+                raise CanonicalValidationError(f"{key}: complete commit has no object id")
+        elif hashes:
+            raise CanonicalValidationError(f"{key}: uncommitted result contains object ids")
+        if vault.get("publication_mode") == "blocked" and hashes:
+            raise CanonicalValidationError(f"{key}: blocked result contains object ids")
+        for field in ("local_head", "remote_head"):
+            value = vault.get(field)
+            if value is not None and not valid_object_id(value):
+                raise CanonicalValidationError(f"{key}: {field} is invalid")
+        if mode_map.get(key) != vault.get("publication_mode"):
+            raise CanonicalValidationError(f"{key}: publication mode maps disagree")
+        if deferred_map.get(key) != vault.get("deferred_cleanup"):
+            raise CanonicalValidationError(f"{key}: deferred cleanup maps disagree")
+
+    outcome = result.get("outcome")
+    if outcome == "success":
+        if (
+            result.get("daily_pipeline_status") != "complete"
+            or not isinstance(result.get("summary_path"), str)
+            or not result["summary_path"]
+            or not isinstance(result.get("advisory_path"), str)
+            or not result["advisory_path"]
+            or not valid_object_id(result.get("evidence_finalization_commit"))
+            or result.get("next_action") is not None
+        ):
+            raise CanonicalValidationError("success terminal fields are inconsistent")
+        for key, vault in vaults.items():
+            if (
+                vault.get("commit_status") != "complete"
+                or vault.get("push_status") != "complete"
+                or not vault.get("commit_hashes")
+                or vault.get("publication_mode") not in {"sweep", "own_only"}
+                or not valid_object_id(vault.get("local_head"))
+                or vault.get("local_head") != vault.get("remote_head")
+                or (vault.get("publication_mode") == "sweep" and vault.get("clean") is not True)
+            ):
+                raise CanonicalValidationError(f"{key}: success publication is incomplete")
+        return "success\t0"
+    if outcome == "blocked":
+        if (
+            not isinstance(result.get("next_action"), str)
+            or not result["next_action"]
+            or result.get("evidence_finalization_commit") is not None
+        ):
+            raise CanonicalValidationError("blocked terminal fields are inconsistent")
+        for key, vault in vaults.items():
+            if (
+                vault.get("commit_hashes")
+                or vault.get("commit_status") not in {"failed", "not_started", "not_required"}
+                or vault.get("push_status") not in {"failed", "not_started", "not_required"}
+            ):
+                raise CanonicalValidationError(f"{key}: blocked publication made progress")
+        return "blocked\t75"
+    if outcome == "partial_publication":
+        if not isinstance(result.get("next_action"), str) or not result["next_action"]:
+            raise CanonicalValidationError("partial publication requires a next action")
+        progressed = any(
+            bool(vault.get("commit_hashes"))
+            or vault.get("push_status") == "complete"
+            or vault.get("local_head") != vault.get("remote_head")
+            or vault.get("clean") is False
+            for vault in vaults.values()
+        )
+        if not progressed:
+            raise CanonicalValidationError("partial publication contains no progress")
+        return "partial_publication\t75"
+    raise CanonicalValidationError("terminal outcome is invalid")
+
+
+def main(argv: list[str]) -> int:
+    terminal_mode = len(argv) > 1 and argv[1] == "--terminal-status"
+    if len(argv) != (4 if terminal_mode else 3):
+        print(
+            "usage: validate-canonical-result.py [--terminal-status] SCHEMA RESULT",
+            file=sys.stderr,
+        )
+        return 64
+    schema_path, result_path = argv[-2:]
+    try:
+        schema = stable_json_file(schema_path)
+        result = stable_json_file(result_path)
         if not isinstance(schema, dict):
             raise CanonicalValidationError("schema root must be an object")
         validate(result, schema, schema)
-    except (OSError, json.JSONDecodeError, TypeError, CanonicalValidationError) as exc:
+        if terminal_mode:
+            print(validate_terminal_semantics(result))
+    except (
+        OSError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        TypeError,
+        CanonicalValidationError,
+    ) as exc:
+        if terminal_mode:
+            print("invalid_result\t65")
+            return 0
         print(f"canonical result validation failed:{exc}", file=sys.stderr)
         return 75
     return 0
