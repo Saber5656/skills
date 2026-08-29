@@ -103,7 +103,8 @@ repository:
   default_branch: "main"
   verified_base_sha: "<sha>"
 issue_scope:
-  selector: "explicit | parent | milestone | project | task-record"
+  # `selector` and `scope_resolution.selector_kind` share this canonical enum.
+  selector: "explicit | task_detail | parent | milestone | project | vault_completion | repository_fallback"
   selector_value: "<id/url>"
   snapshot_at: "<ISO-8601>"
 authorization:
@@ -217,7 +218,10 @@ waves:
 
 ## Scope resolution
 
-Resolve and record the remaining-Issue selector in this order:
+Resolve and record the remaining-Issue selector in this order. The `issue_scope.selector` and
+`scope_resolution.selector_kind` fields must use the same canonical enum:
+`explicit | task_detail | parent | milestone | project | vault_completion | repository_fallback`.
+The former `task-record` spelling is not accepted; a Task Detail is represented as `task_detail`.
 
 1. explicit Issue number or URL in the user instruction;
 2. the current Task Detail's typed selector;
