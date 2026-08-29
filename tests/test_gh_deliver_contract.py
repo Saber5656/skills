@@ -24,5 +24,15 @@ class GhDeliverContractTests(unittest.TestCase):
             self.assertNotIn("environ={}", text)
             self.assertNotIn("returned catalog values", text)
 
+    def test_publication_and_review_flags_have_bound_provenance(self) -> None:
+        for field in (
+            "repository_restrictions_provenance",
+            "required_provenance",
+            "ready_pr_provenance",
+            "stacked_provenance",
+            "labels_provenance",
+        ):
+            self.assertIn(field, CONTRACT_TEXT)
+
 if __name__ == "__main__":
     unittest.main()

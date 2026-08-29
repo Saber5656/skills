@@ -145,6 +145,7 @@ authorization:
     - action: "push | create_ready_pr | merge | release"
       effect: "deny_only"
       source: "<repository policy evidence>"
+  repository_restrictions_provenance: "<typed provenance object for authorization.repository_restrictions>"
 coordination:
   coordinator: "<trusted-context assigned role/provider>"
   coordinator_source: "<trusted source object>"
@@ -235,6 +236,7 @@ issues:
       provider_provenance: "<typed provenance object for implementer_assignment.provider>"
     integration_review:
       required: false
+      required_provenance: "<typed provenance object for issues[].integration_review.required>"
       assignment: null
       assignment_source: null
       assignment_provenance: null
@@ -247,10 +249,13 @@ issues:
       approved_provenance: "<typed provenance object for publication.approved>"
       authorization_provenance: "<typed provenance object for publication.authorization_source>"
       ready_pr: true
+      ready_pr_provenance: "<typed provenance object for issues[].publication.ready_pr>"
       base: "main"
       base_provenance: "<typed provenance object for publication.base>"
       stacked: false
+      stacked_provenance: "<typed provenance object for issues[].publication.stacked>"
       labels: []
+      labels_provenance: "<typed provenance object for issues[].publication.labels>"
 waves:
   - id: "wave-1"
     issue_numbers: [123]
