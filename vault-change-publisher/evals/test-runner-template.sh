@@ -12,10 +12,11 @@ REPO_ROOT="$SCRIPT_DIR/../.."
 /usr/bin/grep -F -- 'daily-it-news.evidence-review.prompt.md' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- 'prepare-publication-review-context.py' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- 'PINNED_REVIEW_RUNNER="$WORKDIR/run-pinned-review.py"' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- 'NOTIFICATION_SENDER="$WORKDIR/send-it-news-discord-notification.py"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- '--add-dir "$STAGING_ROOT"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- 'COLLECTION_FETCHER="$WORKDIR/collect-public-sources.py"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- 'SOURCE_CATALOG="$WORKDIR/it-news-sources.json"' "$RUNNER" >/dev/null
-/usr/bin/grep -F -- 'for executable in "$COLLECTION_FETCHER" "$PINNED_REVIEW_RUNNER"; do' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- 'for executable in "$COLLECTION_FETCHER" "$PINNED_REVIEW_RUNNER" "$NOTIFICATION_SENDER"; do' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- '[[ ! -x "$executable" ]]' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- '"$PINNED_REVIEW_RUNNER"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- 'required daily automation asset is not executable' "$RUNNER" >/dev/null
@@ -49,7 +50,7 @@ for required_name in \
   validate-collection-result.py collect-public-sources.py \
   it-news-sources.json install-verified-artifacts.py \
   commit-reviewed-publication.py validate-publication-review.py \
-  push-committed-heads.py prepare-publication-evidence.py \
+  push-committed-heads.py send-it-news-discord-notification.py prepare-publication-evidence.py \
   commit-push-publication-evidence.py evidence_hunk.py git_diff_digest.py \
   isolated_git_transport.py atomic_file_ops.py trusted_gitleaks.py gitleaks-default.toml \
   prepare-codex-output-schema.py validate-canonical-result.py \
@@ -195,7 +196,30 @@ fi
 /usr/bin/grep -F -- 'trusted_gitleaks.py' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- 'gitleaks-default.toml' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- 'fail_run 75 artifact_plan' "$RUNNER" >/dev/null
-/usr/bin/grep -F -- '/bin/cp "$INITIAL_PUSH_RESULT" "$PUBLICATION_RESULT"' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- '/bin/cp "$EFFECTIVE_PUSH_RESULT" "$PUBLICATION_RESULT"' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- 'notification_status=$NOTIFICATION_STATUS' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- 'SEMANTIC_STATUS="notification_failed"' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- 'NOTIFICATION_FALLBACK_PUSH_RESULT=' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- 'error_code=sender_failed_closed' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- '[[ "$NOTIFICATION_RESULT_VALID" == "true" ]]' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- '`already_delivered`' \
+  "$SCRIPT_DIR/../assets/daily-it-news.evidence-review.prompt.md" >/dev/null
+/usr/bin/grep -F -- 'raw Hermes' \
+  "$SCRIPT_DIR/../assets/daily-it-news.evidence-review.prompt.md" >/dev/null
+/usr/bin/grep -F -- '"$NOTIFICATION_SENDER" \' "$RUNNER" >/dev/null
+NOTIFICATION_TERMINAL_BLOCK="$(sed -n '/^if \[\[ "\$NOTIFICATION_DISPOSITION" == "attempted" \]\]/,/^fi$/p' "$RUNNER")"
+if print -r -- "$NOTIFICATION_TERMINAL_BLOCK" \
+  | /usr/bin/grep -F -- '[[ "$STATUS" -eq 0 ]]' >/dev/null; then
+  echo "notification failure must override a prior terminal status" >&2
+  exit 1
+fi
+PUSH_LINE="$(/usr/bin/grep -n -F -- '"$FIXED_PUSHER" \' "$RUNNER" | /usr/bin/tail -n 1 | /usr/bin/cut -d: -f1)"
+NOTIFICATION_LINE="$(/usr/bin/grep -n -F -- '"$NOTIFICATION_SENDER" \' "$RUNNER" | /usr/bin/tail -n 1 | /usr/bin/cut -d: -f1)"
+EVIDENCE_LINE="$(/usr/bin/grep -n -F -- '"$EVIDENCE_PREPARER" \' "$RUNNER" | /usr/bin/cut -d: -f1)"
+if [[ "$PUSH_LINE" -ge "$NOTIFICATION_LINE" || "$NOTIFICATION_LINE" -ge "$EVIDENCE_LINE" ]]; then
+  echo "Discord notification must run after fixed push and before evidence preparation" >&2
+  exit 1
+fi
 EVIDENCE_PREPARATION_BLOCK="$(sed -n '/^if \[\[ "\$EVIDENCE_PREPARE_STATUS" -eq 0 \]\]; then$/,/^fi$/p' "$RUNNER")"
 EVIDENCE_FALLBACK_BLOCK="$(print -r -- "$EVIDENCE_PREPARATION_BLOCK" | sed -n '/^[[:space:]]*else[[:space:]]*$/,$p')"
 if [[ -z "$EVIDENCE_FALLBACK_BLOCK" ]]; then
@@ -266,7 +290,7 @@ for audit_pointer in \
     exit 1
   fi
 done
-TERMINAL_STATUS_BLOCK="$(sed -n '/^{$/,/^} > "\$STATUS_FILE"$/p' "$RUNNER" | tail -n 20)"
+TERMINAL_STATUS_BLOCK="$(sed -n '/^{$/,/^} > "\$STATUS_FILE"$/p' "$RUNNER" | tail -n 32)"
 for audit_pointer in \
   'collection_agent_result=$COLLECTION_AGENT_RESULT' \
   'collection_result=$COLLECTION_RESULT' \

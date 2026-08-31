@@ -20,6 +20,7 @@ launchd 04:00
   -> core artifact + residual sweep review Codex process (read-only, no search/network)
   -> deterministic local commit helper (sweep or isolated-index own_only, no network)
   -> initial fixed runner pushes (manifest-bound object IDs -> refs/heads/main)
+  -> success-only Discord notification (immutable User Vault commit URL, idempotent receipt)
   -> deterministic push evidence hunk + sealed HEAD/index/worktree candidates
   -> evidence review Codex process (read-only, no search/network)
   -> deterministic evidence commit + fixed Agents main push
@@ -50,6 +51,7 @@ launchd 04:00
 | `scripts/commit-reviewed-publication.py` | same workdir |
 | `scripts/validate-publication-review.py` | same workdir |
 | `scripts/push-committed-heads.py` | same workdir |
+| `scripts/send-it-news-discord-notification.py` | same workdir |
 | `scripts/prepare-publication-evidence.py` | same workdir |
 | `scripts/commit-push-publication-evidence.py` | same workdir |
 | `scripts/evidence_hunk.py` | same workdir |
@@ -66,7 +68,9 @@ launchd 04:00
 | `scripts/run-pinned-review.py` | same workdir |
 | `scripts/interpret-automation-result.sh` | same workdir |
 
-配備はPR前受入とmerge後releaseの二段階で行う。PR前受入では、独立review済みのfrozen task-branch sourceをbackup付きでcanonical production runtimeへcopyし、各source/destinationのSHA-256とfile mode一致を確認する。task worktreeをproduction runtime pathとして参照しない。実環境E2E成功後だけsource commit/push/PRへ進み、merge後は最新mainの同一filesを再配備する。特にdirect executionされる`collect-public-sources.py`は、両段階でtracked sourceとruntimeの双方がexecutableであることをgateで検証する。
+配備はPR前受入とmerge後releaseの二段階で行う。PR前受入では、独立review済みのfrozen task-branch sourceをbackup付きでcanonical production runtimeへcopyし、各source/destinationのSHA-256とfile mode一致を確認する。task worktreeをproduction runtime pathとして参照しない。実環境E2E成功後だけsource commit/push/PRへ進み、merge後は最新mainの同一filesを再配備する。特にdirect executionされる`collect-public-sources.py`、`run-pinned-review.py`、`send-it-news-discord-notification.py`は、両段階でtracked sourceとruntimeの双方がexecutableであることをgateで検証する。
+
+`automation.local.env`には`HERMES_BIN`のabsolute pathと`DISCORD_NEWS_TARGET=discord:<channel-id>`を置く。Discord credentialやtokenはこのfileへ複製せず、Hermesのmachine-local configでユーザーが管理する。runnerは両Vault initial pushの成功とlocal/remote head一致を確認した後だけ通知し、User Vault GitHub remoteとpushed commit SHAからimmutable summary URLを作る。通知のintent/result/delivery receiptはruntimeのowner-only `notification-state`へ保存し、初回state directoryを親directoryまでfsyncする。既送信扱いにするのはnumeric message ID、attempt、run ID、bounded digestを再検証できるreceiptだけとし、run rootにはraw Hermes outputではなくdigest、message ID、stable error codeだけを残す。senderがoutputを残さず失敗した場合もrunnerはsanitizedなambiguous resultを生成してevidence hunkをfinalizeし、publicationをrollbackせず`notification_failed`・terminal exit 75で示す。
 
 正本のresult schemaはstate-dependent constraintを保持する。runnerは各run配下へCodex Structured Outputs対応subsetを生成してAPIへ渡し、生成結果は各phaseのdeterministic validatorで正本契約に照合する。互換schemaだけをpublication可否の判定に使わない。
 

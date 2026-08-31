@@ -30,6 +30,8 @@ ALLOWED_KEYS = {
     "AUTHORIZATION_TASK_SHA256",
     "PUBLISHER_GIT_NAME",
     "PUBLISHER_GIT_EMAIL",
+    "HERMES_BIN",
+    "DISCORD_NEWS_TARGET",
 }
 REQUIRED_KEYS = ALLOWED_KEYS
 CONTROL_COMMAND_TIMEOUT_SECONDS = 30
@@ -115,6 +117,24 @@ def validated_git_identity(name: str, email: str) -> tuple[str, str]:
     ):
         raise ContextError("invalid publisher Git email")
     return name, email
+
+
+def validated_discord_target(value: str) -> str:
+    """Require an immutable Discord channel snowflake rather than a name."""
+    if re.fullmatch(r"discord:[1-9][0-9]{16,19}", value) is None:
+        raise ContextError("DISCORD_NEWS_TARGET must use discord:<channel-id>")
+    return value
+
+
+def validated_executable_path(value: str, key: str) -> str:
+    """Resolve one absolute executable path for a machine-local integration."""
+    candidate = Path(value).expanduser()
+    if not candidate.is_absolute():
+        raise ContextError(f"{key} must be an absolute path")
+    resolved = candidate.resolve()
+    if not resolved.is_file() or not os.access(resolved, os.X_OK):
+        raise ContextError(f"{key} is not an executable regular file")
+    return str(resolved)
 
 
 def git_directory(repo_root: Path) -> str:
@@ -387,6 +407,8 @@ def resolve_context(local_config: Path, workdir: Path) -> dict[str, str]:
     publisher_name, publisher_email = validated_git_identity(
         values["PUBLISHER_GIT_NAME"], values["PUBLISHER_GIT_EMAIL"]
     )
+    hermes_bin = validated_executable_path(values["HERMES_BIN"], "HERMES_BIN")
+    discord_news_target = validated_discord_target(values["DISCORD_NEWS_TARGET"])
 
     agents_git_dir = git_directory(agents_root)
     user_git_dir = git_directory(user_root)
@@ -437,6 +459,8 @@ def resolve_context(local_config: Path, workdir: Path) -> dict[str, str]:
         "authorization_task_sha256": authorization_digest,
         "publisher_git_name": publisher_name,
         "publisher_git_email": publisher_email,
+        "hermes_bin": hermes_bin,
+        "discord_news_target": discord_news_target,
     }
     for key, value in context.items():
         if not value:

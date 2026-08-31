@@ -645,6 +645,7 @@ def main(argv: list[str]) -> int:
             ),
             "publication_mode": initial["publication_mode"],
             "deferred_cleanup": initial["deferred_cleanup"],
+            "notification_result": initial["notification_result"],
         }
         marker = f"vault-change-publisher:{argv[5]}"
         block = (

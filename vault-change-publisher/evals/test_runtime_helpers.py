@@ -85,6 +85,14 @@ EVIDENCE_SPEC = importlib.util.spec_from_file_location(
 assert EVIDENCE_SPEC and EVIDENCE_SPEC.loader
 EVIDENCE_MODULE = importlib.util.module_from_spec(EVIDENCE_SPEC)
 EVIDENCE_SPEC.loader.exec_module(EVIDENCE_MODULE)
+NOTIFICATION_SPEC = importlib.util.spec_from_file_location(
+    "send_it_news_discord_notification",
+    SCRIPTS / "send-it-news-discord-notification.py",
+)
+assert NOTIFICATION_SPEC and NOTIFICATION_SPEC.loader
+NOTIFICATION_MODULE = importlib.util.module_from_spec(NOTIFICATION_SPEC)
+sys.modules[NOTIFICATION_SPEC.name] = NOTIFICATION_MODULE
+NOTIFICATION_SPEC.loader.exec_module(NOTIFICATION_MODULE)
 CAPTURE_SPEC = importlib.util.spec_from_file_location(
     "capture_vault_state", SCRIPTS / "capture-vault-state.py"
 )
@@ -378,12 +386,23 @@ def load_environment(*, checkout_root, environ, require_catalog):
             encoding="utf-8",
         )
         self.fake_gitleaks.chmod(0o755)
+        self.fake_hermes = self.workdir / "fake-hermes"
+        self.fake_hermes.write_text(
+            "#!/bin/sh\n"
+            "printf '%s\\n' "
+            "'{\"success\":true,\"platform\":\"discord\","
+            "\"chat_id\":\"1234567890123456789\",\"message_id\":\"fixture-message\"}'\n",
+            encoding="utf-8",
+        )
+        self.fake_hermes.chmod(0o755)
         self.config.write_text(
             "\n".join(
                 (
                     f"SAIHAI_CHECKOUT_ROOT={self.saihai}",
                     "CODEX_BIN=/usr/bin/true",
                     f"GITLEAKS_BIN={self.fake_gitleaks}",
+                    f"HERMES_BIN={self.fake_hermes}",
+                    "DISCORD_NEWS_TARGET=discord:1234567890123456789",
                     "IT_NEWS_ARCHIVE_RELATIVE=10_Prompt",
                     "ADVISORY_ARCHIVE_RELATIVE=03-Contexts/Reports/Security",
                     "STANDING_TASK_ID=TSK-STANDING",
@@ -401,6 +420,80 @@ def load_environment(*, checkout_root, environ, require_catalog):
     def tearDown(self) -> None:
         """Remove the isolated fixture."""
         self.temp_dir.cleanup()
+
+    def notification_fixture(
+        self, stdout: str, returncode: int
+    ) -> tuple[Path, Path, Path, Path, Path]:
+        """Create one schema-valid fixed-push result and a controllable Hermes."""
+        notification_workdir = self.root / "notification-workdir"
+        notification_workdir.mkdir()
+        summary = (
+            self.user
+            / "10 Prompt"
+            / "2026"
+            / "08"
+            / "31"
+            / "SUMMARY-IT-NEWS-2026-08-31.md"
+        )
+        summary.parent.mkdir(parents=True)
+        summary.write_text("private summary body must not be sent\n", encoding="utf-8")
+        counter = notification_workdir / "hermes-calls.txt"
+        arguments = notification_workdir / "hermes-arguments.json"
+        hermes = notification_workdir / "hermes"
+        hermes.write_text(
+            f"#!{sys.executable}\n"
+            "import json, sys\n"
+            "from pathlib import Path\n"
+            f"counter = Path({str(counter)!r})\n"
+            "with counter.open('a', encoding='utf-8') as stream:\n"
+            "    stream.write('called\\n')\n"
+            f"Path({str(arguments)!r}).write_text("
+            "json.dumps(sys.argv[1:], ensure_ascii=False), encoding='utf-8')\n"
+            f"sys.stdout.write({stdout!r})\n"
+            f"raise SystemExit({returncode})\n",
+            encoding="utf-8",
+        )
+        hermes.chmod(0o755)
+        runtime = {
+            "workdir": str(notification_workdir.resolve()),
+            "hermes_bin": str(hermes.resolve()),
+            "discord_news_target": "discord:1234567890123456789",
+            "user_vault_root": str(self.user.resolve()),
+            "user_remote_url": "git@github.com:fixture-owner/fixture-repo.git",
+        }
+        head = "a" * 40
+        published_vault = {
+            "commit_status": "complete",
+            "commit_hashes": [head],
+            "push_status": "complete",
+            "local_head": head,
+            "remote_head": head,
+            "clean": True,
+            "publication_mode": "sweep",
+            "deferred_cleanup": [],
+        }
+        initial = {
+            "outcome": "partial_publication",
+            "phase": "initial_fixed_push",
+            "daily_pipeline_status": "complete",
+            "summary_path": str(summary.resolve()),
+            "advisory_path": str((self.agents / "advisory.md").resolve()),
+            "notification_result": "none",
+            "agents_vault": dict(published_vault),
+            "user_vault": dict(published_vault),
+            "publication_mode": {
+                "agents_vault": "sweep",
+                "user_vault": "sweep",
+            },
+            "deferred_cleanup": {"agents_vault": [], "user_vault": []},
+            "evidence_finalization_commit": None,
+            "next_action": "Finalize publication evidence.",
+        }
+        runtime_path = notification_workdir / "runtime.json"
+        initial_path = notification_workdir / "initial.json"
+        runtime_path.write_text(json.dumps(runtime), encoding="utf-8")
+        initial_path.write_text(json.dumps(initial), encoding="utf-8")
+        return notification_workdir, runtime_path, initial_path, counter, arguments
 
     def test_collection_date_parser_rejects_embedded_date_substrings(self) -> None:
         """Accept complete sealed dates, never arbitrary text containing a date."""
@@ -5598,6 +5691,357 @@ def load_environment(*, checkout_root, environ, require_catalog):
         self.assertIn("fixed fetch blocked:", result.stderr)
         self.assertNotIn("Traceback", result.stderr)
 
+    def test_discord_notification_uses_immutable_link_and_deduplicates(self) -> None:
+        """Send one fixed-channel link and reuse its durable delivery receipt."""
+        response = json.dumps(
+            {
+                "success": True,
+                "platform": "discord",
+                "chat_id": "1234567890123456789",
+                "message_id": "2234567890123456789",
+            }
+        )
+        workdir, runtime, initial, counter, arguments = self.notification_fixture(
+            response + "\n", 0
+        )
+        receipt = workdir / "receipt.json"
+        effective = workdir / "effective.json"
+        status = NOTIFICATION_MODULE.main(
+            [
+                "send-it-news-discord-notification.py",
+                str(runtime),
+                str(initial),
+                "run-1",
+                str(receipt),
+                str(effective),
+            ]
+        )
+        self.assertEqual(status, 0)
+        observed = json.loads(receipt.read_text(encoding="utf-8"))
+        self.assertEqual(observed["status"], "delivered")
+        self.assertEqual(observed["message_id"], "2234567890123456789")
+        self.assertEqual(observed["summary_commit"], "a" * 40)
+        self.assertIn("/blob/" + "a" * 40 + "/", observed["summary_url"])
+        self.assertIn("10%20Prompt", observed["summary_url"])
+        sent_arguments = json.loads(arguments.read_text(encoding="utf-8"))
+        self.assertEqual(
+            sent_arguments[:4],
+            ["send", "--to", "discord:1234567890123456789", "--json"],
+        )
+        self.assertIn(observed["summary_url"], sent_arguments[4])
+        self.assertNotIn("private summary body", sent_arguments[4])
+        effective_result = json.loads(effective.read_text(encoding="utf-8"))
+        self.assertIn("discord:delivered", effective_result["notification_result"])
+
+        second_receipt = workdir / "receipt-2.json"
+        second_effective = workdir / "effective-2.json"
+        second_status = NOTIFICATION_MODULE.main(
+            [
+                "send-it-news-discord-notification.py",
+                str(runtime),
+                str(initial),
+                "run-2",
+                str(second_receipt),
+                str(second_effective),
+            ]
+        )
+        self.assertEqual(second_status, 0)
+        self.assertEqual(
+            json.loads(second_receipt.read_text(encoding="utf-8"))["status"],
+            "already_delivered",
+        )
+        self.assertEqual(counter.read_text(encoding="utf-8").splitlines(), ["called"])
+
+    def test_discord_notification_rejects_corrupt_delivery_receipt(self) -> None:
+        """Never suppress delivery from an invalid persistent success receipt."""
+        response = json.dumps(
+            {
+                "success": True,
+                "platform": "discord",
+                "chat_id": "1234567890123456789",
+                "message_id": "2234567890123456789",
+            }
+        )
+        workdir, runtime, initial, counter, _arguments = self.notification_fixture(
+            response + "\n", 0
+        )
+        first_status = NOTIFICATION_MODULE.main(
+            [
+                "send-it-news-discord-notification.py",
+                str(runtime),
+                str(initial),
+                "run-receipt-valid",
+                str(workdir / "receipt-valid.json"),
+                str(workdir / "effective-valid.json"),
+            ]
+        )
+        self.assertEqual(first_status, 0)
+        delivery = next((workdir / "notification-state").rglob("delivery.json"))
+        corrupt = json.loads(delivery.read_text(encoding="utf-8"))
+        corrupt["message_id"] = "not-a-snowflake"
+        delivery.write_text(json.dumps(corrupt), encoding="utf-8")
+
+        second_status = NOTIFICATION_MODULE.main(
+            [
+                "send-it-news-discord-notification.py",
+                str(runtime),
+                str(initial),
+                "run-receipt-corrupt",
+                str(workdir / "receipt-corrupt.json"),
+                str(workdir / "effective-corrupt.json"),
+            ]
+        )
+        self.assertEqual(second_status, 75)
+        self.assertEqual(counter.read_text(encoding="utf-8").splitlines(), ["called"])
+        self.assertFalse((workdir / "receipt-corrupt.json").exists())
+
+    def test_discord_notification_rejects_corrupt_delivered_result(self) -> None:
+        """Require a strict result schema before recovering delivery.json."""
+        response = json.dumps(
+            {
+                "success": True,
+                "platform": "discord",
+                "chat_id": "1234567890123456789",
+                "message_id": "2234567890123456789",
+            }
+        )
+        workdir, runtime, initial, counter, _arguments = self.notification_fixture(
+            response + "\n", 0
+        )
+        first_status = NOTIFICATION_MODULE.main(
+            [
+                "send-it-news-discord-notification.py",
+                str(runtime),
+                str(initial),
+                "run-result-valid",
+                str(workdir / "result-receipt-valid.json"),
+                str(workdir / "result-effective-valid.json"),
+            ]
+        )
+        self.assertEqual(first_status, 0)
+        state_root = workdir / "notification-state"
+        next(state_root.rglob("delivery.json")).unlink()
+        result_path = next(state_root.rglob("attempt-000001-result.json"))
+        corrupt = json.loads(result_path.read_text(encoding="utf-8"))
+        corrupt["message_id"] = "1"
+        result_path.write_text(json.dumps(corrupt), encoding="utf-8")
+
+        second_status = NOTIFICATION_MODULE.main(
+            [
+                "send-it-news-discord-notification.py",
+                str(runtime),
+                str(initial),
+                "run-result-corrupt",
+                str(workdir / "result-receipt-corrupt.json"),
+                str(workdir / "result-effective-corrupt.json"),
+            ]
+        )
+        self.assertEqual(second_status, 75)
+        self.assertEqual(counter.read_text(encoding="utf-8").splitlines(), ["called"])
+
+    def test_discord_notification_state_root_creation_fsyncs_workdir(self) -> None:
+        """Make the first notification-state directory entry durable before send."""
+        workdir = self.root / "notification-state-fsync-workdir"
+        workdir.mkdir()
+        workdir_identity = (workdir.stat().st_dev, workdir.stat().st_ino)
+        fsynced_workdir = False
+        real_fsync = os.fsync
+
+        def recording_fsync(descriptor: int) -> None:
+            nonlocal fsynced_workdir
+            opened = os.fstat(descriptor)
+            if (opened.st_dev, opened.st_ino) == workdir_identity:
+                fsynced_workdir = True
+            real_fsync(descriptor)
+
+        with mock.patch.object(
+            NOTIFICATION_MODULE.os, "fsync", side_effect=recording_fsync
+        ):
+            descriptor = NOTIFICATION_MODULE.ensure_private_directory(
+                workdir / "notification-state"
+            )
+            os.close(descriptor)
+        self.assertTrue(fsynced_workdir)
+
+    def test_evidence_review_contract_allows_only_sanitized_notification(self) -> None:
+        """Authorize bounded notification states while rejecting raw backend text."""
+        prompt = (
+            SKILL_ROOT / "assets" / "daily-it-news.evidence-review.prompt.md"
+        ).read_text(encoding="utf-8")
+        for value in ("delivered", "already_delivered", "failed", "ambiguous"):
+            self.assertIn(f"`{value}`", prompt)
+        self.assertIn("raw Hermes", prompt)
+        self.assertIn("summary body", prompt)
+        self.assertIn("model text", prompt)
+
+    def test_discord_notification_retries_only_definite_backend_failure(self) -> None:
+        """Retry explicit rejection without persisting raw backend details."""
+        response = json.dumps(
+            {
+                "success": False,
+                "platform": "discord",
+                "error": "sensitive backend detail",
+            }
+        )
+        workdir, runtime, initial, counter, _arguments = self.notification_fixture(
+            response + "\n", 1
+        )
+        receipt = workdir / "failed-receipt.json"
+        effective = workdir / "failed-effective.json"
+        status = NOTIFICATION_MODULE.main(
+            [
+                "send-it-news-discord-notification.py",
+                str(runtime),
+                str(initial),
+                "run-failed",
+                str(receipt),
+                str(effective),
+            ]
+        )
+        self.assertEqual(status, 75)
+        observed_text = receipt.read_text(encoding="utf-8")
+        observed = json.loads(observed_text)
+        self.assertEqual(observed["status"], "failed")
+        self.assertEqual(observed["error_code"], "backend_rejected")
+        self.assertNotIn("sensitive backend detail", observed_text)
+        self.assertEqual(len(counter.read_text(encoding="utf-8").splitlines()), 3)
+        self.assertTrue(effective.is_file())
+
+    def test_discord_notification_does_not_retry_spawn_failure(self) -> None:
+        """Persist a pre-delivery spawn failure without automatic retry."""
+        workdir, runtime, initial, counter, _arguments = self.notification_fixture(
+            "", 0
+        )
+        runtime_payload = json.loads(runtime.read_text(encoding="utf-8"))
+        hermes = Path(runtime_payload["hermes_bin"])
+        hermes.write_text("#!/definitely/missing/interpreter\n", encoding="utf-8")
+        hermes.chmod(0o755)
+        receipt = workdir / "spawn-failed-receipt.json"
+        effective = workdir / "spawn-failed-effective.json"
+        status = NOTIFICATION_MODULE.main(
+            [
+                "send-it-news-discord-notification.py",
+                str(runtime),
+                str(initial),
+                "run-spawn-failed",
+                str(receipt),
+                str(effective),
+            ]
+        )
+        self.assertEqual(status, 75)
+        observed = json.loads(receipt.read_text(encoding="utf-8"))
+        self.assertEqual(observed["status"], "failed")
+        self.assertEqual(observed["error_code"], "spawn_failed")
+        self.assertEqual(observed["attempts_this_run"], 1)
+        self.assertFalse(counter.exists())
+
+        second_receipt = workdir / "spawn-failed-receipt-2.json"
+        second_status = NOTIFICATION_MODULE.main(
+            [
+                "send-it-news-discord-notification.py",
+                str(runtime),
+                str(initial),
+                "run-spawn-failed-2",
+                str(second_receipt),
+                str(workdir / "spawn-failed-effective-2.json"),
+            ]
+        )
+        self.assertEqual(second_status, 75)
+        self.assertEqual(
+            json.loads(second_receipt.read_text(encoding="utf-8"))[
+                "attempts_this_run"
+            ],
+            0,
+        )
+        state_entries = list((workdir / "notification-state").rglob("attempt-*.json"))
+        self.assertEqual(len(state_entries), 2)
+
+    def test_discord_notification_bounds_oversized_response_without_retry(self) -> None:
+        """Stop and classify an oversized post-send response as ambiguous."""
+        workdir, runtime, initial, counter, _arguments = self.notification_fixture(
+            "x" * (NOTIFICATION_MODULE.MAX_PROCESS_OUTPUT_BYTES + 1), 0
+        )
+        receipt = workdir / "oversized-receipt.json"
+        status = NOTIFICATION_MODULE.main(
+            [
+                "send-it-news-discord-notification.py",
+                str(runtime),
+                str(initial),
+                "run-oversized",
+                str(receipt),
+                str(workdir / "oversized-effective.json"),
+            ]
+        )
+        self.assertEqual(status, 75)
+        observed = json.loads(receipt.read_text(encoding="utf-8"))
+        self.assertEqual(observed["status"], "ambiguous")
+        self.assertEqual(observed["error_code"], "response_too_large")
+        self.assertEqual(observed["attempts_this_run"], 1)
+        self.assertEqual(counter.read_text(encoding="utf-8").splitlines(), ["called"])
+
+    def test_discord_notification_does_not_retry_ambiguous_response(self) -> None:
+        """Treat an unverifiable post-send response as at-most-once ambiguity."""
+        workdir, runtime, initial, counter, _arguments = self.notification_fixture(
+            "not-json\n", 1
+        )
+        receipt = workdir / "ambiguous-receipt.json"
+        effective = workdir / "ambiguous-effective.json"
+        status = NOTIFICATION_MODULE.main(
+            [
+                "send-it-news-discord-notification.py",
+                str(runtime),
+                str(initial),
+                "run-ambiguous",
+                str(receipt),
+                str(effective),
+            ]
+        )
+        self.assertEqual(status, 75)
+        self.assertEqual(
+            json.loads(receipt.read_text(encoding="utf-8"))["status"], "ambiguous"
+        )
+        second_status = NOTIFICATION_MODULE.main(
+            [
+                "send-it-news-discord-notification.py",
+                str(runtime),
+                str(initial),
+                "run-ambiguous-2",
+                str(workdir / "ambiguous-receipt-2.json"),
+                str(workdir / "ambiguous-effective-2.json"),
+            ]
+        )
+        self.assertEqual(second_status, 75)
+        self.assertEqual(counter.read_text(encoding="utf-8").splitlines(), ["called"])
+
+    def test_discord_notification_requires_complete_two_vault_push(self) -> None:
+        """Never call Hermes before both Vaults are durably published."""
+        response = json.dumps(
+            {
+                "success": True,
+                "platform": "discord",
+                "chat_id": "1234567890123456789",
+                "message_id": "2234567890123456789",
+            }
+        )
+        workdir, runtime, initial, counter, _arguments = self.notification_fixture(
+            response + "\n", 0
+        )
+        initial_result = json.loads(initial.read_text(encoding="utf-8"))
+        initial_result["agents_vault"]["push_status"] = "failed"
+        initial.write_text(json.dumps(initial_result), encoding="utf-8")
+        status = NOTIFICATION_MODULE.main(
+            [
+                "send-it-news-discord-notification.py",
+                str(runtime),
+                str(initial),
+                "run-blocked",
+                str(workdir / "blocked-receipt.json"),
+                str(workdir / "blocked-effective.json"),
+            ]
+        )
+        self.assertEqual(status, 75)
+        self.assertFalse(counter.exists())
+
     def test_resolver_uses_catalog_and_relative_config(self) -> None:
         """Resolve roots and Git directories without tracked personal paths."""
         result = subprocess.run(
@@ -5615,7 +6059,34 @@ def load_environment(*, checkout_root, environ, require_catalog):
         self.assertEqual(context["standing_task_id"], "TSK-STANDING")
         self.assertEqual(context["publisher_git_name"], "Fixture Publisher")
         self.assertEqual(context["publisher_git_email"], "publisher@example.invalid")
+        self.assertEqual(context["hermes_bin"], str(self.fake_hermes.resolve()))
+        self.assertEqual(
+            context["discord_news_target"], "discord:1234567890123456789"
+        )
         self.assertTrue(Path(context["agents_git_dir"]).is_absolute())
+
+    def test_resolver_rejects_mutable_discord_channel_name(self) -> None:
+        """Bind notifications to one snowflake rather than a mutable channel name."""
+        invalid = self.workdir / "invalid-discord-target.local.env"
+        invalid.write_text(
+            self.config.read_text(encoding="utf-8").replace(
+                "DISCORD_NEWS_TARGET=discord:1234567890123456789",
+                "DISCORD_NEWS_TARGET=discord:it-news",
+            ),
+            encoding="utf-8",
+        )
+        result = subprocess.run(
+            [
+                str(SCRIPTS / "resolve-runtime-context.py"),
+                str(invalid),
+                str(self.workdir),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 78)
+        self.assertIn("DISCORD_NEWS_TARGET", result.stderr)
 
     def test_resolver_rejects_invalid_private_publisher_identity(self) -> None:
         """Fail closed before runtime context creation for malformed identity."""
@@ -10873,6 +11344,7 @@ def load_environment(*, checkout_root, environ, require_catalog):
             SCRIPTS / "commit-reviewed-publication.py",
             SCRIPTS / "validate-publication-review.py",
             SCRIPTS / "push-committed-heads.py",
+            SCRIPTS / "send-it-news-discord-notification.py",
             SCRIPTS / "prepare-publication-evidence.py",
             SCRIPTS / "commit-push-publication-evidence.py",
             SCRIPTS / "evidence_hunk.py",
@@ -10892,6 +11364,24 @@ def load_environment(*, checkout_root, environ, require_catalog):
             SOURCE_CATALOG,
         ):
             shutil.copy2(source, runtime / source.name)
+
+        notification_sender = runtime / "send-it-news-discord-notification.py"
+        notification_sender.write_text(
+            """#!/usr/bin/env python3
+import json, os, sys
+from pathlib import Path
+initial=json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
+if os.environ.get("FAKE_NOTIFICATION_NO_OUTPUT") == "1":
+    raise SystemExit(75)
+summary="discord:delivered;summary_commit="+initial["user_vault"]["remote_head"]+";receipt_sha256="+("d"*64)+";message_id=2234567890123456789"
+receipt={"schema_version":1,"status":"delivered","notification_result":summary}
+Path(sys.argv[4]).write_text(json.dumps(receipt),encoding="utf-8")
+initial["notification_result"]=summary
+Path(sys.argv[5]).write_text(json.dumps(initial),encoding="utf-8")
+""",
+            encoding="utf-8",
+        )
+        notification_sender.chmod(0o755)
 
         installer = runtime / "install-verified-artifacts.py"
         real_installer = runtime / "install-verified-artifacts.real.py"
@@ -11033,7 +11523,7 @@ raise SystemExit(completed.returncode)
         fake_codex = runtime / "fake-codex.py"
         fake_codex.write_text(
             """#!/usr/bin/env python3
-import hashlib, json, os, subprocess, sys
+import hashlib, json, os, re, subprocess, sys
 from pathlib import Path
 args=sys.argv[1:]
 output=Path(args[args.index("--output-last-message")+1])
@@ -11181,8 +11671,16 @@ else:
     assert set(evidence_payload) == {
         "run_id","publication_context_sha256","agents_vault","user_vault",
         "summary_repo_path","advisory_repo_path","publication_mode",
-        "deferred_cleanup",
+        "deferred_cleanup","notification_result",
     }
+    assert re.fullmatch(
+        r"discord:(delivered|already_delivered|failed|ambiguous);"
+        r"summary_commit=[0-9a-f]{40};"
+        r"receipt_sha256=([0-9a-f]{64}|none)"
+        r"(;message_id=[1-9][0-9]{16,19})?"
+        r"(;error_code=[a-z0-9_]+)?",
+        evidence_payload["notification_result"],
+    )
     if os.environ.get("FAKE_EVIDENCE_REVIEW_BLOCKED") == "1":
         result={"outcome":"blocked","target_path":plan["target_path"],"evidence_diff_sha256":plan["evidence_diff_sha256"],"publication_context_sha256":plan["publication_context_sha256"],"review_status":"blocked","next_action":"fixture evidence review rejection"}
     else:
@@ -11427,6 +11925,8 @@ if stage=="collection" and os.environ.get("FAKE_SNAPSHOT_RAW_COLLECTION") == "1"
         self.assertEqual(len(status_files), 1)
         terminal_status = status_files[0].read_text()
         self.assertIn("semantic_status=success", terminal_status)
+        self.assertIn("notification_disposition=attempted", terminal_status)
+        self.assertIn("notification_status=0", terminal_status)
         for audit_name in (
             "collection-agent-result.json",
             "collection-result.json",
@@ -11502,6 +12002,9 @@ if stage=="collection" and os.environ.get("FAKE_SNAPSHOT_RAW_COLLECTION") == "1"
         publication_results = list(runtime.glob("logs/**/publication-result.json"))
         self.assertEqual(len(publication_results), 1)
         publication_result = json.loads(publication_results[0].read_text())
+        self.assertTrue(
+            publication_result["notification_result"].startswith("discord:delivered;")
+        )
         self.assertEqual(
             publication_result["evidence_review"]["reason_code"], "approved"
         )
@@ -11693,6 +12196,79 @@ if stage=="collection" and os.environ.get("FAKE_SNAPSHOT_RAW_COLLECTION") == "1"
         self.assertIsNone(second_context["carried_commit_result"])
         self.assertIsNone(second_context["carried_commit_result_sha256"])
         self.assertTrue((runtime / "commit-blocked-replan-once.marker").is_file())
+
+        subprocess.run(["chmod", "-R", "u+w", str(runtime / "logs")], check=True)
+        shutil.rmtree(runtime / "logs")
+        (runtime / "last-status.txt").unlink()
+
+        remote_before_notification_failure = {
+            key: subprocess.check_output(
+                ["git", "-C", str(repo), "ls-remote", "origin", "refs/heads/main"],
+                text=True,
+            ).split()[0]
+            for key, repo in (("agents", self.agents), ("user", self.user))
+        }
+        notification_failure = subprocess.run(
+            [str(runtime / "run-daily-it-news-vulnerability-check.sh")],
+            check=False,
+            env={
+                **os.environ,
+                "PATH": os.environ["PATH"],
+                "FAKE_NOTIFICATION_NO_OUTPUT": "1",
+            },
+        )
+        self.assertEqual(notification_failure.returncode, 75)
+        notification_failure_status = (runtime / "last-status.txt").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("phase=notification", notification_failure_status)
+        self.assertIn(
+            "semantic_status=notification_failed", notification_failure_status
+        )
+        self.assertIn("notification_status=75", notification_failure_status)
+        self.assertIn("evidence_finalization_status=0", notification_failure_status)
+        self.assertIn(
+            "discord-notification-fallback-result.json", notification_failure_status
+        )
+        notification_failure_results = list(
+            runtime.glob("logs/**/publication-result.json")
+        )
+        self.assertEqual(len(notification_failure_results), 1)
+        notification_failure_result = json.loads(
+            notification_failure_results[0].read_text(encoding="utf-8")
+        )
+        self.assertTrue(
+            notification_failure_result["notification_result"].startswith(
+                "discord:ambiguous;"
+            )
+        )
+        self.assertIn(
+            "error_code=sender_failed_closed",
+            notification_failure_result["notification_result"],
+        )
+        self.assertEqual(
+            notification_failure_result["evidence_review"]["reason_code"],
+            "approved",
+        )
+        self.assertIsNotNone(
+            notification_failure_result["evidence_finalization_commit"]
+        )
+        remote_after_notification_failure = {
+            key: subprocess.check_output(
+                ["git", "-C", str(repo), "ls-remote", "origin", "refs/heads/main"],
+                text=True,
+            ).split()[0]
+            for key, repo in (("agents", self.agents), ("user", self.user))
+        }
+        for key in remote_before_notification_failure:
+            self.assertNotEqual(
+                remote_before_notification_failure[key],
+                remote_after_notification_failure[key],
+            )
+        self.assertEqual(
+            notification_failure_result["user_vault"]["local_head"],
+            notification_failure_result["user_vault"]["remote_head"],
+        )
 
         subprocess.run(["chmod", "-R", "u+w", str(runtime / "logs")], check=True)
         shutil.rmtree(runtime / "logs")
