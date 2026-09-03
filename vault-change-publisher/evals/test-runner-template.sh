@@ -16,7 +16,9 @@ REPO_ROOT="$SCRIPT_DIR/../.."
 /usr/bin/grep -F -- '--add-dir "$STAGING_ROOT"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- 'COLLECTION_FETCHER="$WORKDIR/collect-public-sources.py"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- 'SOURCE_CATALOG="$WORKDIR/it-news-sources.json"' "$RUNNER" >/dev/null
-/usr/bin/grep -F -- 'for executable in "$COLLECTION_FETCHER" "$PINNED_REVIEW_RUNNER" "$NOTIFICATION_SENDER"; do' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- 'RUNTIME_RELEASE_MANIFEST="$WORKDIR/runtime-release-manifest.json"' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- 'RUNTIME_RELEASE_VERIFIER="$WORKDIR/verify-runtime-release.py"' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- 'for executable in "$COLLECTION_FETCHER" "$PINNED_REVIEW_RUNNER" "$NOTIFICATION_SENDER" "$RUNTIME_RELEASE_VERIFIER"; do' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- '[[ ! -x "$executable" ]]' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- '"$PINNED_REVIEW_RUNNER"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- 'required daily automation asset is not executable' "$RUNNER" >/dev/null
@@ -59,7 +61,7 @@ for required_name in \
   daily-it-news.evidence-review.prompt.md collection-result.schema.json \
   publication-review-result.schema.json publication-commit-result.schema.json \
   evidence-review-result.schema.json automation-result.schema.json \
-  interpret-automation-result.sh; do
+  interpret-automation-result.sh runtime-release-manifest.json verify-runtime-release.py; do
   /usr/bin/touch "$MODE_FIXTURE_ROOT/$required_name"
 done
 /bin/chmod 0755 "$MODE_FIXTURE_ROOT"/*.py "$MODE_FIXTURE_ROOT"/*.sh
@@ -188,7 +190,11 @@ fi
 /usr/bin/grep -F -- '"$PUBLICATION_CONTEXT_FILE"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- '"$ARTIFACT_PLAN"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- 'mkdir "$RUN_ROOT"' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- 'release_integrity' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- 'runtime release manifest verification failed' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- 'COLLECTION_START_STATE="$RUN_ROOT/collection-start-state.json"' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- '"$STATE_CAPTURE" --index-only "$RUNTIME_CONTEXT_FILE" > "$COLLECTION_START_STATE"' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- '"$STATE_CAPTURE" --index-only --include-local-history "$RUNTIME_CONTEXT_FILE"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- '"$EVIDENCE_FINALIZER"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- 'git_diff_digest.py' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- 'isolated_git_transport.py' "$RUNNER" >/dev/null
@@ -238,7 +244,7 @@ fi
 /usr/bin/grep -F -- '"$LOCAL_COMMITTER" --recover "$RUNTIME_CONTEXT_FILE"' "$RUNNER" >/dev/null
 RECOVERY_LINE="$(/usr/bin/grep -n -F -- '"$LOCAL_COMMITTER" --recover "$RUNTIME_CONTEXT_FILE"' "$RUNNER" | /usr/bin/cut -d: -f1)"
 FETCH_LINE="$(/usr/bin/grep -n -F -- '"$FIXED_FETCHER" "$RUNTIME_CONTEXT_FILE"' "$RUNNER" | /usr/bin/cut -d: -f1)"
-CAPTURE_LINE="$(/usr/bin/grep -n -F -- '"$STATE_CAPTURE" "$RUNTIME_CONTEXT_FILE" > "$COLLECTION_START_STATE"' "$RUNNER" | /usr/bin/cut -d: -f1)"
+CAPTURE_LINE="$(/usr/bin/grep -n -F -- '"$STATE_CAPTURE" --index-only "$RUNTIME_CONTEXT_FILE" > "$COLLECTION_START_STATE"' "$RUNNER" | /usr/bin/cut -d: -f1)"
 if [[ "$RECOVERY_LINE" -ge "$FETCH_LINE" || "$RECOVERY_LINE" -ge "$CAPTURE_LINE" ]]; then
   echo "durable transaction recovery must precede fetch and collection-state capture" >&2
   exit 1
@@ -264,7 +270,7 @@ if [[ "$(/usr/bin/grep -c -F -- 'AGENTS_STABLE_STATE=0' "$RUNNER")" -ne 1 \
 fi
 /usr/bin/grep -F -- 'if [[ "$AGENTS_STABLE_STATE" -ne 1 ]]; then' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- 'if [[ "$USER_STABLE_STATE" -ne 1 ]]; then' "$RUNNER" >/dev/null
-/usr/bin/grep -F -- '"$STATE_CAPTURE" --include-local-history' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- '"$STATE_CAPTURE" --index-only --include-local-history' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- 'The interpreter performs one stable descriptor read' "$RUNNER" >/dev/null
 NORMALIZATION_FAILURE_BLOCK="$(sed -n \
   '/^if ! "\$REVIEW_VALIDATOR" --canonicalize-own-only/,/^fi$/p' "$RUNNER")"
@@ -320,9 +326,15 @@ cat > "$FAKE_STATE_CAPTURE" <<'ZSH'
 #!/bin/zsh
 set -eu
 include_history=0
-if [[ "${1:-}" == "--include-local-history" ]]; then
-  include_history=1
-fi
+index_only=0
+for argument in "$@"; do
+  [[ "$argument" == "--include-local-history" ]] && include_history=1
+  [[ "$argument" == "--index-only" ]] && index_only=1
+done
+[[ "$index_only" -eq 1 ]] || {
+  echo "snapshot capture omitted index-only mode" >&2
+  exit 1
+}
 attempt="$(<"$SNAPSHOT_COUNTER")"
 if [[ "$include_history" -eq 1 ]]; then
   attempt=$((attempt + 1))
@@ -478,7 +490,7 @@ print -r -- '{"outcome":"partial_publication"}' \
   }
 )
 collection_line="$(/usr/bin/grep -n -F -- 'COLLECTION_STATUS=$?' "$RUNNER" | /usr/bin/cut -d: -f1)"
-history_line="$(/usr/bin/grep -n -F -- '"$STATE_CAPTURE" --include-local-history' "$RUNNER" | /usr/bin/head -n 1 | /usr/bin/cut -d: -f1)"
+history_line="$(/usr/bin/grep -n -F -- '"$STATE_CAPTURE" --index-only --include-local-history' "$RUNNER" | /usr/bin/head -n 1 | /usr/bin/cut -d: -f1)"
 if [[ -z "$collection_line" || -z "$history_line" || "$history_line" -le "$collection_line" ]]; then
   echo "local-only history materialization must happen after collection" >&2
   exit 1

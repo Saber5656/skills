@@ -3,15 +3,33 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
 import stat
 import sys
+import time
 from pathlib import Path
 
 
 MAX_TASK_BYTES = 2 * 1024 * 1024
+SNAPSHOT_RETRY_ATTEMPTS = 30
+SNAPSHOT_RETRY_DELAY_SECONDS = 1.0
+RETRYABLE_FILESYSTEM_ERRNOS = frozenset(
+    errno_value
+    for errno_value in (
+        getattr(errno, "EDEADLK", None),
+        getattr(errno, "EAGAIN", None),
+        getattr(errno, "EBUSY", None),
+    )
+    if errno_value is not None
+)
+RETRYABLE_SNAPSHOT_ERRORS = frozenset(
+    {
+        "standing task changed while being read",
+    }
+)
 
 
 class SnapshotError(RuntimeError):
@@ -84,6 +102,28 @@ def read_regular_beneath(root: Path, relative: Path) -> bytes:
             os.close(directory_descriptor)
 
 
+def read_regular_beneath_with_retry(root: Path, relative: Path) -> bytes:
+    """Retry bounded File Provider locks and within-read identity churn."""
+    for attempt in range(SNAPSHOT_RETRY_ATTEMPTS):
+        try:
+            return read_regular_beneath(root, relative)
+        except OSError as exc:
+            if (
+                exc.errno not in RETRYABLE_FILESYSTEM_ERRNOS
+                or attempt + 1 >= SNAPSHOT_RETRY_ATTEMPTS
+            ):
+                raise
+            time.sleep(SNAPSHOT_RETRY_DELAY_SECONDS)
+        except SnapshotError as exc:
+            if (
+                str(exc) not in RETRYABLE_SNAPSHOT_ERRORS
+                or attempt + 1 >= SNAPSHOT_RETRY_ATTEMPTS
+            ):
+                raise
+            time.sleep(SNAPSHOT_RETRY_DELAY_SECONDS)
+    raise SnapshotError("Vault task snapshot retry budget was exhausted")
+
+
 def write_exclusive(staging_root: Path, destination_name: str, content: bytes) -> None:
     directory_flags = (
         os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
@@ -127,7 +167,7 @@ def main(argv: list[str]) -> int:
             relative = source.relative_to(agents_root)
         except ValueError as exc:
             raise SnapshotError(f"{task_kind} task is outside Agents Vault") from exc
-        content = read_regular_beneath(agents_root, relative)
+        content = read_regular_beneath_with_retry(agents_root, relative)
         if task_kind == "authorization":
             expected_digest = runtime["authorization_task_sha256"]
             actual_digest = hashlib.sha256(content).hexdigest()

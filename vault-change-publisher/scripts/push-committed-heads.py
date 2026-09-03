@@ -42,9 +42,13 @@ def clean_git_environment() -> dict[str, str]:
             "GIT_NO_LAZY_FETCH": "1",
             "GIT_NO_REPLACE_OBJECTS": "1",
             "GIT_OPTIONAL_LOCKS": "0",
-            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_COUNT": "3",
             "GIT_CONFIG_KEY_0": "core.fsmonitor",
             "GIT_CONFIG_VALUE_0": "false",
+            "GIT_CONFIG_KEY_1": "core.trustctime",
+            "GIT_CONFIG_VALUE_1": "false",
+            "GIT_CONFIG_KEY_2": "core.checkStat",
+            "GIT_CONFIG_VALUE_2": "minimal",
         }
     )
     return environment
@@ -102,6 +106,8 @@ def git(
             "git", *repository_arguments,
             "-c", f"core.hooksPath={os.devnull}",
             "-c", "core.fsmonitor=false",
+            "-c", "core.trustctime=false",
+            "-c", "core.checkStat=minimal",
             *arguments,
         ],
         check=check,
@@ -121,14 +127,21 @@ def dirty_digest(repo: str) -> str:
 def current_local(repo: str, pre_state: dict[str, object]) -> dict[str, object]:
     """Capture local progress relative to the immutable pre-collection state."""
     head = git(repo, "rev-parse", "HEAD").stdout.strip()
-    digest = dirty_digest(repo)
+    digest = (
+        str(pre_state["dirty_digest"])
+        if pre_state.get("worktree_capture_scope") == "index_only"
+        else dirty_digest(repo)
+    )
     commits = git(
         repo,
         "rev-list",
         "--reverse",
         f"{pre_state['local_head']}..{head}",
     ).stdout.splitlines()
-    clean = digest == hashlib.sha256(b"").hexdigest()
+    clean = (
+        pre_state.get("worktree_capture_scope") == "full"
+        and digest == hashlib.sha256(b"").hexdigest()
+    )
     return {
         "commit_status": "complete" if commits else "not_started",
         "commit_hashes": commits,
@@ -293,6 +306,8 @@ def commit_patch_sha256(repo: str, commit: str, parents: list[str]) -> str:
             "git", "-C", repo,
             "-c", f"core.hooksPath={os.devnull}",
             "-c", "core.fsmonitor=false",
+            "-c", "core.trustctime=false",
+            "-c", "core.checkStat=minimal",
             *arguments,
         ],
         check=True,
@@ -346,6 +361,10 @@ def blob_sha256(repo: str, head: str, relative: str) -> str:
             f"core.hooksPath={os.devnull}",
             "-c",
             "core.fsmonitor=false",
+            "-c",
+            "core.trustctime=false",
+            "-c",
+            "core.checkStat=minimal",
             "show",
             f"{head}:{relative}",
         ],
@@ -362,9 +381,13 @@ def blob_sha256(repo: str, head: str, relative: str) -> str:
             "GIT_NO_LAZY_FETCH": "1",
             "GIT_NO_REPLACE_OBJECTS": "1",
             "GIT_OPTIONAL_LOCKS": "0",
-            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_COUNT": "3",
             "GIT_CONFIG_KEY_0": "core.fsmonitor",
             "GIT_CONFIG_VALUE_0": "false",
+            "GIT_CONFIG_KEY_1": "core.trustctime",
+            "GIT_CONFIG_VALUE_1": "false",
+            "GIT_CONFIG_KEY_2": "core.checkStat",
+            "GIT_CONFIG_VALUE_2": "minimal",
         },
         timeout=LOCAL_COMMAND_TIMEOUT_SECONDS,
     )
@@ -518,9 +541,13 @@ def scan_commits(gitleaks_bin: str, repo: str, old: str, new: str) -> None:
     environment["GIT_NO_LAZY_FETCH"] = "1"
     environment["GIT_NO_REPLACE_OBJECTS"] = "1"
     environment["GIT_OPTIONAL_LOCKS"] = "0"
-    environment["GIT_CONFIG_COUNT"] = "1"
+    environment["GIT_CONFIG_COUNT"] = "3"
     environment["GIT_CONFIG_KEY_0"] = "core.fsmonitor"
     environment["GIT_CONFIG_VALUE_0"] = "false"
+    environment["GIT_CONFIG_KEY_1"] = "core.trustctime"
+    environment["GIT_CONFIG_VALUE_1"] = "false"
+    environment["GIT_CONFIG_KEY_2"] = "core.checkStat"
+    environment["GIT_CONFIG_VALUE_2"] = "minimal"
     try:
         with trusted_scan_invocation() as (scan_prefix, pass_fds):
             result = run_local_command(
@@ -558,8 +585,17 @@ def validate_local(
     branch = git(repo, "branch", "--show-current").stdout.strip()
     local_head = git(repo, "rev-parse", "HEAD").stdout.strip()
     mode = reported.get("publication_mode")
-    if mode == "blocked":
+    if pre_state.get("worktree_capture_scope") == "index_only":
+        if (
+            current_state is None
+            or current_state.get("worktree_capture_scope") != "index_only"
+            or not isinstance(current_state.get("dirty_digest"), str)
+        ):
+            raise PushError("index-only residual state was not recaptured")
+        actual_dirty = str(current_state["dirty_digest"])
+    else:
         actual_dirty = dirty_digest(repo)
+    if mode == "blocked":
         if (
             local_head != pre_state["local_head"]
             or reported.get("local_head") != local_head
@@ -583,7 +619,7 @@ def validate_local(
             pre_state["local_head"] != local_head
             or reported.get("commit_status") != "complete"
             or not reported.get("commit_hashes")
-            or reported.get("post_dirty_digest") != dirty_digest(repo)
+            or reported.get("post_dirty_digest") != actual_dirty
             or current_state is None
         ):
             raise PushError("carried publication state is inconsistent")
@@ -600,7 +636,7 @@ def validate_local(
             "staged_paths", "index_entries",
             "dirty_worktree_sha256", "dirty_digest", "diff_snapshot_sha256",
             "git_control_sha256", "branch", "upstream", "operation_in_progress",
-            "remote_head",
+            "remote_head", "worktree_capture_scope",
         ):
             if current_state.get(field) != pre_state.get(field):
                 raise PushError(f"carried publication state changed before push: {field}")
@@ -609,7 +645,6 @@ def validate_local(
         raise PushError("reported pre-publication head does not match captured state")
     if reported["pre_dirty_digest"] != pre_state["dirty_digest"]:
         raise PushError("reported pre-publication dirty digest does not match")
-    actual_dirty = dirty_digest(repo)
     if actual_dirty != reported["post_dirty_digest"]:
         raise PushError("reported residual status differs from the checkout")
     commits = git(
@@ -635,7 +670,7 @@ def validate_local(
             "dirty_lines", "dirty_paths", "dirty_entries", "dirty_metadata",
             "staged_paths", "dirty_worktree_sha256", "dirty_digest",
             "diff_snapshot_sha256", "git_control_sha256", "branch", "upstream",
-            "operation_in_progress", "remote_head",
+            "operation_in_progress", "remote_head", "worktree_capture_scope",
         ):
             if current_state.get(field) != pre_state.get(field):
                 raise PushError(f"own_only residual changed before push: {field}")
@@ -658,7 +693,7 @@ def capture_complete(runtime_file: str) -> dict[str, object]:
     """Reuse the canonical state helper immediately before fixed pushes."""
     helper = Path(__file__).with_name("capture-vault-state.py")
     result = run_local_command(
-        [str(helper), "--include-local-history", runtime_file],
+        [str(helper), "--index-only", "--include-local-history", runtime_file],
         check=True,
         capture_output=True,
         text=True,
@@ -676,7 +711,11 @@ def capture_one(repo: str) -> dict[str, object]:
         raise PushError("could not load canonical Vault state helper")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    return module.capture(repo, include_local_history=True)
+    return module.capture(
+        repo,
+        include_local_history=True,
+        worktree_scope="index_only",
+    )
 
 
 def validate_and_push_one(

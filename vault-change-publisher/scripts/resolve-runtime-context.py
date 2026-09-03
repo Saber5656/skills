@@ -3,14 +3,18 @@
 
 from __future__ import annotations
 
-import json
+import errno
 import hashlib
+import json
 import os
 import shlex
 import subprocess
 import sys
 import re
 import tempfile
+import time
+from collections.abc import Callable
+from typing import TypeVar
 from urllib.parse import urlsplit
 from pathlib import Path, PurePosixPath
 
@@ -38,10 +42,80 @@ CONTROL_COMMAND_TIMEOUT_SECONDS = 30
 EXTERNAL_BINARY_TIMEOUT_SECONDS = 60
 SUPPORTED_GITLEAKS_MAJOR = 8
 MINIMUM_GITLEAKS_VERSION = (8, 19, 0)
+# File Provider can transiently lock any existing Vault path used while the
+# context is assembled, including catalog validation, pinned evidence, and Git
+# metadata. Retry the complete read-only resolution attempt so a lock after the
+# catalog load is covered by the same bounded window.
+CONTEXT_RETRY_ATTEMPTS = 30
+CONTEXT_RETRY_DELAY_SECONDS = 1.0
+RETRYABLE_FILESYSTEM_ERRNOS = frozenset(
+    errno_value
+    for errno_value in (
+        getattr(errno, "EDEADLK", None),
+        getattr(errno, "EAGAIN", None),
+        getattr(errno, "EBUSY", None),
+    )
+    if errno_value is not None
+)
+RETRYABLE_SUBPROCESS_MARKERS = frozenset(
+    os.strerror(errno_value).casefold()
+    for errno_value in RETRYABLE_FILESYSTEM_ERRNOS
+)
+T = TypeVar("T")
 
 
 class ContextError(RuntimeError):
     """Represent invalid or unavailable runtime configuration."""
+
+
+def subprocess_error_text(exc: subprocess.CalledProcessError) -> str:
+    """Return bounded diagnostic text used only to classify transient locks."""
+    values: list[str] = [str(exc)]
+    for stream in (exc.stdout, exc.stderr):
+        if isinstance(stream, bytes):
+            values.append(stream.decode("utf-8", errors="replace"))
+        elif isinstance(stream, str):
+            values.append(stream)
+    return "\n".join(values).casefold()
+
+
+def is_retryable_file_provider_error(exc: BaseException) -> bool:
+    """Recognize only the three approved transient File Provider failures."""
+    if isinstance(exc, OSError):
+        return exc.errno in RETRYABLE_FILESYSTEM_ERRNOS
+    if isinstance(exc, subprocess.CalledProcessError):
+        diagnostic = subprocess_error_text(exc)
+        return any(marker in diagnostic for marker in RETRYABLE_SUBPROCESS_MARKERS)
+    return False
+
+
+def retry_read_only_context(operation: Callable[[], T]) -> T:
+    """Retry a read-only context build without weakening permanent failures."""
+    for attempt in range(CONTEXT_RETRY_ATTEMPTS):
+        try:
+            return operation()
+        except (OSError, subprocess.CalledProcessError) as exc:
+            if (
+                not is_retryable_file_provider_error(exc)
+                or attempt + 1 >= CONTEXT_RETRY_ATTEMPTS
+            ):
+                raise
+            time.sleep(CONTEXT_RETRY_DELAY_SECONDS)
+    raise ContextError("runtime context resolution exhausted retry attempts")
+
+
+def load_directory_catalog(directory_paths: object, checkout_root: Path, catalog: dict[str, str]) -> dict[str, object]:
+    """Load one fresh catalog snapshot within a context-resolution attempt."""
+    loader = getattr(directory_paths, "load_environment")
+    catalog.clear()
+    diagnostics = loader(
+        checkout_root=checkout_root,
+        environ=catalog,
+        require_catalog=True,
+    )
+    if not isinstance(diagnostics, dict):
+        raise ContextError("directory catalog diagnostics are malformed")
+    return diagnostics
 
 
 def clean_git_environment() -> dict[str, str]:
@@ -56,9 +130,13 @@ def clean_git_environment() -> dict[str, str]:
             "GIT_NO_LAZY_FETCH": "1",
             "GIT_NO_REPLACE_OBJECTS": "1",
             "GIT_OPTIONAL_LOCKS": "0",
-            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_COUNT": "3",
             "GIT_CONFIG_KEY_0": "core.fsmonitor",
             "GIT_CONFIG_VALUE_0": "false",
+            "GIT_CONFIG_KEY_1": "core.trustctime",
+            "GIT_CONFIG_VALUE_1": "false",
+            "GIT_CONFIG_KEY_2": "core.checkStat",
+            "GIT_CONFIG_VALUE_2": "minimal",
         }
     )
     return environment
@@ -142,6 +220,7 @@ def git_directory(repo_root: Path) -> str:
     top_level = run_local_command(
         [
             "git", "-C", str(repo_root), "-c", "core.fsmonitor=false",
+            "-c", "core.trustctime=false", "-c", "core.checkStat=minimal",
             "rev-parse", "--show-toplevel",
         ],
         check=True,
@@ -155,6 +234,7 @@ def git_directory(repo_root: Path) -> str:
     result = run_local_command(
         [
             "git", "-C", str(repo_root), "-c", "core.fsmonitor=false",
+            "-c", "core.trustctime=false", "-c", "core.checkStat=minimal",
             "rev-parse", "--absolute-git-dir",
         ],
         check=True,
@@ -355,8 +435,8 @@ def validated_gitleaks_version(value: str) -> str:
     return value
 
 
-def resolve_context(local_config: Path, workdir: Path) -> dict[str, str]:
-    """Load the canonical catalog with env={} and derive runtime paths."""
+def resolve_context_once(local_config: Path, workdir: Path) -> dict[str, str]:
+    """Load one canonical env={} snapshot and derive runtime paths read-only."""
     values = parse_local_config(local_config)
     saihai_root = Path(values["SAIHAI_CHECKOUT_ROOT"]).expanduser().resolve()
     if not saihai_root.is_dir():
@@ -365,11 +445,7 @@ def resolve_context(local_config: Path, workdir: Path) -> dict[str, str]:
     import directory_paths  # type: ignore[import-not-found]
 
     catalog: dict[str, str] = {}
-    diagnostics = directory_paths.load_environment(
-        checkout_root=saihai_root,
-        environ=catalog,
-        require_catalog=True,
-    )
+    diagnostics = load_directory_catalog(directory_paths, saihai_root, catalog)
     if diagnostics.get("status") != "loaded":
         raise ContextError("directory catalog status is not loaded")
 
@@ -470,6 +546,13 @@ def resolve_context(local_config: Path, workdir: Path) -> dict[str, str]:
     if not os.access(context["gitleaks_bin"], os.X_OK):
         raise ContextError("GITLEAKS_BIN is not executable")
     return context
+
+
+def resolve_context(local_config: Path, workdir: Path) -> dict[str, str]:
+    """Resolve context with bounded retries across every existing Vault read."""
+    return retry_read_only_context(
+        lambda: resolve_context_once(local_config, workdir)
+    )
 
 
 def main(argv: list[str]) -> int:

@@ -96,9 +96,13 @@ def clean_git_environment() -> dict[str, str]:
     environment["GIT_LITERAL_PATHSPECS"] = "1"
     environment["LC_ALL"] = "C"
     environment["LANG"] = "C"
-    environment["GIT_CONFIG_COUNT"] = "1"
+    environment["GIT_CONFIG_COUNT"] = "3"
     environment["GIT_CONFIG_KEY_0"] = "core.fsmonitor"
     environment["GIT_CONFIG_VALUE_0"] = "false"
+    environment["GIT_CONFIG_KEY_1"] = "core.trustctime"
+    environment["GIT_CONFIG_VALUE_1"] = "false"
+    environment["GIT_CONFIG_KEY_2"] = "core.checkStat"
+    environment["GIT_CONFIG_VALUE_2"] = "minimal"
     return environment
 
 

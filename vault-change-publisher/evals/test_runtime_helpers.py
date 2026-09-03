@@ -23,6 +23,7 @@ SKILL_ROOT = Path(__file__).parents[1]
 REPO_ROOT = SKILL_ROOT.parent
 SOURCE_CATALOG = REPO_ROOT / "summarize-it-news" / "references" / "it-news-sources.json"
 SCRIPTS = SKILL_ROOT / "scripts"
+RUNTIME_RELEASE_VERIFIER = SCRIPTS / "verify-runtime-release.py"
 sys.path.insert(0, str(SCRIPTS))
 PUSH_SPEC = importlib.util.spec_from_file_location(
     "push_committed_heads", SCRIPTS / "push-committed-heads.py"
@@ -124,6 +125,12 @@ RESOLVER_SPEC = importlib.util.spec_from_file_location(
 assert RESOLVER_SPEC and RESOLVER_SPEC.loader
 RESOLVER_MODULE = importlib.util.module_from_spec(RESOLVER_SPEC)
 RESOLVER_SPEC.loader.exec_module(RESOLVER_MODULE)
+STANDING_STAGER_SPEC = importlib.util.spec_from_file_location(
+    "stage_standing_task", SCRIPTS / "stage-standing-task.py"
+)
+assert STANDING_STAGER_SPEC and STANDING_STAGER_SPEC.loader
+STANDING_STAGER_MODULE = importlib.util.module_from_spec(STANDING_STAGER_SPEC)
+STANDING_STAGER_SPEC.loader.exec_module(STANDING_STAGER_MODULE)
 import isolated_git_transport as TRANSPORT_MODULE
 import git_diff_digest as DIFF_MODULE
 import trusted_gitleaks as TRUSTED_GITLEAKS_MODULE
@@ -420,6 +427,86 @@ def load_environment(*, checkout_root, environ, require_catalog):
     def tearDown(self) -> None:
         """Remove the isolated fixture."""
         self.temp_dir.cleanup()
+
+    def test_runtime_release_verifier_accepts_exact_manifest(self) -> None:
+        """A runtime is accepted only when its declared mode and digest match."""
+        release_root = self.workdir / "release"
+        release_root.mkdir()
+        executable = release_root / "runner.py"
+        executable.write_bytes(b"#!/usr/bin/env python3\nprint('fixture')\n")
+        executable.chmod(0o755)
+        manifest = release_root / "runtime-release-manifest.json"
+        manifest.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "source_commit": "a" * 40,
+                    "files": [
+                        {
+                            "path": "runner.py",
+                            "mode": "100755",
+                            "sha256": hashlib.sha256(executable.read_bytes()).hexdigest(),
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        result = subprocess.run(
+            [str(RUNTIME_RELEASE_VERIFIER), str(manifest), str(release_root)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("source_commit=" + "a" * 40, result.stdout)
+
+    def test_runtime_release_verifier_rejects_tampering_and_symlink_escape(self) -> None:
+        """A changed file or symlink cannot silently replace the reviewed runtime."""
+        release_root = self.workdir / "release-tamper"
+        release_root.mkdir()
+        target = release_root / "runner.py"
+        target.write_text("original\n", encoding="utf-8")
+        target.chmod(0o755)
+        manifest = release_root / "runtime-release-manifest.json"
+        manifest.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "source_commit": "b" * 40,
+                    "files": [
+                        {
+                            "path": "runner.py",
+                            "mode": "100755",
+                            "sha256": hashlib.sha256(target.read_bytes()).hexdigest(),
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        target.write_text("tampered\n", encoding="utf-8")
+        result = subprocess.run(
+            [str(RUNTIME_RELEASE_VERIFIER), str(manifest), str(release_root)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 78)
+        self.assertIn("runtime_file_digest_mismatch", result.stderr)
+
+        outside = self.root / "outside.py"
+        outside.write_text("outside\n", encoding="utf-8")
+        target.unlink()
+        target.symlink_to(outside)
+        result = subprocess.run(
+            [str(RUNTIME_RELEASE_VERIFIER), str(manifest), str(release_root)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 78)
+        self.assertIn("runtime_file_symlink_escape", result.stderr)
 
     def notification_fixture(
         self, stdout: str, returncode: int
@@ -2098,6 +2185,113 @@ def load_environment(*, checkout_root, environ, require_catalog):
         )
         self.assertFalse(destination.exists())
 
+    def test_standing_task_snapshot_retries_only_transient_file_provider_locks(self) -> None:
+        content = b"# Approved authorization\n"
+        transient = OSError(
+            STANDING_STAGER_MODULE.errno.EDEADLK,
+            "Resource deadlock avoided",
+        )
+        with (
+            mock.patch.object(
+                STANDING_STAGER_MODULE,
+                "read_regular_beneath",
+                side_effect=[transient, transient, content],
+            ) as reader,
+            mock.patch.object(STANDING_STAGER_MODULE.time, "sleep") as sleep,
+        ):
+            observed = STANDING_STAGER_MODULE.read_regular_beneath_with_retry(
+                self.agents,
+                Path("authorization-source.md"),
+            )
+        self.assertEqual(observed, content)
+        self.assertEqual(reader.call_count, 3)
+        self.assertEqual(sleep.call_count, 2)
+
+        permanent = OSError(STANDING_STAGER_MODULE.errno.EACCES, "denied")
+        with (
+            mock.patch.object(
+                STANDING_STAGER_MODULE,
+                "read_regular_beneath",
+                side_effect=permanent,
+            ) as reader,
+            mock.patch.object(STANDING_STAGER_MODULE.time, "sleep") as sleep,
+            self.assertRaises(OSError),
+        ):
+            STANDING_STAGER_MODULE.read_regular_beneath_with_retry(
+                self.agents,
+                Path("authorization-source.md"),
+            )
+        self.assertEqual(reader.call_count, 1)
+        sleep.assert_not_called()
+
+    def test_standing_task_snapshot_retries_within_read_identity_churn(self) -> None:
+        """A provider-only identity refresh gets a fresh stable descriptor read."""
+        content = b"# Stable standing task\n"
+        transient = STANDING_STAGER_MODULE.SnapshotError(
+            "standing task changed while being read"
+        )
+        with (
+            mock.patch.object(
+                STANDING_STAGER_MODULE,
+                "read_regular_beneath",
+                side_effect=[transient, transient, content],
+            ) as reader,
+            mock.patch.object(STANDING_STAGER_MODULE.time, "sleep") as sleep,
+        ):
+            observed = STANDING_STAGER_MODULE.read_regular_beneath_with_retry(
+                self.agents,
+                Path("standing-source.md"),
+            )
+        self.assertEqual(observed, content)
+        self.assertEqual(reader.call_count, 3)
+        self.assertEqual(sleep.call_count, 2)
+
+        permanent = STANDING_STAGER_MODULE.SnapshotError(
+            "standing task is not UTF-8"
+        )
+        with (
+            mock.patch.object(
+                STANDING_STAGER_MODULE,
+                "read_regular_beneath",
+                side_effect=permanent,
+            ) as reader,
+            mock.patch.object(STANDING_STAGER_MODULE.time, "sleep") as sleep,
+            self.assertRaises(STANDING_STAGER_MODULE.SnapshotError),
+        ):
+            STANDING_STAGER_MODULE.read_regular_beneath_with_retry(
+                self.agents,
+                Path("standing-source.md"),
+            )
+        self.assertEqual(reader.call_count, 1)
+        sleep.assert_not_called()
+
+    def test_standing_task_snapshot_identity_churn_exhausts_closed(self) -> None:
+        """Continuous mutation still fails closed after the bounded retry window."""
+        transient = STANDING_STAGER_MODULE.SnapshotError(
+            "standing task changed while being read"
+        )
+        with (
+            mock.patch.object(
+                STANDING_STAGER_MODULE,
+                "read_regular_beneath",
+                side_effect=transient,
+            ) as reader,
+            mock.patch.object(STANDING_STAGER_MODULE.time, "sleep") as sleep,
+            self.assertRaisesRegex(
+                STANDING_STAGER_MODULE.SnapshotError,
+                "standing task changed while being read",
+            ),
+        ):
+            STANDING_STAGER_MODULE.read_regular_beneath_with_retry(
+                self.agents,
+                Path("standing-source.md"),
+            )
+        self.assertEqual(reader.call_count, STANDING_STAGER_MODULE.SNAPSHOT_RETRY_ATTEMPTS)
+        self.assertEqual(
+            sleep.call_count,
+            STANDING_STAGER_MODULE.SNAPSHOT_RETRY_ATTEMPTS - 1,
+        )
+
     def test_publication_validator_hashes_authorization_snapshot_nofollow(self) -> None:
         snapshot = self.workdir / "authorization-task.md"
         snapshot.write_text("approved\n", encoding="utf-8")
@@ -2122,9 +2316,13 @@ def load_environment(*, checkout_root, environ, require_catalog):
             PUSH_MODULE.clean_git_environment(),
             EVIDENCE_MODULE.clean_git_environment(),
         ):
-            self.assertEqual(environment["GIT_CONFIG_COUNT"], "1")
+            self.assertEqual(environment["GIT_CONFIG_COUNT"], "3")
             self.assertEqual(environment["GIT_CONFIG_KEY_0"], "core.fsmonitor")
             self.assertEqual(environment["GIT_CONFIG_VALUE_0"], "false")
+            self.assertEqual(environment["GIT_CONFIG_KEY_1"], "core.trustctime")
+            self.assertEqual(environment["GIT_CONFIG_VALUE_1"], "false")
+            self.assertEqual(environment["GIT_CONFIG_KEY_2"], "core.checkStat")
+            self.assertEqual(environment["GIT_CONFIG_VALUE_2"], "minimal")
         heads = {
             "agents": create_empty_base(self.agents),
             "user": create_empty_base(self.user),
@@ -3315,6 +3513,315 @@ def load_environment(*, checkout_root, environ, require_catalog):
         )
         self.assertIsNotNone(entry["git_blob_oid"])
         self.assertEqual(state["capture_status"], "available")
+
+    def test_index_only_capture_never_walks_existing_worktree(self) -> None:
+        """Bind HEAD/index/control state without hydrating unrelated cloud files."""
+        repo = self.user
+        subprocess.run(
+            ["git", "-C", str(repo), "config", "user.name", "Fixture"],
+            check=True,
+        )
+        subprocess.run(
+            [
+                "git", "-C", str(repo), "config", "user.email",
+                "fixture@example.invalid",
+            ],
+            check=True,
+        )
+        tracked = repo / "tracked.md"
+        tracked.write_text("head\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", tracked.name], check=True)
+        subprocess.run(
+            ["git", "-C", str(repo), "commit", "-q", "-m", "base"],
+            check=True,
+        )
+        subprocess.run(["git", "-C", str(repo), "branch", "-M", "main"], check=True)
+        subprocess.run(
+            ["git", "-C", str(repo), "push", "-q", "-u", "origin", "main"],
+            check=True,
+        )
+
+        staged = repo / "staged-cloud.md"
+        staged.write_text("sealed in index\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", staged.name], check=True)
+        staged.unlink()
+        tracked.write_text("unstaged cloud bytes\n", encoding="utf-8")
+        (repo / "untracked-cloud.md").write_text(
+            "untracked cloud bytes\n", encoding="utf-8"
+        )
+
+        real_runner = CAPTURE_MODULE.run_local_command
+        commands: list[list[str]] = []
+
+        def record_command(arguments: list[str], **kwargs: object):
+            commands.append(arguments)
+            return real_runner(arguments, **kwargs)
+
+        with mock.patch.object(
+            CAPTURE_MODULE, "run_local_command", side_effect=record_command
+        ):
+            state = CAPTURE_MODULE.capture(
+                str(repo), include_local_history=True, worktree_scope="index_only"
+            )
+
+        flattened = [argument for command in commands for argument in command]
+        self.assertNotIn("status", flattened)
+        self.assertFalse(
+            any("--untracked-files" in argument for argument in flattened)
+        )
+        self.assertFalse(
+            any(
+                "ls-files" in command and "--others" in command
+                for command in commands
+            )
+        )
+        self.assertFalse(
+            any(
+                "diff" in command and "--cached" not in command
+                for command in commands
+            )
+        )
+        self.assertFalse(any("hash-object" in command for command in commands))
+        self.assertEqual(state["worktree_capture_scope"], "index_only")
+        self.assertEqual(state["dirty_paths"], [staged.name])
+        self.assertEqual(state["staged_paths"], [staged.name])
+        self.assertEqual(state["dirty_entries"][0]["mode"], "100644")
+        self.assertIsNotNone(state["dirty_entries"][0]["git_blob_oid"])
+        self.assertTrue(
+            all(value is None for value in state["dirty_metadata"][0].values() if value != staged.name)
+        )
+        self.assertEqual(
+            state["dirty_materialization"],
+            {
+                "status": "deferred",
+                "deferred_paths": [],
+                "reason": "worktree_scan_intentionally_omitted",
+            },
+        )
+
+    def test_index_only_capture_forces_own_only_publication(self) -> None:
+        """Never infer sweep cleanliness from an intentionally omitted worktree."""
+        base = {
+            "capture_status": "available",
+            "branch": "main",
+            "upstream": "origin/main",
+            "local_head": "a" * 40,
+            "remote_head": "a" * 40,
+            "history_relation": "equal",
+            "history_capture_status": "available",
+            "operation_in_progress": False,
+            "git_control_sha256": "b" * 64,
+            "worktree_capture_scope": "index_only",
+            "dirty_lines": [],
+            "dirty_paths": [],
+            "dirty_entries": [],
+            "dirty_metadata": [],
+            "dirty_materialization": {
+                "status": "deferred",
+                "deferred_paths": [],
+                "reason": "worktree_scan_intentionally_omitted",
+            },
+            "staged_paths": [],
+            "index_entries": [],
+            "index_sha256": "c" * 64,
+            "index_identity": [1, 2, 3, 33188, 4, 5],
+            "dirty_worktree_sha256": "d" * 64,
+            "dirty_digest": "e" * 64,
+            "diff_snapshot_sha256": "f" * 64,
+        }
+        mode = MODE_MODULE.vault_mode(base, dict(base), "reports/news.md")
+        self.assertEqual(mode["required_mode"], "own_only")
+        self.assertFalse(mode["state_changed"])
+        self.assertIn("worktree_scan_intentionally_omitted", mode["reasons"])
+
+    def test_every_publication_recapture_requests_index_only_scope(self) -> None:
+        """Keep later commit, push, and evidence gates off full worktree status."""
+        payload = json.dumps({"agents_vault": {}, "user_vault": {}})
+        completed = subprocess.CompletedProcess([], 0, payload, "")
+        calls = (
+            (COMMITTER_MODULE, lambda: COMMITTER_MODULE.capture_state("/capture", "/runtime")),
+            (PUSH_MODULE, lambda: PUSH_MODULE.capture_complete("/runtime")),
+            (EVIDENCE_MODULE, lambda: EVIDENCE_MODULE.capture_complete("/runtime")),
+            (FINALIZER_MODULE, lambda: FINALIZER_MODULE.capture_complete("/runtime")),
+        )
+        for module, callback in calls:
+            with self.subTest(module=module.__name__), mock.patch.object(
+                module, "run_local_command", return_value=completed
+            ) as runner:
+                callback()
+                arguments = runner.call_args.args[0]
+                self.assertIn("--index-only", arguments)
+                self.assertIn("--include-local-history", arguments)
+
+    def test_index_only_install_validation_rejects_shared_index_drift(self) -> None:
+        """Trust the artifact receipt only while reviewed index/control state holds."""
+        before = {
+            "worktree_capture_scope": "index_only",
+            "local_head": "a" * 40,
+            "git_control_sha256": "b" * 64,
+            "dirty_lines": [],
+            "dirty_paths": [],
+            "dirty_entries": [],
+            "dirty_metadata": [],
+            "staged_paths": [],
+            "index_entries": [],
+            "index_sha256": "c" * 64,
+            "index_identity": [1, 2, 3, 33188, 4, 5],
+            "dirty_worktree_sha256": "d" * 64,
+            "dirty_digest": "e" * 64,
+            "diff_snapshot_sha256": "f" * 64,
+        }
+        volatile = json.loads(json.dumps(before))
+        volatile["index_sha256"] = "1" * 64
+        volatile["index_identity"] = [1, 6, 3, 33188, 7, 8]
+        COMMITTER_MODULE.validate_installed_vault(
+            before, volatile, "reports/news.md"
+        )
+        COMMITTER_MODULE.validate_installed_scope(
+            {"agents_vault": before, "user_vault": before},
+            {"agents_vault": volatile, "user_vault": volatile},
+            {
+                "agents_vault": "reports/advisory.md",
+                "user_vault": "reports/news.md",
+            },
+        )
+
+        drifted = json.loads(json.dumps(volatile))
+        drifted["index_entries"] = [
+            {
+                "path": "third-party.md",
+                "mode": "100644",
+                "git_blob_oid": "2" * 40,
+                "stage": 0,
+            }
+        ]
+        with self.assertRaisesRegex(
+            COMMITTER_MODULE.CommitError, "control/index state changed"
+        ):
+            COMMITTER_MODULE.validate_installed_vault(
+                before, drifted, "reports/news.md"
+            )
+        with self.assertRaisesRegex(
+            COMMITTER_MODULE.CommitError, "control/index state changed"
+        ):
+            COMMITTER_MODULE.validate_installed_scope(
+                {"agents_vault": before, "user_vault": before},
+                {"agents_vault": drifted, "user_vault": volatile},
+                {
+                    "agents_vault": "reports/advisory.md",
+                    "user_vault": "reports/news.md",
+                },
+            )
+
+    def test_capture_defers_file_provider_hash_failure_without_blocking_vault(self) -> None:
+        """Keep the Git path/metadata contract when one residual cannot hydrate."""
+        for repo in (self.agents, self.user):
+            subprocess.run(
+                ["git", "-C", str(repo), "config", "user.name", "Fixture"],
+                check=True,
+            )
+            subprocess.run(
+                [
+                    "git", "-C", str(repo), "config", "user.email",
+                    "fixture@example.invalid",
+                ],
+                check=True,
+            )
+            (repo / "base.md").write_text("base\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(repo), "add", "base.md"], check=True)
+            subprocess.run(
+                ["git", "-C", str(repo), "commit", "-q", "-m", "base"],
+                check=True,
+            )
+            subprocess.run(["git", "-C", str(repo), "branch", "-M", "main"], check=True)
+            subprocess.run(
+                ["git", "-C", str(repo), "push", "-q", "-u", "origin", "main"],
+                check=True,
+            )
+        (self.agents / "first.md").write_text("first\n", encoding="utf-8")
+        (self.agents / "second.md").write_text("second\n", encoding="utf-8")
+        real_runner = CAPTURE_MODULE.run_local_command
+        hash_attempts: list[list[str]] = []
+
+        def fail_file_provider_hash(arguments: list[str], **kwargs: object):
+            if "hash-object" in arguments and "--no-filters" in arguments:
+                hash_attempts.append(arguments)
+                raise subprocess.TimeoutExpired(arguments, CAPTURE_MODULE.DIRTY_ENTRY_TIMEOUT_SECONDS)
+            return real_runner(arguments, **kwargs)
+
+        context = self.workdir / "provider-capture-context.json"
+        context.write_text(
+            json.dumps(
+                {
+                    "agents_vault_root": str(self.agents),
+                    "user_vault_root": str(self.user),
+                }
+            ),
+            encoding="utf-8",
+        )
+        with mock.patch.object(
+            CAPTURE_MODULE, "run_local_command", side_effect=fail_file_provider_hash
+        ):
+            result = CAPTURE_MODULE.capture(str(self.agents))
+        self.assertEqual(len(hash_attempts), 1)
+        self.assertEqual(result["capture_status"], "available")
+        self.assertTrue(
+            {"first.md", "second.md"}.issubset(set(result["dirty_paths"]))
+        )
+        self.assertEqual(result["dirty_materialization"]["status"], "deferred")
+        self.assertEqual(
+            result["dirty_materialization"]["deferred_paths"], result["dirty_paths"]
+        )
+        self.assertEqual(
+            result["dirty_materialization"]["reason"],
+            "dirty_entry_snapshot_unavailable",
+        )
+        self.assertTrue(
+            all(
+                entry["mode"] == CAPTURE_MODULE.UNAVAILABLE_DIRTY_MODE
+                and entry["git_blob_oid"] is None
+                for entry in result["dirty_entries"]
+            )
+        )
+
+    def test_capture_keeps_index_only_entry_materialized_after_provider_failure(self) -> None:
+        """An index-only residual needs no cloud bytes and stays exact."""
+        repo = self.agents
+        subprocess.run(
+            ["git", "-C", str(repo), "config", "user.name", "Fixture"], check=True
+        )
+        subprocess.run(
+            ["git", "-C", str(repo), "config", "user.email", "fixture@example.invalid"],
+            check=True,
+        )
+        (repo / "tracked.md").write_text("head\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "tracked.md"], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "base"], check=True)
+        subprocess.run(["git", "-C", str(repo), "branch", "-M", "main"], check=True)
+        subprocess.run(
+            ["git", "-C", str(repo), "push", "-q", "-u", "origin", "main"], check=True
+        )
+        tracked = repo / "tracked.md"
+        tracked.write_text("staged\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "tracked.md"], check=True)
+        tracked.write_text("head\n", encoding="utf-8")
+        (repo / "provider.md").write_text("provider\n", encoding="utf-8")
+        real_runner = CAPTURE_MODULE.run_local_command
+
+        def fail_file_provider_hash(arguments: list[str], **kwargs: object):
+            if "hash-object" in arguments and "--no-filters" in arguments:
+                raise subprocess.TimeoutExpired(arguments, CAPTURE_MODULE.DIRTY_ENTRY_TIMEOUT_SECONDS)
+            return real_runner(arguments, **kwargs)
+
+        with mock.patch.object(
+            CAPTURE_MODULE, "run_local_command", side_effect=fail_file_provider_hash
+        ):
+            result = CAPTURE_MODULE.capture(str(repo))
+        entries = {entry["path"]: entry for entry in result["dirty_entries"]}
+        self.assertEqual(entries["tracked.md"]["mode"], "100644")
+        self.assertIsNotNone(entries["tracked.md"]["git_blob_oid"])
+        self.assertEqual(entries["provider.md"]["mode"], CAPTURE_MODULE.UNAVAILABLE_DIRTY_MODE)
+        self.assertIsNone(entries["provider.md"]["git_blob_oid"])
 
     def test_oversize_local_commit_patch_blocks_only_residual_sweep(self) -> None:
         """Materialize local history under a hard bound after collection only."""
@@ -6129,6 +6636,66 @@ def load_environment(*, checkout_root, environ, require_catalog):
             RESOLVER_MODULE.EXTERNAL_BINARY_TIMEOUT_SECONDS,
             RESOLVER_MODULE.CONTROL_COMMAND_TIMEOUT_SECONDS,
         )
+
+    def test_resolver_retries_transient_file_provider_error_across_context(self) -> None:
+        """Retry a transient lock even when it happens after catalog loading."""
+        attempts = 0
+
+        def resolve_once(_local_config, _workdir):
+            nonlocal attempts
+            attempts += 1
+            if attempts < 5:
+                raise OSError(
+                    RESOLVER_MODULE.errno.EDEADLK,
+                    "Resource deadlock avoided",
+                )
+            return {"status": "resolved"}
+
+        with mock.patch.object(RESOLVER_MODULE.time, "sleep") as sleep:
+            with mock.patch.object(
+                RESOLVER_MODULE,
+                "resolve_context_once",
+                side_effect=resolve_once,
+            ):
+                context = RESOLVER_MODULE.resolve_context(self.config, self.workdir)
+        self.assertEqual(context, {"status": "resolved"})
+        self.assertEqual(attempts, 5)
+        self.assertEqual(sleep.call_count, 4)
+
+    def test_resolver_retries_git_wrapped_file_provider_error(self) -> None:
+        """Recognize the same transient errno when Git reports it via stderr."""
+        attempts = 0
+
+        def operation():
+            nonlocal attempts
+            attempts += 1
+            if attempts < 3:
+                raise subprocess.CalledProcessError(
+                    128,
+                    ["git", "rev-parse"],
+                    stderr="fatal: Resource deadlock avoided\n",
+                )
+            return "resolved"
+
+        with mock.patch.object(RESOLVER_MODULE.time, "sleep") as sleep:
+            observed = RESOLVER_MODULE.retry_read_only_context(operation)
+        self.assertEqual(observed, "resolved")
+        self.assertEqual(attempts, 3)
+        self.assertEqual(sleep.call_count, 2)
+
+    def test_resolver_does_not_retry_permanent_context_failure(self) -> None:
+        """Keep permanent Git and validation failures immediately fail-closed."""
+        permanent = subprocess.CalledProcessError(
+            128,
+            ["git", "rev-parse"],
+            stderr="fatal: not a git repository\n",
+        )
+        with mock.patch.object(RESOLVER_MODULE.time, "sleep") as sleep:
+            with self.assertRaises(subprocess.CalledProcessError):
+                RESOLVER_MODULE.retry_read_only_context(
+                    mock.Mock(side_effect=permanent)
+                )
+        sleep.assert_not_called()
 
     def test_resolver_sanitizes_gitleaks_version_probe_environment(self) -> None:
         """Do not let ambient Git or Gitleaks variables control the version probe."""
@@ -9906,6 +10473,68 @@ def load_environment(*, checkout_root, environ, require_catalog):
                 str(self.user), pre, reported, current_state=pre
             )
 
+    def test_index_only_pusher_uses_recaptured_index_state_without_status(self) -> None:
+        """Validate own_only publication without walking the cloud worktree."""
+        head = create_empty_base(self.user)
+        subprocess.run(["git", "-C", str(self.user), "branch", "-M", "main"], check=True)
+        subprocess.run(
+            ["git", "-C", str(self.user), "push", "-q", "-u", "origin", "main"],
+            check=True,
+        )
+        pre = CAPTURE_MODULE.capture(
+            str(self.user), include_local_history=True, worktree_scope="index_only"
+        )
+        reported = {
+            "publication_mode": "own_only",
+            "commit_status": "not_required",
+            "commit_hashes": [],
+            "pre_local_head": head,
+            "local_head": head,
+            "pre_dirty_digest": pre["dirty_digest"],
+            "post_dirty_digest": pre["dirty_digest"],
+            "clean": False,
+        }
+        with mock.patch.object(
+            PUSH_MODULE,
+            "dirty_digest",
+            side_effect=AssertionError("worktree status must not run"),
+        ) as dirty:
+            self.assertEqual(
+                PUSH_MODULE.validate_local(
+                    str(self.user),
+                    pre,
+                    reported,
+                    current_state=pre,
+                    artifact_path="reports/news.md",
+                ),
+                head,
+            )
+        dirty.assert_not_called()
+
+        drifted = json.loads(json.dumps(pre))
+        drifted["index_entries"] = [
+            {
+                "path": "third-party.md",
+                "mode": "100644",
+                "git_blob_oid": "f" * 40,
+                "stage": 0,
+            }
+        ]
+        with self.assertRaisesRegex(
+            PUSH_MODULE.PushError, "non-owned index entry"
+        ), mock.patch.object(
+            PUSH_MODULE,
+            "dirty_digest",
+            side_effect=AssertionError("worktree status must not run"),
+        ):
+            PUSH_MODULE.validate_local(
+                str(self.user),
+                pre,
+                reported,
+                current_state=drifted,
+                artifact_path="reports/news.md",
+            )
+
     def test_fixed_pusher_validates_and_pushes_exact_heads(self) -> None:
         """Push both validated local main heads outside the Codex process."""
         runtime = {
@@ -11359,11 +11988,34 @@ def load_environment(*, checkout_root, environ, require_catalog):
             SCRIPTS / "stage-dirty-review-inputs.py",
             SCRIPTS / "prepare-publication-review-context.py",
             SCRIPTS / "run-pinned-review.py",
+            SCRIPTS / "verify-runtime-release.py",
             SCRIPTS / "interpret-automation-result.sh",
             REPO_ROOT / "summarize-it-news" / "scripts" / "collect-public-sources.py",
             SOURCE_CATALOG,
         ):
             shutil.copy2(source, runtime / source.name)
+
+        runtime_verifier = runtime / "verify-runtime-release.py"
+        runtime_verifier.chmod(0o755)
+        runtime_manifest = runtime / "runtime-release-manifest.json"
+        runtime_manifest.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "source_commit": "c" * 40,
+                    "files": [
+                        {
+                            "path": runtime_verifier.name,
+                            "mode": "100755",
+                            "sha256": hashlib.sha256(
+                                runtime_verifier.read_bytes()
+                            ).hexdigest(),
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
 
         notification_sender = runtime / "send-it-news-discord-notification.py"
         notification_sender.write_text(
@@ -11515,7 +12167,7 @@ raise SystemExit(completed.returncode)
             subprocess.run(["git", "-C", str(repo), "config", "user.name", "Fixture"], check=True)
             subprocess.run(["git", "-C", str(repo), "config", "user.email", "fixture@example.invalid"], check=True)
             (repo / "initial.md").write_text("initial\n", encoding="utf-8")
-            subprocess.run(["git", "-C", str(repo), "add", "initial.md"], check=True)
+            subprocess.run(["git", "-C", str(repo), "add", "--all"], check=True)
             subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "initial"], check=True)
             subprocess.run(["git", "-C", str(repo), "branch", "-M", "main"], check=True)
             subprocess.run(["git", "-C", str(repo), "push", "-q", "-u", "origin", "main"], check=True)
@@ -11927,6 +12579,9 @@ if stage=="collection" and os.environ.get("FAKE_SNAPSHOT_RAW_COLLECTION") == "1"
         self.assertIn("semantic_status=success", terminal_status)
         self.assertIn("notification_disposition=attempted", terminal_status)
         self.assertIn("notification_status=0", terminal_status)
+        release_checks = list(runtime.glob("logs/**/runtime-release-verification.txt"))
+        self.assertEqual(len(release_checks), 1)
+        self.assertIn("source_commit=" + "c" * 40, release_checks[0].read_text())
         for audit_name in (
             "collection-agent-result.json",
             "collection-result.json",
@@ -12040,17 +12695,14 @@ if stage=="collection" and os.environ.get("FAKE_SNAPSHOT_RAW_COLLECTION") == "1"
         )
         self.assertEqual(
             [item["path"] for item in publication_result["deferred_cleanup"]["user_vault"]],
-            [
-                ".codex-handoff/unsafe.md",
-                str(conflicted_target.resolve().relative_to(self.user.resolve())),
-            ],
+            [],
         )
         self.assertEqual(
             [
                 item["path"]
                 for item in publication_result["deferred_cleanup"]["agents_vault"]
             ],
-            [".codex-handoff/unsafe-agents.md", standing_relative],
+            [standing_relative],
         )
         normalization_receipts = list(
             runtime.glob("logs/**/publication-review-normalization.json")

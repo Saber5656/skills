@@ -143,6 +143,11 @@ def clean_transport_environment(object_directory: Path) -> dict[str, str]:
             "GIT_TERMINAL_PROMPT": "0",
             "GIT_SSH_COMMAND": SSH_COMMAND,
             "GIT_OBJECT_DIRECTORY": str(object_directory),
+            "GIT_CONFIG_COUNT": "2",
+            "GIT_CONFIG_KEY_0": "core.trustctime",
+            "GIT_CONFIG_VALUE_0": "false",
+            "GIT_CONFIG_KEY_1": "core.checkStat",
+            "GIT_CONFIG_VALUE_1": "minimal",
         }
     )
     return environment
@@ -236,6 +241,10 @@ class IsolatedGitTransport:
             f"core.hooksPath={os.devnull}",
             "-c",
             "core.fsmonitor=false",
+            "-c",
+            "core.trustctime=false",
+            "-c",
+            "core.checkStat=minimal",
             "-c",
             f"core.sshCommand={SSH_COMMAND}",
             "-c",

@@ -40,6 +40,7 @@ RESIDUAL_ARRAY_KEYS = frozenset(
         "excluded_paths",
         "unrelated_dirty_paths",
         "deferred_cleanup",
+        "deferred_paths",
         "owned_paths",
         "commit_groups",
         "changed_paths",

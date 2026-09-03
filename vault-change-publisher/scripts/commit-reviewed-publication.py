@@ -101,9 +101,13 @@ def clean_environment(
             "GIT_OPTIONAL_LOCKS": "0",
             "LC_ALL": "C",
             "LANG": "C",
-            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_COUNT": "3",
             "GIT_CONFIG_KEY_0": "core.fsmonitor",
             "GIT_CONFIG_VALUE_0": "false",
+            "GIT_CONFIG_KEY_1": "core.trustctime",
+            "GIT_CONFIG_VALUE_1": "false",
+            "GIT_CONFIG_KEY_2": "core.checkStat",
+            "GIT_CONFIG_VALUE_2": "minimal",
         }
     )
     if publisher_identity is not None:
@@ -142,6 +146,10 @@ def git(
             "-c",
             "core.fsmonitor=false",
             "-c",
+            "core.trustctime=false",
+            "-c",
+            "core.checkStat=minimal",
+            "-c",
             "commit.gpgSign=false",
             *arguments,
         ],
@@ -175,6 +183,10 @@ def git_bytes(
             "-c",
             "core.fsmonitor=false",
             "-c",
+            "core.trustctime=false",
+            "-c",
+            "core.checkStat=minimal",
+            "-c",
             "commit.gpgSign=false",
             *arguments,
         ],
@@ -206,9 +218,18 @@ def safe_path(value: object) -> str:
 def current_state(repo: str, git_dir: str, pre: dict[str, object]) -> dict[str, object]:
     """Capture local progress in the canonical commit-result shape."""
     head = git(repo, git_dir, "rev-parse", "HEAD").stdout.strip()
-    status = git(
-        repo, git_dir, "status", "--porcelain=v1", "--untracked-files=all"
-    ).stdout
+    if pre.get("worktree_capture_scope") == "index_only":
+        # own_only commits are constructed from an isolated index and publish
+        # through HEAD/index CAS. Unrelated worktree bytes are deliberately
+        # outside this transaction and must not be re-walked through iCloud.
+        post_dirty_digest = str(pre["dirty_digest"])
+        clean = False
+    else:
+        status = git(
+            repo, git_dir, "status", "--porcelain=v1", "--untracked-files=all"
+        ).stdout
+        post_dirty_digest = hashlib.sha256(status.encode("utf-8")).hexdigest()
+        clean = not status
     commits = git(
         repo,
         git_dir,
@@ -222,15 +243,15 @@ def current_state(repo: str, git_dir: str, pre: dict[str, object]) -> dict[str, 
         "pre_local_head": pre["local_head"],
         "local_head": head,
         "pre_dirty_digest": pre["dirty_digest"],
-        "post_dirty_digest": hashlib.sha256(status.encode("utf-8")).hexdigest(),
-        "clean": not status,
+        "post_dirty_digest": post_dirty_digest,
+        "clean": clean,
     }
 
 
 def capture_exact(capture: str, runtime_file: str, expected: dict[str, object]) -> None:
     """Require the current two-Vault state to equal the immutable pre-state."""
     completed = run_local_command(
-        [capture, "--include-local-history", runtime_file],
+        [capture, "--index-only", "--include-local-history", runtime_file],
         cwd="/",
         check=True,
         capture_output=True,
@@ -245,7 +266,7 @@ def capture_exact(capture: str, runtime_file: str, expected: dict[str, object]) 
 def capture_state(capture: str, runtime_file: str) -> dict[str, object]:
     """Capture the complete current state for both Vaults."""
     completed = run_local_command(
-        [capture, "--include-local-history", runtime_file],
+        [capture, "--index-only", "--include-local-history", runtime_file],
         cwd="/",
         check=True,
         capture_output=True,
@@ -278,6 +299,22 @@ def validate_installed_scope(
     for key in ("agents_vault", "user_vault"):
         expected_state = before[key]
         current_state_value = current[key]
+        if expected_state.get("worktree_capture_scope") == "index_only":
+            if {
+                field: value
+                for field, value in current_state_value.items()
+                if field not in VOLATILE_INDEX_FIELDS
+            } != {
+                field: value
+                for field, value in expected_state.items()
+                if field not in VOLATILE_INDEX_FIELDS
+            }:
+                raise CommitError(
+                    "Vault control/index state changed during artifact installation"
+                )
+            # The exclusive installer receipt binds the new worktree file;
+            # index-only capture intentionally cannot enumerate it.
+            continue
         if {
             field: value
             for field, value in current_state_value.items()
@@ -1489,7 +1526,9 @@ def validate_post_commit_state(
         "dirty_worktree_sha256",
         "dirty_digest",
         "diff_snapshot_sha256",
+        "dirty_materialization",
         "git_control_sha256",
+        "worktree_capture_scope",
         "branch",
         "upstream",
         "operation_in_progress",
@@ -1640,6 +1679,22 @@ def validate_installed_vault(
     allow_volatile_index: bool = False,
 ) -> None:
     """Allow one newly installed artifact while preserving one Vault residual."""
+    if before.get("worktree_capture_scope") == "index_only":
+        if {
+            field: value
+            for field, value in current.items()
+            if field not in VOLATILE_INDEX_FIELDS
+        } != {
+            field: value
+            for field, value in before.items()
+            if field not in VOLATILE_INDEX_FIELDS
+        }:
+            raise CommitError(
+                "Vault control/index state changed during artifact installation"
+            )
+        # validated_installer_receipt already binds exact target identity,
+        # bytes, mode, parent directory, and absence from HEAD/shared index.
+        return
     mutable_fields = {
         "dirty_lines", "dirty_paths", "dirty_entries", "dirty_metadata",
         "staged_paths", "index_entries",
@@ -1694,7 +1749,10 @@ def vault_result_from_snapshot(
         "local_head": snapshot["local_head"],
         "pre_dirty_digest": pre["dirty_digest"],
         "post_dirty_digest": snapshot["dirty_digest"],
-        "clean": not snapshot["dirty_lines"],
+        "clean": (
+            snapshot.get("worktree_capture_scope") == "full"
+            and not snapshot["dirty_lines"]
+        ),
         "publication_mode": publication_mode,
         "deferred_cleanup": deferred_cleanup,
     }
@@ -2144,7 +2202,10 @@ def main(argv: list[str]) -> int:
                 claimed["publication_mode"] = review[key]["publication_mode"]
                 claimed["deferred_cleanup"] = list(review[key]["deferred_cleanup"])
                 claimed["post_dirty_digest"] = current["dirty_digest"]
-                claimed["clean"] = not current["dirty_lines"]
+                claimed["clean"] = (
+                    current.get("worktree_capture_scope") == "full"
+                    and not current["dirty_lines"]
+                )
                 return claimed, True, False, None, None
             if same_context_resume and previous is not None and previous[key].get("commit_hashes"):
                 actual = current_state(

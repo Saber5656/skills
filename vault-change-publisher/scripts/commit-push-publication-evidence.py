@@ -94,9 +94,13 @@ def clean_environment(
     environment["GIT_NO_LAZY_FETCH"] = "1"
     environment["GIT_NO_REPLACE_OBJECTS"] = "1"
     environment["GIT_OPTIONAL_LOCKS"] = "0"
-    environment["GIT_CONFIG_COUNT"] = "1"
+    environment["GIT_CONFIG_COUNT"] = "3"
     environment["GIT_CONFIG_KEY_0"] = "core.fsmonitor"
     environment["GIT_CONFIG_VALUE_0"] = "false"
+    environment["GIT_CONFIG_KEY_1"] = "core.trustctime"
+    environment["GIT_CONFIG_VALUE_1"] = "false"
+    environment["GIT_CONFIG_KEY_2"] = "core.checkStat"
+    environment["GIT_CONFIG_VALUE_2"] = "minimal"
     if publisher_identity is not None:
         name, email = publisher_identity
         environment["GIT_AUTHOR_NAME"] = name
@@ -135,6 +139,8 @@ def git(
             "git", *repository_arguments,
             "-c", f"core.hooksPath={os.devnull}",
             "-c", "core.fsmonitor=false",
+            "-c", "core.trustctime=false",
+            "-c", "core.checkStat=minimal",
             "-c", "commit.gpgSign=false",
             *arguments,
         ],
@@ -376,7 +382,7 @@ def capture_complete(runtime_file: str) -> dict[str, object]:
     """Capture both Vaults through the canonical publication state helper."""
     helper = Path(__file__).with_name("capture-vault-state.py")
     completed = run_local_command(
-        [str(helper), "--include-local-history", runtime_file],
+        [str(helper), "--index-only", "--include-local-history", runtime_file],
         check=True,
         capture_output=True,
         text=True,
@@ -398,6 +404,7 @@ def validate_residual_after_commit(
     for field in (
         "dirty_lines", "dirty_paths", "staged_paths", "git_control_sha256",
         "branch", "upstream", "operation_in_progress", "remote_head",
+        "worktree_capture_scope",
     ):
         if current.get(field) != baseline.get(field):
             raise FinalizationError(f"evidence commit changed residual state: {field}")
@@ -694,6 +701,8 @@ def git_object_bytes(repo: str, git_dir: str, object_spec: str) -> bytes:
             "git", f"--git-dir={git_dir}", f"--work-tree={repo}",
             "-c", f"core.hooksPath={os.devnull}",
             "-c", "core.fsmonitor=false",
+            "-c", "core.trustctime=false",
+            "-c", "core.checkStat=minimal",
             "cat-file", "blob", object_spec,
         ],
         check=False,
@@ -1740,7 +1749,11 @@ def partial_result(
         local_known = True
         try:
             head: str | None = git(repo, "rev-parse", "HEAD").stdout.strip()
-            clean, _ = dirty_status(repo)
+            clean = (
+                False
+                if pre.get(key, {}).get("worktree_capture_scope") == "index_only"
+                else dirty_status(repo)[0]
+            )
             if key == "agents_vault":
                 finalization_commits = git(
                     repo,
@@ -1984,7 +1997,12 @@ def main(argv: list[str]) -> int:
             evidence_commit,
             before_remote,
         )
-        clean, _ = dirty_status(repo)
+        clean = (
+            False
+            if committed_state["agents_vault"].get("worktree_capture_scope")
+            == "index_only"
+            else dirty_status(repo)[0]
+        )
         if remote != evidence_commit:
             raise FinalizationError("final evidence state is not published")
         user_repo = runtime["user_vault_root"]
@@ -1992,7 +2010,12 @@ def main(argv: list[str]) -> int:
         user_remote = remote_head(
             user_repo, runtime["user_remote_url"], runtime["user_git_dir"]
         )
-        user_clean, _ = dirty_status(user_repo)
+        user_clean = (
+            False
+            if committed_state["user_vault"].get("worktree_capture_scope")
+            == "index_only"
+            else dirty_status(user_repo)[0]
+        )
         if (
             git(user_repo, "branch", "--show-current").stdout.strip() != "main"
             or user_head != initial["user_vault"]["local_head"]
