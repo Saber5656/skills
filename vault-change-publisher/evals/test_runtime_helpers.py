@@ -24,6 +24,47 @@ REPO_ROOT = SKILL_ROOT.parent
 SOURCE_CATALOG = REPO_ROOT / "summarize-it-news" / "references" / "it-news-sources.json"
 SCRIPTS = SKILL_ROOT / "scripts"
 RUNTIME_RELEASE_VERIFIER = SCRIPTS / "verify-runtime-release.py"
+EXPECTED_RUNTIME_RELEASE_FILES = frozenset(
+    {
+        "atomic_file_ops.py",
+        "automation-result.schema.json",
+        "capture-vault-state.py",
+        "collect-public-sources.py",
+        "collection-result.schema.json",
+        "commit-push-publication-evidence.py",
+        "commit-reviewed-publication.py",
+        "daily-it-news.collect.prompt.md",
+        "daily-it-news.evidence-review.prompt.md",
+        "daily-it-news.review.prompt.md",
+        "determine-publication-modes.py",
+        "evidence-review-result.schema.json",
+        "evidence_hunk.py",
+        "fetch-vault-main.py",
+        "git_diff_digest.py",
+        "gitleaks-default.toml",
+        "install-verified-artifacts.py",
+        "interpret-automation-result.sh",
+        "isolated_git_transport.py",
+        "it-news-sources.json",
+        "prepare-codex-output-schema.py",
+        "prepare-publication-evidence.py",
+        "prepare-publication-review-context.py",
+        "publication-commit-result.schema.json",
+        "publication-review-result.schema.json",
+        "push-committed-heads.py",
+        "resolve-runtime-context.py",
+        "run-daily-it-news-vulnerability-check.sh",
+        "run-pinned-review.py",
+        "send-it-news-discord-notification.py",
+        "stage-dirty-review-inputs.py",
+        "stage-standing-task.py",
+        "trusted_gitleaks.py",
+        "validate-canonical-result.py",
+        "validate-collection-result.py",
+        "validate-publication-review.py",
+        "verify-runtime-release.py",
+    }
+)
 sys.path.insert(0, str(SCRIPTS))
 PUSH_SPEC = importlib.util.spec_from_file_location(
     "push_committed_heads", SCRIPTS / "push-committed-heads.py"
@@ -428,30 +469,50 @@ def load_environment(*, checkout_root, environ, require_catalog):
         """Remove the isolated fixture."""
         self.temp_dir.cleanup()
 
-    def test_runtime_release_verifier_accepts_exact_manifest(self) -> None:
-        """A runtime is accepted only when its declared mode and digest match."""
-        release_root = self.workdir / "release"
-        release_root.mkdir()
-        executable = release_root / "runner.py"
-        executable.write_bytes(b"#!/usr/bin/env python3\nprint('fixture')\n")
-        executable.chmod(0o755)
+    def write_runtime_release_manifest(
+        self, release_root: Path, source_commit: str
+    ) -> Path:
+        """Seal the independently enumerated complete runtime fixture."""
+        entries = []
+        for name in sorted(EXPECTED_RUNTIME_RELEASE_FILES):
+            target = release_root / name
+            mode = stat.S_IMODE(target.lstat().st_mode)
+            self.assertIn(mode, {0o644, 0o755}, name)
+            entries.append(
+                {
+                    "path": name,
+                    "mode": f"100{mode:03o}",
+                    "sha256": hashlib.sha256(target.read_bytes()).hexdigest(),
+                }
+            )
         manifest = release_root / "runtime-release-manifest.json"
         manifest.write_text(
             json.dumps(
                 {
                     "schema_version": 1,
-                    "source_commit": "a" * 40,
-                    "files": [
-                        {
-                            "path": "runner.py",
-                            "mode": "100755",
-                            "sha256": hashlib.sha256(executable.read_bytes()).hexdigest(),
-                        }
-                    ],
+                    "source_commit": source_commit,
+                    "files": entries,
                 }
             ),
             encoding="utf-8",
         )
+        return manifest
+
+    def create_runtime_release_fixture(
+        self, release_root: Path, source_commit: str
+    ) -> Path:
+        """Create deterministic files for the complete runtime contract."""
+        release_root.mkdir()
+        for name in EXPECTED_RUNTIME_RELEASE_FILES:
+            target = release_root / name
+            target.write_text(f"fixture:{name}\n", encoding="utf-8")
+            target.chmod(0o755 if name.endswith((".py", ".sh")) else 0o644)
+        return self.write_runtime_release_manifest(release_root, source_commit)
+
+    def test_runtime_release_verifier_accepts_exact_manifest(self) -> None:
+        """Accept the independently enumerated complete runtime release."""
+        release_root = self.workdir / "release"
+        manifest = self.create_runtime_release_fixture(release_root, "a" * 40)
         result = subprocess.run(
             [str(RUNTIME_RELEASE_VERIFIER), str(manifest), str(release_root)],
             check=False,
@@ -460,31 +521,33 @@ def load_environment(*, checkout_root, environ, require_catalog):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("source_commit=" + "a" * 40, result.stdout)
+        self.assertIn(f"files={len(EXPECTED_RUNTIME_RELEASE_FILES)}", result.stdout)
+
+    def test_runtime_release_verifier_rejects_incomplete_manifest(self) -> None:
+        """A stale required runtime file cannot be omitted from the manifest."""
+        release_root = self.workdir / "release-incomplete"
+        manifest = self.create_runtime_release_fixture(release_root, "b" * 40)
+        payload = json.loads(manifest.read_text(encoding="utf-8"))
+        payload["files"] = [
+            entry
+            for entry in payload["files"]
+            if entry["path"] != "send-it-news-discord-notification.py"
+        ]
+        manifest.write_text(json.dumps(payload), encoding="utf-8")
+        result = subprocess.run(
+            [str(RUNTIME_RELEASE_VERIFIER), str(manifest), str(release_root)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 78)
+        self.assertIn("manifest_runtime_file_set_mismatch", result.stderr)
 
     def test_runtime_release_verifier_rejects_tampering_and_symlink_escape(self) -> None:
         """A changed file or symlink cannot silently replace the reviewed runtime."""
         release_root = self.workdir / "release-tamper"
-        release_root.mkdir()
-        target = release_root / "runner.py"
-        target.write_text("original\n", encoding="utf-8")
-        target.chmod(0o755)
-        manifest = release_root / "runtime-release-manifest.json"
-        manifest.write_text(
-            json.dumps(
-                {
-                    "schema_version": 1,
-                    "source_commit": "b" * 40,
-                    "files": [
-                        {
-                            "path": "runner.py",
-                            "mode": "100755",
-                            "sha256": hashlib.sha256(target.read_bytes()).hexdigest(),
-                        }
-                    ],
-                }
-            ),
-            encoding="utf-8",
-        )
+        manifest = self.create_runtime_release_fixture(release_root, "c" * 40)
+        target = release_root / "send-it-news-discord-notification.py"
         target.write_text("tampered\n", encoding="utf-8")
         result = subprocess.run(
             [str(RUNTIME_RELEASE_VERIFIER), str(manifest), str(release_root)],
@@ -11997,25 +12060,6 @@ def load_environment(*, checkout_root, environ, require_catalog):
 
         runtime_verifier = runtime / "verify-runtime-release.py"
         runtime_verifier.chmod(0o755)
-        runtime_manifest = runtime / "runtime-release-manifest.json"
-        runtime_manifest.write_text(
-            json.dumps(
-                {
-                    "schema_version": 1,
-                    "source_commit": "c" * 40,
-                    "files": [
-                        {
-                            "path": runtime_verifier.name,
-                            "mode": "100755",
-                            "sha256": hashlib.sha256(
-                                runtime_verifier.read_bytes()
-                            ).hexdigest(),
-                        }
-                    ],
-                }
-            ),
-            encoding="utf-8",
-        )
 
         notification_sender = runtime / "send-it-news-discord-notification.py"
         notification_sender.write_text(
@@ -12355,6 +12399,7 @@ if stage=="collection" and os.environ.get("FAKE_SNAPSHOT_RAW_COLLECTION") == "1"
             ),
             encoding="utf-8",
         )
+        self.write_runtime_release_manifest(runtime, "c" * 40)
 
         subprocess.run(  # noqa: S603 -- controlled Git fixture command
             ["git", "-C", str(self.user), "branch", "--unset-upstream"],  # noqa: S607

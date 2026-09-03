@@ -21,6 +21,47 @@ SHA256_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
 COMMIT_PATTERN = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?\Z")
 ALLOWED_KEYS = {"schema_version", "source_commit", "files"}
 FILE_KEYS = {"path", "mode", "sha256"}
+REQUIRED_RUNTIME_FILES = frozenset(
+    {
+        "atomic_file_ops.py",
+        "automation-result.schema.json",
+        "capture-vault-state.py",
+        "collect-public-sources.py",
+        "collection-result.schema.json",
+        "commit-push-publication-evidence.py",
+        "commit-reviewed-publication.py",
+        "daily-it-news.collect.prompt.md",
+        "daily-it-news.evidence-review.prompt.md",
+        "daily-it-news.review.prompt.md",
+        "determine-publication-modes.py",
+        "evidence-review-result.schema.json",
+        "evidence_hunk.py",
+        "fetch-vault-main.py",
+        "git_diff_digest.py",
+        "gitleaks-default.toml",
+        "install-verified-artifacts.py",
+        "interpret-automation-result.sh",
+        "isolated_git_transport.py",
+        "it-news-sources.json",
+        "prepare-codex-output-schema.py",
+        "prepare-publication-evidence.py",
+        "prepare-publication-review-context.py",
+        "publication-commit-result.schema.json",
+        "publication-review-result.schema.json",
+        "push-committed-heads.py",
+        "resolve-runtime-context.py",
+        "run-daily-it-news-vulnerability-check.sh",
+        "run-pinned-review.py",
+        "send-it-news-discord-notification.py",
+        "stage-dirty-review-inputs.py",
+        "stage-standing-task.py",
+        "trusted_gitleaks.py",
+        "validate-canonical-result.py",
+        "validate-collection-result.py",
+        "validate-publication-review.py",
+        "verify-runtime-release.py",
+    }
+)
 
 
 class ReleaseVerificationError(ValueError):
@@ -105,6 +146,8 @@ def validated_manifest(manifest: dict[str, Any]) -> tuple[str, list[dict[str, st
         if not isinstance(digest, str) or not SHA256_PATTERN.fullmatch(digest):
             raise ReleaseVerificationError("manifest_invalid_sha256")
         entries.append({"path": path, "mode": mode, "sha256": digest})
+    if seen != REQUIRED_RUNTIME_FILES:
+        raise ReleaseVerificationError("manifest_runtime_file_set_mismatch")
     return source_commit, entries
 
 
