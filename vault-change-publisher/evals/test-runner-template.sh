@@ -12,10 +12,13 @@ REPO_ROOT="$SCRIPT_DIR/../.."
 /usr/bin/grep -F -- 'daily-it-news.evidence-review.prompt.md' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- 'prepare-publication-review-context.py' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- 'PINNED_REVIEW_RUNNER="$WORKDIR/run-pinned-review.py"' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- 'NOTIFICATION_SENDER="$WORKDIR/send-it-news-discord-notification.py"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- '--add-dir "$STAGING_ROOT"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- 'COLLECTION_FETCHER="$WORKDIR/collect-public-sources.py"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- 'SOURCE_CATALOG="$WORKDIR/it-news-sources.json"' "$RUNNER" >/dev/null
-/usr/bin/grep -F -- 'for executable in "$COLLECTION_FETCHER" "$PINNED_REVIEW_RUNNER"; do' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- 'RUNTIME_RELEASE_MANIFEST="$WORKDIR/runtime-release-manifest.json"' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- 'RUNTIME_RELEASE_VERIFIER="$WORKDIR/verify-runtime-release.py"' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- 'for executable in "$COLLECTION_FETCHER" "$PINNED_REVIEW_RUNNER" "$NOTIFICATION_SENDER" "$RUNTIME_RELEASE_VERIFIER"; do' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- '[[ ! -x "$executable" ]]' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- '"$PINNED_REVIEW_RUNNER"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- 'required daily automation asset is not executable' "$RUNNER" >/dev/null
@@ -49,7 +52,7 @@ for required_name in \
   validate-collection-result.py collect-public-sources.py \
   it-news-sources.json install-verified-artifacts.py \
   commit-reviewed-publication.py validate-publication-review.py \
-  push-committed-heads.py prepare-publication-evidence.py \
+  push-committed-heads.py send-it-news-discord-notification.py prepare-publication-evidence.py \
   commit-push-publication-evidence.py evidence_hunk.py git_diff_digest.py \
   isolated_git_transport.py atomic_file_ops.py trusted_gitleaks.py gitleaks-default.toml \
   prepare-codex-output-schema.py validate-canonical-result.py \
@@ -58,7 +61,7 @@ for required_name in \
   daily-it-news.evidence-review.prompt.md collection-result.schema.json \
   publication-review-result.schema.json publication-commit-result.schema.json \
   evidence-review-result.schema.json automation-result.schema.json \
-  interpret-automation-result.sh; do
+  interpret-automation-result.sh runtime-release-manifest.json verify-runtime-release.py; do
   /usr/bin/touch "$MODE_FIXTURE_ROOT/$required_name"
 done
 /bin/chmod 0755 "$MODE_FIXTURE_ROOT"/*.py "$MODE_FIXTURE_ROOT"/*.sh
@@ -187,7 +190,11 @@ fi
 /usr/bin/grep -F -- '"$PUBLICATION_CONTEXT_FILE"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- '"$ARTIFACT_PLAN"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- 'mkdir "$RUN_ROOT"' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- 'release_integrity' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- 'runtime release manifest verification failed' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- 'COLLECTION_START_STATE="$RUN_ROOT/collection-start-state.json"' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- '"$STATE_CAPTURE" --index-only "$RUNTIME_CONTEXT_FILE" > "$COLLECTION_START_STATE"' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- '"$STATE_CAPTURE" --index-only --include-local-history "$RUNTIME_CONTEXT_FILE"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- '"$EVIDENCE_FINALIZER"' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- 'git_diff_digest.py' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- 'isolated_git_transport.py' "$RUNNER" >/dev/null
@@ -195,7 +202,30 @@ fi
 /usr/bin/grep -F -- 'trusted_gitleaks.py' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- 'gitleaks-default.toml' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- 'fail_run 75 artifact_plan' "$RUNNER" >/dev/null
-/usr/bin/grep -F -- '/bin/cp "$INITIAL_PUSH_RESULT" "$PUBLICATION_RESULT"' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- '/bin/cp "$EFFECTIVE_PUSH_RESULT" "$PUBLICATION_RESULT"' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- 'notification_status=$NOTIFICATION_STATUS' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- 'SEMANTIC_STATUS="notification_failed"' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- 'NOTIFICATION_FALLBACK_PUSH_RESULT=' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- 'error_code=sender_failed_closed' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- '[[ "$NOTIFICATION_RESULT_VALID" == "true" ]]' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- '`already_delivered`' \
+  "$SCRIPT_DIR/../assets/daily-it-news.evidence-review.prompt.md" >/dev/null
+/usr/bin/grep -F -- 'raw Hermes' \
+  "$SCRIPT_DIR/../assets/daily-it-news.evidence-review.prompt.md" >/dev/null
+/usr/bin/grep -F -- '"$NOTIFICATION_SENDER" \' "$RUNNER" >/dev/null
+NOTIFICATION_TERMINAL_BLOCK="$(sed -n '/^if \[\[ "\$NOTIFICATION_DISPOSITION" == "attempted" \]\]/,/^fi$/p' "$RUNNER")"
+if print -r -- "$NOTIFICATION_TERMINAL_BLOCK" \
+  | /usr/bin/grep -F -- '[[ "$STATUS" -eq 0 ]]' >/dev/null; then
+  echo "notification failure must override a prior terminal status" >&2
+  exit 1
+fi
+PUSH_LINE="$(/usr/bin/grep -n -F -- '"$FIXED_PUSHER" \' "$RUNNER" | /usr/bin/tail -n 1 | /usr/bin/cut -d: -f1)"
+NOTIFICATION_LINE="$(/usr/bin/grep -n -F -- '"$NOTIFICATION_SENDER" \' "$RUNNER" | /usr/bin/tail -n 1 | /usr/bin/cut -d: -f1)"
+EVIDENCE_LINE="$(/usr/bin/grep -n -F -- '"$EVIDENCE_PREPARER" \' "$RUNNER" | /usr/bin/cut -d: -f1)"
+if [[ "$PUSH_LINE" -ge "$NOTIFICATION_LINE" || "$NOTIFICATION_LINE" -ge "$EVIDENCE_LINE" ]]; then
+  echo "Discord notification must run after fixed push and before evidence preparation" >&2
+  exit 1
+fi
 EVIDENCE_PREPARATION_BLOCK="$(sed -n '/^if \[\[ "\$EVIDENCE_PREPARE_STATUS" -eq 0 \]\]; then$/,/^fi$/p' "$RUNNER")"
 EVIDENCE_FALLBACK_BLOCK="$(print -r -- "$EVIDENCE_PREPARATION_BLOCK" | sed -n '/^[[:space:]]*else[[:space:]]*$/,$p')"
 if [[ -z "$EVIDENCE_FALLBACK_BLOCK" ]]; then
@@ -214,7 +244,7 @@ fi
 /usr/bin/grep -F -- '"$LOCAL_COMMITTER" --recover "$RUNTIME_CONTEXT_FILE"' "$RUNNER" >/dev/null
 RECOVERY_LINE="$(/usr/bin/grep -n -F -- '"$LOCAL_COMMITTER" --recover "$RUNTIME_CONTEXT_FILE"' "$RUNNER" | /usr/bin/cut -d: -f1)"
 FETCH_LINE="$(/usr/bin/grep -n -F -- '"$FIXED_FETCHER" "$RUNTIME_CONTEXT_FILE"' "$RUNNER" | /usr/bin/cut -d: -f1)"
-CAPTURE_LINE="$(/usr/bin/grep -n -F -- '"$STATE_CAPTURE" "$RUNTIME_CONTEXT_FILE" > "$COLLECTION_START_STATE"' "$RUNNER" | /usr/bin/cut -d: -f1)"
+CAPTURE_LINE="$(/usr/bin/grep -n -F -- '"$STATE_CAPTURE" --index-only "$RUNTIME_CONTEXT_FILE" > "$COLLECTION_START_STATE"' "$RUNNER" | /usr/bin/cut -d: -f1)"
 if [[ "$RECOVERY_LINE" -ge "$FETCH_LINE" || "$RECOVERY_LINE" -ge "$CAPTURE_LINE" ]]; then
   echo "durable transaction recovery must precede fetch and collection-state capture" >&2
   exit 1
@@ -240,7 +270,7 @@ if [[ "$(/usr/bin/grep -c -F -- 'AGENTS_STABLE_STATE=0' "$RUNNER")" -ne 1 \
 fi
 /usr/bin/grep -F -- 'if [[ "$AGENTS_STABLE_STATE" -ne 1 ]]; then' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- 'if [[ "$USER_STABLE_STATE" -ne 1 ]]; then' "$RUNNER" >/dev/null
-/usr/bin/grep -F -- '"$STATE_CAPTURE" --include-local-history' "$RUNNER" >/dev/null
+/usr/bin/grep -F -- '"$STATE_CAPTURE" --index-only --include-local-history' "$RUNNER" >/dev/null
 /usr/bin/grep -F -- 'The interpreter performs one stable descriptor read' "$RUNNER" >/dev/null
 NORMALIZATION_FAILURE_BLOCK="$(sed -n \
   '/^if ! "\$REVIEW_VALIDATOR" --canonicalize-own-only/,/^fi$/p' "$RUNNER")"
@@ -266,7 +296,7 @@ for audit_pointer in \
     exit 1
   fi
 done
-TERMINAL_STATUS_BLOCK="$(sed -n '/^{$/,/^} > "\$STATUS_FILE"$/p' "$RUNNER" | tail -n 20)"
+TERMINAL_STATUS_BLOCK="$(sed -n '/^{$/,/^} > "\$STATUS_FILE"$/p' "$RUNNER" | tail -n 32)"
 for audit_pointer in \
   'collection_agent_result=$COLLECTION_AGENT_RESULT' \
   'collection_result=$COLLECTION_RESULT' \
@@ -296,9 +326,15 @@ cat > "$FAKE_STATE_CAPTURE" <<'ZSH'
 #!/bin/zsh
 set -eu
 include_history=0
-if [[ "${1:-}" == "--include-local-history" ]]; then
-  include_history=1
-fi
+index_only=0
+for argument in "$@"; do
+  [[ "$argument" == "--include-local-history" ]] && include_history=1
+  [[ "$argument" == "--index-only" ]] && index_only=1
+done
+[[ "$index_only" -eq 1 ]] || {
+  echo "snapshot capture omitted index-only mode" >&2
+  exit 1
+}
 attempt="$(<"$SNAPSHOT_COUNTER")"
 if [[ "$include_history" -eq 1 ]]; then
   attempt=$((attempt + 1))
@@ -454,7 +490,7 @@ print -r -- '{"outcome":"partial_publication"}' \
   }
 )
 collection_line="$(/usr/bin/grep -n -F -- 'COLLECTION_STATUS=$?' "$RUNNER" | /usr/bin/cut -d: -f1)"
-history_line="$(/usr/bin/grep -n -F -- '"$STATE_CAPTURE" --include-local-history' "$RUNNER" | /usr/bin/head -n 1 | /usr/bin/cut -d: -f1)"
+history_line="$(/usr/bin/grep -n -F -- '"$STATE_CAPTURE" --index-only --include-local-history' "$RUNNER" | /usr/bin/head -n 1 | /usr/bin/cut -d: -f1)"
 if [[ -z "$collection_line" || -z "$history_line" || "$history_line" -le "$collection_line" ]]; then
   echo "local-only history materialization must happen after collection" >&2
   exit 1

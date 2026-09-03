@@ -704,6 +704,38 @@
       "expected_output": "run-pinned-review.pyがno-follow stable read、metrics digest/文字数/bytes/SHA-256照合、同一bytesのstdin pipeを行い、Codexが別bytesを消費できないようにする。evidence reviewの非0、input_too_large、result欠落、canonical validation失敗は具体的なreasonをfinalizerとterminal statusへ渡し、stale resultをsuccess扱いしない。",
       "files": ["scripts/run-pinned-review.py", "assets/run-daily-it-news-vulnerability-check.sh", "scripts/commit-push-publication-evidence.py", "evals/test_review_integrity_followup.py"],
       "expectations": ["binds the child stdin bytes to the audited request SHA-256", "rejects stale metrics or replaced request content", "does not reopen the request pathname after metrics validation", "distinguishes input-size rejection from missing result", "propagates a concrete evidence review reason to finalization", "keeps nonzero process status nonzero even when stale output exists"]
+    },
+    {
+      "id": 93,
+      "name": "discord_notification_after_two_fixed_pushes",
+      "prompt": "本日のsummaryとadvisoryは両Vaultへfixed push済みです。User VaultのGitHub summary URLだけを設定済みDiscord channelへ通知し、publication evidenceへ結果を残してください。",
+      "expected_output": "両Vaultのpush statusとlocal/remote head一致を検証した後だけ、User Vaultのcredential-free GitHub remote、remote commit SHA、repo-relative summary pathからimmutable linkを作り、固定Discord snowflakeへHermesで送信する。",
+      "files": ["scripts/send-it-news-discord-notification.py", "assets/run-daily-it-news-vulnerability-check.sh", "scripts/prepare-publication-evidence.py"],
+      "expectations": ["runs only after both fixed pushes are complete", "uses an immutable commit-pinned GitHub URL", "sends no summary body or arbitrary model text", "binds the configured Discord snowflake", "records a digest-bound notification result before evidence finalization"]
+    },
+    {
+      "id": 94,
+      "name": "discord_notification_crash_safe_deduplication",
+      "prompt": "同じsummary commitのDiscord通知処理が再起動されました。直前のprocessはHermes response受信前後で停止した可能性があります。重複送信せず安全に再開してください。",
+      "expected_output": "owner-only persistent stateのintent/result/delivery receiptをexact delivery identityへ束縛する。verified success receiptは再利用し、success result後のcrashはreceiptを復旧し、resultのないintentやunverified responseはambiguousとして再送しない。",
+      "files": ["scripts/send-it-news-discord-notification.py"],
+      "expectations": ["writes intent before invoking Hermes", "fsyncs the first notification-state directory entry before invoking Hermes", "deduplicates only a strict delivered receipt with a numeric message ID and bounded identity fields", "recovers only a strict delivered result without another send", "does not retry an unmatched intent or ambiguous response", "uses an exclusive per-delivery lock"]
+    },
+    {
+      "id": 95,
+      "name": "discord_notification_failure_preserves_publication",
+      "prompt": "両Vaultのpublicationは成功しましたがDiscord backendが明示的に送信を拒否しました。失敗を監査可能にして終了状態を判定してください。",
+      "expected_output": "明示的backend rejectionだけを同一runで最大3回retryし、raw backend outputを保存せずdigestとstable error codeを記録する。既に公開したcommitはrollbackせずevidenceをfinalizeし、runnerはnotification_failedかつexit 75を返す。",
+      "files": ["scripts/send-it-news-discord-notification.py", "assets/run-daily-it-news-vulnerability-check.sh", "assets/daily-it-news.evidence-review.prompt.md"],
+      "expectations": ["retries only explicit backend rejection", "does not retry timeout or unverifiable output", "synthesizes bounded ambiguous evidence when the sender exits without outputs", "allows sanitized delivered already_delivered failed and ambiguous evidence while rejecting raw backend text", "does not roll back published commits", "finalizes evidence after notification failure", "returns notification_failed and exit 75"]
+    },
+    {
+      "id": 96,
+      "name": "new_artifact_publication_avoids_cloud_worktree_scan",
+      "prompt": "iCloud上のVaultには多数の既存ファイルがあり、full git statusは90秒でtimeoutします。本日のsummaryとadvisoryは新規pathへ排他的に作成されます。既存ファイルを変更せずpublishしてください。",
+      "expected_output": "HEAD、remote、Git control、shared indexを固定するindex-only snapshotを使い、worktree未走査を理由に常にown_onlyを選ぶ。新規artifactはexclusive installer receiptへ束縛し、isolated indexとHEAD/index CASでartifactだけをcommit/pushする。",
+      "files": ["scripts/capture-vault-state.py", "scripts/determine-publication-modes.py", "scripts/commit-reviewed-publication.py", "scripts/push-committed-heads.py", "scripts/prepare-publication-evidence.py", "scripts/commit-push-publication-evidence.py", "assets/run-daily-it-news-vulnerability-check.sh"],
+      "expectations": ["does not invoke git status or enumerate untracked and unstaged worktree paths", "does not claim the uninspected worktree is clean", "forces own_only whenever worktree capture is omitted", "rejects shared index or Git control drift", "binds exact new artifact bytes and path to an exclusive installer receipt", "commits only the owned artifact through an isolated index", "uses the same index-only recapture through commit push and evidence finalization", "preserves unrelated existing worktree files"]
     }
   ]
 }

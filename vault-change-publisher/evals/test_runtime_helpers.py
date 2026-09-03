@@ -23,6 +23,48 @@ SKILL_ROOT = Path(__file__).parents[1]
 REPO_ROOT = SKILL_ROOT.parent
 SOURCE_CATALOG = REPO_ROOT / "summarize-it-news" / "references" / "it-news-sources.json"
 SCRIPTS = SKILL_ROOT / "scripts"
+RUNTIME_RELEASE_VERIFIER = SCRIPTS / "verify-runtime-release.py"
+EXPECTED_RUNTIME_RELEASE_FILES = frozenset(
+    {
+        "atomic_file_ops.py",
+        "automation-result.schema.json",
+        "capture-vault-state.py",
+        "collect-public-sources.py",
+        "collection-result.schema.json",
+        "commit-push-publication-evidence.py",
+        "commit-reviewed-publication.py",
+        "daily-it-news.collect.prompt.md",
+        "daily-it-news.evidence-review.prompt.md",
+        "daily-it-news.review.prompt.md",
+        "determine-publication-modes.py",
+        "evidence-review-result.schema.json",
+        "evidence_hunk.py",
+        "fetch-vault-main.py",
+        "git_diff_digest.py",
+        "gitleaks-default.toml",
+        "install-verified-artifacts.py",
+        "interpret-automation-result.sh",
+        "isolated_git_transport.py",
+        "it-news-sources.json",
+        "prepare-codex-output-schema.py",
+        "prepare-publication-evidence.py",
+        "prepare-publication-review-context.py",
+        "publication-commit-result.schema.json",
+        "publication-review-result.schema.json",
+        "push-committed-heads.py",
+        "resolve-runtime-context.py",
+        "run-daily-it-news-vulnerability-check.sh",
+        "run-pinned-review.py",
+        "send-it-news-discord-notification.py",
+        "stage-dirty-review-inputs.py",
+        "stage-standing-task.py",
+        "trusted_gitleaks.py",
+        "validate-canonical-result.py",
+        "validate-collection-result.py",
+        "validate-publication-review.py",
+        "verify-runtime-release.py",
+    }
+)
 sys.path.insert(0, str(SCRIPTS))
 PUSH_SPEC = importlib.util.spec_from_file_location(
     "push_committed_heads", SCRIPTS / "push-committed-heads.py"
@@ -85,6 +127,14 @@ EVIDENCE_SPEC = importlib.util.spec_from_file_location(
 assert EVIDENCE_SPEC and EVIDENCE_SPEC.loader
 EVIDENCE_MODULE = importlib.util.module_from_spec(EVIDENCE_SPEC)
 EVIDENCE_SPEC.loader.exec_module(EVIDENCE_MODULE)
+NOTIFICATION_SPEC = importlib.util.spec_from_file_location(
+    "send_it_news_discord_notification",
+    SCRIPTS / "send-it-news-discord-notification.py",
+)
+assert NOTIFICATION_SPEC and NOTIFICATION_SPEC.loader
+NOTIFICATION_MODULE = importlib.util.module_from_spec(NOTIFICATION_SPEC)
+sys.modules[NOTIFICATION_SPEC.name] = NOTIFICATION_MODULE
+NOTIFICATION_SPEC.loader.exec_module(NOTIFICATION_MODULE)
 CAPTURE_SPEC = importlib.util.spec_from_file_location(
     "capture_vault_state", SCRIPTS / "capture-vault-state.py"
 )
@@ -116,6 +166,12 @@ RESOLVER_SPEC = importlib.util.spec_from_file_location(
 assert RESOLVER_SPEC and RESOLVER_SPEC.loader
 RESOLVER_MODULE = importlib.util.module_from_spec(RESOLVER_SPEC)
 RESOLVER_SPEC.loader.exec_module(RESOLVER_MODULE)
+STANDING_STAGER_SPEC = importlib.util.spec_from_file_location(
+    "stage_standing_task", SCRIPTS / "stage-standing-task.py"
+)
+assert STANDING_STAGER_SPEC and STANDING_STAGER_SPEC.loader
+STANDING_STAGER_MODULE = importlib.util.module_from_spec(STANDING_STAGER_SPEC)
+STANDING_STAGER_SPEC.loader.exec_module(STANDING_STAGER_MODULE)
 import isolated_git_transport as TRANSPORT_MODULE
 import git_diff_digest as DIFF_MODULE
 import trusted_gitleaks as TRUSTED_GITLEAKS_MODULE
@@ -378,12 +434,23 @@ def load_environment(*, checkout_root, environ, require_catalog):
             encoding="utf-8",
         )
         self.fake_gitleaks.chmod(0o755)
+        self.fake_hermes = self.workdir / "fake-hermes"
+        self.fake_hermes.write_text(
+            "#!/bin/sh\n"
+            "printf '%s\\n' "
+            "'{\"success\":true,\"platform\":\"discord\","
+            "\"chat_id\":\"1234567890123456789\",\"message_id\":\"fixture-message\"}'\n",
+            encoding="utf-8",
+        )
+        self.fake_hermes.chmod(0o755)
         self.config.write_text(
             "\n".join(
                 (
                     f"SAIHAI_CHECKOUT_ROOT={self.saihai}",
                     "CODEX_BIN=/usr/bin/true",
                     f"GITLEAKS_BIN={self.fake_gitleaks}",
+                    f"HERMES_BIN={self.fake_hermes}",
+                    "DISCORD_NEWS_TARGET=discord:1234567890123456789",
                     "IT_NEWS_ARCHIVE_RELATIVE=10_Prompt",
                     "ADVISORY_ARCHIVE_RELATIVE=03-Contexts/Reports/Security",
                     "STANDING_TASK_ID=TSK-STANDING",
@@ -401,6 +468,182 @@ def load_environment(*, checkout_root, environ, require_catalog):
     def tearDown(self) -> None:
         """Remove the isolated fixture."""
         self.temp_dir.cleanup()
+
+    def write_runtime_release_manifest(
+        self, release_root: Path, source_commit: str
+    ) -> Path:
+        """Seal the independently enumerated complete runtime fixture."""
+        entries = []
+        for name in sorted(EXPECTED_RUNTIME_RELEASE_FILES):
+            target = release_root / name
+            mode = stat.S_IMODE(target.lstat().st_mode)
+            self.assertIn(mode, {0o644, 0o755}, name)
+            entries.append(
+                {
+                    "path": name,
+                    "mode": f"100{mode:03o}",
+                    "sha256": hashlib.sha256(target.read_bytes()).hexdigest(),
+                }
+            )
+        manifest = release_root / "runtime-release-manifest.json"
+        manifest.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "source_commit": source_commit,
+                    "files": entries,
+                }
+            ),
+            encoding="utf-8",
+        )
+        return manifest
+
+    def create_runtime_release_fixture(
+        self, release_root: Path, source_commit: str
+    ) -> Path:
+        """Create deterministic files for the complete runtime contract."""
+        release_root.mkdir()
+        for name in EXPECTED_RUNTIME_RELEASE_FILES:
+            target = release_root / name
+            target.write_text(f"fixture:{name}\n", encoding="utf-8")
+            target.chmod(0o755 if name.endswith((".py", ".sh")) else 0o644)
+        return self.write_runtime_release_manifest(release_root, source_commit)
+
+    def test_runtime_release_verifier_accepts_exact_manifest(self) -> None:
+        """Accept the independently enumerated complete runtime release."""
+        release_root = self.workdir / "release"
+        manifest = self.create_runtime_release_fixture(release_root, "a" * 40)
+        result = subprocess.run(
+            [str(RUNTIME_RELEASE_VERIFIER), str(manifest), str(release_root)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("source_commit=" + "a" * 40, result.stdout)
+        self.assertIn(f"files={len(EXPECTED_RUNTIME_RELEASE_FILES)}", result.stdout)
+
+    def test_runtime_release_verifier_rejects_incomplete_manifest(self) -> None:
+        """A stale required runtime file cannot be omitted from the manifest."""
+        release_root = self.workdir / "release-incomplete"
+        manifest = self.create_runtime_release_fixture(release_root, "b" * 40)
+        payload = json.loads(manifest.read_text(encoding="utf-8"))
+        payload["files"] = [
+            entry
+            for entry in payload["files"]
+            if entry["path"] != "send-it-news-discord-notification.py"
+        ]
+        manifest.write_text(json.dumps(payload), encoding="utf-8")
+        result = subprocess.run(
+            [str(RUNTIME_RELEASE_VERIFIER), str(manifest), str(release_root)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 78)
+        self.assertIn("manifest_runtime_file_set_mismatch", result.stderr)
+
+    def test_runtime_release_verifier_rejects_tampering_and_symlink_escape(self) -> None:
+        """A changed file or symlink cannot silently replace the reviewed runtime."""
+        release_root = self.workdir / "release-tamper"
+        manifest = self.create_runtime_release_fixture(release_root, "c" * 40)
+        target = release_root / "send-it-news-discord-notification.py"
+        target.write_text("tampered\n", encoding="utf-8")
+        result = subprocess.run(
+            [str(RUNTIME_RELEASE_VERIFIER), str(manifest), str(release_root)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 78)
+        self.assertIn("runtime_file_digest_mismatch", result.stderr)
+
+        outside = self.root / "outside.py"
+        outside.write_text("outside\n", encoding="utf-8")
+        target.unlink()
+        target.symlink_to(outside)
+        result = subprocess.run(
+            [str(RUNTIME_RELEASE_VERIFIER), str(manifest), str(release_root)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 78)
+        self.assertIn("runtime_file_symlink_escape", result.stderr)
+
+    def notification_fixture(
+        self, stdout: str, returncode: int
+    ) -> tuple[Path, Path, Path, Path, Path]:
+        """Create one schema-valid fixed-push result and a controllable Hermes."""
+        notification_workdir = self.root / "notification-workdir"
+        notification_workdir.mkdir()
+        summary = (
+            self.user
+            / "10 Prompt"
+            / "2026"
+            / "08"
+            / "31"
+            / "SUMMARY-IT-NEWS-2026-08-31.md"
+        )
+        summary.parent.mkdir(parents=True)
+        summary.write_text("private summary body must not be sent\n", encoding="utf-8")
+        counter = notification_workdir / "hermes-calls.txt"
+        arguments = notification_workdir / "hermes-arguments.json"
+        hermes = notification_workdir / "hermes"
+        hermes.write_text(
+            f"#!{sys.executable}\n"
+            "import json, sys\n"
+            "from pathlib import Path\n"
+            f"counter = Path({str(counter)!r})\n"
+            "with counter.open('a', encoding='utf-8') as stream:\n"
+            "    stream.write('called\\n')\n"
+            f"Path({str(arguments)!r}).write_text("
+            "json.dumps(sys.argv[1:], ensure_ascii=False), encoding='utf-8')\n"
+            f"sys.stdout.write({stdout!r})\n"
+            f"raise SystemExit({returncode})\n",
+            encoding="utf-8",
+        )
+        hermes.chmod(0o755)
+        runtime = {
+            "workdir": str(notification_workdir.resolve()),
+            "hermes_bin": str(hermes.resolve()),
+            "discord_news_target": "discord:1234567890123456789",
+            "user_vault_root": str(self.user.resolve()),
+            "user_remote_url": "git@github.com:fixture-owner/fixture-repo.git",
+        }
+        head = "a" * 40
+        published_vault = {
+            "commit_status": "complete",
+            "commit_hashes": [head],
+            "push_status": "complete",
+            "local_head": head,
+            "remote_head": head,
+            "clean": True,
+            "publication_mode": "sweep",
+            "deferred_cleanup": [],
+        }
+        initial = {
+            "outcome": "partial_publication",
+            "phase": "initial_fixed_push",
+            "daily_pipeline_status": "complete",
+            "summary_path": str(summary.resolve()),
+            "advisory_path": str((self.agents / "advisory.md").resolve()),
+            "notification_result": "none",
+            "agents_vault": dict(published_vault),
+            "user_vault": dict(published_vault),
+            "publication_mode": {
+                "agents_vault": "sweep",
+                "user_vault": "sweep",
+            },
+            "deferred_cleanup": {"agents_vault": [], "user_vault": []},
+            "evidence_finalization_commit": None,
+            "next_action": "Finalize publication evidence.",
+        }
+        runtime_path = notification_workdir / "runtime.json"
+        initial_path = notification_workdir / "initial.json"
+        runtime_path.write_text(json.dumps(runtime), encoding="utf-8")
+        initial_path.write_text(json.dumps(initial), encoding="utf-8")
+        return notification_workdir, runtime_path, initial_path, counter, arguments
 
     def test_collection_date_parser_rejects_embedded_date_substrings(self) -> None:
         """Accept complete sealed dates, never arbitrary text containing a date."""
@@ -2005,6 +2248,113 @@ def load_environment(*, checkout_root, environ, require_catalog):
         )
         self.assertFalse(destination.exists())
 
+    def test_standing_task_snapshot_retries_only_transient_file_provider_locks(self) -> None:
+        content = b"# Approved authorization\n"
+        transient = OSError(
+            STANDING_STAGER_MODULE.errno.EDEADLK,
+            "Resource deadlock avoided",
+        )
+        with (
+            mock.patch.object(
+                STANDING_STAGER_MODULE,
+                "read_regular_beneath",
+                side_effect=[transient, transient, content],
+            ) as reader,
+            mock.patch.object(STANDING_STAGER_MODULE.time, "sleep") as sleep,
+        ):
+            observed = STANDING_STAGER_MODULE.read_regular_beneath_with_retry(
+                self.agents,
+                Path("authorization-source.md"),
+            )
+        self.assertEqual(observed, content)
+        self.assertEqual(reader.call_count, 3)
+        self.assertEqual(sleep.call_count, 2)
+
+        permanent = OSError(STANDING_STAGER_MODULE.errno.EACCES, "denied")
+        with (
+            mock.patch.object(
+                STANDING_STAGER_MODULE,
+                "read_regular_beneath",
+                side_effect=permanent,
+            ) as reader,
+            mock.patch.object(STANDING_STAGER_MODULE.time, "sleep") as sleep,
+            self.assertRaises(OSError),
+        ):
+            STANDING_STAGER_MODULE.read_regular_beneath_with_retry(
+                self.agents,
+                Path("authorization-source.md"),
+            )
+        self.assertEqual(reader.call_count, 1)
+        sleep.assert_not_called()
+
+    def test_standing_task_snapshot_retries_within_read_identity_churn(self) -> None:
+        """A provider-only identity refresh gets a fresh stable descriptor read."""
+        content = b"# Stable standing task\n"
+        transient = STANDING_STAGER_MODULE.SnapshotError(
+            "standing task changed while being read"
+        )
+        with (
+            mock.patch.object(
+                STANDING_STAGER_MODULE,
+                "read_regular_beneath",
+                side_effect=[transient, transient, content],
+            ) as reader,
+            mock.patch.object(STANDING_STAGER_MODULE.time, "sleep") as sleep,
+        ):
+            observed = STANDING_STAGER_MODULE.read_regular_beneath_with_retry(
+                self.agents,
+                Path("standing-source.md"),
+            )
+        self.assertEqual(observed, content)
+        self.assertEqual(reader.call_count, 3)
+        self.assertEqual(sleep.call_count, 2)
+
+        permanent = STANDING_STAGER_MODULE.SnapshotError(
+            "standing task is not UTF-8"
+        )
+        with (
+            mock.patch.object(
+                STANDING_STAGER_MODULE,
+                "read_regular_beneath",
+                side_effect=permanent,
+            ) as reader,
+            mock.patch.object(STANDING_STAGER_MODULE.time, "sleep") as sleep,
+            self.assertRaises(STANDING_STAGER_MODULE.SnapshotError),
+        ):
+            STANDING_STAGER_MODULE.read_regular_beneath_with_retry(
+                self.agents,
+                Path("standing-source.md"),
+            )
+        self.assertEqual(reader.call_count, 1)
+        sleep.assert_not_called()
+
+    def test_standing_task_snapshot_identity_churn_exhausts_closed(self) -> None:
+        """Continuous mutation still fails closed after the bounded retry window."""
+        transient = STANDING_STAGER_MODULE.SnapshotError(
+            "standing task changed while being read"
+        )
+        with (
+            mock.patch.object(
+                STANDING_STAGER_MODULE,
+                "read_regular_beneath",
+                side_effect=transient,
+            ) as reader,
+            mock.patch.object(STANDING_STAGER_MODULE.time, "sleep") as sleep,
+            self.assertRaisesRegex(
+                STANDING_STAGER_MODULE.SnapshotError,
+                "standing task changed while being read",
+            ),
+        ):
+            STANDING_STAGER_MODULE.read_regular_beneath_with_retry(
+                self.agents,
+                Path("standing-source.md"),
+            )
+        self.assertEqual(reader.call_count, STANDING_STAGER_MODULE.SNAPSHOT_RETRY_ATTEMPTS)
+        self.assertEqual(
+            sleep.call_count,
+            STANDING_STAGER_MODULE.SNAPSHOT_RETRY_ATTEMPTS - 1,
+        )
+
     def test_publication_validator_hashes_authorization_snapshot_nofollow(self) -> None:
         snapshot = self.workdir / "authorization-task.md"
         snapshot.write_text("approved\n", encoding="utf-8")
@@ -2029,9 +2379,13 @@ def load_environment(*, checkout_root, environ, require_catalog):
             PUSH_MODULE.clean_git_environment(),
             EVIDENCE_MODULE.clean_git_environment(),
         ):
-            self.assertEqual(environment["GIT_CONFIG_COUNT"], "1")
+            self.assertEqual(environment["GIT_CONFIG_COUNT"], "3")
             self.assertEqual(environment["GIT_CONFIG_KEY_0"], "core.fsmonitor")
             self.assertEqual(environment["GIT_CONFIG_VALUE_0"], "false")
+            self.assertEqual(environment["GIT_CONFIG_KEY_1"], "core.trustctime")
+            self.assertEqual(environment["GIT_CONFIG_VALUE_1"], "false")
+            self.assertEqual(environment["GIT_CONFIG_KEY_2"], "core.checkStat")
+            self.assertEqual(environment["GIT_CONFIG_VALUE_2"], "minimal")
         heads = {
             "agents": create_empty_base(self.agents),
             "user": create_empty_base(self.user),
@@ -3222,6 +3576,315 @@ def load_environment(*, checkout_root, environ, require_catalog):
         )
         self.assertIsNotNone(entry["git_blob_oid"])
         self.assertEqual(state["capture_status"], "available")
+
+    def test_index_only_capture_never_walks_existing_worktree(self) -> None:
+        """Bind HEAD/index/control state without hydrating unrelated cloud files."""
+        repo = self.user
+        subprocess.run(
+            ["git", "-C", str(repo), "config", "user.name", "Fixture"],
+            check=True,
+        )
+        subprocess.run(
+            [
+                "git", "-C", str(repo), "config", "user.email",
+                "fixture@example.invalid",
+            ],
+            check=True,
+        )
+        tracked = repo / "tracked.md"
+        tracked.write_text("head\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", tracked.name], check=True)
+        subprocess.run(
+            ["git", "-C", str(repo), "commit", "-q", "-m", "base"],
+            check=True,
+        )
+        subprocess.run(["git", "-C", str(repo), "branch", "-M", "main"], check=True)
+        subprocess.run(
+            ["git", "-C", str(repo), "push", "-q", "-u", "origin", "main"],
+            check=True,
+        )
+
+        staged = repo / "staged-cloud.md"
+        staged.write_text("sealed in index\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", staged.name], check=True)
+        staged.unlink()
+        tracked.write_text("unstaged cloud bytes\n", encoding="utf-8")
+        (repo / "untracked-cloud.md").write_text(
+            "untracked cloud bytes\n", encoding="utf-8"
+        )
+
+        real_runner = CAPTURE_MODULE.run_local_command
+        commands: list[list[str]] = []
+
+        def record_command(arguments: list[str], **kwargs: object):
+            commands.append(arguments)
+            return real_runner(arguments, **kwargs)
+
+        with mock.patch.object(
+            CAPTURE_MODULE, "run_local_command", side_effect=record_command
+        ):
+            state = CAPTURE_MODULE.capture(
+                str(repo), include_local_history=True, worktree_scope="index_only"
+            )
+
+        flattened = [argument for command in commands for argument in command]
+        self.assertNotIn("status", flattened)
+        self.assertFalse(
+            any("--untracked-files" in argument for argument in flattened)
+        )
+        self.assertFalse(
+            any(
+                "ls-files" in command and "--others" in command
+                for command in commands
+            )
+        )
+        self.assertFalse(
+            any(
+                "diff" in command and "--cached" not in command
+                for command in commands
+            )
+        )
+        self.assertFalse(any("hash-object" in command for command in commands))
+        self.assertEqual(state["worktree_capture_scope"], "index_only")
+        self.assertEqual(state["dirty_paths"], [staged.name])
+        self.assertEqual(state["staged_paths"], [staged.name])
+        self.assertEqual(state["dirty_entries"][0]["mode"], "100644")
+        self.assertIsNotNone(state["dirty_entries"][0]["git_blob_oid"])
+        self.assertTrue(
+            all(value is None for value in state["dirty_metadata"][0].values() if value != staged.name)
+        )
+        self.assertEqual(
+            state["dirty_materialization"],
+            {
+                "status": "deferred",
+                "deferred_paths": [],
+                "reason": "worktree_scan_intentionally_omitted",
+            },
+        )
+
+    def test_index_only_capture_forces_own_only_publication(self) -> None:
+        """Never infer sweep cleanliness from an intentionally omitted worktree."""
+        base = {
+            "capture_status": "available",
+            "branch": "main",
+            "upstream": "origin/main",
+            "local_head": "a" * 40,
+            "remote_head": "a" * 40,
+            "history_relation": "equal",
+            "history_capture_status": "available",
+            "operation_in_progress": False,
+            "git_control_sha256": "b" * 64,
+            "worktree_capture_scope": "index_only",
+            "dirty_lines": [],
+            "dirty_paths": [],
+            "dirty_entries": [],
+            "dirty_metadata": [],
+            "dirty_materialization": {
+                "status": "deferred",
+                "deferred_paths": [],
+                "reason": "worktree_scan_intentionally_omitted",
+            },
+            "staged_paths": [],
+            "index_entries": [],
+            "index_sha256": "c" * 64,
+            "index_identity": [1, 2, 3, 33188, 4, 5],
+            "dirty_worktree_sha256": "d" * 64,
+            "dirty_digest": "e" * 64,
+            "diff_snapshot_sha256": "f" * 64,
+        }
+        mode = MODE_MODULE.vault_mode(base, dict(base), "reports/news.md")
+        self.assertEqual(mode["required_mode"], "own_only")
+        self.assertFalse(mode["state_changed"])
+        self.assertIn("worktree_scan_intentionally_omitted", mode["reasons"])
+
+    def test_every_publication_recapture_requests_index_only_scope(self) -> None:
+        """Keep later commit, push, and evidence gates off full worktree status."""
+        payload = json.dumps({"agents_vault": {}, "user_vault": {}})
+        completed = subprocess.CompletedProcess([], 0, payload, "")
+        calls = (
+            (COMMITTER_MODULE, lambda: COMMITTER_MODULE.capture_state("/capture", "/runtime")),
+            (PUSH_MODULE, lambda: PUSH_MODULE.capture_complete("/runtime")),
+            (EVIDENCE_MODULE, lambda: EVIDENCE_MODULE.capture_complete("/runtime")),
+            (FINALIZER_MODULE, lambda: FINALIZER_MODULE.capture_complete("/runtime")),
+        )
+        for module, callback in calls:
+            with self.subTest(module=module.__name__), mock.patch.object(
+                module, "run_local_command", return_value=completed
+            ) as runner:
+                callback()
+                arguments = runner.call_args.args[0]
+                self.assertIn("--index-only", arguments)
+                self.assertIn("--include-local-history", arguments)
+
+    def test_index_only_install_validation_rejects_shared_index_drift(self) -> None:
+        """Trust the artifact receipt only while reviewed index/control state holds."""
+        before = {
+            "worktree_capture_scope": "index_only",
+            "local_head": "a" * 40,
+            "git_control_sha256": "b" * 64,
+            "dirty_lines": [],
+            "dirty_paths": [],
+            "dirty_entries": [],
+            "dirty_metadata": [],
+            "staged_paths": [],
+            "index_entries": [],
+            "index_sha256": "c" * 64,
+            "index_identity": [1, 2, 3, 33188, 4, 5],
+            "dirty_worktree_sha256": "d" * 64,
+            "dirty_digest": "e" * 64,
+            "diff_snapshot_sha256": "f" * 64,
+        }
+        volatile = json.loads(json.dumps(before))
+        volatile["index_sha256"] = "1" * 64
+        volatile["index_identity"] = [1, 6, 3, 33188, 7, 8]
+        COMMITTER_MODULE.validate_installed_vault(
+            before, volatile, "reports/news.md"
+        )
+        COMMITTER_MODULE.validate_installed_scope(
+            {"agents_vault": before, "user_vault": before},
+            {"agents_vault": volatile, "user_vault": volatile},
+            {
+                "agents_vault": "reports/advisory.md",
+                "user_vault": "reports/news.md",
+            },
+        )
+
+        drifted = json.loads(json.dumps(volatile))
+        drifted["index_entries"] = [
+            {
+                "path": "third-party.md",
+                "mode": "100644",
+                "git_blob_oid": "2" * 40,
+                "stage": 0,
+            }
+        ]
+        with self.assertRaisesRegex(
+            COMMITTER_MODULE.CommitError, "control/index state changed"
+        ):
+            COMMITTER_MODULE.validate_installed_vault(
+                before, drifted, "reports/news.md"
+            )
+        with self.assertRaisesRegex(
+            COMMITTER_MODULE.CommitError, "control/index state changed"
+        ):
+            COMMITTER_MODULE.validate_installed_scope(
+                {"agents_vault": before, "user_vault": before},
+                {"agents_vault": drifted, "user_vault": volatile},
+                {
+                    "agents_vault": "reports/advisory.md",
+                    "user_vault": "reports/news.md",
+                },
+            )
+
+    def test_capture_defers_file_provider_hash_failure_without_blocking_vault(self) -> None:
+        """Keep the Git path/metadata contract when one residual cannot hydrate."""
+        for repo in (self.agents, self.user):
+            subprocess.run(
+                ["git", "-C", str(repo), "config", "user.name", "Fixture"],
+                check=True,
+            )
+            subprocess.run(
+                [
+                    "git", "-C", str(repo), "config", "user.email",
+                    "fixture@example.invalid",
+                ],
+                check=True,
+            )
+            (repo / "base.md").write_text("base\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(repo), "add", "base.md"], check=True)
+            subprocess.run(
+                ["git", "-C", str(repo), "commit", "-q", "-m", "base"],
+                check=True,
+            )
+            subprocess.run(["git", "-C", str(repo), "branch", "-M", "main"], check=True)
+            subprocess.run(
+                ["git", "-C", str(repo), "push", "-q", "-u", "origin", "main"],
+                check=True,
+            )
+        (self.agents / "first.md").write_text("first\n", encoding="utf-8")
+        (self.agents / "second.md").write_text("second\n", encoding="utf-8")
+        real_runner = CAPTURE_MODULE.run_local_command
+        hash_attempts: list[list[str]] = []
+
+        def fail_file_provider_hash(arguments: list[str], **kwargs: object):
+            if "hash-object" in arguments and "--no-filters" in arguments:
+                hash_attempts.append(arguments)
+                raise subprocess.TimeoutExpired(arguments, CAPTURE_MODULE.DIRTY_ENTRY_TIMEOUT_SECONDS)
+            return real_runner(arguments, **kwargs)
+
+        context = self.workdir / "provider-capture-context.json"
+        context.write_text(
+            json.dumps(
+                {
+                    "agents_vault_root": str(self.agents),
+                    "user_vault_root": str(self.user),
+                }
+            ),
+            encoding="utf-8",
+        )
+        with mock.patch.object(
+            CAPTURE_MODULE, "run_local_command", side_effect=fail_file_provider_hash
+        ):
+            result = CAPTURE_MODULE.capture(str(self.agents))
+        self.assertEqual(len(hash_attempts), 1)
+        self.assertEqual(result["capture_status"], "available")
+        self.assertTrue(
+            {"first.md", "second.md"}.issubset(set(result["dirty_paths"]))
+        )
+        self.assertEqual(result["dirty_materialization"]["status"], "deferred")
+        self.assertEqual(
+            result["dirty_materialization"]["deferred_paths"], result["dirty_paths"]
+        )
+        self.assertEqual(
+            result["dirty_materialization"]["reason"],
+            "dirty_entry_snapshot_unavailable",
+        )
+        self.assertTrue(
+            all(
+                entry["mode"] == CAPTURE_MODULE.UNAVAILABLE_DIRTY_MODE
+                and entry["git_blob_oid"] is None
+                for entry in result["dirty_entries"]
+            )
+        )
+
+    def test_capture_keeps_index_only_entry_materialized_after_provider_failure(self) -> None:
+        """An index-only residual needs no cloud bytes and stays exact."""
+        repo = self.agents
+        subprocess.run(
+            ["git", "-C", str(repo), "config", "user.name", "Fixture"], check=True
+        )
+        subprocess.run(
+            ["git", "-C", str(repo), "config", "user.email", "fixture@example.invalid"],
+            check=True,
+        )
+        (repo / "tracked.md").write_text("head\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "tracked.md"], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "base"], check=True)
+        subprocess.run(["git", "-C", str(repo), "branch", "-M", "main"], check=True)
+        subprocess.run(
+            ["git", "-C", str(repo), "push", "-q", "-u", "origin", "main"], check=True
+        )
+        tracked = repo / "tracked.md"
+        tracked.write_text("staged\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "tracked.md"], check=True)
+        tracked.write_text("head\n", encoding="utf-8")
+        (repo / "provider.md").write_text("provider\n", encoding="utf-8")
+        real_runner = CAPTURE_MODULE.run_local_command
+
+        def fail_file_provider_hash(arguments: list[str], **kwargs: object):
+            if "hash-object" in arguments and "--no-filters" in arguments:
+                raise subprocess.TimeoutExpired(arguments, CAPTURE_MODULE.DIRTY_ENTRY_TIMEOUT_SECONDS)
+            return real_runner(arguments, **kwargs)
+
+        with mock.patch.object(
+            CAPTURE_MODULE, "run_local_command", side_effect=fail_file_provider_hash
+        ):
+            result = CAPTURE_MODULE.capture(str(repo))
+        entries = {entry["path"]: entry for entry in result["dirty_entries"]}
+        self.assertEqual(entries["tracked.md"]["mode"], "100644")
+        self.assertIsNotNone(entries["tracked.md"]["git_blob_oid"])
+        self.assertEqual(entries["provider.md"]["mode"], CAPTURE_MODULE.UNAVAILABLE_DIRTY_MODE)
+        self.assertIsNone(entries["provider.md"]["git_blob_oid"])
 
     def test_oversize_local_commit_patch_blocks_only_residual_sweep(self) -> None:
         """Materialize local history under a hard bound after collection only."""
@@ -5598,6 +6261,437 @@ def load_environment(*, checkout_root, environ, require_catalog):
         self.assertIn("fixed fetch blocked:", result.stderr)
         self.assertNotIn("Traceback", result.stderr)
 
+    def test_discord_notification_uses_immutable_link_and_deduplicates(self) -> None:
+        """Send one fixed-channel link and reuse its durable delivery receipt."""
+        response = json.dumps(
+            {
+                "success": True,
+                "platform": "discord",
+                "chat_id": "1234567890123456789",
+                "message_id": "2234567890123456789",
+            }
+        )
+        workdir, runtime, initial, counter, arguments = self.notification_fixture(
+            response + "\n", 0
+        )
+        receipt = workdir / "receipt.json"
+        effective = workdir / "effective.json"
+        status = NOTIFICATION_MODULE.main(
+            [
+                "send-it-news-discord-notification.py",
+                str(runtime),
+                str(initial),
+                "run-1",
+                str(receipt),
+                str(effective),
+            ]
+        )
+        self.assertEqual(status, 0)
+        observed = json.loads(receipt.read_text(encoding="utf-8"))
+        self.assertEqual(observed["status"], "delivered")
+        self.assertEqual(observed["message_id"], "2234567890123456789")
+        self.assertEqual(observed["summary_commit"], "a" * 40)
+        self.assertIn("/blob/" + "a" * 40 + "/", observed["summary_url"])
+        self.assertIn("10%20Prompt", observed["summary_url"])
+        sent_arguments = json.loads(arguments.read_text(encoding="utf-8"))
+        self.assertEqual(
+            sent_arguments[:4],
+            ["send", "--to", "discord:1234567890123456789", "--json"],
+        )
+        self.assertIn(observed["summary_url"], sent_arguments[4])
+        self.assertNotIn("private summary body", sent_arguments[4])
+        effective_result = json.loads(effective.read_text(encoding="utf-8"))
+        self.assertIn("discord:delivered", effective_result["notification_result"])
+
+        second_receipt = workdir / "receipt-2.json"
+        second_effective = workdir / "effective-2.json"
+        second_status = NOTIFICATION_MODULE.main(
+            [
+                "send-it-news-discord-notification.py",
+                str(runtime),
+                str(initial),
+                "run-2",
+                str(second_receipt),
+                str(second_effective),
+            ]
+        )
+        self.assertEqual(second_status, 0)
+        self.assertEqual(
+            json.loads(second_receipt.read_text(encoding="utf-8"))["status"],
+            "already_delivered",
+        )
+        self.assertEqual(counter.read_text(encoding="utf-8").splitlines(), ["called"])
+
+    def test_discord_notification_rejects_corrupt_delivery_receipt(self) -> None:
+        """Never suppress delivery from an invalid persistent success receipt."""
+        response = json.dumps(
+            {
+                "success": True,
+                "platform": "discord",
+                "chat_id": "1234567890123456789",
+                "message_id": "2234567890123456789",
+            }
+        )
+        workdir, runtime, initial, counter, _arguments = self.notification_fixture(
+            response + "\n", 0
+        )
+        first_status = NOTIFICATION_MODULE.main(
+            [
+                "send-it-news-discord-notification.py",
+                str(runtime),
+                str(initial),
+                "run-receipt-valid",
+                str(workdir / "receipt-valid.json"),
+                str(workdir / "effective-valid.json"),
+            ]
+        )
+        self.assertEqual(first_status, 0)
+        delivery = next((workdir / "notification-state").rglob("delivery.json"))
+        corrupt = json.loads(delivery.read_text(encoding="utf-8"))
+        corrupt["message_id"] = "not-a-snowflake"
+        delivery.write_text(json.dumps(corrupt), encoding="utf-8")
+
+        second_status = NOTIFICATION_MODULE.main(
+            [
+                "send-it-news-discord-notification.py",
+                str(runtime),
+                str(initial),
+                "run-receipt-corrupt",
+                str(workdir / "receipt-corrupt.json"),
+                str(workdir / "effective-corrupt.json"),
+            ]
+        )
+        self.assertEqual(second_status, 75)
+        self.assertEqual(counter.read_text(encoding="utf-8").splitlines(), ["called"])
+        self.assertFalse((workdir / "receipt-corrupt.json").exists())
+
+    def test_discord_notification_recovery_preserves_originating_run_id(self) -> None:
+        """Bind a crash-recovered durable receipt to the run that sent it."""
+        response = json.dumps(
+            {
+                "success": True,
+                "platform": "discord",
+                "chat_id": "1234567890123456789",
+                "message_id": "2234567890123456789",
+            }
+        )
+        workdir, runtime, initial, counter, _arguments = self.notification_fixture(
+            response + "\n", 0
+        )
+        first_status = NOTIFICATION_MODULE.main(
+            [
+                "send-it-news-discord-notification.py",
+                str(runtime),
+                str(initial),
+                "run-origin",
+                str(workdir / "origin-receipt.json"),
+                str(workdir / "origin-effective.json"),
+            ]
+        )
+        self.assertEqual(first_status, 0)
+        state_root = workdir / "notification-state"
+        delivery_path = next(state_root.rglob("delivery.json"))
+        delivery_path.unlink()
+
+        recovery_receipt = workdir / "recovery-receipt.json"
+        recovery_status = NOTIFICATION_MODULE.main(
+            [
+                "send-it-news-discord-notification.py",
+                str(runtime),
+                str(initial),
+                "run-recovery",
+                str(recovery_receipt),
+                str(workdir / "recovery-effective.json"),
+            ]
+        )
+        self.assertEqual(recovery_status, 0)
+        recovered_delivery = json.loads(delivery_path.read_text(encoding="utf-8"))
+        self.assertEqual(recovered_delivery["run_id"], "run-origin")
+        self.assertEqual(recovered_delivery["attempt"], 1)
+        self.assertEqual(
+            json.loads(recovery_receipt.read_text(encoding="utf-8"))["run_id"],
+            "run-recovery",
+        )
+        self.assertEqual(counter.read_text(encoding="utf-8").splitlines(), ["called"])
+
+    def test_discord_notification_rejects_corrupt_delivered_result(self) -> None:
+        """Require a strict result schema before recovering delivery.json."""
+        response = json.dumps(
+            {
+                "success": True,
+                "platform": "discord",
+                "chat_id": "1234567890123456789",
+                "message_id": "2234567890123456789",
+            }
+        )
+        workdir, runtime, initial, counter, _arguments = self.notification_fixture(
+            response + "\n", 0
+        )
+        first_status = NOTIFICATION_MODULE.main(
+            [
+                "send-it-news-discord-notification.py",
+                str(runtime),
+                str(initial),
+                "run-result-valid",
+                str(workdir / "result-receipt-valid.json"),
+                str(workdir / "result-effective-valid.json"),
+            ]
+        )
+        self.assertEqual(first_status, 0)
+        state_root = workdir / "notification-state"
+        next(state_root.rglob("delivery.json")).unlink()
+        result_path = next(state_root.rglob("attempt-000001-result.json"))
+        corrupt = json.loads(result_path.read_text(encoding="utf-8"))
+        corrupt["message_id"] = "1"
+        result_path.write_text(json.dumps(corrupt), encoding="utf-8")
+
+        second_status = NOTIFICATION_MODULE.main(
+            [
+                "send-it-news-discord-notification.py",
+                str(runtime),
+                str(initial),
+                "run-result-corrupt",
+                str(workdir / "result-receipt-corrupt.json"),
+                str(workdir / "result-effective-corrupt.json"),
+            ]
+        )
+        self.assertEqual(second_status, 75)
+        self.assertEqual(counter.read_text(encoding="utf-8").splitlines(), ["called"])
+
+    def test_discord_notification_state_root_creation_fsyncs_workdir(self) -> None:
+        """Make the first notification-state directory entry durable before send."""
+        workdir = self.root / "notification-state-fsync-workdir"
+        workdir.mkdir()
+        workdir_identity = (workdir.stat().st_dev, workdir.stat().st_ino)
+        fsynced_workdir = False
+        real_fsync = os.fsync
+
+        def recording_fsync(descriptor: int) -> None:
+            nonlocal fsynced_workdir
+            opened = os.fstat(descriptor)
+            if (opened.st_dev, opened.st_ino) == workdir_identity:
+                fsynced_workdir = True
+            real_fsync(descriptor)
+
+        with mock.patch.object(
+            NOTIFICATION_MODULE.os, "fsync", side_effect=recording_fsync
+        ):
+            descriptor = NOTIFICATION_MODULE.ensure_private_directory(
+                workdir / "notification-state"
+            )
+            os.close(descriptor)
+        self.assertTrue(fsynced_workdir)
+
+    def test_evidence_review_contract_allows_only_sanitized_notification(self) -> None:
+        """Authorize bounded notification states while rejecting raw backend text."""
+        prompt = (
+            SKILL_ROOT / "assets" / "daily-it-news.evidence-review.prompt.md"
+        ).read_text(encoding="utf-8")
+        for value in ("delivered", "already_delivered", "failed", "ambiguous"):
+            self.assertIn(f"`{value}`", prompt)
+        self.assertIn("raw Hermes", prompt)
+        self.assertIn("summary body", prompt)
+        self.assertIn("model text", prompt)
+
+    def test_discord_notification_retries_only_definite_backend_failure(self) -> None:
+        """Retry explicit rejection without persisting raw backend details."""
+        response = json.dumps(
+            {
+                "success": False,
+                "platform": "discord",
+                "error": "sensitive backend detail",
+            }
+        )
+        workdir, runtime, initial, counter, _arguments = self.notification_fixture(
+            response + "\n", 1
+        )
+        receipt = workdir / "failed-receipt.json"
+        effective = workdir / "failed-effective.json"
+        status = NOTIFICATION_MODULE.main(
+            [
+                "send-it-news-discord-notification.py",
+                str(runtime),
+                str(initial),
+                "run-failed",
+                str(receipt),
+                str(effective),
+            ]
+        )
+        self.assertEqual(status, 75)
+        observed_text = receipt.read_text(encoding="utf-8")
+        observed = json.loads(observed_text)
+        self.assertEqual(observed["status"], "failed")
+        self.assertEqual(observed["error_code"], "backend_rejected")
+        self.assertNotIn("sensitive backend detail", observed_text)
+        self.assertEqual(len(counter.read_text(encoding="utf-8").splitlines()), 3)
+        self.assertTrue(effective.is_file())
+
+    def test_discord_notification_retries_spawn_failure_only_in_later_run(self) -> None:
+        """Retry a pre-delivery failure later, never twice in the same run."""
+        response = json.dumps(
+            {
+                "success": True,
+                "platform": "discord",
+                "chat_id": "1234567890123456789",
+                "message_id": "2234567890123456789",
+            }
+        )
+        workdir, runtime, initial, counter, _arguments = self.notification_fixture(
+            response + "\n", 0
+        )
+        runtime_payload = json.loads(runtime.read_text(encoding="utf-8"))
+        hermes = Path(runtime_payload["hermes_bin"])
+        working_hermes = hermes.read_bytes()
+        hermes.write_text("#!/definitely/missing/interpreter\n", encoding="utf-8")
+        hermes.chmod(0o755)
+        receipt = workdir / "spawn-failed-receipt.json"
+        effective = workdir / "spawn-failed-effective.json"
+        status = NOTIFICATION_MODULE.main(
+            [
+                "send-it-news-discord-notification.py",
+                str(runtime),
+                str(initial),
+                "run-spawn-failed",
+                str(receipt),
+                str(effective),
+            ]
+        )
+        self.assertEqual(status, 75)
+        observed = json.loads(receipt.read_text(encoding="utf-8"))
+        self.assertEqual(observed["status"], "failed")
+        self.assertEqual(observed["error_code"], "spawn_failed")
+        self.assertEqual(observed["attempts_this_run"], 1)
+        self.assertFalse(counter.exists())
+
+        second_receipt = workdir / "spawn-failed-receipt-2.json"
+        second_status = NOTIFICATION_MODULE.main(
+            [
+                "send-it-news-discord-notification.py",
+                str(runtime),
+                str(initial),
+                "run-spawn-failed",
+                str(second_receipt),
+                str(workdir / "spawn-failed-effective-2.json"),
+            ]
+        )
+        self.assertEqual(second_status, 75)
+        self.assertEqual(
+            json.loads(second_receipt.read_text(encoding="utf-8"))[
+                "attempts_this_run"
+            ],
+            0,
+        )
+        state_entries = list((workdir / "notification-state").rglob("attempt-*.json"))
+        self.assertEqual(len(state_entries), 2)
+
+        hermes.write_bytes(working_hermes)
+        hermes.chmod(0o755)
+        recovered_receipt = workdir / "spawn-recovered-receipt.json"
+        recovered_status = NOTIFICATION_MODULE.main(
+            [
+                "send-it-news-discord-notification.py",
+                str(runtime),
+                str(initial),
+                "run-spawn-recovered",
+                str(recovered_receipt),
+                str(workdir / "spawn-recovered-effective.json"),
+            ]
+        )
+        self.assertEqual(recovered_status, 0)
+        recovered = json.loads(recovered_receipt.read_text(encoding="utf-8"))
+        self.assertEqual(recovered["status"], "delivered")
+        self.assertEqual(recovered["message_id"], "2234567890123456789")
+        self.assertEqual(recovered["attempts_this_run"], 1)
+        self.assertEqual(counter.read_text(encoding="utf-8").splitlines(), ["called"])
+        state_entries = list((workdir / "notification-state").rglob("attempt-*.json"))
+        self.assertEqual(len(state_entries), 4)
+
+    def test_discord_notification_bounds_oversized_response_without_retry(self) -> None:
+        """Stop and classify an oversized post-send response as ambiguous."""
+        workdir, runtime, initial, counter, _arguments = self.notification_fixture(
+            "x" * (NOTIFICATION_MODULE.MAX_PROCESS_OUTPUT_BYTES + 1), 0
+        )
+        receipt = workdir / "oversized-receipt.json"
+        status = NOTIFICATION_MODULE.main(
+            [
+                "send-it-news-discord-notification.py",
+                str(runtime),
+                str(initial),
+                "run-oversized",
+                str(receipt),
+                str(workdir / "oversized-effective.json"),
+            ]
+        )
+        self.assertEqual(status, 75)
+        observed = json.loads(receipt.read_text(encoding="utf-8"))
+        self.assertEqual(observed["status"], "ambiguous")
+        self.assertEqual(observed["error_code"], "response_too_large")
+        self.assertEqual(observed["attempts_this_run"], 1)
+        self.assertEqual(counter.read_text(encoding="utf-8").splitlines(), ["called"])
+
+    def test_discord_notification_does_not_retry_ambiguous_response(self) -> None:
+        """Treat an unverifiable post-send response as at-most-once ambiguity."""
+        workdir, runtime, initial, counter, _arguments = self.notification_fixture(
+            "not-json\n", 1
+        )
+        receipt = workdir / "ambiguous-receipt.json"
+        effective = workdir / "ambiguous-effective.json"
+        status = NOTIFICATION_MODULE.main(
+            [
+                "send-it-news-discord-notification.py",
+                str(runtime),
+                str(initial),
+                "run-ambiguous",
+                str(receipt),
+                str(effective),
+            ]
+        )
+        self.assertEqual(status, 75)
+        self.assertEqual(
+            json.loads(receipt.read_text(encoding="utf-8"))["status"], "ambiguous"
+        )
+        second_status = NOTIFICATION_MODULE.main(
+            [
+                "send-it-news-discord-notification.py",
+                str(runtime),
+                str(initial),
+                "run-ambiguous-2",
+                str(workdir / "ambiguous-receipt-2.json"),
+                str(workdir / "ambiguous-effective-2.json"),
+            ]
+        )
+        self.assertEqual(second_status, 75)
+        self.assertEqual(counter.read_text(encoding="utf-8").splitlines(), ["called"])
+
+    def test_discord_notification_requires_complete_two_vault_push(self) -> None:
+        """Never call Hermes before both Vaults are durably published."""
+        response = json.dumps(
+            {
+                "success": True,
+                "platform": "discord",
+                "chat_id": "1234567890123456789",
+                "message_id": "2234567890123456789",
+            }
+        )
+        workdir, runtime, initial, counter, _arguments = self.notification_fixture(
+            response + "\n", 0
+        )
+        initial_result = json.loads(initial.read_text(encoding="utf-8"))
+        initial_result["agents_vault"]["push_status"] = "failed"
+        initial.write_text(json.dumps(initial_result), encoding="utf-8")
+        status = NOTIFICATION_MODULE.main(
+            [
+                "send-it-news-discord-notification.py",
+                str(runtime),
+                str(initial),
+                "run-blocked",
+                str(workdir / "blocked-receipt.json"),
+                str(workdir / "blocked-effective.json"),
+            ]
+        )
+        self.assertEqual(status, 75)
+        self.assertFalse(counter.exists())
+
     def test_resolver_uses_catalog_and_relative_config(self) -> None:
         """Resolve roots and Git directories without tracked personal paths."""
         result = subprocess.run(
@@ -5615,7 +6709,34 @@ def load_environment(*, checkout_root, environ, require_catalog):
         self.assertEqual(context["standing_task_id"], "TSK-STANDING")
         self.assertEqual(context["publisher_git_name"], "Fixture Publisher")
         self.assertEqual(context["publisher_git_email"], "publisher@example.invalid")
+        self.assertEqual(context["hermes_bin"], str(self.fake_hermes.resolve()))
+        self.assertEqual(
+            context["discord_news_target"], "discord:1234567890123456789"
+        )
         self.assertTrue(Path(context["agents_git_dir"]).is_absolute())
+
+    def test_resolver_rejects_mutable_discord_channel_name(self) -> None:
+        """Bind notifications to one snowflake rather than a mutable channel name."""
+        invalid = self.workdir / "invalid-discord-target.local.env"
+        invalid.write_text(
+            self.config.read_text(encoding="utf-8").replace(
+                "DISCORD_NEWS_TARGET=discord:1234567890123456789",
+                "DISCORD_NEWS_TARGET=discord:it-news",
+            ),
+            encoding="utf-8",
+        )
+        result = subprocess.run(
+            [
+                str(SCRIPTS / "resolve-runtime-context.py"),
+                str(invalid),
+                str(self.workdir),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 78)
+        self.assertIn("DISCORD_NEWS_TARGET", result.stderr)
 
     def test_resolver_rejects_invalid_private_publisher_identity(self) -> None:
         """Fail closed before runtime context creation for malformed identity."""
@@ -5658,6 +6779,66 @@ def load_environment(*, checkout_root, environ, require_catalog):
             RESOLVER_MODULE.EXTERNAL_BINARY_TIMEOUT_SECONDS,
             RESOLVER_MODULE.CONTROL_COMMAND_TIMEOUT_SECONDS,
         )
+
+    def test_resolver_retries_transient_file_provider_error_across_context(self) -> None:
+        """Retry a transient lock even when it happens after catalog loading."""
+        attempts = 0
+
+        def resolve_once(_local_config, _workdir):
+            nonlocal attempts
+            attempts += 1
+            if attempts < 5:
+                raise OSError(
+                    RESOLVER_MODULE.errno.EDEADLK,
+                    "Resource deadlock avoided",
+                )
+            return {"status": "resolved"}
+
+        with mock.patch.object(RESOLVER_MODULE.time, "sleep") as sleep:
+            with mock.patch.object(
+                RESOLVER_MODULE,
+                "resolve_context_once",
+                side_effect=resolve_once,
+            ):
+                context = RESOLVER_MODULE.resolve_context(self.config, self.workdir)
+        self.assertEqual(context, {"status": "resolved"})
+        self.assertEqual(attempts, 5)
+        self.assertEqual(sleep.call_count, 4)
+
+    def test_resolver_retries_git_wrapped_file_provider_error(self) -> None:
+        """Recognize the same transient errno when Git reports it via stderr."""
+        attempts = 0
+
+        def operation():
+            nonlocal attempts
+            attempts += 1
+            if attempts < 3:
+                raise subprocess.CalledProcessError(
+                    128,
+                    ["git", "rev-parse"],
+                    stderr="fatal: Resource deadlock avoided\n",
+                )
+            return "resolved"
+
+        with mock.patch.object(RESOLVER_MODULE.time, "sleep") as sleep:
+            observed = RESOLVER_MODULE.retry_read_only_context(operation)
+        self.assertEqual(observed, "resolved")
+        self.assertEqual(attempts, 3)
+        self.assertEqual(sleep.call_count, 2)
+
+    def test_resolver_does_not_retry_permanent_context_failure(self) -> None:
+        """Keep permanent Git and validation failures immediately fail-closed."""
+        permanent = subprocess.CalledProcessError(
+            128,
+            ["git", "rev-parse"],
+            stderr="fatal: not a git repository\n",
+        )
+        with mock.patch.object(RESOLVER_MODULE.time, "sleep") as sleep:
+            with self.assertRaises(subprocess.CalledProcessError):
+                RESOLVER_MODULE.retry_read_only_context(
+                    mock.Mock(side_effect=permanent)
+                )
+        sleep.assert_not_called()
 
     def test_resolver_sanitizes_gitleaks_version_probe_environment(self) -> None:
         """Do not let ambient Git or Gitleaks variables control the version probe."""
@@ -9435,6 +10616,68 @@ def load_environment(*, checkout_root, environ, require_catalog):
                 str(self.user), pre, reported, current_state=pre
             )
 
+    def test_index_only_pusher_uses_recaptured_index_state_without_status(self) -> None:
+        """Validate own_only publication without walking the cloud worktree."""
+        head = create_empty_base(self.user)
+        subprocess.run(["git", "-C", str(self.user), "branch", "-M", "main"], check=True)
+        subprocess.run(
+            ["git", "-C", str(self.user), "push", "-q", "-u", "origin", "main"],
+            check=True,
+        )
+        pre = CAPTURE_MODULE.capture(
+            str(self.user), include_local_history=True, worktree_scope="index_only"
+        )
+        reported = {
+            "publication_mode": "own_only",
+            "commit_status": "not_required",
+            "commit_hashes": [],
+            "pre_local_head": head,
+            "local_head": head,
+            "pre_dirty_digest": pre["dirty_digest"],
+            "post_dirty_digest": pre["dirty_digest"],
+            "clean": False,
+        }
+        with mock.patch.object(
+            PUSH_MODULE,
+            "dirty_digest",
+            side_effect=AssertionError("worktree status must not run"),
+        ) as dirty:
+            self.assertEqual(
+                PUSH_MODULE.validate_local(
+                    str(self.user),
+                    pre,
+                    reported,
+                    current_state=pre,
+                    artifact_path="reports/news.md",
+                ),
+                head,
+            )
+        dirty.assert_not_called()
+
+        drifted = json.loads(json.dumps(pre))
+        drifted["index_entries"] = [
+            {
+                "path": "third-party.md",
+                "mode": "100644",
+                "git_blob_oid": "f" * 40,
+                "stage": 0,
+            }
+        ]
+        with self.assertRaisesRegex(
+            PUSH_MODULE.PushError, "non-owned index entry"
+        ), mock.patch.object(
+            PUSH_MODULE,
+            "dirty_digest",
+            side_effect=AssertionError("worktree status must not run"),
+        ):
+            PUSH_MODULE.validate_local(
+                str(self.user),
+                pre,
+                reported,
+                current_state=drifted,
+                artifact_path="reports/news.md",
+            )
+
     def test_fixed_pusher_validates_and_pushes_exact_heads(self) -> None:
         """Push both validated local main heads outside the Codex process."""
         runtime = {
@@ -10873,6 +12116,7 @@ def load_environment(*, checkout_root, environ, require_catalog):
             SCRIPTS / "commit-reviewed-publication.py",
             SCRIPTS / "validate-publication-review.py",
             SCRIPTS / "push-committed-heads.py",
+            SCRIPTS / "send-it-news-discord-notification.py",
             SCRIPTS / "prepare-publication-evidence.py",
             SCRIPTS / "commit-push-publication-evidence.py",
             SCRIPTS / "evidence_hunk.py",
@@ -10887,11 +12131,33 @@ def load_environment(*, checkout_root, environ, require_catalog):
             SCRIPTS / "stage-dirty-review-inputs.py",
             SCRIPTS / "prepare-publication-review-context.py",
             SCRIPTS / "run-pinned-review.py",
+            SCRIPTS / "verify-runtime-release.py",
             SCRIPTS / "interpret-automation-result.sh",
             REPO_ROOT / "summarize-it-news" / "scripts" / "collect-public-sources.py",
             SOURCE_CATALOG,
         ):
             shutil.copy2(source, runtime / source.name)
+
+        runtime_verifier = runtime / "verify-runtime-release.py"
+        runtime_verifier.chmod(0o755)
+
+        notification_sender = runtime / "send-it-news-discord-notification.py"
+        notification_sender.write_text(
+            """#!/usr/bin/env python3
+import json, os, sys
+from pathlib import Path
+initial=json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
+if os.environ.get("FAKE_NOTIFICATION_NO_OUTPUT") == "1":
+    raise SystemExit(75)
+summary="discord:delivered;summary_commit="+initial["user_vault"]["remote_head"]+";receipt_sha256="+("d"*64)+";message_id=2234567890123456789"
+receipt={"schema_version":1,"status":"delivered","notification_result":summary}
+Path(sys.argv[4]).write_text(json.dumps(receipt),encoding="utf-8")
+initial["notification_result"]=summary
+Path(sys.argv[5]).write_text(json.dumps(initial),encoding="utf-8")
+""",
+            encoding="utf-8",
+        )
+        notification_sender.chmod(0o755)
 
         installer = runtime / "install-verified-artifacts.py"
         real_installer = runtime / "install-verified-artifacts.real.py"
@@ -11025,7 +12291,7 @@ raise SystemExit(completed.returncode)
             subprocess.run(["git", "-C", str(repo), "config", "user.name", "Fixture"], check=True)
             subprocess.run(["git", "-C", str(repo), "config", "user.email", "fixture@example.invalid"], check=True)
             (repo / "initial.md").write_text("initial\n", encoding="utf-8")
-            subprocess.run(["git", "-C", str(repo), "add", "initial.md"], check=True)
+            subprocess.run(["git", "-C", str(repo), "add", "--all"], check=True)
             subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "initial"], check=True)
             subprocess.run(["git", "-C", str(repo), "branch", "-M", "main"], check=True)
             subprocess.run(["git", "-C", str(repo), "push", "-q", "-u", "origin", "main"], check=True)
@@ -11033,7 +12299,7 @@ raise SystemExit(completed.returncode)
         fake_codex = runtime / "fake-codex.py"
         fake_codex.write_text(
             """#!/usr/bin/env python3
-import hashlib, json, os, subprocess, sys
+import hashlib, json, os, re, subprocess, sys
 from pathlib import Path
 args=sys.argv[1:]
 output=Path(args[args.index("--output-last-message")+1])
@@ -11181,8 +12447,16 @@ else:
     assert set(evidence_payload) == {
         "run_id","publication_context_sha256","agents_vault","user_vault",
         "summary_repo_path","advisory_repo_path","publication_mode",
-        "deferred_cleanup",
+        "deferred_cleanup","notification_result",
     }
+    assert re.fullmatch(
+        r"discord:(delivered|already_delivered|failed|ambiguous);"
+        r"summary_commit=[0-9a-f]{40};"
+        r"receipt_sha256=([0-9a-f]{64}|none)"
+        r"(;message_id=[1-9][0-9]{16,19})?"
+        r"(;error_code=[a-z0-9_]+)?",
+        evidence_payload["notification_result"],
+    )
     if os.environ.get("FAKE_EVIDENCE_REVIEW_BLOCKED") == "1":
         result={"outcome":"blocked","target_path":plan["target_path"],"evidence_diff_sha256":plan["evidence_diff_sha256"],"publication_context_sha256":plan["publication_context_sha256"],"review_status":"blocked","next_action":"fixture evidence review rejection"}
     else:
@@ -11205,6 +12479,7 @@ if stage=="collection" and os.environ.get("FAKE_SNAPSHOT_RAW_COLLECTION") == "1"
             ),
             encoding="utf-8",
         )
+        self.write_runtime_release_manifest(runtime, "c" * 40)
 
         subprocess.run(  # noqa: S603 -- controlled Git fixture command
             ["git", "-C", str(self.user), "branch", "--unset-upstream"],  # noqa: S607
@@ -11427,6 +12702,11 @@ if stage=="collection" and os.environ.get("FAKE_SNAPSHOT_RAW_COLLECTION") == "1"
         self.assertEqual(len(status_files), 1)
         terminal_status = status_files[0].read_text()
         self.assertIn("semantic_status=success", terminal_status)
+        self.assertIn("notification_disposition=attempted", terminal_status)
+        self.assertIn("notification_status=0", terminal_status)
+        release_checks = list(runtime.glob("logs/**/runtime-release-verification.txt"))
+        self.assertEqual(len(release_checks), 1)
+        self.assertIn("source_commit=" + "c" * 40, release_checks[0].read_text())
         for audit_name in (
             "collection-agent-result.json",
             "collection-result.json",
@@ -11502,6 +12782,9 @@ if stage=="collection" and os.environ.get("FAKE_SNAPSHOT_RAW_COLLECTION") == "1"
         publication_results = list(runtime.glob("logs/**/publication-result.json"))
         self.assertEqual(len(publication_results), 1)
         publication_result = json.loads(publication_results[0].read_text())
+        self.assertTrue(
+            publication_result["notification_result"].startswith("discord:delivered;")
+        )
         self.assertEqual(
             publication_result["evidence_review"]["reason_code"], "approved"
         )
@@ -11537,17 +12820,14 @@ if stage=="collection" and os.environ.get("FAKE_SNAPSHOT_RAW_COLLECTION") == "1"
         )
         self.assertEqual(
             [item["path"] for item in publication_result["deferred_cleanup"]["user_vault"]],
-            [
-                ".codex-handoff/unsafe.md",
-                str(conflicted_target.resolve().relative_to(self.user.resolve())),
-            ],
+            [],
         )
         self.assertEqual(
             [
                 item["path"]
                 for item in publication_result["deferred_cleanup"]["agents_vault"]
             ],
-            [".codex-handoff/unsafe-agents.md", standing_relative],
+            [standing_relative],
         )
         normalization_receipts = list(
             runtime.glob("logs/**/publication-review-normalization.json")
@@ -11693,6 +12973,79 @@ if stage=="collection" and os.environ.get("FAKE_SNAPSHOT_RAW_COLLECTION") == "1"
         self.assertIsNone(second_context["carried_commit_result"])
         self.assertIsNone(second_context["carried_commit_result_sha256"])
         self.assertTrue((runtime / "commit-blocked-replan-once.marker").is_file())
+
+        subprocess.run(["chmod", "-R", "u+w", str(runtime / "logs")], check=True)
+        shutil.rmtree(runtime / "logs")
+        (runtime / "last-status.txt").unlink()
+
+        remote_before_notification_failure = {
+            key: subprocess.check_output(
+                ["git", "-C", str(repo), "ls-remote", "origin", "refs/heads/main"],
+                text=True,
+            ).split()[0]
+            for key, repo in (("agents", self.agents), ("user", self.user))
+        }
+        notification_failure = subprocess.run(
+            [str(runtime / "run-daily-it-news-vulnerability-check.sh")],
+            check=False,
+            env={
+                **os.environ,
+                "PATH": os.environ["PATH"],
+                "FAKE_NOTIFICATION_NO_OUTPUT": "1",
+            },
+        )
+        self.assertEqual(notification_failure.returncode, 75)
+        notification_failure_status = (runtime / "last-status.txt").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("phase=notification", notification_failure_status)
+        self.assertIn(
+            "semantic_status=notification_failed", notification_failure_status
+        )
+        self.assertIn("notification_status=75", notification_failure_status)
+        self.assertIn("evidence_finalization_status=0", notification_failure_status)
+        self.assertIn(
+            "discord-notification-fallback-result.json", notification_failure_status
+        )
+        notification_failure_results = list(
+            runtime.glob("logs/**/publication-result.json")
+        )
+        self.assertEqual(len(notification_failure_results), 1)
+        notification_failure_result = json.loads(
+            notification_failure_results[0].read_text(encoding="utf-8")
+        )
+        self.assertTrue(
+            notification_failure_result["notification_result"].startswith(
+                "discord:ambiguous;"
+            )
+        )
+        self.assertIn(
+            "error_code=sender_failed_closed",
+            notification_failure_result["notification_result"],
+        )
+        self.assertEqual(
+            notification_failure_result["evidence_review"]["reason_code"],
+            "approved",
+        )
+        self.assertIsNotNone(
+            notification_failure_result["evidence_finalization_commit"]
+        )
+        remote_after_notification_failure = {
+            key: subprocess.check_output(
+                ["git", "-C", str(repo), "ls-remote", "origin", "refs/heads/main"],
+                text=True,
+            ).split()[0]
+            for key, repo in (("agents", self.agents), ("user", self.user))
+        }
+        for key in remote_before_notification_failure:
+            self.assertNotEqual(
+                remote_before_notification_failure[key],
+                remote_after_notification_failure[key],
+            )
+        self.assertEqual(
+            notification_failure_result["user_vault"]["local_head"],
+            notification_failure_result["user_vault"]["remote_head"],
+        )
 
         subprocess.run(["chmod", "-R", "u+w", str(runtime / "logs")], check=True)
         shutil.rmtree(runtime / "logs")

@@ -4,7 +4,8 @@ description: >
   承認済みPublication ManifestとVaultごとのTask Change Manifestに従い、
   ITニュースの検証済み成果物を既存dirty状態から独立して優先配置し、
   Vaultごとのsweep/own_only/blocked判定に従ってisolated commitし、
-  両mainへfixed object IDのfast-forward non-force pushを行う。安定した既存差分だけbest-effortで整理する。
+  両mainへfixed object IDのfast-forward non-force pushを行い、成功後に固定Discord channelへimmutable summary linkを通知する。
+  安定した既存差分だけbest-effortで整理する。
   Web収集phase、通常のVault編集、承認情報のない依頼では使用しない。
 allowed-tools: Read, Grep, Glob, Bash
 ---
@@ -140,9 +141,17 @@ non-blocked Vaultの今回artifact commitが`complete`で、1件以上のcommit 
 - 片側だけのcommit/push、またはevidence finalization失敗も`partial_publication`とする。
 - rejection、認証、network failureをpull/rebase/history rewriteで回避しない。
 
+## Discord Notification Barrier
+
+Discord通知は両Vaultのinitial fixed pushが`complete`または`not_required`で、各local headとremote headが一致した場合だけ行う。ignoredな`automation.local.env`にはabsolute `HERMES_BIN`とimmutable `DISCORD_NEWS_TARGET=discord:<channel-id>`を置く。Discord credentialやtokenはHermes自身のmachine-local configでユーザーが管理し、tracked file、runtime context、run receiptへ複製しない。
+
+`send-it-news-discord-notification.py`はUser Vaultのcredential-free GitHub remote、pushed commit SHA、repo-relative summary pathからimmutable `/blob/<commit>/...` URLを生成し、summary本文や任意model textをDiscordへ送らない。Hermesはshellを介さず固定argvと最小環境で実行し、JSON responseの`success=true`、`platform=discord`、exact channel ID、message IDを検証する。
+
+persistent owner-only stateの初回directory entryを親directoryまでfsyncしてからsend intentを先に記録し、numeric message ID、attempt、run ID、bounded digestを含む厳格な成功receiptがあれば再送しない。timeout、未検証response、intentに対応するresult欠落はambiguousとして自動再送せず、明示的backend rejectionだけ同一runで最大3回retryする。senderがoutput確定前に失敗した場合もrunnerがraw stderrを含まないboundedなambiguous resultを作り、通知receiptのdigestと結果をstanding task evidenceへ含める。通知失敗で既に公開済みcommitをrollbackせず、evidence finalization後もrunnerを`notification_failed`・exit 75として運用者へ明示する。
+
 ## Evidence Finalization
 
-初回push後、deterministic helperがstanding taskのHEAD版、index版、worktree版を別々に読み、各版へ同一のevidence hunkを適用したsealed candidateを作る。両Vaultのcommit hashes、actual push status、local/remote一致、repo-relative artifact paths、context digestを追記し、personal absolute pathは記録しない。worktree temporaryはwrite/fsync後とcanonical nameへのno-replace move直前にopen descriptorとnamed descriptorから同じdevice/inode・content・size・modeへ束縛し、move後もdestination descriptorから再検証する。move直後に別inodeへ置換された場合はそのentryを0700 retentionへ保持し、review済みoriginalをno-replaceで復元してfail closedにする。original detachmentの検証も移動前fdやretained hardlinkだけで代用せず、保持先directoryから`detached`を再openしてregular type、device/inode、size、mode、sealed contentを照合する。
+初回pushとsanitized Discord通知結果の確定後、deterministic helperがstanding taskのHEAD版、index版、worktree版を別々に読み、各版へ同一のevidence hunkを適用したsealed candidateを作る。両Vaultのcommit hashes、actual push status、local/remote一致、repo-relative artifact paths、context digest、notification resultとreceipt digestを追記し、personal absolute pathやcredentialは記録しない。worktree temporaryはwrite/fsync後とcanonical nameへのno-replace move直前にopen descriptorとnamed descriptorから同じdevice/inode・content・size・modeへ束縛し、move後もdestination descriptorから再検証する。move直後に別inodeへ置換された場合はそのentryを0700 retentionへ保持し、review済みoriginalをno-replaceで復元してfail closedにする。original detachmentの検証も移動前fdやretained hardlinkだけで代用せず、保持先directoryから`detached`を再openしてregular type、device/inode、size、mode、sealed contentを照合する。
 
 追記hunkとsealed HEAD candidateだけを別のread-only/no-network processでmutation前に再レビューし、candidateとhunkのdigest一致時だけrunnerがHEAD candidateをisolated index/commit-tree/CASでcommitする。worktree targetの親はVault root descriptorから各componentを`O_NOFOLLOW|O_DIRECTORY`で順に開き、途中のsymlinkを追わない。配置は二相transactionとし、canonical nameを外す前にexactな元inodeへGit-privateかつ同一filesystemのretained hardlinkを作り、destination→source順にdirectoryをfsyncする。HEAD CAS・共有index同期・committed state・Git control-plane検証後もretained originalを自動削除しない。candidate配置直後にもpathnameとopen descriptorのdevice/inode、SHA-256、size、modeを再検証し、同一inodeのcontent・size・mode driftも拒否する。rollbackはreceiptと一致するcandidate inodeだけをprivate tombstoneへ退避し、retained original inodeをhardlink no-replaceでcanonical pathへ戻すため、restore後の差替えや削除でもoriginalのdurable nameを失わない。rollback時にcanonical candidateをcandidate quarantineの`worktree`へ移した場合も、保持先directoryから同名entryを再openしてregular type、device/inode、size、mode、sealed contentをreceiptと照合し、別hardlink fdを代用しない。pathが第三者に再占有された場合は、そのentryを上書き・削除せず、今回candidateと元entryをquarantineへ保持してfail closedにする。timestamp-only driftは許容するが、同じbytesの別inodeを今回runの所有物とみなさない。その後、元のindex candidateとworktree candidateをexactに復元し、通常indexの既存staged entry、worktreeのunstaged hunk、mode、mtime、全residualを保持する。Git control-plane不変を再確認し、expected remoteがevidence commitのancestorであることを検証してからAgents-Vault `main`へfixed evidence commitの通常fast-forward non-force pushを行う。その後Vaultを編集せず、residual snapshot不変とlocal/remote HEAD一致を確認する。review拒否時はstanding taskをbyte/mode/mtime/indexごと変更しない。
 
