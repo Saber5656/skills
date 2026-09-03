@@ -6526,13 +6526,22 @@ def load_environment(*, checkout_root, environ, require_catalog):
         self.assertEqual(len(counter.read_text(encoding="utf-8").splitlines()), 3)
         self.assertTrue(effective.is_file())
 
-    def test_discord_notification_does_not_retry_spawn_failure(self) -> None:
-        """Persist a pre-delivery spawn failure without automatic retry."""
+    def test_discord_notification_retries_spawn_failure_only_in_later_run(self) -> None:
+        """Retry a pre-delivery failure later, never twice in the same run."""
+        response = json.dumps(
+            {
+                "success": True,
+                "platform": "discord",
+                "chat_id": "1234567890123456789",
+                "message_id": "2234567890123456789",
+            }
+        )
         workdir, runtime, initial, counter, _arguments = self.notification_fixture(
-            "", 0
+            response + "\n", 0
         )
         runtime_payload = json.loads(runtime.read_text(encoding="utf-8"))
         hermes = Path(runtime_payload["hermes_bin"])
+        working_hermes = hermes.read_bytes()
         hermes.write_text("#!/definitely/missing/interpreter\n", encoding="utf-8")
         hermes.chmod(0o755)
         receipt = workdir / "spawn-failed-receipt.json"
@@ -6560,7 +6569,7 @@ def load_environment(*, checkout_root, environ, require_catalog):
                 "send-it-news-discord-notification.py",
                 str(runtime),
                 str(initial),
-                "run-spawn-failed-2",
+                "run-spawn-failed",
                 str(second_receipt),
                 str(workdir / "spawn-failed-effective-2.json"),
             ]
@@ -6574,6 +6583,28 @@ def load_environment(*, checkout_root, environ, require_catalog):
         )
         state_entries = list((workdir / "notification-state").rglob("attempt-*.json"))
         self.assertEqual(len(state_entries), 2)
+
+        hermes.write_bytes(working_hermes)
+        hermes.chmod(0o755)
+        recovered_receipt = workdir / "spawn-recovered-receipt.json"
+        recovered_status = NOTIFICATION_MODULE.main(
+            [
+                "send-it-news-discord-notification.py",
+                str(runtime),
+                str(initial),
+                "run-spawn-recovered",
+                str(recovered_receipt),
+                str(workdir / "spawn-recovered-effective.json"),
+            ]
+        )
+        self.assertEqual(recovered_status, 0)
+        recovered = json.loads(recovered_receipt.read_text(encoding="utf-8"))
+        self.assertEqual(recovered["status"], "delivered")
+        self.assertEqual(recovered["message_id"], "2234567890123456789")
+        self.assertEqual(recovered["attempts_this_run"], 1)
+        self.assertEqual(counter.read_text(encoding="utf-8").splitlines(), ["called"])
+        state_entries = list((workdir / "notification-state").rglob("attempt-*.json"))
+        self.assertEqual(len(state_entries), 4)
 
     def test_discord_notification_bounds_oversized_response_without_retry(self) -> None:
         """Stop and classify an oversized post-send response as ambiguous."""

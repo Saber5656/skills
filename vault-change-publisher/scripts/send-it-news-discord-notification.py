@@ -897,10 +897,13 @@ def deliver_with_state(prepared: PreparedDelivery) -> dict[str, object]:
                 raise NotificationError(
                     "state_invalid", "notification result classification is invalid"
                 )
-            if result.get("error_code") != "backend_rejected":
+            error_code = result.get("error_code")
+            if error_code == "spawn_failed" and result["run_id"] != prepared.run_id:
+                continue
+            if error_code != "backend_rejected":
                 return {
                     "status": "failed",
-                    "error_code": str(result.get("error_code") or "delivery_failed"),
+                    "error_code": str(error_code or "delivery_failed"),
                     "message_id": None,
                     "attempts_this_run": 0,
                     "state_receipt_sha256": result_sha256,
