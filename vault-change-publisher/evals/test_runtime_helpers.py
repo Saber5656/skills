@@ -6365,6 +6365,55 @@ def load_environment(*, checkout_root, environ, require_catalog):
         self.assertEqual(counter.read_text(encoding="utf-8").splitlines(), ["called"])
         self.assertFalse((workdir / "receipt-corrupt.json").exists())
 
+    def test_discord_notification_recovery_preserves_originating_run_id(self) -> None:
+        """Bind a crash-recovered durable receipt to the run that sent it."""
+        response = json.dumps(
+            {
+                "success": True,
+                "platform": "discord",
+                "chat_id": "1234567890123456789",
+                "message_id": "2234567890123456789",
+            }
+        )
+        workdir, runtime, initial, counter, _arguments = self.notification_fixture(
+            response + "\n", 0
+        )
+        first_status = NOTIFICATION_MODULE.main(
+            [
+                "send-it-news-discord-notification.py",
+                str(runtime),
+                str(initial),
+                "run-origin",
+                str(workdir / "origin-receipt.json"),
+                str(workdir / "origin-effective.json"),
+            ]
+        )
+        self.assertEqual(first_status, 0)
+        state_root = workdir / "notification-state"
+        delivery_path = next(state_root.rglob("delivery.json"))
+        delivery_path.unlink()
+
+        recovery_receipt = workdir / "recovery-receipt.json"
+        recovery_status = NOTIFICATION_MODULE.main(
+            [
+                "send-it-news-discord-notification.py",
+                str(runtime),
+                str(initial),
+                "run-recovery",
+                str(recovery_receipt),
+                str(workdir / "recovery-effective.json"),
+            ]
+        )
+        self.assertEqual(recovery_status, 0)
+        recovered_delivery = json.loads(delivery_path.read_text(encoding="utf-8"))
+        self.assertEqual(recovered_delivery["run_id"], "run-origin")
+        self.assertEqual(recovered_delivery["attempt"], 1)
+        self.assertEqual(
+            json.loads(recovery_receipt.read_text(encoding="utf-8"))["run_id"],
+            "run-recovery",
+        )
+        self.assertEqual(counter.read_text(encoding="utf-8").splitlines(), ["called"])
+
     def test_discord_notification_rejects_corrupt_delivered_result(self) -> None:
         """Require a strict result schema before recovering delivery.json."""
         response = json.dumps(

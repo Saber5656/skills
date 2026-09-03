@@ -774,7 +774,11 @@ def validate_attempt_result(
 
 
 def delivery_receipt(
-    prepared: PreparedDelivery, observation: dict[str, object], attempt: int
+    prepared: PreparedDelivery,
+    observation: dict[str, object],
+    attempt: int,
+    *,
+    origin_run_id: str,
 ) -> dict[str, object]:
     """Build a durable delivered receipt from an authenticated Hermes response."""
     return {
@@ -788,7 +792,7 @@ def delivery_receipt(
         "message_sha256": prepared.message_sha256,
         "message_id": observation["message_id"],
         "attempt": attempt,
-        "run_id": prepared.run_id,
+        "run_id": origin_run_id,
     }
 
 
@@ -863,7 +867,12 @@ def deliver_with_state(prepared: PreparedDelivery) -> dict[str, object]:
             )
             classification = result.get("classification")
             if classification == "delivered":
-                receipt = delivery_receipt(prepared, result, attempt)
+                receipt = delivery_receipt(
+                    prepared,
+                    result,
+                    attempt,
+                    origin_run_id=str(result["run_id"]),
+                )
                 try:
                     receipt_sha256 = write_json_at(key_fd, "delivery.json", receipt)
                 except FileExistsError:
@@ -939,7 +948,12 @@ def deliver_with_state(prepared: PreparedDelivery) -> dict[str, object]:
             )
             classification = observation["classification"]
             if classification == "delivered":
-                receipt = delivery_receipt(prepared, observation, attempt)
+                receipt = delivery_receipt(
+                    prepared,
+                    observation,
+                    attempt,
+                    origin_run_id=prepared.run_id,
+                )
                 receipt_sha256 = write_json_at(key_fd, "delivery.json", receipt)
                 return {
                     "status": "delivered",
