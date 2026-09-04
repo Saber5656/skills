@@ -44,6 +44,8 @@ interactive manualでは`references/it-news-sources.json`を正本として同�
 
 `Content-Length` fieldが複数存在するresponseは、値が同一に見える場合を含めtransport framingが曖昧なためbody read前に拒否する。最初のfieldだけを使うCPython内部lengthや、後続fieldを無視したprefix一致をchallenge evidenceに使わない。
 
+ASCII decimalだけで構成された`Content-Length`も20桁を超える場合は整数変換前に拒否し、変換不能なdecimal値を長さ宣言なしへ降格しない。
+
 Challenge parserのopaque nestingは128段で上限化し、超過時は既出のwidgetを含むchallenge evidence全体を無効化する。
 
 CAPTCHA widget候補の`class`、`id`、`aria-label`、`title`は各4096文字以下の場合だけ解析し、超過した候補はfail closedにする。class/id tokenはboundedなincremental scanで既知ASCII tokenとの一致だけを確認し、空白数に比例するtoken listやsetを作らない。

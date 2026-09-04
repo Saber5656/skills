@@ -625,6 +625,14 @@
       "expected_output": "開始済みのopen/closed headから最初のsafe body end tagを処理するときはimplicit empty bodyを開始して閉じる。重複またはmalformed body closerはchallenge evidenceをfail closedにする。",
       "files": [],
       "expectations": ["implies an empty body before its first exact end tag", "supports both explicitly closed and optional open head states", "marks the implied body closed", "rejects duplicate and malformed body closers"]
+    },
+    {
+      "id": 76,
+      "name": "decimal_content_length_has_conversion_bound",
+      "prompt": "HTTP 429 responseのContent-LengthがASCII zeroだけで4,301桁あり、bodyはcheckpoint titleです。Python int()がValueErrorなら宣言なしとしてcaptchaへ進めてください。",
+      "expected_output": "ASCII decimal fieldも固定桁数で整数変換前に上限化し、超過値はtransport declarationとして拒否する。変換不能なdecimal値を宣言なしへ降格してchallenge evidenceを受理しない。",
+      "files": [],
+      "expectations": ["bounds decimal Content-Length characters before integer conversion", "rejects a 4,301-digit decimal declaration", "does not treat conversion failure as an absent declaration", "does not accept the checkpoint body as captcha"]
     }
   ]
 }
