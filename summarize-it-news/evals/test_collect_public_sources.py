@@ -2780,6 +2780,30 @@ class PublicSourceCollectorTests(unittest.TestCase):
         )
         self.assertIsNone(MODULE.detect_access_constraint(body))
 
+    def test_challenge_script_double_escape_does_not_expose_widget(self) -> None:
+        """Reject a script end callback that HTML5 keeps double escaped."""
+        double_escaped = (
+            b"<html><head><title>Rate limited</title></head><body>"
+            b"<script><!--<script></script>"
+            b"<div class='g-recaptcha'></div></body></html>"
+        )
+        parsed = MODULE.parse_access_constraint_markup(double_escaped.decode())
+        self.assertIsNotNone(parsed)
+        self.assertTrue(parsed.structure_invalid)
+        self.assertTrue(parsed.captcha_widget)
+        self.assertFalse(parsed.has_captcha_evidence)
+        self.assertIsNone(MODULE.detect_access_constraint(double_escaped))
+
+        escaped_then_closed = (
+            b"<html><head><title>Rate limited</title></head><body>"
+            b"<script><!-- fixture --></script>"
+            b"<div class='g-recaptcha'></div></body></html>"
+        )
+        self.assertEqual(
+            MODULE.detect_access_constraint(escaped_then_closed),
+            "captcha",
+        )
+
     def test_vercel_checkpoint_requires_plain_document_title_in_head(self) -> None:
         """Reject title attributes, body placement, and template-contained markup."""
         bodies = (

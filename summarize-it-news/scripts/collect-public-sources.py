@@ -91,6 +91,9 @@ RFC_PUBLICATION_DATE = re.compile(
 AMBIGUOUS_SCRIPT_CLOSER = re.compile(
     r"</[\t\n\f\r ]+script(?:[\t\n\f\r />])", re.IGNORECASE
 )
+SCRIPT_DOUBLE_ESCAPE_START = re.compile(
+    r"<script(?=[\t\n\f\r />])", re.IGNORECASE | re.ASCII
+)
 ENGLISH_MONTHS = {
     name: number
     for number, names in enumerate(
@@ -2139,6 +2142,25 @@ def extract_content(
     }
 
 
+def script_data_enters_double_escaped_state(data: str) -> bool:
+    """Detect a script end tag that HTMLParser would close too early."""
+    position = 0
+    while True:
+        escape_start = data.find("<!--", position)
+        if escape_start < 0:
+            return False
+        escaped_position = escape_start + 4
+        escape_end = data.find("-->", escaped_position)
+        nested_script = SCRIPT_DOUBLE_ESCAPE_START.search(data, escaped_position)
+        if nested_script is not None and (
+            escape_end < 0 or nested_script.start() < escape_end
+        ):
+            return True
+        if escape_end < 0:
+            return False
+        position = escape_end + 3
+
+
 class AccessConstraintMarkupParser(HTMLParser):
     """Extract explicit challenge evidence from a conservative HTML subset."""
 
@@ -2565,6 +2587,12 @@ class AccessConstraintMarkupParser(HTMLParser):
             self.body_closed = True
 
     def handle_data(self, data: str) -> None:
+        if (
+            self.opaque_containers
+            and self.opaque_containers[-1] == "script"
+            and script_data_enters_double_escaped_state(data)
+        ):
+            self.structure_invalid = True
         if self.capture_title:
             self.title_parts.append(data)
             return
