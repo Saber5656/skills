@@ -2153,6 +2153,7 @@ class AccessConstraintMarkupParser(HTMLParser):
         self.in_head = False
         self.body_started = False
         self.body_closed = False
+        self.form_open = False
         self.opaque_containers: list[str] = []
         self.capture_title = False
         self.invalid_title = False
@@ -2359,6 +2360,10 @@ class AccessConstraintMarkupParser(HTMLParser):
         if normalized != "html" and not head_metadata:
             self.start_implicit_body()
         if self.body_started and not self.body_closed:
+            if normalized == "form":
+                if self.form_open:
+                    return
+                self.form_open = True
             self.record_captcha_widget(normalized)
 
     def handle_startendtag(
@@ -2396,6 +2401,14 @@ class AccessConstraintMarkupParser(HTMLParser):
             self.structure_invalid = True
             self.title_structure_invalid = True
             return
+        if normalized == "form":
+            self.start_implicit_body()
+            if self.body_started and not self.body_closed and not self.form_open:
+                # HTML ignores the slash for this non-void element.  Retain the
+                # form pointer, but keep the conservative no-widget policy for
+                # a self-closing callback.
+                self.form_open = True
+            return
         head_metadata = bool(
             normalized in self.HEAD_METADATA_TAGS
             and (self.in_head or self.is_after_head_compatible(normalized))
@@ -2432,6 +2445,13 @@ class AccessConstraintMarkupParser(HTMLParser):
             return
         if normalized in self.OPAQUE_CONTAINERS:
             self.structure_invalid = True
+            return
+        if normalized == "form":
+            if self.form_open:
+                if not self.has_safe_end_tag(normalized):
+                    self.structure_invalid = True
+                    return
+                self.form_open = False
             return
         if normalized == "title":
             if not self.capture_title:

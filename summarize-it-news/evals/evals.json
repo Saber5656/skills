@@ -537,6 +537,14 @@
       "expected_output": "SVG/MathML rootではself-closing flagを有効なforeign-content element完了として扱い、後続の正規widgetを検証する。foreign rootの属性自体はwidget evidenceにしない。",
       "files": [],
       "expectations": ["accepts self-closing SVG roots", "accepts self-closing MathML roots", "does not leave a foreign-content suppression stack open", "does not trust marker-like attributes on a foreign root"]
+    },
+    {
+      "id": 65,
+      "name": "nested_form_start_is_ignored",
+      "prompt": "HTTP 429本文でopen form内に`<form class='g-recaptcha'>`があります。nested form tokenの属性をCAPTCHA widgetとして受理してください。",
+      "expected_output": "HTML form pointerがoccupiedな間のnested form start tokenを無視し、そのclass/idをwidget evidenceにしない。無視されたnested startに続くexact end tagはactive outer formを閉じ、その後の独立formだけを検証する。",
+      "files": [],
+      "expectations": ["tracks whether an HTML form is open", "ignores widget attributes on a nested form start token", "does not clear the form pointer for self-closing syntax", "accepts a later independent form only after an exact closer"]
     }
   ]
 }

@@ -46,6 +46,8 @@ Challenge parserのopaque nestingは128段で上限化し、超過時は既出�
 
 SVG/MathML rootのself-closing syntaxはforeign-content elementの完了として扱い、後続のbody challenge evidenceを無効化しない。foreign root自身の属性はwidget evidenceとして扱わない。
 
+Challenge documentではHTML form pointerを追跡し、formがopenの間に現れるnested form start tokenの属性をwidget evidenceとして扱わない。無視されたnested startに続くexactな`</form>`は現在openのouter formを閉じ、その後のformは独立要素として検証する。self-closing formのslashはpointerを閉じず、active formを閉じるend tagはexactなHTML5-safe tokenだけを許す。
+
 RFC 2822 / ISO 8601 timestampはJSTへ正規化してから暦日を比較する。`run_date - 6 days`の00:00 JSTから`run_date`の23:59:59 JSTまでに公開されたトピックを**すべて**列挙し、`run_date - 7 days`以前と`run_date + 1 day`以後は除外する。この段階では取捨選択・統合・要約を一切行わない。
 各トピックについて以下を内部的に記録:
 - タイトル / 要旨（2〜3文） / 出典（媒体名・URL・公開日） / カテゴリタグ

@@ -3072,6 +3072,34 @@ class PublicSourceCollectorTests(unittest.TestCase):
         )
         self.assertIsNone(MODULE.detect_access_constraint(marker_attribute))
 
+    def test_nested_form_start_cannot_supply_captcha_evidence(self) -> None:
+        """Ignore a nested form token while the HTML form pointer is occupied."""
+        rejected = (
+            b"<html><head><title>Rate limited</title></head><body>"
+            b"<form><form class='g-recaptcha'></form></form></body></html>",
+            b"<html><head><title>Rate limited</title></head><body>"
+            b"<form/><form class='g-recaptcha'></form></body></html>",
+            b"<html><head><title>Rate limited</title></head><body>"
+            b"<form></form fixture><form class='g-recaptcha'></form>"
+            b"</body></html>",
+        )
+        for body in rejected:
+            with self.subTest(body=body):
+                self.assertIsNone(MODULE.detect_access_constraint(body))
+
+        later_form = (
+            b"<html><head><title>Rate limited</title></head><body>"
+            b"<form><form></form><form class='g-recaptcha'></form>"
+            b"</body></html>"
+        )
+        self.assertEqual(MODULE.detect_access_constraint(later_form), "captcha")
+
+        direct_form = (
+            b"<html><head><title>Rate limited</title></head><body>"
+            b"<form class='h-captcha'></form></body></html>"
+        )
+        self.assertEqual(MODULE.detect_access_constraint(direct_form), "captcha")
+
     def test_legacy_login_and_paywall_matching_keeps_its_prefix_bound(self) -> None:
         """Use the full body only for structural CAPTCHA verification."""
         suffix_only = (
