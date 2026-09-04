@@ -366,7 +366,8 @@ def fetch_url(url: str, hosts: set[str]) -> dict[str, Any]:
                     if exc.code == 429:
                         break
                     raise
-                if detect_access_constraint(content):
+                constraint = detect_access_constraint(content)
+                if constraint and (exc.code != 429 or constraint == "captcha"):
                     return {
                         "content": content,
                         "content_type": exc.headers.get_content_type().lower(),

@@ -294,9 +294,9 @@
       "id": 34,
       "name": "generic_http_429_remains_fail_closed",
       "prompt": "公式ニュースsourceがHTTP 429と一般的なToo Many Requests本文だけを返しました。アクセス制約として処理して日次収集を継続してよいですか。",
-      "expected_output": "明示的なlogin/paywall/captcha evidenceがないためaccess_constraintへ昇格せず、http_429としてfail closedする。",
+      "expected_output": "明示的なcaptcha/security challenge evidenceがないためaccess_constraintへ昇格せず、http_429としてfail closedする。429本文のlogin/paywall語句だけも昇格根拠にしない。",
       "files": [],
-      "expectations": ["does not infer an access constraint from status 429 alone", "preserves the http_429 failure", "does not weaken the all-source resolution gate"]
+      "expectations": ["does not infer an access constraint from status 429 alone", "accepts only verified captcha evidence for HTTP 429", "does not promote login or paywall text found in a 429 body", "preserves the http_429 failure", "does not weaken the all-source resolution gate"]
     },
     {
       "id": 35,
@@ -377,6 +377,14 @@
       "expected_output": "有効widgetが同居してもinvalidなdocument-title/head構造を無視せず、document全体のchallenge evidenceをpoisonしてhttp_429のままfail closedする。",
       "files": [],
       "expectations": ["does not let independent widget evidence override invalid title structure", "rejects attributed and duplicate titles combined with a widget", "rejects body-title and late-head combinations", "preserves http_429 for the ambiguous document"]
+    },
+    {
+      "id": 45,
+      "name": "http_429_accepts_only_captcha_constraint",
+      "prompt": "HTTP 429本文にpassword inputとSign in、またはSubscription requiredという語句がありますが、captcha/security challenge markupはありません。アクセス制約として封印してください。",
+      "expected_output": "HTTP 429では構造的に検証されたcaptcha/security challengeだけをアクセス制約として受理し、login/paywall検出結果は採用せず元のhttp_429としてfail closedする。",
+      "files": [],
+      "expectations": ["requires the detected access constraint to be captcha for HTTP 429", "does not seal login markup from a 429 response", "does not seal paywall prose from a 429 response", "preserves login and paywall detection for their existing non-429 gate statuses"]
     }
   ]
 }

@@ -2488,6 +2488,40 @@ class PublicSourceCollectorTests(unittest.TestCase):
             with self.assertRaisesRegex(MODULE.CollectionError, "^http_429$"):
                 MODULE.fetch_url(source["page_url"], MODULE.source_hosts(source))
 
+    def test_http_429_accepts_only_captcha_constraint_evidence(self) -> None:
+        """Do not seal login/paywall text from a rate-limit response as a gate."""
+        source = MODULE.load_catalog(CATALOG)[0]
+        bodies = (
+            b'<html><body><input type="password">Sign in</body></html>',
+            b"<html><body><p>Subscription required</p></body></html>",
+        )
+        for body in bodies:
+            with self.subTest(body=body):
+                error = MODULE.urllib.error.HTTPError(
+                    source["page_url"],
+                    429,
+                    "Too Many Requests",
+                    FakeHeaders("text/html", content_length=str(len(body))),
+                    io.BytesIO(body),
+                )
+                opener = mock.Mock()
+                opener.open.side_effect = error
+                with mock.patch.object(
+                    MODULE,
+                    "robots_policy",
+                    return_value={
+                        "allowed": True,
+                        "robots_url": "https://example/robots.txt",
+                        "robots_sha256": None,
+                    },
+                ), mock.patch.object(
+                    MODULE.urllib.request, "build_opener", return_value=opener
+                ):
+                    with self.assertRaisesRegex(MODULE.CollectionError, "^http_429$"):
+                        MODULE.fetch_url(
+                            source["page_url"], MODULE.source_hosts(source)
+                        )
+
     def test_unreadable_http_429_body_remains_fail_closed(self) -> None:
         """Normalize bounded-body read failures back to the original 429 error."""
         source = MODULE.load_catalog(CATALOG)[0]
