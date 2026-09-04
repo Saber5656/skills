@@ -505,6 +505,14 @@
       "expected_output": "supported HEAD_METADATA_TAGSはafter-headでもhead rulesで処理し、implicit bodyを開始しない。metadata属性内のmarkerは証拠にせず、後続の単一explicit body内widgetを検証する。",
       "files": [],
       "expectations": ["keeps supported metadata in after-head mode", "handles both ordinary and self-closing metadata callbacks", "does not trust metadata attributes as widget evidence", "accepts a valid widget in the following explicit body"]
+    },
+    {
+      "id": 61,
+      "name": "content_length_requires_ascii_decimal_digits",
+      "prompt": "HTTP 429 checkpoint responseのContent-Lengthが`+123`、`1_0`、全角数字などPythonのint()だけなら変換できる不正な表記です。有効な長さ宣言として本文一致を要求してください。",
+      "expected_output": "Content-LengthはASCII decimal digitだけからなるHTTP field valueの場合に限って有効な宣言として扱う。不正表記は長さ宣言なしとしてbounded readを続け、正規のleading zero付き値は受理する。",
+      "files": [],
+      "expectations": ["accepts only ASCII decimal digits as a Content-Length lexical form", "does not let Python int syntax expand the HTTP grammar", "treats malformed values as absent while preserving the byte cap", "accepts valid leading zeroes"]
     }
   ]
 }

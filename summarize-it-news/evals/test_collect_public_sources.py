@@ -2415,7 +2415,7 @@ class PublicSourceCollectorTests(unittest.TestCase):
 
     def test_ignores_malformed_content_length_and_reads_bounded_body(self) -> None:
         """Do not let a malformed upstream header abort fallback verification."""
-        for declared in ("not-a-number", "-1"):
+        for declared in ("not-a-number", "-1", "+7", "1_0", "７", " 7"):
             with self.subTest(declared=declared):
                 response = FakeResponse(
                     b"bounded", "text/plain", "https://example.test"
@@ -2424,6 +2424,10 @@ class PublicSourceCollectorTests(unittest.TestCase):
                     "text/plain", content_length=declared
                 )
                 self.assertEqual(MODULE.read_bounded(response), b"bounded")
+
+        response = FakeResponse(b"bounded", "text/plain", "https://example.test")
+        response.headers = FakeHeaders("text/plain", content_length="0007")
+        self.assertEqual(MODULE.read_bounded(response), b"bounded")
 
     def test_rejects_body_that_does_not_match_valid_content_length(self) -> None:
         """Do not parse a transport-truncated body as complete evidence."""

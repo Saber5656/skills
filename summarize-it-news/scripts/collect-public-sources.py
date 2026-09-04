@@ -284,12 +284,10 @@ def read_bounded(response) -> bytes:  # type: ignore[no-untyped-def]
     """Read a response with a hard size cap and optional gzip decoding."""
     declared = response.headers.get("Content-Length")
     declared_size = None
-    if declared is not None:
+    if isinstance(declared, str) and re.fullmatch(r"[0-9]+", declared, re.ASCII):
         try:
             declared_size = int(declared)
         except (TypeError, ValueError):
-            declared_size = None
-        if declared_size is not None and declared_size < 0:
             declared_size = None
         if declared_size is not None and declared_size > MAX_BYTES:
             raise CollectionError("response exceeds size limit")
