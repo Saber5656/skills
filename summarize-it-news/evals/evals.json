@@ -473,6 +473,14 @@
       "expected_output": "decode後のdocument先頭にある単一U+FEFFだけをencoding signatureとしてparser入力前に除去し、正規head/titleを検証する。先頭以外のU+FEFFはbody dataとして扱う。",
       "files": [],
       "expectations": ["ignores one UTF-8 BOM only at document start", "accepts a valid checkpoint immediately after that BOM", "does not ignore a BOM after other document data"]
+    },
+    {
+      "id": 57,
+      "name": "challenge_parser_infers_optional_head_start",
+      "prompt": "有効なHTTP 429 HTMLがoptionalな`head`開始tagを省略し、doctype直後にdocument titleまたはhead metadataを置いてからbodyへ進みます。titleをbody titleとして拒否してください。",
+      "expected_output": "body開始前のinitial head-compatible title、metadata、opaque tokenからimplied head phaseを開始し、単一document titleを検証する。body content開始後のtitleは従来どおりpoisonする。",
+      "files": [],
+      "expectations": ["infers the optional head before an initial title", "keeps initial metadata in the implied head", "keeps initial head-compatible opaque tokens in the implied head", "does not infer a head after body content starts"]
     }
   ]
 }

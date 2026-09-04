@@ -2124,6 +2124,9 @@ class AccessConstraintMarkupParser(HTMLParser):
     HEAD_METADATA_TAGS = frozenset(
         {"base", "basefont", "bgsound", "link", "meta"}
     )
+    IMPLIED_HEAD_START_TAGS = (
+        HEAD_METADATA_TAGS | HEAD_OPAQUE_CONTAINERS | {"title"}
+    )
     CAPTCHA_WIDGET_TAGS = frozenset({"div", "form", "iframe", "section"})
     CAPTCHA_WIDGET_TOKENS = frozenset({
         "cf-turnstile",
@@ -2203,6 +2206,18 @@ class AccessConstraintMarkupParser(HTMLParser):
             self.head_closed = True
         self.body_started = True
 
+    def start_implied_head(self) -> None:
+        """Infer the optional head start for an initial head-compatible token."""
+        if (
+            not self.head_seen
+            and not self.head_closed
+            and not self.in_head
+            and not self.body_started
+            and not self.body_closed
+        ):
+            self.head_seen = True
+            self.in_head = True
+
     def record_captcha_widget(self, tag: str) -> None:
         """Accept known widget tokens only from strict structural attributes."""
         if tag not in self.CAPTCHA_WIDGET_TAGS:
@@ -2242,6 +2257,8 @@ class AccessConstraintMarkupParser(HTMLParser):
         if normalized == "frameset":
             self.structure_invalid = True
             return
+        if normalized in self.IMPLIED_HEAD_START_TAGS:
+            self.start_implied_head()
         if normalized == "body":
             if self.body_started or self.body_closed:
                 self.structure_invalid = True

@@ -2968,6 +2968,25 @@ class PublicSourceCollectorTests(unittest.TestCase):
             MODULE.detect_access_constraint(b" \xef\xbb\xbf" + checkpoint)
         )
 
+    def test_access_constraint_infers_an_optional_initial_head(self) -> None:
+        """Recognize head-compatible tokens before body without an explicit head."""
+        implied_heads = (
+            b"<!doctype html><title>Vercel Security Checkpoint</title><body></body>",
+            b"<!doctype html><meta charset='utf-8'>"
+            b"<title>Vercel Security Checkpoint</title><body></body>",
+            b"<!doctype html><script>const fixture = '<body>';</script>"
+            b"<title>Vercel Security Checkpoint</title><body></body>",
+        )
+        for body in implied_heads:
+            with self.subTest(body=body):
+                self.assertEqual(MODULE.detect_access_constraint(body), "captcha")
+
+        late_title = (
+            b"<!doctype html><div>body content</div>"
+            b"<title>Vercel Security Checkpoint</title>"
+        )
+        self.assertIsNone(MODULE.detect_access_constraint(late_title))
+
     def test_rejects_escape_before_creating_output(self) -> None:
         """Do not leave directories outside the caller-bound staging root."""
         with tempfile.TemporaryDirectory() as temporary:
