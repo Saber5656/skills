@@ -33,6 +33,7 @@ from zoneinfo import ZoneInfo
 
 MAX_BYTES = 8 * 1024 * 1024
 MAX_JSON_BYTES = 1024 * 1024
+MAX_CONTENT_LENGTH_DIGITS = 20
 LEGACY_CONSTRAINT_TEXT_BYTES = 1024 * 1024
 TIMEOUT_SECONDS = 20
 JSON_LD_MAX_DEPTH = 64
@@ -296,10 +297,12 @@ def read_bounded(response) -> bytes:  # type: ignore[no-untyped-def]
         and re.fullmatch(r"[0-9]+", declared, re.ASCII)
     )
     if valid_declared_length:
+        if len(declared) > MAX_CONTENT_LENGTH_DIGITS:
+            raise CollectionError("response Content-Length field is too long")
         try:
             declared_size = int(declared)
-        except (TypeError, ValueError):
-            declared_size = None
+        except (TypeError, ValueError) as exc:
+            raise CollectionError("response Content-Length is invalid") from exc
         if declared_size is not None and declared_size > MAX_BYTES:
             raise CollectionError("response exceeds size limit")
     elif declared is not None:

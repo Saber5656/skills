@@ -2508,6 +2508,24 @@ class PublicSourceCollectorTests(unittest.TestCase):
         ):
             MODULE.read_bounded(error)
 
+    def test_rejects_decimal_content_length_beyond_conversion_bound(self) -> None:
+        """Reject an oversized decimal field instead of treating it as absent."""
+        response = FakeResponse(
+            b"<title>Vercel Security Checkpoint</title>",
+            "text/html",
+            "https://example.test/checkpoint",
+        )
+        response.headers = FakeHeaders(
+            "text/html",
+            content_length="0" * 4_301,
+        )
+
+        with self.assertRaisesRegex(
+            MODULE.CollectionError,
+            "^response Content-Length field is too long$",
+        ):
+            MODULE.read_bounded(response)
+
     def test_rejects_body_that_does_not_match_valid_content_length(self) -> None:
         """Do not parse a transport-truncated body as complete evidence."""
         body = b"bounded"
