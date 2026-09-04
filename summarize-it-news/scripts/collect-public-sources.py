@@ -33,6 +33,7 @@ from zoneinfo import ZoneInfo
 
 MAX_BYTES = 8 * 1024 * 1024
 MAX_JSON_BYTES = 1024 * 1024
+LEGACY_CONSTRAINT_TEXT_BYTES = 1024 * 1024
 TIMEOUT_SECONDS = 20
 JSON_LD_MAX_DEPTH = 64
 JSON_LD_MAX_NODES = 10_000
@@ -2471,10 +2472,12 @@ def detect_access_constraint(content: bytes) -> Optional[str]:
     decoded = content.decode("utf-8", errors="replace")
     if decoded.startswith("\ufeff"):
         decoded = decoded[1:]
-    text = decoded.lower()
     parsed_constraint = parse_access_constraint_markup(decoded)
     if parsed_constraint and parsed_constraint.has_captcha_evidence:
         return "captcha"
+    text = content[:LEGACY_CONSTRAINT_TEXT_BYTES].decode(
+        "utf-8", errors="replace"
+    ).lower()
     if re.search(r"<input[^>]+type=[\"']password[\"']", text) and re.search(
         r"sign[ -]?in|log[ -]?in|ログイン", text
     ):

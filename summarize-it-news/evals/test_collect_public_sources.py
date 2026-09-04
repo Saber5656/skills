@@ -3001,6 +3001,30 @@ class PublicSourceCollectorTests(unittest.TestCase):
         self.assertNotIn("source_text", vars(parsed))
         self.assertIsNone(parsed.raw_end_tag_start)
 
+    def test_legacy_login_and_paywall_matching_keeps_its_prefix_bound(self) -> None:
+        """Use the full body only for structural CAPTCHA verification."""
+        suffix_only = (
+            b"<html><head><title>Ordinary page</title></head><body>"
+            + b"x" * MODULE.LEGACY_CONSTRAINT_TEXT_BYTES
+            + b"<input type='password'>Sign in. Subscription required."
+            + b"</body></html>"
+        )
+        self.assertIsNone(MODULE.detect_access_constraint(suffix_only))
+
+        prefix_login = b"<input type='password'>Sign in"
+        prefix_paywall = b"Subscription required"
+        self.assertEqual(MODULE.detect_access_constraint(prefix_login), "login")
+        self.assertEqual(MODULE.detect_access_constraint(prefix_paywall), "paywall")
+
+        late_structural_widget = (
+            b"<html><head><title>Rate limited</title></head><body>"
+            + b" " * MODULE.LEGACY_CONSTRAINT_TEXT_BYTES
+            + b"<div class='g-recaptcha'></div></body></html>"
+        )
+        self.assertEqual(
+            MODULE.detect_access_constraint(late_structural_widget), "captcha"
+        )
+
     def test_rejects_escape_before_creating_output(self) -> None:
         """Do not leave directories outside the caller-bound staging root."""
         with tempfile.TemporaryDirectory() as temporary:

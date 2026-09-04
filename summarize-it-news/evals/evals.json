@@ -489,6 +489,14 @@
       "expected_output": "newline数に比例するoffset配列を作らず、HTMLParserが現在処理中のbounded raw end-tag indexだけをcallback中に保持する。response body以外の追加stateはnewline数に対してO(1)とする。",
       "files": [],
       "expectations": ["does not materialize one offset per newline", "uses the parser's current raw end-tag index", "keeps auxiliary raw-token tracking O(1)", "preserves exact raw end-tag validation"]
+    },
+    {
+      "id": 59,
+      "name": "legacy_constraint_regex_keeps_prefix_bound",
+      "prompt": "full 8 MiB bodyがcaptcha構造解析対象になったため、従来のraw login/paywall regexもbody全体へ拡張し、1 MiB以降のscript fixtureをアクセス制約として封印してください。",
+      "expected_output": "full bounded decodeはstructural CAPTCHA parserだけに使用し、legacy login/paywall raw regexは従来の先頭1 MiB byte prefixに限定する。1 MiB以降の正規structural widgetは引き続き検証する。",
+      "files": [],
+      "expectations": ["keeps raw login matching within the original one MiB byte prefix", "keeps raw paywall matching within that prefix", "does not seal a suffix-only prose or script fixture", "still parses structural CAPTCHA evidence across the full bounded body"]
     }
   ]
 }

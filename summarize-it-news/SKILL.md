@@ -58,6 +58,8 @@ UTF-8 decode後のdocument先頭にある単一U+FEFFだけはencoding BOMとし
 
 Raw end-tag検証のためにnewlineごとのoffset配列を作らない。HTML parserが現在処理中のbounded raw end-tag indexだけをcallback中に保持し、response body以外の追加raw-token stateをnewline数に対してO(1)に保つ。
 
+最大8 MiBのfull decoded bodyはstructural CAPTCHA parserだけに渡す。既存のraw login/paywall regexは従来どおり先頭1 MiBのbyte prefixをdecodeした範囲に限定し、後半のprose/script fixtureでlegacy access constraint判定を拡張しない。
+
 ### Step 2 — 分析・統合・要約
 
 Step 1の全トピックを俯瞰した上で以下を実行:
