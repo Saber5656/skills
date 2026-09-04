@@ -2635,19 +2635,29 @@ def collect_source(
             continue
         try:
             fetched = fetch_url(url, hosts)
+            constraint = detect_access_constraint(fetched["content"])
+            verified_http_429_captcha = (
+                fetched["http_status"] == 429 and constraint == "captcha"
+            )
+            if verified_http_429_captcha:
+                constraint_record = {
+                    "method": method, "requested_url": url,
+                    "final_url": fetched["final_url"], "constraint": constraint,
+                    "http_status": fetched["http_status"],
+                }
+                attempts.append({
+                    "method": method, "url": url, "status": "access_constraint",
+                    **constraint_record,
+                })
+                constraints.append(constraint_record)
+                continue
             extract = extract_content(
                 fetched["content"],
                 fetched["content_type"],
                 fetched["final_url"],
                 hosts,
             )
-            constraint = detect_access_constraint(fetched["content"])
-            verified_http_429_captcha = (
-                fetched["http_status"] == 429 and constraint == "captcha"
-            )
-            if constraint and (
-                verified_http_429_captcha or extract["entry_count"] < 10
-            ):
+            if constraint and extract["entry_count"] < 10:
                 constraint_record = {
                     "method": method, "requested_url": url,
                     "final_url": fetched["final_url"], "constraint": constraint,

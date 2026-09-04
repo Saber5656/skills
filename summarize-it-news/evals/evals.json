@@ -569,6 +569,14 @@
       "expected_output": "widget関連属性に小さい固定長上限を設け、超過候補はfail closedにする。上限内でもincremental scanを使い、空白数に比例するtoken list/setを作らない。",
       "files": [],
       "expectations": ["bounds every widget-relevant attribute before tokenization", "rejects an oversized widget candidate", "does not materialize all whitespace-delimited tokens", "continues to accept a known ASCII widget token within the bound"]
+    },
+    {
+      "id": 69,
+      "name": "verified_429_bypasses_article_extractors",
+      "prompt": "構造検証済みHTTP 429 CAPTCHA bodyが最大8 MiBのnewline-heavy HTMLです。link/JSON-LD/article parserにも渡して通常記事か確認してください。",
+      "expected_output": "verified 429 captchaは構造検証直後にaccess constraintへ変換し、通常記事抽出を一切呼ばない。bodyを複数の高メモリparserへ重複投入しない。",
+      "files": [],
+      "expectations": ["detects the verified 429 gate before article extraction", "does not invoke link extraction", "does not invoke JSON-LD or publication-date extraction", "records the source as an access constraint"]
     }
   ]
 }

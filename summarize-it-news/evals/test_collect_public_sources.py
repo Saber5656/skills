@@ -4229,6 +4229,35 @@ class PublicSourceCollectorTests(unittest.TestCase):
             all(item["status"] == "access_constraint" for item in result["attempts"])
         )
 
+    def test_verified_http_429_captcha_bypasses_article_extraction(self) -> None:
+        """Do not send a bounded gate body through higher-memory article parsers."""
+        source = MODULE.load_catalog(CATALOG)[0]
+        body = (
+            b"<html><head><title>Vercel Security Checkpoint</title></head><body>"
+            + b"\n" * 10000
+            + b"</body></html>"
+        )
+        fetched = {
+            "content": body,
+            "content_type": "text/html",
+            "final_url": source["page_url"],
+            "http_status": 429,
+        }
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.object(
+            MODULE, "fetch_url", return_value=fetched
+        ), mock.patch.object(
+            MODULE,
+            "extract_content",
+            side_effect=AssertionError("verified 429 gate reached article extraction"),
+        ) as extract:
+            result = MODULE.collect_source(
+                1, source, MODULE.source_hosts(source), Path(temporary)
+            )
+
+        extract.assert_not_called()
+        self.assertEqual(result["status"], "access_constraint")
+        self.assertEqual(result["constraint"], "captcha")
+
     def test_verified_robots_constraint_requires_all_direct_endpoints(self) -> None:
         """Seal robots evidence only when every direct endpoint is disallowed."""
         source = MODULE.load_catalog(CATALOG)[0]
