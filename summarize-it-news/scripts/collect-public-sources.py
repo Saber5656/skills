@@ -7,6 +7,7 @@ import concurrent.futures
 import gzip
 import html
 import hashlib
+import http.client
 import ipaddress
 import io
 import json
@@ -22,6 +23,7 @@ import urllib.parse
 import urllib.request
 import urllib.robotparser
 import xml.etree.ElementTree as ET
+import zlib
 from datetime import date, datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
@@ -351,8 +353,19 @@ def fetch_url(url: str, hosts: set[str]) -> dict[str, Any]:
                 validate_url(redirected, hosts)
                 request = urllib.request.Request(redirected, headers=dict(request.header_items()))
                 continue
-            if exc.code in (401, 402, 403, 407):
-                content = read_bounded(exc)
+            if exc.code in (401, 402, 403, 407, 429):
+                try:
+                    content = read_bounded(exc)
+                except (
+                    CollectionError,
+                    OSError,
+                    EOFError,
+                    http.client.HTTPException,
+                    zlib.error,
+                ):
+                    if exc.code == 429:
+                        break
+                    raise
                 if detect_access_constraint(content):
                     return {
                         "content": content,
@@ -361,8 +374,6 @@ def fetch_url(url: str, hosts: set[str]) -> dict[str, Any]:
                         "http_status": exc.code,
                         "attempt": attempt,
                     }
-                break
-            if exc.code == 429:
                 break
         except (CollectionError, OSError, urllib.error.URLError, socket.timeout) as exc:
             last_error = str(exc)
@@ -2091,10 +2102,100 @@ def extract_content(
     }
 
 
+class AccessConstraintTitleParser(HTMLParser):
+    """Match one attribute-free document title without trusting raw-text strings."""
+
+    OPAQUE_CONTAINERS = frozenset({"script", "style", "template", "noscript"})
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.in_head = False
+        self.opaque_depth = 0
+        self.capture_title = False
+        self.invalid_title = False
+        self.title_parts: list[str] = []
+        self.vercel_checkpoint = False
+
+    def handle_starttag(
+        self, tag: str, attrs: list[tuple[str, Optional[str]]]
+    ) -> None:
+        normalized = tag.lower()
+        if normalized == "head" and not self.capture_title:
+            self.in_head = True
+            return
+        if normalized in self.OPAQUE_CONTAINERS:
+            self.opaque_depth += 1
+        if normalized == "title":
+            raw_tag = self.get_starttag_text() or ""
+            if (
+                self.in_head
+                and self.opaque_depth == 0
+                and not attrs
+                and not self.capture_title
+                and re.fullmatch(r"<[\t\n\f\r ]*title[\t\n\f\r ]*>", raw_tag, re.IGNORECASE)
+            ):
+                self.capture_title = True
+                self.invalid_title = False
+                self.title_parts = []
+            return
+        if self.capture_title:
+            self.invalid_title = True
+
+    def handle_startendtag(
+        self, tag: str, attrs: list[tuple[str, Optional[str]]]
+    ) -> None:
+        if self.capture_title:
+            self.invalid_title = True
+
+    def handle_endtag(self, tag: str) -> None:
+        normalized = tag.lower()
+        if normalized == "title" and self.capture_title:
+            title = "".join(self.title_parts)
+            if not self.invalid_title and re.fullmatch(
+                r"[\t\n\f\r ]*vercel security checkpoint[\t\n\f\r ]*",
+                title,
+                re.IGNORECASE,
+            ):
+                self.vercel_checkpoint = True
+            self.capture_title = False
+            self.invalid_title = False
+            self.title_parts = []
+            return
+        if self.capture_title:
+            self.invalid_title = True
+        if normalized in self.OPAQUE_CONTAINERS and self.opaque_depth:
+            self.opaque_depth -= 1
+        if normalized == "head":
+            self.in_head = False
+
+    def handle_data(self, data: str) -> None:
+        if self.capture_title:
+            self.title_parts.append(data)
+
+    def handle_comment(self, data: str) -> None:
+        if self.capture_title:
+            self.invalid_title = True
+
+
+def has_vercel_security_checkpoint_title(text: str) -> bool:
+    """Require a parsed title element instead of a matching raw byte sequence."""
+    parser = AccessConstraintTitleParser()
+    try:
+        parser.feed(text)
+        parser.close()
+    except (AssertionError, ValueError):
+        return False
+    return parser.vercel_checkpoint
+
+
 def detect_access_constraint(content: bytes) -> Optional[str]:
     """Recognize explicit gate markup without treating generic HTTP errors as proof."""
-    text = content[: 1024 * 1024].decode("utf-8", errors="replace").lower()
-    if re.search(r"g-recaptcha|hcaptcha|cf-turnstile|captcha challenge", text):
+    decoded = content[: 1024 * 1024].decode("utf-8", errors="replace")
+    text = decoded.lower()
+    if has_vercel_security_checkpoint_title(decoded) or re.search(
+        r"g-recaptcha|hcaptcha|cf-turnstile|captcha challenge",
+        text,
+    ):
         return "captcha"
     if re.search(r"<input[^>]+type=[\"']password[\"']", text) and re.search(
         r"sign[ -]?in|log[ -]?in|ログイン", text

@@ -2441,6 +2441,139 @@ class PublicSourceCollectorTests(unittest.TestCase):
         self.assertEqual(fetched["http_status"], 403)
         self.assertEqual(MODULE.detect_access_constraint(fetched["content"]), "login")
 
+    def test_reads_vercel_security_checkpoint_from_http_429(self) -> None:
+        """Treat an explicit Vercel challenge as a gate, not a generic rate limit."""
+        source = MODULE.load_catalog(CATALOG)[0]
+        body = (
+            b"<!doctype html><html><head>"
+            b"<title>Vercel Security Checkpoint</title>"
+            b"</head><body><main>Security verification</main></body></html>"
+        )
+        error = MODULE.urllib.error.HTTPError(
+            source["page_url"],
+            429,
+            "Too Many Requests",
+            FakeHeaders("text/html", content_length=str(len(body))),
+            io.BytesIO(body),
+        )
+        opener = mock.Mock()
+        opener.open.side_effect = error
+        with mock.patch.object(
+            MODULE,
+            "robots_policy",
+            return_value={"allowed": True, "robots_url": "https://example/robots.txt", "robots_sha256": None},
+        ), mock.patch.object(MODULE.urllib.request, "build_opener", return_value=opener):
+            fetched = MODULE.fetch_url(source["page_url"], MODULE.source_hosts(source))
+        self.assertEqual(fetched["http_status"], 429)
+        self.assertEqual(MODULE.detect_access_constraint(fetched["content"]), "captcha")
+
+    def test_generic_http_429_remains_fail_closed(self) -> None:
+        """Do not infer a CAPTCHA or login gate from status 429 alone."""
+        source = MODULE.load_catalog(CATALOG)[0]
+        body = b"<html><head><title>Too Many Requests</title></head></html>"
+        error = MODULE.urllib.error.HTTPError(
+            source["page_url"],
+            429,
+            "Too Many Requests",
+            FakeHeaders("text/html", content_length=str(len(body))),
+            io.BytesIO(body),
+        )
+        opener = mock.Mock()
+        opener.open.side_effect = error
+        with mock.patch.object(
+            MODULE,
+            "robots_policy",
+            return_value={"allowed": True, "robots_url": "https://example/robots.txt", "robots_sha256": None},
+        ), mock.patch.object(MODULE.urllib.request, "build_opener", return_value=opener):
+            with self.assertRaisesRegex(MODULE.CollectionError, "^http_429$"):
+                MODULE.fetch_url(source["page_url"], MODULE.source_hosts(source))
+
+    def test_unreadable_http_429_body_remains_fail_closed(self) -> None:
+        """Normalize bounded-body read failures back to the original 429 error."""
+        source = MODULE.load_catalog(CATALOG)[0]
+        error = MODULE.urllib.error.HTTPError(
+            source["page_url"],
+            429,
+            "Too Many Requests",
+            FakeHeaders("text/html"),
+            io.BytesIO(b"unreadable"),
+        )
+        opener = mock.Mock()
+        opener.open.side_effect = error
+        with mock.patch.object(
+            MODULE,
+            "robots_policy",
+            return_value={"allowed": True, "robots_url": "https://example/robots.txt", "robots_sha256": None},
+        ), mock.patch.object(
+            MODULE.urllib.request, "build_opener", return_value=opener
+        ), mock.patch.object(
+            MODULE, "read_bounded", side_effect=OSError("body unavailable")
+        ):
+            with self.assertRaisesRegex(MODULE.CollectionError, "^http_429$"):
+                MODULE.fetch_url(source["page_url"], MODULE.source_hosts(source))
+
+    def test_incomplete_http_429_body_remains_fail_closed(self) -> None:
+        """Normalize a truncated HTTP error body back to the original 429 error."""
+        source = MODULE.load_catalog(CATALOG)[0]
+        error = MODULE.urllib.error.HTTPError(
+            source["page_url"],
+            429,
+            "Too Many Requests",
+            FakeHeaders("text/html"),
+            io.BytesIO(b"partial"),
+        )
+        opener = mock.Mock()
+        opener.open.side_effect = error
+        with mock.patch.object(
+            MODULE,
+            "robots_policy",
+            return_value={"allowed": True, "robots_url": "https://example/robots.txt", "robots_sha256": None},
+        ), mock.patch.object(
+            MODULE.urllib.request, "build_opener", return_value=opener
+        ), mock.patch.object(
+            MODULE,
+            "read_bounded",
+            side_effect=MODULE.http.client.IncompleteRead(b"partial"),
+        ):
+            with self.assertRaisesRegex(MODULE.CollectionError, "^http_429$"):
+                MODULE.fetch_url(source["page_url"], MODULE.source_hosts(source))
+
+    def test_vercel_checkpoint_prose_mention_is_not_a_gate(self) -> None:
+        """Require explicit checkpoint markup instead of a prose phrase match."""
+        body = (
+            b"<html><head><title>Cloud security news</title></head>"
+            b"<body><article>Vercel Security Checkpoint behavior changed.</article></body></html>"
+        )
+        self.assertIsNone(MODULE.detect_access_constraint(body))
+
+    def test_vercel_checkpoint_title_in_comment_is_not_a_gate(self) -> None:
+        """Do not recognize title-looking bytes inside an HTML comment."""
+        body = (
+            b"<html><head><!-- <title>Vercel Security Checkpoint</title> -->"
+            b"<title>Ordinary article</title></head><body></body></html>"
+        )
+        self.assertIsNone(MODULE.detect_access_constraint(body))
+
+    def test_vercel_checkpoint_title_in_script_is_not_a_gate(self) -> None:
+        """Do not recognize title-looking text inside a script raw-text element."""
+        body = (
+            b"<html><head><script>"
+            b"const sample = '<title>Vercel Security Checkpoint</title>';"
+            b"</script><title>Ordinary article</title></head><body></body></html>"
+        )
+        self.assertIsNone(MODULE.detect_access_constraint(body))
+
+    def test_vercel_checkpoint_requires_plain_document_title_in_head(self) -> None:
+        """Reject title attributes, body placement, and template-contained markup."""
+        bodies = (
+            b"<html><head><title data-test='fixture'>Vercel Security Checkpoint</title></head></html>",
+            b"<html><head></head><body><title>Vercel Security Checkpoint</title></body></html>",
+            b"<html><head><template><title>Vercel Security Checkpoint</title></template></head></html>",
+        )
+        for body in bodies:
+            with self.subTest(body=body):
+                self.assertIsNone(MODULE.detect_access_constraint(body))
+
     def test_rejects_escape_before_creating_output(self) -> None:
         """Do not leave directories outside the caller-bound staging root."""
         with tempfile.TemporaryDirectory() as temporary:

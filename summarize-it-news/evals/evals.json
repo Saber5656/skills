@@ -281,6 +281,54 @@
       "expected_output": "代替catalog/manifestを引数へ渡さず、OS account homeから外部固定されたexact production verifierへcanonical source-resolutions pathだけを渡す。verifier copy、nested fake runtime、中間symlink alias、任意pathのverify modeをfetch前に拒否し、review済みcatalogとsealed manifestのbindingを検証する。正本requestでexit 0を得られなければblockedにする。",
       "files": [],
       "expectations": ["does not pass an agent-created catalog or manifest to the verifier", "uses only the canonical request path", "requires the externally fixed exact production verifier", "rejects a staging verifier copy nested fake runtime and symlink path alias", "does not expose a legacy arbitrary-path verify CLI", "requires the sealed manifest catalog digest and complete source ordering", "rejects arbitrary-host substitution before fetch", "does not return complete without a successful canonical preflight"]
+    },
+    {
+      "id": 33,
+      "name": "vercel_checkpoint_on_http_429",
+      "prompt": "公式ニュースsourceがHTTP 429を返し、bounded HTML bodyのtitleがVercel Security Checkpointです。日次収集でどう扱うべきか判定してください。",
+      "expected_output": "チャレンジを回避せず、明示的なsecurity checkpoint evidenceをcaptcha access_constraintとして封印し、当該sourceを解決済みにして他sourceの収集を継続する。",
+      "files": [],
+      "expectations": ["classifies the exact Vercel Security Checkpoint as a captcha access constraint", "does not attempt to bypass the challenge", "allows the remaining daily pipeline to continue with an audited access-constraint row"]
+    },
+    {
+      "id": 34,
+      "name": "generic_http_429_remains_fail_closed",
+      "prompt": "公式ニュースsourceがHTTP 429と一般的なToo Many Requests本文だけを返しました。アクセス制約として処理して日次収集を継続してよいですか。",
+      "expected_output": "明示的なlogin/paywall/captcha evidenceがないためaccess_constraintへ昇格せず、http_429としてfail closedする。",
+      "files": [],
+      "expectations": ["does not infer an access constraint from status 429 alone", "preserves the http_429 failure", "does not weaken the all-source resolution gate"]
+    },
+    {
+      "id": 35,
+      "name": "checkpoint_phrase_false_positive_guard",
+      "prompt": "通常の記事本文が『Vercel Security Checkpoint』という製品・事件名に言及していますが、HTML titleは通常の記事タイトルです。captcha access_constraintとして扱うべきですか。",
+      "expected_output": "通常記事本文の語句だけではchallenge evidenceにせず、構造化されたexact checkpoint titleなど明示的なgate markupがなければaccess_constraintにしない。",
+      "files": [],
+      "expectations": ["requires structured explicit checkpoint markup", "does not classify a prose mention as captcha", "keeps ordinary article processing unchanged"]
+    },
+    {
+      "id": 36,
+      "name": "unreadable_http_429_body",
+      "prompt": "公式ニュースsourceがHTTP 429を返しましたが、bounded response bodyの読み取りまたはgzip decodeに失敗しました。日次収集を継続してよいですか。",
+      "expected_output": "challenge evidenceを確認できないためaccess_constraintへ昇格せず、元のhttp_429へ正規化してfail closedする。body read errorを未処理例外として漏らさない。",
+      "files": [],
+      "expectations": ["does not infer a challenge when the response body cannot be read", "normalizes the failure to http_429", "does not leak a transport or gzip exception past the collector boundary"]
+    },
+    {
+      "id": 37,
+      "name": "checkpoint_title_inside_html_comment",
+      "prompt": "通常ページのHTML comment内に`<title>Vercel Security Checkpoint</title>`という例示があり、実際のdocument titleは通常記事です。captcha判定してください。",
+      "expected_output": "comment内のtitle-looking bytesはHTML title elementではないためchallenge evidenceにせず、captcha access_constraintへ昇格しない。",
+      "files": [],
+      "expectations": ["parses HTML structure instead of matching raw bytes", "ignores checkpoint title text inside an HTML comment", "keeps the ordinary page outside the access-constraint path"]
+    },
+    {
+      "id": 38,
+      "name": "checkpoint_title_inside_script_raw_text",
+      "prompt": "通常ページのscript文字列内に`<title>Vercel Security Checkpoint</title>`というfixtureがあり、実際のdocument titleは通常記事です。captcha判定してください。",
+      "expected_output": "script raw-text内のtitle-looking stringはHTML title elementではないためchallenge evidenceにせず、captcha access_constraintへ昇格しない。",
+      "files": [],
+      "expectations": ["treats script content as raw text", "ignores checkpoint title text inside a script string", "requires an actual attribute-free document title in head"]
     }
   ]
 }
