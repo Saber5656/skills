@@ -2182,6 +2182,21 @@ class AccessConstraintMarkupParser(HTMLParser):
         finally:
             self.raw_end_tag_start = None
 
+    def close(self) -> None:
+        """Finalize a structurally complete optional head at end of input."""
+        super().close()
+        if (
+            self.in_head
+            and not self.capture_title
+            and not self.opaque_containers
+            and not self.structure_invalid
+            and not self.title_structure_invalid
+            and not self.body_started
+            and not self.body_closed
+        ):
+            self.in_head = False
+            self.head_closed = True
+
     def has_safe_end_tag(self, tag: str) -> bool:
         """Require an exact end-tag name plus HTML5 ASCII whitespace only."""
         raw_tag = self.current_raw_end_tag()

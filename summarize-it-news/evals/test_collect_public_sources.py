@@ -3100,6 +3100,30 @@ class PublicSourceCollectorTests(unittest.TestCase):
         )
         self.assertEqual(MODULE.detect_access_constraint(direct_form), "captcha")
 
+    def test_access_constraint_finalizes_a_valid_head_at_eof(self) -> None:
+        """Apply the implied head transition when a minimal document ends."""
+        valid = (
+            b"<title>Vercel Security Checkpoint</title>",
+            b"<html><head><title>Vercel Security Checkpoint</title>",
+            b"<meta charset='utf-8'><title>Vercel Security Checkpoint</title>",
+        )
+        for body in valid:
+            with self.subTest(body=body):
+                parsed = MODULE.parse_access_constraint_markup(body.decode())
+                self.assertIsNotNone(parsed)
+                self.assertFalse(parsed.in_head)
+                self.assertTrue(parsed.head_closed)
+                self.assertTrue(parsed.vercel_checkpoint)
+                self.assertEqual(MODULE.detect_access_constraint(body), "captcha")
+
+        incomplete = (
+            b"<title>Vercel Security Checkpoint",
+            b"<script><title>Vercel Security Checkpoint</title>",
+        )
+        for body in incomplete:
+            with self.subTest(body=body):
+                self.assertIsNone(MODULE.detect_access_constraint(body))
+
     def test_legacy_login_and_paywall_matching_keeps_its_prefix_bound(self) -> None:
         """Use the full body only for structural CAPTCHA verification."""
         suffix_only = (

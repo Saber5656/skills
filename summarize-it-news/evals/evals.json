@@ -545,6 +545,14 @@
       "expected_output": "HTML form pointerがoccupiedな間のnested form start tokenを無視し、そのclass/idをwidget evidenceにしない。無視されたnested startに続くexact end tagはactive outer formを閉じ、その後の独立formだけを検証する。",
       "files": [],
       "expectations": ["tracks whether an HTML form is open", "ignores widget attributes on a nested form start token", "does not clear the form pointer for self-closing syntax", "accepts a later independent form only after an exact closer"]
+    },
+    {
+      "id": 66,
+      "name": "optional_head_finalizes_at_eof",
+      "prompt": "HTTP 429本文が`<title>Vercel Security Checkpoint</title>`直後にEOFとなり、optionalなhead end tagとbodyを省略しています。open head stateのままcheckpointを拒否してください。",
+      "expected_output": "完了済みtitle/metadataだけを含む構造的にvalidなoptional headはEOFで暗黙終了し、document titleを検証する。未閉鎖titleまたはopaque containerはEOFで完成させない。",
+      "files": [],
+      "expectations": ["finalizes a structurally valid optional head at end of input", "accepts a completed exact checkpoint title without an explicit head end", "does not synthesize a title close", "does not close an unfinished opaque raw-text context"]
     }
   ]
 }
