@@ -433,6 +433,14 @@
       "expected_output": "HTTP 429かつ再検証済みcaptchaはlink数heuristicに左右されずaccess_constraintとして封印する。通常statusのlogin/paywall誤検出抑止heuristicは維持する。",
       "files": [],
       "expectations": ["preserves verified HTTP 429 captcha state through collection", "does not discard a verified gate because of ten or more links", "does not treat the gate page as ordinary content", "keeps the existing heuristic for non-429 pages"]
+    },
+    {
+      "id": 52,
+      "name": "challenge_parser_tracks_implicit_body",
+      "prompt": "HTTP 429本文がbody tagを省略し、`<div>`またはnon-whitespace textの後にcheckpoint headを置くか、head終了後にcaptcha widgetを置いています。どう判定しますか。",
+      "expected_output": "head外のbody-content start/self-closing tagとnon-whitespace textでimplicit body開始を単調追跡する。body開始後のheadは拒否し、body tag省略時も正規widgetはbody evidenceとして認識する。",
+      "files": [],
+      "expectations": ["tracks implicit body start from non-head elements", "tracks implicit body start from non-whitespace text", "rejects a head after implicit body start", "recognizes a valid widget when the optional body tag is omitted"]
     }
   ]
 }

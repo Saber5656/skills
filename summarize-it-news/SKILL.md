@@ -52,6 +52,8 @@ CAPTCHA widgetのclass/id tokenとsemantic labelはASCII文字だけをASCIIの�
 
 HTTP 429で構造的に再検証した`captcha` evidenceは、page内のextractable link数に左右されずaccess constraintとして封印する。link数heuristicで通常contentへ戻したり、verified gateを未解決へ戻したりしない。
 
+Challenge parserはexplicitな`body` tagだけでなく、head外のbody-content start/self-closing tagおよびnon-whitespace textからimplicit body開始を単調追跡する。implicit body開始後の`head`は拒否し、optional body tagが省略されたdocument内のstrictなwidgetはbody evidenceとして検証する。
+
 ### Step 2 — 分析・統合・要約
 
 Step 1の全トピックを俯瞰した上で以下を実行:

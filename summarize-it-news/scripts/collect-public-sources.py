@@ -2114,6 +2114,12 @@ class AccessConstraintMarkupParser(HTMLParser):
     OPAQUE_CONTAINERS = frozenset(
         {"script", "style", "template", "noscript", "select"}
     )
+    HEAD_OPAQUE_CONTAINERS = frozenset(
+        {"script", "style", "template", "noscript"}
+    )
+    HEAD_METADATA_TAGS = frozenset(
+        {"base", "basefont", "bgsound", "link", "meta"}
+    )
     CAPTCHA_WIDGET_TAGS = frozenset({"div", "form", "iframe", "section"})
     CAPTCHA_WIDGET_TOKENS = frozenset({
         "cf-turnstile",
@@ -2182,6 +2188,17 @@ class AccessConstraintMarkupParser(HTMLParser):
             attributes[name] = value
         return attributes
 
+    def start_implicit_body(self) -> None:
+        """Advance monotonically when a token belongs to the document body."""
+        if self.body_closed:
+            return
+        if self.capture_title:
+            self.invalid_title = True
+        if self.in_head:
+            self.in_head = False
+            self.head_closed = True
+        self.body_started = True
+
     def record_captcha_widget(self, tag: str) -> None:
         """Accept known widget tokens only from strict structural attributes."""
         if tag not in self.CAPTCHA_WIDGET_TAGS:
@@ -2238,12 +2255,18 @@ class AccessConstraintMarkupParser(HTMLParser):
             self.in_head = True
             return
         if normalized in self.OPAQUE_CONTAINERS:
+            if (
+                normalized not in self.HEAD_OPAQUE_CONTAINERS
+                or not self.in_head
+            ):
+                self.start_implicit_body()
             if self.capture_title:
                 self.invalid_title = True
             self.opaque_containers.append(normalized)
             return
         if normalized == "title":
             if not self.in_head or self.body_started:
+                self.start_implicit_body()
                 self.title_structure_invalid = True
                 return
             self.title_elements += 1
@@ -2264,6 +2287,10 @@ class AccessConstraintMarkupParser(HTMLParser):
         if self.capture_title:
             self.invalid_title = True
             return
+        if normalized != "html" and not (
+            self.in_head and normalized in self.HEAD_METADATA_TAGS
+        ):
+            self.start_implicit_body()
         if self.body_started and not self.body_closed:
             self.record_captcha_widget(normalized)
 
@@ -2277,6 +2304,10 @@ class AccessConstraintMarkupParser(HTMLParser):
             self.structure_invalid = True
             self.title_structure_invalid = True
             return
+        if normalized != "html" and not (
+            self.in_head and normalized in self.HEAD_METADATA_TAGS
+        ):
+            self.start_implicit_body()
         # Every supported widget element is non-void in HTML.  A callback for
         # self-closing syntax does not prove a stable widget node, so it is
         # never accepted as challenge evidence.
@@ -2335,6 +2366,11 @@ class AccessConstraintMarkupParser(HTMLParser):
     def handle_data(self, data: str) -> None:
         if self.capture_title:
             self.title_parts.append(data)
+            return
+        if self.opaque_containers:
+            return
+        if re.search(r"[^\t\n\f\r ]", data):
+            self.start_implicit_body()
 
     def handle_comment(self, _data: str) -> None:
         if self.capture_title:

@@ -2855,6 +2855,36 @@ class PublicSourceCollectorTests(unittest.TestCase):
         self.assertLess(len(body), MODULE.MAX_BYTES)
         self.assertIsNone(MODULE.detect_access_constraint(body))
 
+    def test_access_constraint_tracks_implicit_body_tokens(self) -> None:
+        """Reject late heads and recognize widgets when the body tag is omitted."""
+        late_heads = (
+            b"<html><div>body content</div><head>"
+            b"<title>Vercel Security Checkpoint</title></head></html>",
+            b"<html>body text<head>"
+            b"<title>Vercel Security Checkpoint</title></head></html>",
+        )
+        for body in late_heads:
+            with self.subTest(body=body):
+                self.assertIsNone(MODULE.detect_access_constraint(body))
+
+        implicit_body_widgets = (
+            b"<html><head><title>Rate limited</title></head>"
+            b"<div class='g-recaptcha'></div></html>",
+            b"<html><head><title>Rate limited</title></head>body text"
+            b"<section id='cf-turnstile'></section></html>",
+        )
+        for body in implicit_body_widgets:
+            with self.subTest(body=body):
+                self.assertEqual(MODULE.detect_access_constraint(body), "captcha")
+
+        post_document_script = (
+            b"<html><head><title>Vercel Security Checkpoint</title></head>"
+            b"<body></body></html><script type='module'>challenge()</script>"
+        )
+        self.assertEqual(
+            MODULE.detect_access_constraint(post_document_script), "captcha"
+        )
+
     def test_rejects_escape_before_creating_output(self) -> None:
         """Do not leave directories outside the caller-bound staging root."""
         with tempfile.TemporaryDirectory() as temporary:
