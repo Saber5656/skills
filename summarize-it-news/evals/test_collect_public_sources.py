@@ -2705,6 +2705,19 @@ class PublicSourceCollectorTests(unittest.TestCase):
             with self.subTest(body=body):
                 self.assertIsNone(MODULE.detect_access_constraint(body))
 
+    def test_vercel_checkpoint_title_uses_ascii_only_case_folding(self) -> None:
+        """Reject Unicode lookalikes while accepting ordinary ASCII case."""
+        lookalike = (
+            "<html><head><title>Vercel Security Chec\u212apoint</title>"
+            "</head><body></body></html>"
+        ).encode()
+        self.assertIsNone(MODULE.detect_access_constraint(lookalike))
+        ascii_case = (
+            b"<html><head><title>vErCeL sEcUrItY cHeCkPoInT</title>"
+            b"</head><body></body></html>"
+        )
+        self.assertEqual(MODULE.detect_access_constraint(ascii_case), "captcha")
+
     def test_generic_captcha_markers_require_structural_widget_markup(self) -> None:
         """Ignore marker strings in comments, scripts, prose, and unrelated attrs."""
         bodies = (

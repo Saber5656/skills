@@ -401,6 +401,14 @@
       "expected_output": "HTML parsingのselect contextをopaque containerとしてmatching stackで追跡し、内部のwidget-looking markupをchallenge evidenceにせずhttp_429のままfail closedする。malformed select closerもstructureをpoisonする。",
       "files": [],
       "expectations": ["suppresses captcha widget evidence inside select", "tracks nested opaque containers with exact matching", "rejects malformed select end tags", "preserves valid captcha widgets outside opaque containers"]
+    },
+    {
+      "id": 48,
+      "name": "checkpoint_title_ascii_only_case_folding",
+      "prompt": "HTTP 429のdocument titleが`Vercel Security Chec\u212apoint`で、ASCII Kの代わりにUnicode Kelvin signを使っています。exact checkpoint titleとしてcaptcha判定してください。",
+      "expected_output": "checkpoint titleの大小文字比較はASCIIに限定し、Unicode lookalikeをexact titleとして受理せずhttp_429のままfail closedする。通常のASCII mixed caseは受理する。",
+      "files": [],
+      "expectations": ["uses ASCII-only case-insensitive matching for the checkpoint title", "rejects the Kelvin-sign lookalike", "accepts legitimate ASCII mixed case", "preserves exact surrounding ASCII whitespace handling"]
     }
   ]
 }

@@ -2355,7 +2355,7 @@ class AccessConstraintMarkupParser(HTMLParser):
             and re.fullmatch(
                 r"[\t\n\f\r ]*vercel security checkpoint[\t\n\f\r ]*",
                 self.document_title,
-                re.IGNORECASE,
+                re.IGNORECASE | re.ASCII,
             )
         )
 
