@@ -2954,6 +2954,20 @@ class PublicSourceCollectorTests(unittest.TestCase):
             MODULE.detect_access_constraint(suppressed_frameset), "captcha"
         )
 
+    def test_access_constraint_ignores_only_a_leading_utf8_bom(self) -> None:
+        """Allow the encoding signature without ignoring later body data."""
+        checkpoint = (
+            b"<html><head><title>Vercel Security Checkpoint</title>"
+            b"</head><body></body></html>"
+        )
+        self.assertEqual(
+            MODULE.detect_access_constraint(b"\xef\xbb\xbf" + checkpoint),
+            "captcha",
+        )
+        self.assertIsNone(
+            MODULE.detect_access_constraint(b" \xef\xbb\xbf" + checkpoint)
+        )
+
     def test_rejects_escape_before_creating_output(self) -> None:
         """Do not leave directories outside the caller-bound staging root."""
         with tempfile.TemporaryDirectory() as temporary:

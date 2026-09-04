@@ -2449,6 +2449,8 @@ def has_vercel_security_checkpoint_title(text: str) -> bool:
 def detect_access_constraint(content: bytes) -> Optional[str]:
     """Recognize explicit gate markup without treating generic HTTP errors as proof."""
     decoded = content.decode("utf-8", errors="replace")
+    if decoded.startswith("\ufeff"):
+        decoded = decoded[1:]
     text = decoded.lower()
     parsed_constraint = parse_access_constraint_markup(decoded)
     if parsed_constraint and parsed_constraint.has_captcha_evidence:

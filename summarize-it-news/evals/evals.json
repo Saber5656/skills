@@ -465,6 +465,14 @@
       "expected_output": "actual frameset tokenを含むchallenge documentはdocument-wide fail closedにし、frameset insertion modeで無視されるiframe風callbackをrendered CAPTCHA evidenceとして扱わない。opaque context内のframeset-like markupはactual tokenとみなさない。",
       "files": [],
       "expectations": ["rejects captcha evidence from a frameset document", "does not trust iframe-like callbacks in frameset insertion mode", "invalidates earlier widget evidence when a frameset appears later", "ignores frameset-like markup inside an opaque context"]
+    },
+    {
+      "id": 56,
+      "name": "challenge_parser_ignores_initial_utf8_bom",
+      "prompt": "HTTP 429のUTF-8 HTMLが標準BOM `EF BB BF`で始まり、その直後に正規Vercel checkpoint headがあります。BOMをbody開始としてcheckpointを拒否してください。",
+      "expected_output": "decode後のdocument先頭にある単一U+FEFFだけをencoding signatureとしてparser入力前に除去し、正規head/titleを検証する。先頭以外のU+FEFFはbody dataとして扱う。",
+      "files": [],
+      "expectations": ["ignores one UTF-8 BOM only at document start", "accepts a valid checkpoint immediately after that BOM", "does not ignore a BOM after other document data"]
     }
   ]
 }
