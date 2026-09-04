@@ -329,6 +329,54 @@
       "expected_output": "script raw-text内のtitle-looking stringはHTML title elementではないためchallenge evidenceにせず、captcha access_constraintへ昇格しない。",
       "files": [],
       "expectations": ["treats script content as raw text", "ignores checkpoint title text inside a script string", "requires an actual attribute-free document title in head"]
+    },
+    {
+      "id": 39,
+      "name": "checkpoint_head_after_body_is_rejected",
+      "prompt": "HTTP 429本文が`<body><head><title>Vercel Security Checkpoint</title>`のようにbody開始後のheadを含みます。captchaとして封印してください。",
+      "expected_output": "body開始後に現れるheadはdocument headとして再開せず、checkpoint title evidenceを無効化してgeneric http_429のままfail closedする。",
+      "files": [],
+      "expectations": ["tracks whether body has started", "does not reopen document head after body", "rejects the late checkpoint title", "preserves generic http_429 failure"]
+    },
+    {
+      "id": 40,
+      "name": "checkpoint_opaque_closers_must_match",
+      "prompt": "HTTP 429本文のheadに`<template></noscript><title>Vercel Security Checkpoint</title></template>`があります。captcha判定してください。",
+      "expected_output": "opaque containerをmatching stackで管理し、無関係なclosing tagでtemplateを閉じた扱いにせず、template内titleをevidenceとして採用しない。",
+      "files": [],
+      "expectations": ["uses a matching opaque-container stack", "does not decrement depth for a mismatched closer", "keeps the title inside template opaque", "fails closed on ambiguous structure"]
+    },
+    {
+      "id": 41,
+      "name": "checkpoint_requires_single_document_title",
+      "prompt": "HTTP 429本文のheadに通常titleと`Vercel Security Checkpoint` titleが複数あります。captchaとして封印してください。",
+      "expected_output": "document titleは構造的に1個だけの場合に限ってchallenge evidenceとし、順序にかかわらずduplicate titleを拒否してhttp_429のままfail closedする。",
+      "files": [],
+      "expectations": ["counts document title elements", "rejects duplicate titles", "does not let a later matching title override an ordinary title", "does not retain an earlier match after a duplicate"]
+    },
+    {
+      "id": 42,
+      "name": "generic_captcha_markers_are_structural",
+      "prompt": "HTTP 429本文のcomment、script fixture、通常本文、無関係attributeに`g-recaptcha`、`hcaptcha`、`cf-turnstile`、`captcha challenge`が含まれます。captcha判定してください。",
+      "expected_output": "raw全文検索を行わず、strictにparseした既知captcha widgetのclass/idまたはsemantic labelだけをevidenceとし、comment・script・prose・無関係attributeのmarkerを拒否する。",
+      "files": [],
+      "expectations": ["does not raw-search the decoded document for captcha words", "ignores comments and script contents", "ignores ordinary body prose and unrelated attributes", "accepts known widget tokens only from strict structural attributes"]
+    },
+    {
+      "id": 43,
+      "name": "access_constraint_end_tags_require_exact_syntax",
+      "prompt": "HTTP 429本文が`</template fixture>`、`</title foo>`、`</head foo>`、または`</body foo>`のようなmalformed closing tokenを含みます。Python callback上はend tagに見える場合のcaptcha判定をしてください。",
+      "expected_output": "trust boundaryを閉じるend tagはraw tokenがexact nameとHTML5 ASCII whitespaceだけか再検証し、属性様suffixやsplit nameを拒否してchallenge evidence全体をfail closedする。",
+      "files": [],
+      "expectations": ["recovers the raw end-tag token", "requires exact tag name and HTML5 ASCII whitespace only", "does not close an opaque or document boundary from a malformed callback", "poisons all challenge evidence and preserves http_429"]
+    },
+    {
+      "id": 44,
+      "name": "invalid_title_structure_poisons_widget_evidence",
+      "prompt": "HTTP 429本文にstrictなCAPTCHA widgetがある一方、document titleはattribute付き、duplicate、body内、またはlate head内です。widgetを根拠にcaptchaとして封印してください。",
+      "expected_output": "有効widgetが同居してもinvalidなdocument-title/head構造を無視せず、document全体のchallenge evidenceをpoisonしてhttp_429のままfail closedする。",
+      "files": [],
+      "expectations": ["does not let independent widget evidence override invalid title structure", "rejects attributed and duplicate titles combined with a widget", "rejects body-title and late-head combinations", "preserves http_429 for the ambiguous document"]
     }
   ]
 }

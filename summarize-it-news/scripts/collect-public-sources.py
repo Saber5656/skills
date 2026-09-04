@@ -2102,100 +2102,292 @@ def extract_content(
     }
 
 
-class AccessConstraintTitleParser(HTMLParser):
-    """Match one attribute-free document title without trusting raw-text strings."""
+class AccessConstraintMarkupParser(HTMLParser):
+    """Extract explicit challenge evidence from a conservative HTML subset."""
 
     OPAQUE_CONTAINERS = frozenset({"script", "style", "template", "noscript"})
+    CAPTCHA_WIDGET_TAGS = frozenset({"div", "form", "iframe", "section"})
+    CAPTCHA_WIDGET_TOKENS = frozenset({
+        "cf-turnstile",
+        "g-recaptcha",
+        "h-captcha",
+        "hcaptcha",
+    })
 
-    def __init__(self) -> None:
+    def __init__(self, source_text: str) -> None:
         super().__init__(convert_charrefs=True)
+        self.source_text = source_text
+        self.line_offsets = [0]
+        self.line_offsets.extend(
+            match.end() for match in re.finditer("\n", source_text)
+        )
+        self.head_seen = False
+        self.head_closed = False
         self.in_head = False
-        self.opaque_depth = 0
+        self.body_started = False
+        self.body_closed = False
+        self.opaque_containers: list[str] = []
         self.capture_title = False
         self.invalid_title = False
+        self.title_elements = 0
         self.title_parts: list[str] = []
-        self.vercel_checkpoint = False
+        self.document_title: Optional[str] = None
+        self.title_structure_invalid = False
+        self.structure_invalid = False
+        self.captcha_widget = False
+
+    def current_raw_end_tag(self) -> Optional[str]:
+        """Recover the raw end-tag token at the current parser position."""
+        line, column = self.getpos()
+        if line <= 0 or line > len(self.line_offsets):
+            return None
+        start = self.line_offsets[line - 1] + column
+        end = self.source_text.find(">", start)
+        if end == -1:
+            return None
+        return self.source_text[start : end + 1]
+
+    def has_safe_end_tag(self, tag: str) -> bool:
+        """Require an exact end-tag name plus HTML5 ASCII whitespace only."""
+        raw_tag = self.current_raw_end_tag()
+        return bool(
+            raw_tag
+            and re.fullmatch(
+                rf"</{re.escape(tag)}[\t\n\f\r ]*>",
+                raw_tag,
+                re.IGNORECASE,
+            )
+        )
+
+    def strict_callback_attributes(
+        self, tag: str
+    ) -> Optional[dict[str, Optional[str]]]:
+        """Reparse the raw tag and reject ambiguous or duplicate attributes."""
+        raw_tag = self.get_starttag_text() or ""
+        parsed = strict_html_attributes(raw_tag, tag)
+        if parsed is None:
+            return None
+        attributes: dict[str, Optional[str]] = {}
+        for name, value in parsed:
+            if name in attributes:
+                return None
+            attributes[name] = value
+        return attributes
+
+    def record_captcha_widget(self, tag: str) -> None:
+        """Accept known widget tokens only from strict structural attributes."""
+        if tag not in self.CAPTCHA_WIDGET_TAGS:
+            return
+        attributes = self.strict_callback_attributes(tag)
+        if attributes is None:
+            return
+        tokens: set[str] = set()
+        for name in ("class", "id"):
+            value = attributes.get(name)
+            if value:
+                tokens.update(
+                    part.casefold()
+                    for part in re.split(r"[\t\n\f\r ]+", value)
+                    if part
+                )
+        semantic_label = attributes.get("aria-label") or attributes.get("title")
+        if tokens.intersection(self.CAPTCHA_WIDGET_TOKENS) or (
+            isinstance(semantic_label, str)
+            and re.fullmatch(
+                r"[\t\n\f\r ]*captcha challenge[\t\n\f\r ]*",
+                semantic_label,
+                re.IGNORECASE,
+            )
+        ):
+            self.captcha_widget = True
 
     def handle_starttag(
-        self, tag: str, attrs: list[tuple[str, Optional[str]]]
+        self, tag: str, _attrs: list[tuple[str, Optional[str]]]
     ) -> None:
         normalized = tag.lower()
-        if normalized == "head" and not self.capture_title:
+        if self.opaque_containers:
+            if normalized in self.OPAQUE_CONTAINERS:
+                self.opaque_containers.append(normalized)
+            return
+        if normalized == "body":
+            if self.body_started or self.body_closed:
+                self.structure_invalid = True
+                return
+            if self.capture_title:
+                self.invalid_title = True
+            if self.in_head:
+                self.in_head = False
+                self.head_closed = True
+            self.body_started = True
+            return
+        if normalized == "head":
+            if self.head_seen or self.head_closed or self.body_started or self.in_head:
+                self.structure_invalid = True
+                self.title_structure_invalid = True
+                return
+            self.head_seen = True
             self.in_head = True
             return
         if normalized in self.OPAQUE_CONTAINERS:
-            self.opaque_depth += 1
+            if self.capture_title:
+                self.invalid_title = True
+            self.opaque_containers.append(normalized)
+            return
         if normalized == "title":
-            raw_tag = self.get_starttag_text() or ""
+            if not self.in_head or self.body_started:
+                self.title_structure_invalid = True
+                return
+            self.title_elements += 1
+            attributes = self.strict_callback_attributes(normalized)
             if (
-                self.in_head
-                and self.opaque_depth == 0
-                and not attrs
+                self.title_elements == 1
+                and attributes == {}
                 and not self.capture_title
-                and re.fullmatch(r"<[\t\n\f\r ]*title[\t\n\f\r ]*>", raw_tag, re.IGNORECASE)
             ):
                 self.capture_title = True
                 self.invalid_title = False
                 self.title_parts = []
+            else:
+                self.title_structure_invalid = True
+                if self.capture_title:
+                    self.invalid_title = True
             return
         if self.capture_title:
             self.invalid_title = True
+            return
+        if self.body_started and not self.body_closed:
+            self.record_captcha_widget(normalized)
 
     def handle_startendtag(
-        self, tag: str, attrs: list[tuple[str, Optional[str]]]
+        self, tag: str, _attrs: list[tuple[str, Optional[str]]]
     ) -> None:
+        normalized = tag.lower()
         if self.capture_title:
             self.invalid_title = True
+        if normalized in self.OPAQUE_CONTAINERS or normalized in {"body", "head", "title"}:
+            self.structure_invalid = True
+            self.title_structure_invalid = True
+            return
+        # Every supported widget element is non-void in HTML.  A callback for
+        # self-closing syntax does not prove a stable widget node, so it is
+        # never accepted as challenge evidence.
 
     def handle_endtag(self, tag: str) -> None:
         normalized = tag.lower()
-        if normalized == "title" and self.capture_title:
-            title = "".join(self.title_parts)
-            if not self.invalid_title and re.fullmatch(
-                r"[\t\n\f\r ]*vercel security checkpoint[\t\n\f\r ]*",
-                title,
-                re.IGNORECASE,
-            ):
-                self.vercel_checkpoint = True
+        if (
+            normalized in self.OPAQUE_CONTAINERS | {"body", "head", "title"}
+            and not self.has_safe_end_tag(normalized)
+        ):
+            self.structure_invalid = True
+            if normalized in {"head", "title"}:
+                self.title_structure_invalid = True
+            if self.capture_title:
+                self.invalid_title = True
+            return
+        if self.opaque_containers:
+            if normalized in self.OPAQUE_CONTAINERS:
+                if self.opaque_containers[-1] != normalized:
+                    self.structure_invalid = True
+                    return
+                self.opaque_containers.pop()
+            return
+        if normalized in self.OPAQUE_CONTAINERS:
+            self.structure_invalid = True
+            return
+        if normalized == "title":
+            if not self.capture_title:
+                if self.in_head:
+                    self.title_structure_invalid = True
+                return
+            if self.invalid_title:
+                self.title_structure_invalid = True
+            else:
+                self.document_title = "".join(self.title_parts)
             self.capture_title = False
             self.invalid_title = False
             self.title_parts = []
             return
         if self.capture_title:
             self.invalid_title = True
-        if normalized in self.OPAQUE_CONTAINERS and self.opaque_depth:
-            self.opaque_depth -= 1
         if normalized == "head":
+            if not self.in_head:
+                self.structure_invalid = True
+                self.title_structure_invalid = True
+                return
             self.in_head = False
+            self.head_closed = True
+        elif normalized == "body":
+            if not self.body_started or self.body_closed:
+                self.structure_invalid = True
+                return
+            self.body_started = True
+            self.body_closed = True
 
     def handle_data(self, data: str) -> None:
         if self.capture_title:
             self.title_parts.append(data)
 
-    def handle_comment(self, data: str) -> None:
+    def handle_comment(self, _data: str) -> None:
         if self.capture_title:
             self.invalid_title = True
 
+    @property
+    def vercel_checkpoint(self) -> bool:
+        """Return true only for one completed, unambiguous document title."""
+        return bool(
+            not self.structure_invalid
+            and not self.title_structure_invalid
+            and not self.capture_title
+            and not self.in_head
+            and not self.opaque_containers
+            and self.head_seen
+            and self.head_closed
+            and self.title_elements == 1
+            and isinstance(self.document_title, str)
+            and re.fullmatch(
+                r"[\t\n\f\r ]*vercel security checkpoint[\t\n\f\r ]*",
+                self.document_title,
+                re.IGNORECASE,
+            )
+        )
 
-def has_vercel_security_checkpoint_title(text: str) -> bool:
-    """Require a parsed title element instead of a matching raw byte sequence."""
-    parser = AccessConstraintTitleParser()
+    @property
+    def has_captcha_evidence(self) -> bool:
+        """Reject evidence when opaque-container structure remains ambiguous."""
+        return bool(
+            not self.structure_invalid
+            and not self.title_structure_invalid
+            and not self.capture_title
+            and not self.opaque_containers
+            and (self.vercel_checkpoint or self.captcha_widget)
+        )
+
+
+def parse_access_constraint_markup(
+    text: str,
+) -> Optional[AccessConstraintMarkupParser]:
+    """Parse challenge markup once and return no evidence on parser failure."""
+    parser = AccessConstraintMarkupParser(text)
     try:
         parser.feed(text)
         parser.close()
     except (AssertionError, ValueError):
-        return False
-    return parser.vercel_checkpoint
+        return None
+    return parser
+
+
+def has_vercel_security_checkpoint_title(text: str) -> bool:
+    """Require a parsed title element instead of a matching raw byte sequence."""
+    parser = parse_access_constraint_markup(text)
+    return bool(parser and parser.vercel_checkpoint)
 
 
 def detect_access_constraint(content: bytes) -> Optional[str]:
     """Recognize explicit gate markup without treating generic HTTP errors as proof."""
     decoded = content[: 1024 * 1024].decode("utf-8", errors="replace")
     text = decoded.lower()
-    if has_vercel_security_checkpoint_title(decoded) or re.search(
-        r"g-recaptcha|hcaptcha|cf-turnstile|captcha challenge",
-        text,
-    ):
+    parsed_constraint = parse_access_constraint_markup(decoded)
+    if parsed_constraint and parsed_constraint.has_captcha_evidence:
         return "captcha"
     if re.search(r"<input[^>]+type=[\"']password[\"']", text) and re.search(
         r"sign[ -]?in|log[ -]?in|ログイン", text

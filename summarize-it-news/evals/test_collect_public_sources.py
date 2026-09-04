@@ -2569,6 +2569,123 @@ class PublicSourceCollectorTests(unittest.TestCase):
             b"<html><head><title data-test='fixture'>Vercel Security Checkpoint</title></head></html>",
             b"<html><head></head><body><title>Vercel Security Checkpoint</title></body></html>",
             b"<html><head><template><title>Vercel Security Checkpoint</title></template></head></html>",
+            b"<html><head><title>Vercel Security Checkpoint</title></head><body/></html>",
+        )
+        for body in bodies:
+            with self.subTest(body=body):
+                self.assertIsNone(MODULE.detect_access_constraint(body))
+
+    def test_vercel_checkpoint_rejects_head_started_after_body(self) -> None:
+        """Do not let a late malformed head re-enable document-title capture."""
+        bodies = (
+            b"<html><body><head><title>Vercel Security Checkpoint</title></head></body></html>",
+            b"<html><head><title>Ordinary article</title></head><body></body>"
+            b"<head><title>Vercel Security Checkpoint</title></head></html>",
+        )
+        for body in bodies:
+            with self.subTest(body=body):
+                self.assertIsNone(MODULE.detect_access_constraint(body))
+
+    def test_vercel_checkpoint_rejects_mismatched_opaque_closers(self) -> None:
+        """Keep an opaque container active until its own matching end tag."""
+        bodies = (
+            b"<html><head><template></noscript>"
+            b"<title>Vercel Security Checkpoint</title></template></head></html>",
+            b"<html><head><noscript></template>"
+            b"<title>Vercel Security Checkpoint</title></noscript></head></html>",
+        )
+        for body in bodies:
+            with self.subTest(body=body):
+                self.assertIsNone(MODULE.detect_access_constraint(body))
+
+    def test_access_constraint_requires_exact_trust_boundary_end_tags(self) -> None:
+        """Reject Python callbacks synthesized from malformed closing tokens."""
+        bodies = (
+            b"<html><head><template></template fixture>"
+            b"<title>Vercel Security Checkpoint</title></head></html>",
+            b"<html><head><title>Vercel Security Checkpoint</title foo>"
+            b"</head></html>",
+            b"<html><head><title>Vercel Security Checkpoint</title>"
+            b"</head fixture><body></body></html>",
+            b"<html><head><title>Rate limited</title></head><body>"
+            b"<div class='g-recaptcha'></div></body fixture></html>",
+        )
+        for body in bodies:
+            with self.subTest(body=body):
+                self.assertIsNone(MODULE.detect_access_constraint(body))
+
+    def test_vercel_checkpoint_requires_one_document_title(self) -> None:
+        """Reject duplicate titles regardless of which one names the checkpoint."""
+        bodies = (
+            b"<html><head><title>Ordinary article</title>"
+            b"<title>Vercel Security Checkpoint</title></head></html>",
+            b"<html><head><title>Vercel Security Checkpoint</title>"
+            b"<title>Ordinary article</title></head></html>",
+            b"<html><head><title>Vercel Security Checkpoint</title>"
+            b"<title>Vercel Security Checkpoint</title></head></html>",
+        )
+        for body in bodies:
+            with self.subTest(body=body):
+                self.assertIsNone(MODULE.detect_access_constraint(body))
+
+    def test_generic_captcha_markers_require_structural_widget_markup(self) -> None:
+        """Ignore marker strings in comments, scripts, prose, and unrelated attrs."""
+        bodies = (
+            b"<html><head><title>Rate limited</title><!-- g-recaptcha hcaptcha "
+            b"cf-turnstile captcha challenge --></head><body></body></html>",
+            b"<html><head><title>Rate limited</title><script>"
+            b"const fixture = 'g-recaptcha hcaptcha cf-turnstile captcha challenge';"
+            b"</script></head><body></body></html>",
+            b"<html><head><title>Rate limited</title></head><body><p>"
+            b"g-recaptcha hcaptcha cf-turnstile captcha challenge"
+            b"</p></body></html>",
+            b"<html><head><title>Rate limited</title></head><body>"
+            b"<div data-fixture='hcaptcha'>ordinary content</div></body></html>",
+            b"<html><head><title>Rate limited</title></head><body>"
+            b"<div class='g-recaptcha'/></body></html>",
+            b"<html><head><title>Rate limited</title></head><body>"
+            b"<div class='ordinary' class='h-captcha'></div></body></html>",
+            b"<html><head><title>Rate limited</title></head><body><template>"
+            b"<div class='cf-turnstile'></div></template></body></html>",
+            b"<html><head><title>Rate limited</title></head><body></body>"
+            b"<div class='g-recaptcha'></div></html>",
+        )
+        for body in bodies:
+            with self.subTest(body=body):
+                self.assertIsNone(MODULE.detect_access_constraint(body))
+
+        widgets = (
+            b"<div class='g-recaptcha'></div>",
+            b"<div class='h-captcha'></div>",
+            b"<section id='cf-turnstile'></section>",
+            b"<iframe aria-label='Captcha Challenge'></iframe>",
+        )
+        for widget in widgets:
+            with self.subTest(widget=widget):
+                body = (
+                    b"<html><head><title>Rate limited</title></head><body>"
+                    + widget
+                    + b"</body></html>"
+                )
+                self.assertEqual(MODULE.detect_access_constraint(body), "captcha")
+
+    def test_invalid_document_title_poisons_widget_evidence(self) -> None:
+        """Do not let a valid widget override ambiguous document-title structure."""
+        widget = b"<div class='g-recaptcha'></div>"
+        bodies = (
+            b"<html><head><title data-fixture='1'>Rate limited</title></head><body>"
+            + widget
+            + b"</body></html>",
+            b"<html><head><title>Rate limited</title><title>Second</title></head><body>"
+            + widget
+            + b"</body></html>",
+            b"<html><head><title>Rate limited</title></head><body>"
+            b"<title>Fixture title</title>"
+            + widget
+            + b"</body></html>",
+            b"<html><body><head><title>Rate limited</title></head>"
+            + widget
+            + b"</body></html>",
         )
         for body in bodies:
             with self.subTest(body=body):
