@@ -521,6 +521,14 @@
       "expected_output": "opaque nestingを保守的な固定深度で上限化し、超過したdocumentは既出のwidgetを含むchallenge evidence全体を無効化する。入力サイズに比例するstack保持を行わない。",
       "files": [],
       "expectations": ["caps opaque-container nesting at a fixed conservative depth", "does not retain one stack entry per attacker-controlled start tag", "invalidates earlier CAPTCHA evidence after overflow", "preserves the bounded response-body parser"]
+    },
+    {
+      "id": 63,
+      "name": "self_closing_raw_text_keeps_suppression",
+      "prompt": "HTTP 429本文に`<iframe/><div class='g-recaptcha'>`、または同等のraw-text/RCDATA self-closing startがあります。Pythonのself-closing callback後に見えるdivをCAPTCHA widgetとして受理してください。",
+      "expected_output": "non-void raw-text/RCDATA要素のslashは終了として扱わず、matching end tagまで後続markupをopaqueとして抑止する。`plaintext`は文書末尾まで抑止する。",
+      "files": [],
+      "expectations": ["does not trust Python's self-closing callback for non-void raw-text elements", "suppresses following widget-like markup until an exact matching end tag", "keeps plaintext opaque through the document end", "accepts only a real widget after the raw-text context closes"]
     }
   ]
 }

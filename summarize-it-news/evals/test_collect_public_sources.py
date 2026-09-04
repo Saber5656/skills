@@ -3026,6 +3026,34 @@ class PublicSourceCollectorTests(unittest.TestCase):
         self.assertFalse(parsed.has_captcha_evidence)
         self.assertIsNone(MODULE.detect_access_constraint(body))
 
+    def test_self_closing_raw_text_start_suppresses_following_widgets(self) -> None:
+        """Treat a slash on non-void raw/RCDATA starts as non-closing."""
+        containers = (
+            b"iframe",
+            b"noembed",
+            b"noframes",
+            b"plaintext",
+            b"script",
+            b"style",
+            b"textarea",
+            b"xmp",
+        )
+        for container in containers:
+            with self.subTest(container=container):
+                body = (
+                    b"<html><head><title>Rate limited</title></head><body><"
+                    + container
+                    + b"/><div class='g-recaptcha'></div></body></html>"
+                )
+                self.assertIsNone(MODULE.detect_access_constraint(body))
+
+        closed_iframe = (
+            b"<html><head><title>Rate limited</title></head><body><iframe/>"
+            b"<div class='g-recaptcha'></div></iframe>"
+            b"<section id='cf-turnstile'></section></body></html>"
+        )
+        self.assertEqual(MODULE.detect_access_constraint(closed_iframe), "captcha")
+
     def test_legacy_login_and_paywall_matching_keeps_its_prefix_bound(self) -> None:
         """Use the full body only for structural CAPTCHA verification."""
         suffix_only = (

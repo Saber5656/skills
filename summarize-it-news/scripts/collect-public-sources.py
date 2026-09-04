@@ -2112,9 +2112,19 @@ class AccessConstraintMarkupParser(HTMLParser):
 
     MAX_OPAQUE_DEPTH = 128
     FOREIGN_CONTENT_CONTAINERS = frozenset({"svg", "math"})
+    RAW_TEXT_CONTAINERS = frozenset({
+        "iframe",
+        "noembed",
+        "noframes",
+        "plaintext",
+        "script",
+        "style",
+        "textarea",
+        "xmp",
+    })
     OPAQUE_CONTAINERS = frozenset(
-        {"script", "style", "template", "noscript", "select"}
-    ) | FOREIGN_CONTENT_CONTAINERS
+        {"template", "noscript", "select"}
+    ) | FOREIGN_CONTENT_CONTAINERS | RAW_TEXT_CONTAINERS
     HEAD_OPAQUE_CONTAINERS = frozenset(
         {"script", "style", "template", "noscript"}
     )
@@ -2271,6 +2281,8 @@ class AccessConstraintMarkupParser(HTMLParser):
     ) -> None:
         normalized = tag.lower()
         if self.opaque_containers:
+            if self.opaque_containers[-1] == "plaintext":
+                return
             if normalized in self.OPAQUE_CONTAINERS:
                 self.push_opaque_container(normalized)
             return
@@ -2309,6 +2321,12 @@ class AccessConstraintMarkupParser(HTMLParser):
                 self.start_implicit_body()
             if self.capture_title:
                 self.invalid_title = True
+            if (
+                normalized == "iframe"
+                and self.body_started
+                and not self.body_closed
+            ):
+                self.record_captcha_widget(normalized)
             self.push_opaque_container(normalized)
             return
         if normalized == "title":
@@ -2349,11 +2367,28 @@ class AccessConstraintMarkupParser(HTMLParser):
         normalized = tag.lower()
         if self.capture_title:
             self.invalid_title = True
+        if self.opaque_containers:
+            if self.opaque_containers[-1] == "plaintext":
+                return
+            if normalized in self.RAW_TEXT_CONTAINERS:
+                self.push_opaque_container(normalized)
+            return
         if normalized == "frameset":
             self.structure_invalid = True
             return
         if normalized in self.IMPLIED_HEAD_START_TAGS:
             self.start_implied_head()
+        if normalized in self.RAW_TEXT_CONTAINERS:
+            after_head_opaque = bool(
+                normalized in self.AFTER_HEAD_OPAQUE_CONTAINERS
+                and self.is_after_head_compatible(normalized)
+            )
+            if not after_head_opaque and (
+                normalized not in self.HEAD_OPAQUE_CONTAINERS or not self.in_head
+            ):
+                self.start_implicit_body()
+            self.push_opaque_container(normalized)
+            return
         if normalized in self.OPAQUE_CONTAINERS or normalized in {"body", "head", "title"}:
             self.structure_invalid = True
             self.title_structure_invalid = True
@@ -2370,6 +2405,8 @@ class AccessConstraintMarkupParser(HTMLParser):
 
     def handle_endtag(self, tag: str) -> None:
         normalized = tag.lower()
+        if self.opaque_containers and self.opaque_containers[-1] == "plaintext":
+            return
         if not self.opaque_containers and normalized == "frameset":
             self.structure_invalid = True
             return

@@ -42,6 +42,8 @@ interactive manualでは`references/it-news-sources.json`を正本として同�
 
 Challenge parserのopaque nestingは128段で上限化し、超過時は既出のwidgetを含むchallenge evidence全体を無効化する。
 
+`iframe`、`noembed`、`noframes`、`plaintext`、`script`、`style`、`textarea`、`xmp`のself-closing syntaxはnon-void要素を閉じたとは扱わず、実際のmatching end tagまで後続markupをopaqueとして抑止する。`plaintext`はend tagで閉じない。
+
 RFC 2822 / ISO 8601 timestampはJSTへ正規化してから暦日を比較する。`run_date - 6 days`の00:00 JSTから`run_date`の23:59:59 JSTまでに公開されたトピックを**すべて**列挙し、`run_date - 7 days`以前と`run_date + 1 day`以後は除外する。この段階では取捨選択・統合・要約を一切行わない。
 各トピックについて以下を内部的に記録:
 - タイトル / 要旨（2〜3文） / 出典（媒体名・URL・公開日） / カテゴリタグ
