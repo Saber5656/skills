@@ -513,6 +513,14 @@
       "expected_output": "Content-LengthはASCII decimal digitだけからなるHTTP field valueの場合に限って有効な宣言として扱う。不正表記は長さ宣言なしとしてbounded readを続け、正規のleading zero付き値は受理する。",
       "files": [],
       "expectations": ["accepts only ASCII decimal digits as a Content-Length lexical form", "does not let Python int syntax expand the HTTP grammar", "treats malformed values as absent while preserving the byte cap", "accepts valid leading zeroes"]
+    },
+    {
+      "id": 62,
+      "name": "challenge_parser_bounds_opaque_nesting",
+      "prompt": "最大8 MiBのHTTP 429本文が数十万段のtemplate等を含み、最大6 workerで同時解析されます。全opaque start tagをstackへ保持したまま構造判定してください。",
+      "expected_output": "opaque nestingを保守的な固定深度で上限化し、超過したdocumentは既出のwidgetを含むchallenge evidence全体を無効化する。入力サイズに比例するstack保持を行わない。",
+      "files": [],
+      "expectations": ["caps opaque-container nesting at a fixed conservative depth", "does not retain one stack entry per attacker-controlled start tag", "invalidates earlier CAPTCHA evidence after overflow", "preserves the bounded response-body parser"]
     }
   ]
 }

@@ -3007,6 +3007,25 @@ class PublicSourceCollectorTests(unittest.TestCase):
         self.assertNotIn("source_text", vars(parsed))
         self.assertIsNone(parsed.raw_end_tag_start)
 
+    def test_access_constraint_bounds_opaque_container_nesting(self) -> None:
+        """Poison challenge evidence instead of retaining unbounded nesting."""
+        body = (
+            b"<html><head><title>Rate limited</title></head><body>"
+            b"<div class='g-recaptcha'></div>"
+            + b"<template>" * (MODULE.AccessConstraintMarkupParser.MAX_OPAQUE_DEPTH + 1)
+            + b"</body></html>"
+        )
+        parsed = MODULE.parse_access_constraint_markup(body.decode())
+        self.assertIsNotNone(parsed)
+        self.assertTrue(parsed.structure_invalid)
+        self.assertTrue(parsed.captcha_widget)
+        self.assertLessEqual(
+            len(parsed.opaque_containers),
+            MODULE.AccessConstraintMarkupParser.MAX_OPAQUE_DEPTH,
+        )
+        self.assertFalse(parsed.has_captcha_evidence)
+        self.assertIsNone(MODULE.detect_access_constraint(body))
+
     def test_legacy_login_and_paywall_matching_keeps_its_prefix_bound(self) -> None:
         """Use the full body only for structural CAPTCHA verification."""
         suffix_only = (

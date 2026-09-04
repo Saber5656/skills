@@ -2110,6 +2110,7 @@ def extract_content(
 class AccessConstraintMarkupParser(HTMLParser):
     """Extract explicit challenge evidence from a conservative HTML subset."""
 
+    MAX_OPAQUE_DEPTH = 128
     FOREIGN_CONTENT_CONTAINERS = frozenset({"svg", "math"})
     OPAQUE_CONTAINERS = frozenset(
         {"script", "style", "template", "noscript", "select"}
@@ -2258,13 +2259,20 @@ class AccessConstraintMarkupParser(HTMLParser):
         ):
             self.captcha_widget = True
 
+    def push_opaque_container(self, tag: str) -> None:
+        """Bound parser state and poison evidence when nesting is excessive."""
+        if len(self.opaque_containers) >= self.MAX_OPAQUE_DEPTH:
+            self.structure_invalid = True
+            return
+        self.opaque_containers.append(tag)
+
     def handle_starttag(
         self, tag: str, _attrs: list[tuple[str, Optional[str]]]
     ) -> None:
         normalized = tag.lower()
         if self.opaque_containers:
             if normalized in self.OPAQUE_CONTAINERS:
-                self.opaque_containers.append(normalized)
+                self.push_opaque_container(normalized)
             return
         if normalized == "frameset":
             self.structure_invalid = True
@@ -2301,7 +2309,7 @@ class AccessConstraintMarkupParser(HTMLParser):
                 self.start_implicit_body()
             if self.capture_title:
                 self.invalid_title = True
-            self.opaque_containers.append(normalized)
+            self.push_opaque_container(normalized)
             return
         if normalized == "title":
             if not self.in_head or self.body_started:
