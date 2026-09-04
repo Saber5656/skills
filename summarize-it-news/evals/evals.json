@@ -497,6 +497,14 @@
       "expected_output": "full bounded decodeはstructural CAPTCHA parserだけに使用し、legacy login/paywall raw regexは従来の先頭1 MiB byte prefixに限定する。1 MiB以降の正規structural widgetは引き続き検証する。",
       "files": [],
       "expectations": ["keeps raw login matching within the original one MiB byte prefix", "keeps raw paywall matching within that prefix", "does not seal a suffix-only prose or script fixture", "still parses structural CAPTCHA evidence across the full bounded body"]
+    },
+    {
+      "id": 60,
+      "name": "challenge_parser_keeps_after_head_metadata_in_head_mode",
+      "prompt": "HTTP 429 challengeのclosed headとexplicit bodyの間にmeta、link、base等のsupported head metadataがあります。implicit bodyを開始して後続bodyをduplicateとして拒否してください。",
+      "expected_output": "supported HEAD_METADATA_TAGSはafter-headでもhead rulesで処理し、implicit bodyを開始しない。metadata属性内のmarkerは証拠にせず、後続の単一explicit body内widgetを検証する。",
+      "files": [],
+      "expectations": ["keeps supported metadata in after-head mode", "handles both ordinary and self-closing metadata callbacks", "does not trust metadata attributes as widget evidence", "accepts a valid widget in the following explicit body"]
     }
   ]
 }

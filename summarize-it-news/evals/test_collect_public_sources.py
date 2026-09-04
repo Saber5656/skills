@@ -3025,6 +3025,29 @@ class PublicSourceCollectorTests(unittest.TestCase):
             MODULE.detect_access_constraint(late_structural_widget), "captcha"
         )
 
+    def test_after_head_metadata_does_not_start_the_body(self) -> None:
+        """Apply head rules to supported metadata before an explicit body."""
+        after_head_metadata = (
+            b"<meta charset='utf-8'>",
+            b"<link rel='stylesheet' href='/checkpoint.css'>",
+            b"<base href='https://example.test/'>",
+            b"<meta charset='utf-8'/>",
+        )
+        for token in after_head_metadata:
+            with self.subTest(token=token):
+                body = (
+                    b"<html><head><title>Rate limited</title></head>"
+                    + token
+                    + b"<body><div class='g-recaptcha'></div></body></html>"
+                )
+                self.assertEqual(MODULE.detect_access_constraint(body), "captcha")
+
+        metadata_marker = (
+            b"<html><head><title>Rate limited</title></head>"
+            b"<meta class='g-recaptcha'><body></body></html>"
+        )
+        self.assertIsNone(MODULE.detect_access_constraint(metadata_marker))
+
     def test_rejects_escape_before_creating_output(self) -> None:
         """Do not leave directories outside the caller-bound staging root."""
         with tempfile.TemporaryDirectory() as temporary:

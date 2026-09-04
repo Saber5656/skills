@@ -2222,6 +2222,16 @@ class AccessConstraintMarkupParser(HTMLParser):
             self.head_seen = True
             self.in_head = True
 
+    def is_after_head_compatible(self, tag: str) -> bool:
+        """Recognize supported tokens processed with head rules after </head>."""
+        return bool(
+            self.head_seen
+            and self.head_closed
+            and not self.body_started
+            and not self.body_closed
+            and tag in self.AFTER_HEAD_OPAQUE_CONTAINERS | self.HEAD_METADATA_TAGS
+        )
+
     def record_captcha_widget(self, tag: str) -> None:
         """Accept known widget tokens only from strict structural attributes."""
         if tag not in self.CAPTCHA_WIDGET_TAGS:
@@ -2285,10 +2295,7 @@ class AccessConstraintMarkupParser(HTMLParser):
         if normalized in self.OPAQUE_CONTAINERS:
             after_head_opaque = bool(
                 normalized in self.AFTER_HEAD_OPAQUE_CONTAINERS
-                and self.head_seen
-                and self.head_closed
-                and not self.body_started
-                and not self.body_closed
+                and self.is_after_head_compatible(normalized)
             )
             if not after_head_opaque and (
                 normalized not in self.HEAD_OPAQUE_CONTAINERS or not self.in_head
@@ -2321,9 +2328,11 @@ class AccessConstraintMarkupParser(HTMLParser):
         if self.capture_title:
             self.invalid_title = True
             return
-        if normalized != "html" and not (
-            self.in_head and normalized in self.HEAD_METADATA_TAGS
-        ):
+        head_metadata = bool(
+            normalized in self.HEAD_METADATA_TAGS
+            and (self.in_head or self.is_after_head_compatible(normalized))
+        )
+        if normalized != "html" and not head_metadata:
             self.start_implicit_body()
         if self.body_started and not self.body_closed:
             self.record_captcha_widget(normalized)
@@ -2341,9 +2350,11 @@ class AccessConstraintMarkupParser(HTMLParser):
             self.structure_invalid = True
             self.title_structure_invalid = True
             return
-        if normalized != "html" and not (
-            self.in_head and normalized in self.HEAD_METADATA_TAGS
-        ):
+        head_metadata = bool(
+            normalized in self.HEAD_METADATA_TAGS
+            and (self.in_head or self.is_after_head_compatible(normalized))
+        )
+        if normalized != "html" and not head_metadata:
             self.start_implicit_body()
         # Every supported widget element is non-void in HTML.  A callback for
         # self-closing syntax does not prove a stable widget node, so it is
