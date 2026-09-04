@@ -2724,6 +2724,10 @@ class PublicSourceCollectorTests(unittest.TestCase):
             b"<div class='ordinary' class='h-captcha'></div></body></html>",
             b"<html><head><title>Rate limited</title></head><body><template>"
             b"<div class='cf-turnstile'></div></template></body></html>",
+            b"<html><head><title>Rate limited</title></head><body><select>"
+            b"<div class='g-recaptcha'></div></select></body></html>",
+            b"<html><head><title>Rate limited</title></head><body><select>"
+            b"<div class='g-recaptcha'></div></select fixture></body></html>",
             b"<html><head><title>Rate limited</title></head><body></body>"
             b"<div class='g-recaptcha'></div></html>",
         )

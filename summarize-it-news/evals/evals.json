@@ -393,6 +393,14 @@
       "expected_output": "Content-Lengthとgzip展開前の実測transport bytesが完全一致しないbodyはtruncatedとして拒否し、checkpoint markupを解析せず元のhttp_429へ正規化してfail closedする。",
       "files": [],
       "expectations": ["compares a valid Content-Length with raw transport bytes", "rejects both shorter and longer length mismatches", "does not accept complete-looking challenge markup from a truncated response", "preserves malformed Content-Length compatibility", "normalizes the HTTP 429 outcome to http_429"]
+    },
+    {
+      "id": 47,
+      "name": "captcha_widget_inside_select_is_opaque",
+      "prompt": "HTTP 429本文の`select`要素内に`<div class='g-recaptcha'>`があり、document titleは通常のRate limitedです。captchaとして封印してください。",
+      "expected_output": "HTML parsingのselect contextをopaque containerとしてmatching stackで追跡し、内部のwidget-looking markupをchallenge evidenceにせずhttp_429のままfail closedする。malformed select closerもstructureをpoisonする。",
+      "files": [],
+      "expectations": ["suppresses captcha widget evidence inside select", "tracks nested opaque containers with exact matching", "rejects malformed select end tags", "preserves valid captcha widgets outside opaque containers"]
     }
   ]
 }

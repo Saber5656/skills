@@ -2111,7 +2111,9 @@ def extract_content(
 class AccessConstraintMarkupParser(HTMLParser):
     """Extract explicit challenge evidence from a conservative HTML subset."""
 
-    OPAQUE_CONTAINERS = frozenset({"script", "style", "template", "noscript"})
+    OPAQUE_CONTAINERS = frozenset(
+        {"script", "style", "template", "noscript", "select"}
+    )
     CAPTCHA_WIDGET_TAGS = frozenset({"div", "form", "iframe", "section"})
     CAPTCHA_WIDGET_TOKENS = frozenset({
         "cf-turnstile",
