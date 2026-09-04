@@ -44,6 +44,8 @@ interactive manualでは`references/it-news-sources.json`を正本として同�
 
 Challenge parserのopaque nestingは128段で上限化し、超過時は既出のwidgetを含むchallenge evidence全体を無効化する。
 
+CAPTCHA widget候補の`class`、`id`、`aria-label`、`title`は各4096文字以下の場合だけ解析し、超過した候補はfail closedにする。class/id tokenはboundedなincremental scanで既知ASCII tokenとの一致だけを確認し、空白数に比例するtoken listやsetを作らない。
+
 `iframe`、`noembed`、`noframes`、`plaintext`、`script`、`style`、`textarea`、`xmp`のself-closing syntaxはnon-void要素を閉じたとは扱わず、実際のmatching end tagまで後続markupをopaqueとして抑止する。`plaintext`はend tagで閉じない。
 
 SVG/MathML rootのself-closing syntaxはforeign-content elementの完了として扱い、後続のbody challenge evidenceを無効化しない。foreign root自身の属性はwidget evidenceとして扱わない。

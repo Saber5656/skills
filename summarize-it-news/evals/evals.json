@@ -561,6 +561,14 @@
       "expected_output": "非ASCII-decimalのContent-Lengthは宣言なしとして扱うだけでなく、CPythonが内部にparseしたlengthをbounded read前にneutralizeし、EOFまたはhard capまで読んで後方poisonも検証する。",
       "files": [],
       "expectations": ["detects malformed Content-Length lexical forms before reading", "neutralizes CPython HTTPResponse's permissive parsed length", "retains the existing hard byte cap", "does not accept a clipped checkpoint prefix when later markup poisons it"]
+    },
+    {
+      "id": 68,
+      "name": "captcha_widget_attribute_tokenization_is_bounded",
+      "prompt": "最大8 MiBのHTTP 429本文で、widget候補のclass/idがほぼ空白区切りtokenです。全tokenをsplitしてsetへ保持し、既知markerを探してください。",
+      "expected_output": "widget関連属性に小さい固定長上限を設け、超過候補はfail closedにする。上限内でもincremental scanを使い、空白数に比例するtoken list/setを作らない。",
+      "files": [],
+      "expectations": ["bounds every widget-relevant attribute before tokenization", "rejects an oversized widget candidate", "does not materialize all whitespace-delimited tokens", "continues to accept a known ASCII widget token within the bound"]
     }
   ]
 }

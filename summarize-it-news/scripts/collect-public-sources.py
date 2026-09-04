@@ -2133,6 +2133,7 @@ class AccessConstraintMarkupParser(HTMLParser):
     """Extract explicit challenge evidence from a conservative HTML subset."""
 
     MAX_OPAQUE_DEPTH = 128
+    MAX_WIDGET_ATTRIBUTE_CHARS = 4096
     FOREIGN_CONTENT_CONTAINERS = frozenset({"svg", "math"})
     RAW_TEXT_CONTAINERS = frozenset({
         "iframe",
@@ -2286,17 +2287,28 @@ class AccessConstraintMarkupParser(HTMLParser):
         attributes = self.strict_callback_attributes(tag)
         if attributes is None:
             return
-        tokens: set[str] = set()
+        relevant_values = [
+            attributes.get(name) for name in ("class", "id", "aria-label", "title")
+        ]
+        if any(
+            isinstance(value, str)
+            and len(value) > self.MAX_WIDGET_ATTRIBUTE_CHARS
+            for value in relevant_values
+        ):
+            return
+        widget_token = False
         for name in ("class", "id"):
             value = attributes.get(name)
-            if value:
-                tokens.update(
-                    part.lower()
-                    for part in re.split(r"[\t\n\f\r ]+", value)
-                    if part and part.isascii()
-                )
+            if not value or not value.isascii():
+                continue
+            if any(
+                match.group(0).lower() in self.CAPTCHA_WIDGET_TOKENS
+                for match in re.finditer(r"[^\t\n\f\r ]+", value, re.ASCII)
+            ):
+                widget_token = True
+                break
         semantic_label = attributes.get("aria-label") or attributes.get("title")
-        if tokens.intersection(self.CAPTCHA_WIDGET_TOKENS) or (
+        if widget_token or (
             isinstance(semantic_label, str)
             and semantic_label.isascii()
             and re.fullmatch(

@@ -2863,6 +2863,24 @@ class PublicSourceCollectorTests(unittest.TestCase):
         )
         self.assertEqual(MODULE.detect_access_constraint(ascii_case), "captcha")
 
+    def test_captcha_widget_attribute_tokenization_is_bounded(self) -> None:
+        """Reject oversized candidate attributes before creating token objects."""
+        limit = MODULE.AccessConstraintMarkupParser.MAX_WIDGET_ATTRIBUTE_CHARS
+        oversized = "x " * (limit // 2) + "g-recaptcha"
+        for name in ("class", "id", "aria-label", "title"):
+            with self.subTest(name=name):
+                body = (
+                    "<html><head><title>Rate limited</title></head><body>"
+                    f"<div {name}='{oversized}'></div></body></html>"
+                ).encode()
+                self.assertIsNone(MODULE.detect_access_constraint(body))
+
+        bounded = (
+            b"<html><head><title>Rate limited</title></head><body>"
+            b"<div class='ordinary g-recaptcha'></div></body></html>"
+        )
+        self.assertEqual(MODULE.detect_access_constraint(bounded), "captcha")
+
     def test_invalid_document_title_poisons_widget_evidence(self) -> None:
         """Do not let a valid widget override ambiguous document-title structure."""
         widget = b"<div class='g-recaptcha'></div>"
