@@ -3175,6 +3175,24 @@ class PublicSourceCollectorTests(unittest.TestCase):
         )
         self.assertEqual(MODULE.detect_access_constraint(closed_iframe), "captcha")
 
+    def test_noframes_remains_head_compatible_in_challenge_documents(self) -> None:
+        """Process noframes with head rules before the document body begins."""
+        documents = (
+            b"<html><head><noframes>fallback</noframes>"
+            b"<title>Vercel Security Checkpoint</title></head></html>",
+            b"<noframes>fallback</noframes>"
+            b"<title>Vercel Security Checkpoint</title>",
+            b"<html><head><title>Rate limited</title></head>"
+            b"<noframes><div class='g-recaptcha'></div></noframes>"
+            b"<body><section id='cf-turnstile'></section></body></html>",
+        )
+        for body in documents:
+            with self.subTest(body=body):
+                parsed = MODULE.parse_access_constraint_markup(body.decode())
+                self.assertIsNotNone(parsed)
+                self.assertFalse(parsed.structure_invalid)
+                self.assertEqual(MODULE.detect_access_constraint(body), "captcha")
+
     def test_self_closing_foreign_content_closes_immediately(self) -> None:
         """Honor the self-closing flag on SVG and MathML roots."""
         for foreign_root in (b"<svg/>", b"<math/>"):

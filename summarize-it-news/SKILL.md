@@ -78,6 +78,8 @@ Fallback resolution verifierでも同じverified HTTP 429 fast pathを適用す�
 
 Challenge parserはbody開始前のinitial head-compatible `title`、metadata、opaque tokenからoptionalなhead開始を推論する。explicitな`body` tagだけでなく、head外のbody-content start/self-closing tagおよびnon-whitespace textからimplicit body開始を単調追跡する。ただし、closed headと単一explicit bodyの間にある`script`、`style`、`template`およびsupported `HEAD_METADATA_TAGS`はHTML after-headのhead-compatible tokenとしてbody開始にせず、opaque内部やmetadata属性内のmarkerを証拠にしない。implicit body開始後の`head`は拒否し、optional body tagが省略されたdocument内のstrictなwidgetはbody evidenceとして検証する。
 
+`noframes`はexplicit/implied head内およびclosed headとbodyの間でhead-compatibleなopaque raw-textとして扱う。要素自身でimplicit bodyを開始せず、内部markerを無視し、matching end tag後の正規titleまたはbody widgetを検証する。
+
 UTF-8 decode後のdocument先頭にある単一U+FEFFだけはencoding BOMとしてchallenge parserへ渡す前に除去する。先頭以外のU+FEFFは通常のnon-whitespace dataとしてbody開始を維持する。
 
 Raw end-tag検証のためにnewlineごとのoffset配列を作らない。HTML parserが現在処理中のbounded raw end-tag indexだけをcallback中に保持し、response body以外の追加raw-token stateをnewline数に対してO(1)に保つ。

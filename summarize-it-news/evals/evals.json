@@ -609,6 +609,14 @@
       "expected_output": "raw start tagを小さい固定長でHTMLParserのattribute tokenization前に上限化し、超過tokenを含むchallenge documentをfail closedにする。workerごとに入力比例のattribute objectを生成しない。",
       "files": [],
       "expectations": ["checks raw start-tag length before base HTMLParser parsing", "does not materialize an attacker-sized callback attribute list", "invalidates challenge evidence for an oversized token", "continues to accept a normal bounded widget tag"]
+    },
+    {
+      "id": 74,
+      "name": "challenge_noframes_is_head_compatible",
+      "prompt": "有効なHTTP 429 challenge documentのexplicit/implied head内、またはclosed headとbodyの間にnoframesがあります。noframesをbody開始として後続title/bodyを拒否してください。",
+      "expected_output": "noframesを各head phaseでhead-compatibleなopaque raw-textとして扱い、implicit bodyを開始しない。内部markerを無視し、matching close後の正規document titleまたはbody widgetだけを検証する。",
+      "files": [],
+      "expectations": ["keeps noframes in an explicit head", "infers an optional head before initial noframes", "keeps noframes head-compatible after head close", "ignores marker-like markup inside noframes"]
     }
   ]
 }

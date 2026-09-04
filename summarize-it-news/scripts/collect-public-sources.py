@@ -2157,10 +2157,10 @@ class AccessConstraintMarkupParser(HTMLParser):
         {"template", "noscript", "select"}
     ) | FOREIGN_CONTENT_CONTAINERS | RAW_TEXT_CONTAINERS
     HEAD_OPAQUE_CONTAINERS = frozenset(
-        {"script", "style", "template", "noscript"}
+        {"script", "style", "template", "noscript", "noframes"}
     )
     AFTER_HEAD_OPAQUE_CONTAINERS = frozenset(
-        {"script", "style", "template"}
+        {"script", "style", "template", "noframes"}
     )
     HEAD_METADATA_TAGS = frozenset(
         {"base", "basefont", "bgsound", "link", "meta"}
