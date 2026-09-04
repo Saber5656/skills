@@ -2476,7 +2476,7 @@ class AccessConstraintMarkupParser(HTMLParser):
             self.structure_invalid = True
             return
         if (
-            normalized in self.OPAQUE_CONTAINERS | {"body", "head", "title"}
+            normalized in self.OPAQUE_CONTAINERS | {"body", "br", "head", "html", "title"}
             and not self.has_safe_end_tag(normalized)
         ):
             self.structure_invalid = True
@@ -2494,6 +2494,9 @@ class AccessConstraintMarkupParser(HTMLParser):
             return
         if normalized in self.OPAQUE_CONTAINERS:
             self.structure_invalid = True
+            return
+        if normalized in {"br", "html"} and self.in_head:
+            self.start_implicit_body()
             return
         if normalized == "form":
             if self.form_open:

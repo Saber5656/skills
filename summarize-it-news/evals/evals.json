@@ -585,6 +585,14 @@
       "expected_output": "requested captchaと一致するverified HTTP 429をarticle extraction前に分岐し、link数に左右されずverified_access_constraintとして封印する。通常fallback methodならaccess constrainedとして拒否する。",
       "files": [],
       "expectations": ["preserves verified HTTP 429 captcha in resolution verification", "does not apply the link-count heuristic to that gate", "does not invoke article or publication-date extraction", "rejects a verified gate submitted as an ordinary fallback"]
+    },
+    {
+      "id": 71,
+      "name": "challenge_head_ends_on_body_transition_end_tags",
+      "prompt": "HTTP 429本文のhead内に`</br>`または`</html>`があり、その後に`Vercel Security Checkpoint` titleがあります。後続titleをdocument-head evidenceとしてcaptcha判定してください。",
+      "expected_output": "exactなbody-transition end tagでheadを終了してbody phaseへ進め、後続titleを拒否する。malformed end-tag callbackもchallenge evidenceをfail closedにする。",
+      "files": [],
+      "expectations": ["recognizes exact br and html end tags while in head", "ends the head monotonically", "does not accept a later checkpoint title", "rejects malformed transition end-tag syntax"]
     }
   ]
 }

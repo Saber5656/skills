@@ -3179,6 +3179,28 @@ class PublicSourceCollectorTests(unittest.TestCase):
             with self.subTest(body=body):
                 self.assertIsNone(MODULE.detect_access_constraint(body))
 
+    def test_body_transition_end_tags_close_the_challenge_head(self) -> None:
+        """Do not accept a document title after in-head br/html end tokens."""
+        for transition in (b"</br>", b"</html>"):
+            with self.subTest(transition=transition):
+                body = (
+                    b"<html><head>"
+                    + transition
+                    + b"<title>Vercel Security Checkpoint</title></head>"
+                )
+                parsed = MODULE.parse_access_constraint_markup(body.decode())
+                self.assertIsNotNone(parsed)
+                self.assertFalse(parsed.in_head)
+                self.assertTrue(parsed.head_closed)
+                self.assertTrue(parsed.body_started)
+                self.assertIsNone(MODULE.detect_access_constraint(body))
+
+        malformed = (
+            b"<html><head></br fixture>"
+            b"<title>Vercel Security Checkpoint</title></head>"
+        )
+        self.assertIsNone(MODULE.detect_access_constraint(malformed))
+
     def test_legacy_login_and_paywall_matching_keeps_its_prefix_bound(self) -> None:
         """Use the full body only for structural CAPTCHA verification."""
         suffix_only = (
