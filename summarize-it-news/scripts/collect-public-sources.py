@@ -282,7 +282,14 @@ def robots_policy(url: str, hosts: set[str]) -> dict[str, object]:
 
 def read_bounded(response) -> bytes:  # type: ignore[no-untyped-def]
     """Read a response with a hard size cap and optional gzip decoding."""
-    declared = response.headers.get("Content-Length")
+    get_all = getattr(response.headers, "get_all", None)
+    if callable(get_all):
+        declared_values = get_all("Content-Length") or []
+        if len(declared_values) > 1:
+            raise CollectionError("response has duplicate Content-Length fields")
+        declared = declared_values[0] if declared_values else None
+    else:
+        declared = response.headers.get("Content-Length")
     declared_size = None
     valid_declared_length = bool(
         isinstance(declared, str)

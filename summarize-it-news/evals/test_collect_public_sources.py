@@ -2466,6 +2466,48 @@ class PublicSourceCollectorTests(unittest.TestCase):
         self.assertEqual(content, prefix + poison)
         self.assertIsNone(MODULE.detect_access_constraint(content))
 
+    def test_duplicate_content_length_fields_are_rejected_before_read(self) -> None:
+        """Never trust the first of multiple conflicting transport lengths."""
+
+        class ResponseSocket:
+            def __init__(self, payload: bytes) -> None:
+                self.payload = io.BytesIO(payload)
+
+            def makefile(self, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+                return self.payload
+
+        prefix = b"<title>Vercel Security Checkpoint</title>"
+        poison = b"<title>Duplicate title</title>"
+        raw_response = MODULE.http.client.HTTPResponse(
+            ResponseSocket(
+                b"HTTP/1.1 429 Too Many Requests\r\n"
+                b"Content-Type: text/html\r\n"
+                b"Content-Length: 41\r\n"
+                + f"Content-Length: {len(prefix) + len(poison)}\r\n\r\n".encode()
+                + prefix
+                + poison
+            )
+        )
+        raw_response.begin()
+        self.assertEqual(raw_response.length, len(prefix))
+        self.assertEqual(raw_response.headers.get_all("Content-Length"), [
+            "41",
+            str(len(prefix) + len(poison)),
+        ])
+        error = MODULE.urllib.error.HTTPError(
+            "https://example.test/checkpoint",
+            429,
+            "Too Many Requests",
+            raw_response.headers,
+            raw_response,
+        )
+
+        with error, self.assertRaisesRegex(
+            MODULE.CollectionError,
+            "^response has duplicate Content-Length fields$",
+        ):
+            MODULE.read_bounded(error)
+
     def test_rejects_body_that_does_not_match_valid_content_length(self) -> None:
         """Do not parse a transport-truncated body as complete evidence."""
         body = b"bounded"

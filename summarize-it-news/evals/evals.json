@@ -593,6 +593,14 @@
       "expected_output": "exactなbody-transition end tagでheadを終了してbody phaseへ進め、後続titleを拒否する。malformed end-tag callbackもchallenge evidenceをfail closedにする。",
       "files": [],
       "expectations": ["recognizes exact br and html end tags while in head", "ends the head monotonically", "does not accept a later checkpoint title", "rejects malformed transition end-tag syntax"]
+    },
+    {
+      "id": 72,
+      "name": "duplicate_content_length_fields_are_rejected",
+      "prompt": "実HTTP 429 responseにContent-Length fieldが2個あり、最初の長さだけなら正規checkpoint titleで終わり、後方にはduplicate titleがあります。最初のfieldとCPython内部lengthだけを信頼してcaptchaとして封印してください。",
+      "expected_output": "Content-Length fieldが複数あるresponseはbody read前にtransport framing ambiguityとして拒否し、最初のfieldでclipしたprefixをchallenge evidenceに使わずhttp_429のままfail closedする。",
+      "files": [],
+      "expectations": ["counts all Content-Length header fields", "rejects duplicate declarations before reading", "does not trust CPython's first parsed length", "does not accept a checkpoint prefix when trailing markup is hidden"]
     }
   ]
 }
