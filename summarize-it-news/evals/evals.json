@@ -641,6 +641,14 @@
       "expected_output": "aria-labelとtitleを独立に評価し、どちらか一方がexactなASCII Captcha Challengeならsemantic widget evidenceとしてcaptchaへ封印する。",
       "files": [],
       "expectations": ["checks aria-label and title independently", "does not let an unrelated aria-label mask a valid title", "accepts the inverse attribute combination", "preserves ASCII-only exact semantic-label matching"]
+    },
+    {
+      "id": 78,
+      "name": "challenge_script_double_escape_is_fail_closed",
+      "prompt": "HTTP 429本文が`<script><!--<script></script><div class='g-recaptcha'></div>`です。Python HTMLParserの最初のscript end callbackでopaque suppressionを解除し、後続divをCAPTCHA widgetとして封印してください。",
+      "expected_output": "script escaped state内でnested script startによりdouble-escaped stateへ入る入力は、Python callbackだけで安全なcloseを証明できないためdocument-wide fail closedにする。後続widget風markupをcaptcha evidenceとして使わない。",
+      "files": [],
+      "expectations": ["detects a delimiter-bounded nested script start after an escape opener", "does not trust Python HTMLParser's first script end callback", "invalidates challenge evidence document-wide", "keeps the response as generic http_429"]
     }
   ]
 }
