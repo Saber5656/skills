@@ -577,6 +577,14 @@
       "expected_output": "verified 429 captchaは構造検証直後にaccess constraintへ変換し、通常記事抽出を一切呼ばない。bodyを複数の高メモリparserへ重複投入しない。",
       "files": [],
       "expectations": ["detects the verified 429 gate before article extraction", "does not invoke link extraction", "does not invoke JSON-LD or publication-date extraction", "records the source as an access constraint"]
+    },
+    {
+      "id": 70,
+      "name": "resolution_verifier_preserves_verified_429_gate",
+      "prompt": "fallback resolution verifierが10件以上のlinkを持つ構造検証済みHTTP 429 CAPTCHAを再取得しました。link-count heuristicでconstraintを消して通常fallbackとして検証してください。",
+      "expected_output": "requested captchaと一致するverified HTTP 429をarticle extraction前に分岐し、link数に左右されずverified_access_constraintとして封印する。通常fallback methodならaccess constrainedとして拒否する。",
+      "files": [],
+      "expectations": ["preserves verified HTTP 429 captcha in resolution verification", "does not apply the link-count heuristic to that gate", "does not invoke article or publication-date extraction", "rejects a verified gate submitted as an ordinary fallback"]
     }
   ]
 }

@@ -2976,42 +2976,54 @@ def verify_resolutions(
         hosts = source_hosts(by_name[name])
         fetched = fetch_url(validate_url(url, hosts), hosts)
         constraint = detect_access_constraint(fetched["content"])
-        extract = extract_content(
-            fetched["content"], fetched["content_type"], fetched["final_url"], hosts
+        verified_http_429_captcha = (
+            fetched["http_status"] == 429 and constraint == "captcha"
         )
-        if extract["entry_count"] >= 10:
-            constraint = None
-        if method == "access_constraint":
-            if item["constraint"] not in {"login", "paywall", "captcha"} or constraint != item["constraint"]:
-                raise CollectionError("access constraint lacks verified gate evidence")
+        if verified_http_429_captcha:
+            if method != "access_constraint" or item["constraint"] != "captcha":
+                raise CollectionError("fallback URL is access constrained")
             status = "verified_access_constraint"
-        elif constraint:
-            raise CollectionError("fallback URL is access constrained")
+            extracted_entry_count = 0
+            candidates: list[dict[str, Any]] = []
+            published_dates: list[Optional[str]] = []
         else:
-            status = "verified_fallback"
-            if extract["entry_count"] == 0:
-                raise CollectionError("verified fallback extract is empty")
-        primary_published, primary_provenance = extract_primary_publication_evidence(
-            fetched["content"], fetched["final_url"], hosts
-        )
-        if extract["format"] == "html_links" and primary_published:
-            candidates = [{
-                "url": fetched["final_url"],
-                "candidate_provenance": primary_provenance,
-                "published": primary_published,
-            }]
-        else:
-            candidates = (
-                extract["entries"]
-                if extract["format"] == "feed"
-                else [
-                    entry for entry in extract["entries"]
-                    if entry.get("candidate_provenance") in {"article", "json_ld"}
-                ]
+            extract = extract_content(
+                fetched["content"], fetched["content_type"], fetched["final_url"], hosts
             )
-        published_dates = [
-            validated_publication_date(entry.get("published")) for entry in candidates
-        ]
+            if extract["entry_count"] >= 10:
+                constraint = None
+            if method == "access_constraint":
+                if item["constraint"] not in {"login", "paywall", "captcha"} or constraint != item["constraint"]:
+                    raise CollectionError("access constraint lacks verified gate evidence")
+                status = "verified_access_constraint"
+            elif constraint:
+                raise CollectionError("fallback URL is access constrained")
+            else:
+                status = "verified_fallback"
+                if extract["entry_count"] == 0:
+                    raise CollectionError("verified fallback extract is empty")
+            primary_published, primary_provenance = extract_primary_publication_evidence(
+                fetched["content"], fetched["final_url"], hosts
+            )
+            if extract["format"] == "html_links" and primary_published:
+                candidates = [{
+                    "url": fetched["final_url"],
+                    "candidate_provenance": primary_provenance,
+                    "published": primary_published,
+                }]
+            else:
+                candidates = (
+                    extract["entries"]
+                    if extract["format"] == "feed"
+                    else [
+                        entry for entry in extract["entries"]
+                        if entry.get("candidate_provenance") in {"article", "json_ld"}
+                    ]
+                )
+            published_dates = [
+                validated_publication_date(entry.get("published")) for entry in candidates
+            ]
+            extracted_entry_count = extract["entry_count"]
         if status == "verified_fallback" and (
             not published_dates or any(not value for value in published_dates)
         ):
@@ -3024,7 +3036,7 @@ def verify_resolutions(
             "final_url": fetched["final_url"],
             "http_status": fetched["http_status"],
             "constraint": constraint,
-            "extracted_entry_count": extract["entry_count"],
+            "extracted_entry_count": extracted_entry_count,
             "candidate_entry_count": len(candidates),
             "date_evidence_count": sum(bool(value) for value in published_dates),
             "published_dates": published_dates,

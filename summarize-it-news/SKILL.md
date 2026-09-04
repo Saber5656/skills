@@ -68,6 +68,8 @@ HTTP 429で構造的に再検証した`captcha` evidenceは、page内のextracta
 
 Direct collectionでHTTP 429の`captcha` evidenceを構造的に再検証した後は、通常記事向けのlink、JSON-LD、publication-date extractionへbodyを渡さず、直ちにaccess-constraint recordへ変換する。newline-heavyな最大bodyを複数の高メモリparserへ重複投入しない。
 
+Fallback resolution verifierでも同じverified HTTP 429 fast pathを適用する。requested constraintが`captcha`と一致する場合はlink-count heuristicと全article/date extractorを迂回して`verified_access_constraint`へ封印し、通常fallback methodならextract前にaccess constrainedとして拒否する。
+
 Challenge parserはbody開始前のinitial head-compatible `title`、metadata、opaque tokenからoptionalなhead開始を推論する。explicitな`body` tagだけでなく、head外のbody-content start/self-closing tagおよびnon-whitespace textからimplicit body開始を単調追跡する。ただし、closed headと単一explicit bodyの間にある`script`、`style`、`template`およびsupported `HEAD_METADATA_TAGS`はHTML after-headのhead-compatible tokenとしてbody開始にせず、opaque内部やmetadata属性内のmarkerを証拠にしない。implicit body開始後の`head`は拒否し、optional body tagが省略されたdocument内のstrictなwidgetはbody evidenceとして検証する。
 
 UTF-8 decode後のdocument先頭にある単一U+FEFFだけはencoding BOMとしてchallenge parserへ渡す前に除去する。先頭以外のU+FEFFは通常のnon-whitespace dataとしてbody開始を維持する。

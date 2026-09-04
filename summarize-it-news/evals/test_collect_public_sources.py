@@ -4258,6 +4258,68 @@ class PublicSourceCollectorTests(unittest.TestCase):
         self.assertEqual(result["status"], "access_constraint")
         self.assertEqual(result["constraint"], "captcha")
 
+    def test_resolution_verifier_preserves_verified_http_429_captcha(self) -> None:
+        """Keep a verified gate without link heuristics or article extraction."""
+        source = MODULE.load_catalog(CATALOG)[0]
+        links = b"".join(
+            f"<a href='/checkpoint-{index}'>link</a>".encode()
+            for index in range(12)
+        )
+        body = (
+            b"<html><head><title>Vercel Security Checkpoint</title></head><body>"
+            + links
+            + b"</body></html>"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manifest = root / "manifest.json"
+            request = root / "request.json"
+            output = root / "verified.json"
+            write_bound_manifest(
+                manifest, {source["name"]: "needs_search_fallback"}
+            )
+            request.write_text(
+                json.dumps({
+                    "version": 1,
+                    "resolutions": [{
+                        "name": source["name"],
+                        "method": "access_constraint",
+                        "url": source["page_url"],
+                        "constraint": "captcha",
+                    }],
+                    "date_evidence": [],
+                }),
+                encoding="utf-8",
+            )
+            fetched = {
+                "content": body,
+                "content_type": "text/html",
+                "final_url": source["page_url"],
+                "http_status": 429,
+            }
+            with mock.patch.dict(
+                os.environ, {"COLLECTION_OUTPUT_ROOT": str(root)}
+            ), mock.patch.object(
+                MODULE, "fetch_url", return_value=fetched
+            ), mock.patch.object(
+                MODULE,
+                "extract_content",
+                side_effect=AssertionError("verified gate reached article extraction"),
+            ) as extract, mock.patch.object(
+                MODULE,
+                "extract_primary_publication_evidence",
+                side_effect=AssertionError("verified gate reached date extraction"),
+            ) as primary:
+                MODULE.verify_resolutions(CATALOG, manifest, request, output)
+
+            extract.assert_not_called()
+            primary.assert_not_called()
+            verified = json.loads(output.read_text())["resolutions"][0]
+            self.assertEqual(verified["status"], "verified_access_constraint")
+            self.assertEqual(verified["constraint"], "captcha")
+            self.assertEqual(verified["extracted_entry_count"], 0)
+            self.assertEqual(verified["candidate_entry_count"], 0)
+
     def test_verified_robots_constraint_requires_all_direct_endpoints(self) -> None:
         """Seal robots evidence only when every direct endpoint is disallowed."""
         source = MODULE.load_catalog(CATALOG)[0]
