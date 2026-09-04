@@ -2885,6 +2885,29 @@ class PublicSourceCollectorTests(unittest.TestCase):
             MODULE.detect_access_constraint(post_document_script), "captcha"
         )
 
+    def test_after_head_opaque_tokens_do_not_start_the_body(self) -> None:
+        """Apply head rules to script, style, and template before explicit body."""
+        after_head_tokens = (
+            b"<script>const fixture = 'g-recaptcha';</script>",
+            b"<style>.g-recaptcha { display: block; }</style>",
+            b"<template><div class='g-recaptcha'></div></template>",
+        )
+        for token in after_head_tokens:
+            with self.subTest(token=token):
+                body = (
+                    b"<html><head><title>Rate limited</title></head>"
+                    + token
+                    + b"<body><div class='g-recaptcha'></div></body></html>"
+                )
+                self.assertEqual(MODULE.detect_access_constraint(body), "captcha")
+
+        marker_only = (
+            b"<html><head><title>Rate limited</title></head>"
+            b"<template><div class='g-recaptcha'></div></template>"
+            b"<body></body></html>"
+        )
+        self.assertIsNone(MODULE.detect_access_constraint(marker_only))
+
     def test_rejects_escape_before_creating_output(self) -> None:
         """Do not leave directories outside the caller-bound staging root."""
         with tempfile.TemporaryDirectory() as temporary:

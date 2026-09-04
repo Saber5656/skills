@@ -2117,6 +2117,9 @@ class AccessConstraintMarkupParser(HTMLParser):
     HEAD_OPAQUE_CONTAINERS = frozenset(
         {"script", "style", "template", "noscript"}
     )
+    AFTER_HEAD_OPAQUE_CONTAINERS = frozenset(
+        {"script", "style", "template"}
+    )
     HEAD_METADATA_TAGS = frozenset(
         {"base", "basefont", "bgsound", "link", "meta"}
     )
@@ -2255,9 +2258,15 @@ class AccessConstraintMarkupParser(HTMLParser):
             self.in_head = True
             return
         if normalized in self.OPAQUE_CONTAINERS:
-            if (
-                normalized not in self.HEAD_OPAQUE_CONTAINERS
-                or not self.in_head
+            after_head_opaque = bool(
+                normalized in self.AFTER_HEAD_OPAQUE_CONTAINERS
+                and self.head_seen
+                and self.head_closed
+                and not self.body_started
+                and not self.body_closed
+            )
+            if not after_head_opaque and (
+                normalized not in self.HEAD_OPAQUE_CONTAINERS or not self.in_head
             ):
                 self.start_implicit_body()
             if self.capture_title:

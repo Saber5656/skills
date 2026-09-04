@@ -441,6 +441,14 @@
       "expected_output": "head外のbody-content start/self-closing tagとnon-whitespace textでimplicit body開始を単調追跡する。body開始後のheadは拒否し、body tag省略時も正規widgetはbody evidenceとして認識する。",
       "files": [],
       "expectations": ["tracks implicit body start from non-head elements", "tracks implicit body start from non-whitespace text", "rejects a head after implicit body start", "recognizes a valid widget when the optional body tag is omitted"]
+    },
+    {
+      "id": 53,
+      "name": "challenge_parser_keeps_after_head_opaque_tokens_in_head_mode",
+      "prompt": "HTTP 429本文で`</head>`とexplicitな`<body>`の間にscript、style、またはtemplateがあり、その後のbodyに正規captcha widgetがあります。duplicate bodyとして拒否してください。",
+      "expected_output": "HTML after-headでhead rulesが適用されるscript/style/templateはimplicit bodyを開始しない。内部markerはopaqueのまま無視し、後続の単一explicit body内の正規widgetだけを証拠として受理する。",
+      "files": [],
+      "expectations": ["does not start the body for an after-head script", "does not start the body for an after-head style", "does not start the body for an after-head template", "ignores widget-like content inside those opaque elements", "accepts a valid widget in the following explicit body"]
     }
   ]
 }
