@@ -649,6 +649,14 @@
       "expected_output": "script escaped state内でnested script startによりdouble-escaped stateへ入る入力は、Python callbackだけで安全なcloseを証明できないためdocument-wide fail closedにする。後続widget風markupをcaptcha evidenceとして使わない。",
       "files": [],
       "expectations": ["detects a delimiter-bounded nested script start after an escape opener", "does not trust Python HTMLParser's first script end callback", "invalidates challenge evidence document-wide", "keeps the response as generic http_429"]
+    },
+    {
+      "id": 79,
+      "name": "challenge_script_escape_scan_is_linear",
+      "prompt": "最大8 MiBのscript dataに、短く閉じた`<!-- -->` segmentが大量にあり、末尾だけに`<script>`があります。各segmentから末尾のnested scriptまで正規表現探索してdouble-escapeを判定してください。",
+      "expected_output": "各escape openerから最初の対応closerまでだけnested scriptを探索し、closed segment後の末尾markerをそのsegmentへ帰属させない。全segmentを合わせた探索量を入力長に対してlinearに保つ。",
+      "files": [],
+      "expectations": ["bounds each nested-script search at the first matching escape closer", "does not repeatedly scan the remaining body", "keeps aggregate search span linear in input length", "does not classify a script token after closed segments as double escaped"]
     }
   ]
 }

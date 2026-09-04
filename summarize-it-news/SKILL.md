@@ -56,6 +56,8 @@ Challenge parserへ渡すraw start tagは16 KiBで上限化し、超過tokenをP
 
 Challenge parserの`script` raw-textで`<!--`後、対応する`-->`より前にdelimiter付き`<script`が現れた場合、Python `HTMLParser`の最初の`</script>` callbackをHTML5 double-escaped stateの安全なcloseとして扱わず、document-wide fail closedにする。double-escaped script内のwidget風markupをCAPTCHA evidenceとして露出させない。
 
+上記double-escape検査は各`<!--`から最初の対応`-->`までの区間だけを探索し、閉じたescape segmentごとに残りのbody全体を再走査しない。bounded body内に多数の短いcomment segmentと末尾の`<script`がある場合も、総探索量を入力長に対してlinearに保つ。
+
 Challenge parserがhead内でraw tokenとしてexactな`</br>`または`</html>`を受けた場合はHTML body transitionとしてheadを単調終了し、後続titleをdocument titleとして採用しない。Python callbackだけが認識した属性風suffix等を含むmalformed end tagはdocumentをfail closedにする。
 
 Document headが開始済みでbody start tagだけが省略された場合、最初のexactな`</body>`はimplicit empty bodyを開始して直ちに閉じるtokenとして扱う。open/closed headから安全に遷移するが、重複body closerとmalformed closerはchallenge evidenceをfail closedにする。
