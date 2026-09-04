@@ -2194,17 +2194,18 @@ class AccessConstraintMarkupParser(HTMLParser):
             value = attributes.get(name)
             if value:
                 tokens.update(
-                    part.casefold()
+                    part.lower()
                     for part in re.split(r"[\t\n\f\r ]+", value)
-                    if part
+                    if part and part.isascii()
                 )
         semantic_label = attributes.get("aria-label") or attributes.get("title")
         if tokens.intersection(self.CAPTCHA_WIDGET_TOKENS) or (
             isinstance(semantic_label, str)
+            and semantic_label.isascii()
             and re.fullmatch(
                 r"[\t\n\f\r ]*captcha challenge[\t\n\f\r ]*",
                 semantic_label,
-                re.IGNORECASE,
+                re.IGNORECASE | re.ASCII,
             )
         ):
             self.captcha_widget = True

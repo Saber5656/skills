@@ -48,6 +48,8 @@ article card、legacy `p.title`/`p.date`、承認済みinline publisher JavaScri
 
 HTTP 429のchallenge evidenceは、`read_bounded`の8 MiB hard cap内にあるresponse body全体を構造解析し、旧1 MiB境界より後ろにあるduplicate titleやmalformed boundaryなどのpoisoning structureも確認する。prefixだけを解析してcaptchaへ昇格しない。
 
+CAPTCHA widgetのclass/id tokenとsemantic labelはASCII文字だけをASCIIの大小文字差で比較する。Unicode `casefold`で既知のASCII identifierに変換されるlookalikeはchallenge evidenceとして受理しない。
+
 ### Step 2 — 分析・統合・要約
 
 Step 1の全トピックを俯瞰した上で以下を実行:

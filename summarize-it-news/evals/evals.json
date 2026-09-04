@@ -417,6 +417,14 @@
       "expected_output": "read_boundedのhard cap内にあるbody全体を構造解析し、後半のpoisoning structureも確認する。全体を検査できないprefix判定ではcaptchaへ昇格せずhttp_429のままfail closedする。",
       "files": [],
       "expectations": ["parses the entire body already bounded by the transport cap", "does not stop challenge structure inspection at one MiB", "detects poisoning structure after the former cutoff", "preserves the eight MiB hard cap"]
+    },
+    {
+      "id": 50,
+      "name": "captcha_widget_tokens_are_ascii_exact",
+      "prompt": "HTTP 429本文のwidget class/idが`cf-turnſtile`のようなUnicode lookalikeです。ASCIIの既知widget tokenとしてcaptcha判定してください。",
+      "expected_output": "widget class/id tokenはASCII文字だけをASCII lowercaseで比較し、Unicode casefoldで既知tokenに化けるlookalikeを拒否する。正規のASCII mixed caseは受理する。",
+      "files": [],
+      "expectations": ["rejects non-ASCII widget class and id tokens", "does not use Unicode casefold for security identifiers", "uses ASCII-only matching for semantic labels", "accepts legitimate ASCII mixed case"]
     }
   ]
 }

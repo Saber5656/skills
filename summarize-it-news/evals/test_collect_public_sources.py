@@ -2809,6 +2809,19 @@ class PublicSourceCollectorTests(unittest.TestCase):
                 )
                 self.assertEqual(MODULE.detect_access_constraint(body), "captcha")
 
+    def test_captcha_widget_tokens_use_ascii_only_case_folding(self) -> None:
+        """Reject Unicode lookalikes while accepting ordinary ASCII token case."""
+        lookalike = (
+            "<html><head><title>Rate limited</title></head><body>"
+            "<section id='cf-turn\u017ftile'></section></body></html>"
+        ).encode()
+        self.assertIsNone(MODULE.detect_access_constraint(lookalike))
+        ascii_case = (
+            b"<html><head><title>Rate limited</title></head><body>"
+            b"<section id='CF-TURNSTILE'></section></body></html>"
+        )
+        self.assertEqual(MODULE.detect_access_constraint(ascii_case), "captcha")
+
     def test_invalid_document_title_poisons_widget_evidence(self) -> None:
         """Do not let a valid widget override ambiguous document-title structure."""
         widget = b"<div class='g-recaptcha'></div>"
