@@ -2546,10 +2546,13 @@ class AccessConstraintMarkupParser(HTMLParser):
             self.in_head = False
             self.head_closed = True
         elif normalized == "body":
+            if not self.body_started and self.head_seen and (
+                self.in_head or self.head_closed
+            ):
+                self.start_implicit_body()
             if not self.body_started or self.body_closed:
                 self.structure_invalid = True
                 return
-            self.body_started = True
             self.body_closed = True
 
     def handle_data(self, data: str) -> None:

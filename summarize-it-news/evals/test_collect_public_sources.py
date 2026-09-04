@@ -3285,6 +3285,32 @@ class PublicSourceCollectorTests(unittest.TestCase):
         )
         self.assertIsNone(MODULE.detect_access_constraint(malformed))
 
+    def test_body_end_tag_can_close_an_implied_empty_body(self) -> None:
+        """Honor a safe body closer when the optional start tag was omitted."""
+        valid = (
+            b"<html><head><title>Vercel Security Checkpoint</title></head>"
+            b"</body></html>",
+            b"<title>Vercel Security Checkpoint</title></body></html>",
+        )
+        for body in valid:
+            with self.subTest(body=body):
+                parsed = MODULE.parse_access_constraint_markup(body.decode())
+                self.assertIsNotNone(parsed)
+                self.assertTrue(parsed.body_started)
+                self.assertTrue(parsed.body_closed)
+                self.assertTrue(parsed.head_closed)
+                self.assertEqual(MODULE.detect_access_constraint(body), "captcha")
+
+        invalid = (
+            b"<html><head><title>Vercel Security Checkpoint</title></head>"
+            b"</body></body></html>",
+            b"<html><head><title>Vercel Security Checkpoint</title></head>"
+            b"</body fixture></html>",
+        )
+        for body in invalid:
+            with self.subTest(body=body):
+                self.assertIsNone(MODULE.detect_access_constraint(body))
+
     def test_legacy_login_and_paywall_matching_keeps_its_prefix_bound(self) -> None:
         """Use the full body only for structural CAPTCHA verification."""
         suffix_only = (

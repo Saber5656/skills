@@ -52,6 +52,8 @@ Challenge parserへ渡すraw start tagは16 KiBで上限化し、超過tokenをP
 
 Challenge parserがhead内でraw tokenとしてexactな`</br>`または`</html>`を受けた場合はHTML body transitionとしてheadを単調終了し、後続titleをdocument titleとして採用しない。Python callbackだけが認識した属性風suffix等を含むmalformed end tagはdocumentをfail closedにする。
 
+Document headが開始済みでbody start tagだけが省略された場合、最初のexactな`</body>`はimplicit empty bodyを開始して直ちに閉じるtokenとして扱う。open/closed headから安全に遷移するが、重複body closerとmalformed closerはchallenge evidenceをfail closedにする。
+
 `iframe`、`noembed`、`noframes`、`plaintext`、`script`、`style`、`textarea`、`xmp`のself-closing syntaxはnon-void要素を閉じたとは扱わず、実際のmatching end tagまで後続markupをopaqueとして抑止する。`plaintext`はend tagで閉じない。
 
 SVG/MathML rootのself-closing syntaxはforeign-content elementの完了として扱い、後続のbody challenge evidenceを無効化しない。foreign root自身の属性はwidget evidenceとして扱わない。
