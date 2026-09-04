@@ -449,6 +449,14 @@
       "expected_output": "HTML after-headでhead rulesが適用されるscript/style/templateはimplicit bodyを開始しない。内部markerはopaqueのまま無視し、後続の単一explicit body内の正規widgetだけを証拠として受理する。",
       "files": [],
       "expectations": ["does not start the body for an after-head script", "does not start the body for an after-head style", "does not start the body for an after-head template", "ignores widget-like content inside those opaque elements", "accepts a valid widget in the following explicit body"]
+    },
+    {
+      "id": 54,
+      "name": "challenge_parser_separates_foreign_titles",
+      "prompt": "構造検証済みHTTP 429 challengeのbodyに、accessible inline SVGまたはMathMLのローカルtitleがあります。duplicate document titleとしてcaptchaを拒否してください。",
+      "expected_output": "SVG/MathML foreign-contentをmatching opaque contextとして追跡し、そのlocal titleをHTML document titleとして数えない。foreign-content内部のwidget-like markupも証拠にせず、外側bodyの正規widgetだけを受理する。",
+      "files": [],
+      "expectations": ["does not count an SVG title as a document title", "does not count a MathML title as a document title", "suppresses widget evidence inside foreign content", "accepts valid challenge evidence outside foreign content"]
     }
   ]
 }

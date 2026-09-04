@@ -2908,6 +2908,28 @@ class PublicSourceCollectorTests(unittest.TestCase):
         )
         self.assertIsNone(MODULE.detect_access_constraint(marker_only))
 
+    def test_foreign_content_titles_do_not_poison_document_evidence(self) -> None:
+        """Ignore local SVG/MathML titles without trusting nested widgets."""
+        foreign_titles = (
+            b"<svg><title>Lock icon</title></svg>",
+            b"<math><title>Formula description</title></math>",
+        )
+        for foreign_title in foreign_titles:
+            with self.subTest(foreign_title=foreign_title):
+                body = (
+                    b"<html><head><title>Rate limited</title></head><body>"
+                    + foreign_title
+                    + b"<div class='g-recaptcha'></div></body></html>"
+                )
+                self.assertEqual(MODULE.detect_access_constraint(body), "captcha")
+
+        foreign_widget = (
+            b"<html><head><title>Rate limited</title></head><body>"
+            b"<svg><foreignObject><div class='g-recaptcha'></div>"
+            b"</foreignObject></svg></body></html>"
+        )
+        self.assertIsNone(MODULE.detect_access_constraint(foreign_widget))
+
     def test_rejects_escape_before_creating_output(self) -> None:
         """Do not leave directories outside the caller-bound staging root."""
         with tempfile.TemporaryDirectory() as temporary:

@@ -2111,9 +2111,10 @@ def extract_content(
 class AccessConstraintMarkupParser(HTMLParser):
     """Extract explicit challenge evidence from a conservative HTML subset."""
 
+    FOREIGN_CONTENT_CONTAINERS = frozenset({"svg", "math"})
     OPAQUE_CONTAINERS = frozenset(
         {"script", "style", "template", "noscript", "select"}
-    )
+    ) | FOREIGN_CONTENT_CONTAINERS
     HEAD_OPAQUE_CONTAINERS = frozenset(
         {"script", "style", "template", "noscript"}
     )
