@@ -2804,6 +2804,34 @@ class PublicSourceCollectorTests(unittest.TestCase):
             "captcha",
         )
 
+    def test_challenge_script_double_escape_search_is_segment_bounded(self) -> None:
+        """Do not rescan the remaining body for every closed escape segment."""
+        pattern = MODULE.SCRIPT_DOUBLE_ESCAPE_START
+
+        class SearchRecorder:
+            def __init__(self) -> None:
+                self.ranges: list[tuple[int, int]] = []
+
+            def search(
+                self,
+                data: str,
+                start: int,
+                end: int,
+            ) -> object:
+                self.ranges.append((start, end))
+                return pattern.search(data, start, end)
+
+        recorder = SearchRecorder()
+        data = "<!-- -->" * 4096 + "<script>"
+        with mock.patch.object(MODULE, "SCRIPT_DOUBLE_ESCAPE_START", recorder):
+            self.assertFalse(MODULE.script_data_enters_double_escaped_state(data))
+
+        self.assertEqual(len(recorder.ranges), 4096)
+        self.assertLessEqual(
+            sum(end - start for start, end in recorder.ranges),
+            len(data),
+        )
+
     def test_vercel_checkpoint_requires_plain_document_title_in_head(self) -> None:
         """Reject title attributes, body placement, and template-contained markup."""
         bodies = (

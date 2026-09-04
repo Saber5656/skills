@@ -2151,10 +2151,13 @@ def script_data_enters_double_escaped_state(data: str) -> bool:
             return False
         escaped_position = escape_start + 4
         escape_end = data.find("-->", escaped_position)
-        nested_script = SCRIPT_DOUBLE_ESCAPE_START.search(data, escaped_position)
-        if nested_script is not None and (
-            escape_end < 0 or nested_script.start() < escape_end
-        ):
+        scan_end = escape_end if escape_end >= 0 else len(data)
+        nested_script = SCRIPT_DOUBLE_ESCAPE_START.search(
+            data,
+            escaped_position,
+            scan_end,
+        )
+        if nested_script is not None:
             return True
         if escape_end < 0:
             return False
