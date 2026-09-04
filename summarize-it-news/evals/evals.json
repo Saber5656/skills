@@ -633,6 +633,14 @@
       "expected_output": "ASCII decimal fieldも固定桁数で整数変換前に上限化し、超過値はtransport declarationとして拒否する。変換不能なdecimal値を宣言なしへ降格してchallenge evidenceを受理しない。",
       "files": [],
       "expectations": ["bounds decimal Content-Length characters before integer conversion", "rejects a 4,301-digit decimal declaration", "does not treat conversion failure as an absent declaration", "does not accept the checkpoint body as captcha"]
+    },
+    {
+      "id": 77,
+      "name": "captcha_semantic_labels_are_independent",
+      "prompt": "HTTP 429 widgetが`<iframe aria-label=\"security widget\" title=\"Captcha Challenge\">`です。非空のaria-labelを優先し、titleは確認せずgeneric 429にしてください。",
+      "expected_output": "aria-labelとtitleを独立に評価し、どちらか一方がexactなASCII Captcha Challengeならsemantic widget evidenceとしてcaptchaへ封印する。",
+      "files": [],
+      "expectations": ["checks aria-label and title independently", "does not let an unrelated aria-label mask a valid title", "accepts the inverse attribute combination", "preserves ASCII-only exact semantic-label matching"]
     }
   ]
 }

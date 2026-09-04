@@ -50,6 +50,8 @@ Challenge parserのopaque nestingは128段で上限化し、超過時は既出�
 
 CAPTCHA widget候補の`class`、`id`、`aria-label`、`title`は各4096文字以下の場合だけ解析し、超過した候補はfail closedにする。class/id tokenはboundedなincremental scanで既知ASCII tokenとの一致だけを確認し、空白数に比例するtoken listやsetを作らない。
 
+CAPTCHA widgetの`aria-label`と`title`は独立したsemantic labelとして評価し、一方が無関係な非空文字列でも、もう一方がexactなASCII `Captcha Challenge`ならwidget evidenceとして受理する。
+
 Challenge parserへ渡すraw start tagは16 KiBで上限化し、超過tokenをPython `HTMLParser`のattribute parserへ渡す前にdocument-wide fail closedにする。短い属性を大量に並べた最大bodyからcallback attribute listを生成してworkerごとのmemoryを増幅させない。
 
 Challenge parserがhead内でraw tokenとしてexactな`</br>`または`</html>`を受けた場合はHTML body transitionとしてheadを単調終了し、後続titleをdocument titleとして採用しない。Python callbackだけが認識した属性風suffix等を含むmalformed end tagはdocumentをfail closedにする。
