@@ -2419,6 +2419,19 @@ class PublicSourceCollectorTests(unittest.TestCase):
         response.headers = FakeHeaders("text/plain", content_length="not-a-number")
         self.assertEqual(MODULE.read_bounded(response), b"bounded")
 
+    def test_rejects_body_that_does_not_match_valid_content_length(self) -> None:
+        """Do not parse a transport-truncated body as complete evidence."""
+        body = b"bounded"
+        response = FakeResponse(body, "text/plain", "https://example.test")
+        response.headers = FakeHeaders(
+            "text/plain", content_length=str(len(body) + 1)
+        )
+        with self.assertRaisesRegex(
+            MODULE.CollectionError,
+            "^response length does not match Content-Length$",
+        ):
+            MODULE.read_bounded(response)
+
     def test_reads_explicit_gate_body_from_http_error(self) -> None:
         """Recognize bounded login markup returned with an HTTP gate status."""
         source = MODULE.load_catalog(CATALOG)[0]
@@ -2568,6 +2581,36 @@ class PublicSourceCollectorTests(unittest.TestCase):
             MODULE,
             "read_bounded",
             side_effect=MODULE.http.client.IncompleteRead(b"partial"),
+        ):
+            with self.assertRaisesRegex(MODULE.CollectionError, "^http_429$"):
+                MODULE.fetch_url(source["page_url"], MODULE.source_hosts(source))
+
+    def test_declared_truncated_http_429_checkpoint_remains_fail_closed(self) -> None:
+        """Reject a complete-looking checkpoint when transport bytes are missing."""
+        source = MODULE.load_catalog(CATALOG)[0]
+        body = (
+            b"<html><head><title>Vercel Security Checkpoint</title>"
+            b"</head><body></body></html>"
+        )
+        error = MODULE.urllib.error.HTTPError(
+            source["page_url"],
+            429,
+            "Too Many Requests",
+            FakeHeaders("text/html", content_length=str(len(body) + 64)),
+            io.BytesIO(body),
+        )
+        opener = mock.Mock()
+        opener.open.side_effect = error
+        with mock.patch.object(
+            MODULE,
+            "robots_policy",
+            return_value={
+                "allowed": True,
+                "robots_url": "https://example/robots.txt",
+                "robots_sha256": None,
+            },
+        ), mock.patch.object(
+            MODULE.urllib.request, "build_opener", return_value=opener
         ):
             with self.assertRaisesRegex(MODULE.CollectionError, "^http_429$"):
                 MODULE.fetch_url(source["page_url"], MODULE.source_hosts(source))

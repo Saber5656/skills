@@ -385,6 +385,14 @@
       "expected_output": "HTTP 429では構造的に検証されたcaptcha/security challengeだけをアクセス制約として受理し、login/paywall検出結果は採用せず元のhttp_429としてfail closedする。",
       "files": [],
       "expectations": ["requires the detected access constraint to be captcha for HTTP 429", "does not seal login markup from a 429 response", "does not seal paywall prose from a 429 response", "preserves login and paywall detection for their existing non-429 gate statuses"]
+    },
+    {
+      "id": 46,
+      "name": "declared_truncated_http_429_body",
+      "prompt": "HTTP 429のbodyは見た目上completeなVercel Security Checkpoint HTMLですが、有効なContent-Lengthより実際に読めたtransport bytesが短い状態です。captchaとして封印してください。",
+      "expected_output": "Content-Lengthとgzip展開前の実測transport bytesが完全一致しないbodyはtruncatedとして拒否し、checkpoint markupを解析せず元のhttp_429へ正規化してfail closedする。",
+      "files": [],
+      "expectations": ["compares a valid Content-Length with raw transport bytes", "rejects both shorter and longer length mismatches", "does not accept complete-looking challenge markup from a truncated response", "preserves malformed Content-Length compatibility", "normalizes the HTTP 429 outcome to http_429"]
     }
   ]
 }

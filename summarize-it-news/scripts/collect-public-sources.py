@@ -282,16 +282,21 @@ def robots_policy(url: str, hosts: set[str]) -> dict[str, object]:
 def read_bounded(response) -> bytes:  # type: ignore[no-untyped-def]
     """Read a response with a hard size cap and optional gzip decoding."""
     declared = response.headers.get("Content-Length")
-    if declared:
+    declared_size = None
+    if declared is not None:
         try:
             declared_size = int(declared)
         except (TypeError, ValueError):
+            declared_size = None
+        if declared_size is not None and declared_size < 0:
             declared_size = None
         if declared_size is not None and declared_size > MAX_BYTES:
             raise CollectionError("response exceeds size limit")
     content = response.read(MAX_BYTES + 1)
     if len(content) > MAX_BYTES:
         raise CollectionError("response exceeds size limit")
+    if declared_size is not None and len(content) != declared_size:
+        raise CollectionError("response length does not match Content-Length")
     if response.headers.get("Content-Encoding", "").lower() == "gzip":
         with gzip.GzipFile(fileobj=io.BytesIO(content)) as decompressor:
             content = decompressor.read(MAX_BYTES + 1)
