@@ -2415,9 +2415,15 @@ class PublicSourceCollectorTests(unittest.TestCase):
 
     def test_ignores_malformed_content_length_and_reads_bounded_body(self) -> None:
         """Do not let a malformed upstream header abort fallback verification."""
-        response = FakeResponse(b"bounded", "text/plain", "https://example.test")
-        response.headers = FakeHeaders("text/plain", content_length="not-a-number")
-        self.assertEqual(MODULE.read_bounded(response), b"bounded")
+        for declared in ("not-a-number", "-1"):
+            with self.subTest(declared=declared):
+                response = FakeResponse(
+                    b"bounded", "text/plain", "https://example.test"
+                )
+                response.headers = FakeHeaders(
+                    "text/plain", content_length=declared
+                )
+                self.assertEqual(MODULE.read_bounded(response), b"bounded")
 
     def test_rejects_body_that_does_not_match_valid_content_length(self) -> None:
         """Do not parse a transport-truncated body as complete evidence."""
@@ -2477,6 +2483,39 @@ class PublicSourceCollectorTests(unittest.TestCase):
             return_value={"allowed": True, "robots_url": "https://example/robots.txt", "robots_sha256": None},
         ), mock.patch.object(MODULE.urllib.request, "build_opener", return_value=opener):
             fetched = MODULE.fetch_url(source["page_url"], MODULE.source_hosts(source))
+        self.assertEqual(fetched["http_status"], 429)
+        self.assertEqual(MODULE.detect_access_constraint(fetched["content"]), "captcha")
+
+    def test_malformed_length_does_not_hide_valid_checkpoint_evidence(self) -> None:
+        """Keep bounded structural inspection when no valid length is declared."""
+        source = MODULE.load_catalog(CATALOG)[0]
+        body = (
+            b"<!doctype html><html><head><title>\t Vercel Security Checkpoint\n"
+            b"</title></head><body></body></html>"
+        )
+        error = MODULE.urllib.error.HTTPError(
+            source["page_url"],
+            429,
+            "Too Many Requests",
+            FakeHeaders("text/html", content_length="not-a-number"),
+            io.BytesIO(body),
+        )
+        opener = mock.Mock()
+        opener.open.side_effect = error
+        with mock.patch.object(
+            MODULE,
+            "robots_policy",
+            return_value={
+                "allowed": True,
+                "robots_url": "https://example/robots.txt",
+                "robots_sha256": None,
+            },
+        ), mock.patch.object(
+            MODULE.urllib.request, "build_opener", return_value=opener
+        ):
+            fetched = MODULE.fetch_url(
+                source["page_url"], MODULE.source_hosts(source)
+            )
         self.assertEqual(fetched["http_status"], 429)
         self.assertEqual(MODULE.detect_access_constraint(fetched["content"]), "captcha")
 
@@ -2717,6 +2756,13 @@ class PublicSourceCollectorTests(unittest.TestCase):
             b"</head><body></body></html>"
         )
         self.assertEqual(MODULE.detect_access_constraint(ascii_case), "captcha")
+        ascii_whitespace = (
+            b"<html><head><title>\t Vercel Security Checkpoint\r\n </title>"
+            b"</head><body></body></html>"
+        )
+        self.assertEqual(
+            MODULE.detect_access_constraint(ascii_whitespace), "captcha"
+        )
 
     def test_generic_captcha_markers_require_structural_widget_markup(self) -> None:
         """Ignore marker strings in comments, scripts, prose, and unrelated attrs."""
