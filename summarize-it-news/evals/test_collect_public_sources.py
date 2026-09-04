@@ -2923,6 +2923,26 @@ class PublicSourceCollectorTests(unittest.TestCase):
         )
         self.assertEqual(MODULE.detect_access_constraint(ascii_case), "captcha")
 
+    def test_captcha_widget_checks_both_semantic_label_attributes(self) -> None:
+        """Accept either supported label even when the other is unrelated."""
+        widgets = (
+            b"<iframe aria-label='security widget' "
+            b"title='Captcha Challenge'></iframe>",
+            b"<iframe aria-label='Captcha Challenge' "
+            b"title='security widget'></iframe>",
+        )
+        for widget in widgets:
+            with self.subTest(widget=widget):
+                body = (
+                    b"<html><head><title>Rate limited</title></head><body>"
+                    + widget
+                    + b"</body></html>"
+                )
+                self.assertEqual(
+                    MODULE.detect_access_constraint(body),
+                    "captcha",
+                )
+
     def test_captcha_widget_attribute_tokenization_is_bounded(self) -> None:
         """Reject oversized candidate attributes before creating token objects."""
         limit = MODULE.AccessConstraintMarkupParser.MAX_WIDGET_ATTRIBUTE_CHARS

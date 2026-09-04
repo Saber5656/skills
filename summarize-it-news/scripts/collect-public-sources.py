@@ -2328,14 +2328,20 @@ class AccessConstraintMarkupParser(HTMLParser):
             ):
                 widget_token = True
                 break
-        semantic_label = attributes.get("aria-label") or attributes.get("title")
+        semantic_labels = (
+            attributes.get("aria-label"),
+            attributes.get("title"),
+        )
         if widget_token or (
-            isinstance(semantic_label, str)
-            and semantic_label.isascii()
-            and re.fullmatch(
-                r"[\t\n\f\r ]*captcha challenge[\t\n\f\r ]*",
-                semantic_label,
-                re.IGNORECASE | re.ASCII,
+            any(
+                isinstance(semantic_label, str)
+                and semantic_label.isascii()
+                and re.fullmatch(
+                    r"[\t\n\f\r ]*captcha challenge[\t\n\f\r ]*",
+                    semantic_label,
+                    re.IGNORECASE | re.ASCII,
+                )
+                for semantic_label in semantic_labels
             )
         ):
             self.captcha_widget = True
