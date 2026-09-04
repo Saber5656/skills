@@ -2346,6 +2346,8 @@ class AccessConstraintMarkupParser(HTMLParser):
         if normalized == "frameset":
             self.structure_invalid = True
             return
+        if normalized in self.IMPLIED_HEAD_START_TAGS:
+            self.start_implied_head()
         if normalized in self.OPAQUE_CONTAINERS or normalized in {"body", "head", "title"}:
             self.structure_invalid = True
             self.title_structure_invalid = True

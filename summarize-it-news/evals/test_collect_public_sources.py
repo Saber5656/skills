@@ -2974,6 +2974,8 @@ class PublicSourceCollectorTests(unittest.TestCase):
             b"<!doctype html><title>Vercel Security Checkpoint</title><body></body>",
             b"<!doctype html><meta charset='utf-8'>"
             b"<title>Vercel Security Checkpoint</title><body></body>",
+            b"<!doctype html><meta charset='utf-8'/>"
+            b"<title>Vercel Security Checkpoint</title><body></body>",
             b"<!doctype html><script>const fixture = '<body>';</script>"
             b"<title>Vercel Security Checkpoint</title><body></body>",
         )
