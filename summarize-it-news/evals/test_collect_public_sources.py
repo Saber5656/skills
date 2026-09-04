@@ -3054,6 +3054,24 @@ class PublicSourceCollectorTests(unittest.TestCase):
         )
         self.assertEqual(MODULE.detect_access_constraint(closed_iframe), "captcha")
 
+    def test_self_closing_foreign_content_closes_immediately(self) -> None:
+        """Honor the self-closing flag on SVG and MathML roots."""
+        for foreign_root in (b"<svg/>", b"<math/>"):
+            with self.subTest(foreign_root=foreign_root):
+                body = (
+                    b"<html><head><title>Rate limited</title></head><body>"
+                    + foreign_root
+                    + b"<div class='g-recaptcha'></div></body></html>"
+                )
+                self.assertEqual(MODULE.detect_access_constraint(body), "captcha")
+
+        marker_attribute = (
+            b"<html><head><title>Rate limited</title></head><body>"
+            b"<svg class='g-recaptcha'/><math id='cf-turnstile'/>"
+            b"</body></html>"
+        )
+        self.assertIsNone(MODULE.detect_access_constraint(marker_attribute))
+
     def test_legacy_login_and_paywall_matching_keeps_its_prefix_bound(self) -> None:
         """Use the full body only for structural CAPTCHA verification."""
         suffix_only = (

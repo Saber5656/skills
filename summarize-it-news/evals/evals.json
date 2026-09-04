@@ -529,6 +529,14 @@
       "expected_output": "non-void raw-text/RCDATA要素のslashは終了として扱わず、matching end tagまで後続markupをopaqueとして抑止する。`plaintext`は文書末尾まで抑止する。",
       "files": [],
       "expectations": ["does not trust Python's self-closing callback for non-void raw-text elements", "suppresses following widget-like markup until an exact matching end tag", "keeps plaintext opaque through the document end", "accepts only a real widget after the raw-text context closes"]
+    },
+    {
+      "id": 64,
+      "name": "self_closing_foreign_roots_complete",
+      "prompt": "HTTP 429本文のbodyに`<svg/>`または`<math/>`があり、その後に正規CAPTCHA widgetがあります。self-closing foreign rootをmalformed containerとしてdocument全体を拒否してください。",
+      "expected_output": "SVG/MathML rootではself-closing flagを有効なforeign-content element完了として扱い、後続の正規widgetを検証する。foreign rootの属性自体はwidget evidenceにしない。",
+      "files": [],
+      "expectations": ["accepts self-closing SVG roots", "accepts self-closing MathML roots", "does not leave a foreign-content suppression stack open", "does not trust marker-like attributes on a foreign root"]
     }
   ]
 }

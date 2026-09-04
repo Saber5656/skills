@@ -2378,6 +2378,9 @@ class AccessConstraintMarkupParser(HTMLParser):
             return
         if normalized in self.IMPLIED_HEAD_START_TAGS:
             self.start_implied_head()
+        if normalized in self.FOREIGN_CONTENT_CONTAINERS:
+            self.start_implicit_body()
+            return
         if normalized in self.RAW_TEXT_CONTAINERS:
             after_head_opaque = bool(
                 normalized in self.AFTER_HEAD_OPAQUE_CONTAINERS
