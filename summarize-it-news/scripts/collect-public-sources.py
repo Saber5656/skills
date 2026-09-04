@@ -2135,13 +2135,9 @@ class AccessConstraintMarkupParser(HTMLParser):
         "hcaptcha",
     })
 
-    def __init__(self, source_text: str) -> None:
+    def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
-        self.source_text = source_text
-        self.line_offsets = [0]
-        self.line_offsets.extend(
-            match.end() for match in re.finditer("\n", source_text)
-        )
+        self.raw_end_tag_start: Optional[int] = None
         self.head_seen = False
         self.head_closed = False
         self.in_head = False
@@ -2159,14 +2155,21 @@ class AccessConstraintMarkupParser(HTMLParser):
 
     def current_raw_end_tag(self) -> Optional[str]:
         """Recover the raw end-tag token at the current parser position."""
-        line, column = self.getpos()
-        if line <= 0 or line > len(self.line_offsets):
+        start = self.raw_end_tag_start
+        if start is None or start < 0 or start >= len(self.rawdata):
             return None
-        start = self.line_offsets[line - 1] + column
-        end = self.source_text.find(">", start)
+        end = self.rawdata.find(">", start)
         if end == -1:
             return None
-        return self.source_text[start : end + 1]
+        return self.rawdata[start : end + 1]
+
+    def parse_endtag(self, index: int) -> int:
+        """Expose the parser's bounded raw token index only during its callback."""
+        self.raw_end_tag_start = index
+        try:
+            return super().parse_endtag(index)
+        finally:
+            self.raw_end_tag_start = None
 
     def has_safe_end_tag(self, tag: str) -> bool:
         """Require an exact end-tag name plus HTML5 ASCII whitespace only."""
@@ -2448,7 +2451,7 @@ def parse_access_constraint_markup(
     text: str,
 ) -> Optional[AccessConstraintMarkupParser]:
     """Parse challenge markup once and return no evidence on parser failure."""
-    parser = AccessConstraintMarkupParser(text)
+    parser = AccessConstraintMarkupParser()
     try:
         parser.feed(text)
         parser.close()

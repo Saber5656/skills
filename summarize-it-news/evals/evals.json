@@ -481,6 +481,14 @@
       "expected_output": "body開始前のinitial head-compatible title、metadata、opaque tokenからimplied head phaseを開始し、単一document titleを検証する。body content開始後のtitleは従来どおりpoisonする。",
       "files": [],
       "expectations": ["infers the optional head before an initial title", "keeps initial metadata in the implied head", "keeps initial head-compatible opaque tokens in the implied head", "does not infer a head after body content starts"]
+    },
+    {
+      "id": 58,
+      "name": "challenge_parser_bounds_newline_tracking_memory",
+      "prompt": "最大8 MiBのHTTP 429 bodyがほぼnewlineで、collectorは最大6 workerです。raw end-tag検証のためnewlineごとのoffset listを保持してください。",
+      "expected_output": "newline数に比例するoffset配列を作らず、HTMLParserが現在処理中のbounded raw end-tag indexだけをcallback中に保持する。response body以外の追加stateはnewline数に対してO(1)とする。",
+      "files": [],
+      "expectations": ["does not materialize one offset per newline", "uses the parser's current raw end-tag index", "keeps auxiliary raw-token tracking O(1)", "preserves exact raw end-tag validation"]
     }
   ]
 }

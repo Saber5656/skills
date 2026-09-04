@@ -2987,6 +2987,20 @@ class PublicSourceCollectorTests(unittest.TestCase):
         )
         self.assertIsNone(MODULE.detect_access_constraint(late_title))
 
+    def test_access_constraint_uses_constant_space_raw_tag_tracking(self) -> None:
+        """Do not retain one Python offset object for every response newline."""
+        body = (
+            b"<html><head><title>Rate limited</title></head><body>"
+            + b"\n" * (512 * 1024)
+            + b"<div class='g-recaptcha'></div></body></html>"
+        )
+        parsed = MODULE.parse_access_constraint_markup(body.decode())
+        self.assertIsNotNone(parsed)
+        self.assertTrue(parsed.has_captcha_evidence)
+        self.assertNotIn("line_offsets", vars(parsed))
+        self.assertNotIn("source_text", vars(parsed))
+        self.assertIsNone(parsed.raw_end_tag_start)
+
     def test_rejects_escape_before_creating_output(self) -> None:
         """Do not leave directories outside the caller-bound staging root."""
         with tempfile.TemporaryDirectory() as temporary:

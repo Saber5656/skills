@@ -56,6 +56,8 @@ Challenge parserはbody開始前のinitial head-compatible `title`、metadata、
 
 UTF-8 decode後のdocument先頭にある単一U+FEFFだけはencoding BOMとしてchallenge parserへ渡す前に除去する。先頭以外のU+FEFFは通常のnon-whitespace dataとしてbody開始を維持する。
 
+Raw end-tag検証のためにnewlineごとのoffset配列を作らない。HTML parserが現在処理中のbounded raw end-tag indexだけをcallback中に保持し、response body以外の追加raw-token stateをnewline数に対してO(1)に保つ。
+
 ### Step 2 — 分析・統合・要約
 
 Step 1の全トピックを俯瞰した上で以下を実行:
