@@ -2239,6 +2239,9 @@ class AccessConstraintMarkupParser(HTMLParser):
             if normalized in self.OPAQUE_CONTAINERS:
                 self.opaque_containers.append(normalized)
             return
+        if normalized == "frameset":
+            self.structure_invalid = True
+            return
         if normalized == "body":
             if self.body_started or self.body_closed:
                 self.structure_invalid = True
@@ -2310,6 +2313,9 @@ class AccessConstraintMarkupParser(HTMLParser):
         normalized = tag.lower()
         if self.capture_title:
             self.invalid_title = True
+        if normalized == "frameset":
+            self.structure_invalid = True
+            return
         if normalized in self.OPAQUE_CONTAINERS or normalized in {"body", "head", "title"}:
             self.structure_invalid = True
             self.title_structure_invalid = True
@@ -2324,6 +2330,9 @@ class AccessConstraintMarkupParser(HTMLParser):
 
     def handle_endtag(self, tag: str) -> None:
         normalized = tag.lower()
+        if not self.opaque_containers and normalized == "frameset":
+            self.structure_invalid = True
+            return
         if (
             normalized in self.OPAQUE_CONTAINERS | {"body", "head", "title"}
             and not self.has_safe_end_tag(normalized)

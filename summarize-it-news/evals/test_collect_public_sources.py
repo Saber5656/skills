@@ -2930,6 +2930,30 @@ class PublicSourceCollectorTests(unittest.TestCase):
         )
         self.assertIsNone(MODULE.detect_access_constraint(foreign_widget))
 
+    def test_frameset_documents_cannot_supply_captcha_evidence(self) -> None:
+        """Fail closed for actual framesets without trusting iframe callbacks."""
+        frameset_documents = (
+            b"<html><head><title>Rate limited</title></head>"
+            b"<frameset><iframe aria-label='Captcha Challenge'></iframe></frameset>"
+            b"</html>",
+            b"<html><head><title>Rate limited</title></head><body>"
+            b"<div class='g-recaptcha'></div></body><frameset></frameset></html>",
+            b"<html><head><title>Rate limited</title></head><body>"
+            b"<div class='g-recaptcha'></div></body></frameset></html>",
+        )
+        for body in frameset_documents:
+            with self.subTest(body=body):
+                self.assertIsNone(MODULE.detect_access_constraint(body))
+
+        suppressed_frameset = (
+            b"<html><head><title>Rate limited</title></head><body><template>"
+            b"<frameset><iframe aria-label='Captcha Challenge'></iframe></frameset>"
+            b"</template><div class='g-recaptcha'></div></body></html>"
+        )
+        self.assertEqual(
+            MODULE.detect_access_constraint(suppressed_frameset), "captcha"
+        )
+
     def test_rejects_escape_before_creating_output(self) -> None:
         """Do not leave directories outside the caller-bound staging root."""
         with tempfile.TemporaryDirectory() as temporary:

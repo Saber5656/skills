@@ -457,6 +457,14 @@
       "expected_output": "SVG/MathML foreign-contentをmatching opaque contextとして追跡し、そのlocal titleをHTML document titleとして数えない。foreign-content内部のwidget-like markupも証拠にせず、外側bodyの正規widgetだけを受理する。",
       "files": [],
       "expectations": ["does not count an SVG title as a document title", "does not count a MathML title as a document title", "suppresses widget evidence inside foreign content", "accepts valid challenge evidence outside foreign content"]
+    },
+    {
+      "id": 55,
+      "name": "challenge_parser_rejects_frameset_evidence",
+      "prompt": "HTTP 429のframeset document内に`iframe aria-label=Captcha Challenge`があり、callback上はwidgetに見えます。captcha access constraintとして封印してください。",
+      "expected_output": "actual frameset tokenを含むchallenge documentはdocument-wide fail closedにし、frameset insertion modeで無視されるiframe風callbackをrendered CAPTCHA evidenceとして扱わない。opaque context内のframeset-like markupはactual tokenとみなさない。",
+      "files": [],
+      "expectations": ["rejects captcha evidence from a frameset document", "does not trust iframe-like callbacks in frameset insertion mode", "invalidates earlier widget evidence when a frameset appears later", "ignores frameset-like markup inside an opaque context"]
     }
   ]
 }
