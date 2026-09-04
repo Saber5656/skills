@@ -284,13 +284,35 @@ def read_bounded(response) -> bytes:  # type: ignore[no-untyped-def]
     """Read a response with a hard size cap and optional gzip decoding."""
     declared = response.headers.get("Content-Length")
     declared_size = None
-    if isinstance(declared, str) and re.fullmatch(r"[0-9]+", declared, re.ASCII):
+    valid_declared_length = bool(
+        isinstance(declared, str)
+        and re.fullmatch(r"[0-9]+", declared, re.ASCII)
+    )
+    if valid_declared_length:
         try:
             declared_size = int(declared)
         except (TypeError, ValueError):
             declared_size = None
         if declared_size is not None and declared_size > MAX_BYTES:
             raise CollectionError("response exceeds size limit")
+    elif declared is not None:
+        # CPython accepts forms such as ``+41`` when it initializes an
+        # HTTPResponse and then silently clips read(amt) to that parsed length.
+        # The collector treats non-ASCII-decimal field values as absent, so
+        # clear only that implementation cache before the bounded read.
+        reader = response
+        seen_readers: set[int] = set()
+        for _depth in range(3):
+            if isinstance(reader, http.client.HTTPResponse):
+                reader.length = None
+                break
+            reader_id = id(reader)
+            if reader_id in seen_readers:
+                break
+            seen_readers.add(reader_id)
+            reader = getattr(reader, "fp", None)
+            if reader is None:
+                break
     content = response.read(MAX_BYTES + 1)
     if len(content) > MAX_BYTES:
         raise CollectionError("response exceeds size limit")

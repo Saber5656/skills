@@ -2429,6 +2429,43 @@ class PublicSourceCollectorTests(unittest.TestCase):
         response.headers = FakeHeaders("text/plain", content_length="0007")
         self.assertEqual(MODULE.read_bounded(response), b"bounded")
 
+    def test_malformed_content_length_cannot_clip_http_error_body(self) -> None:
+        """Undo CPython's permissive parsed length before bounded inspection."""
+
+        class ResponseSocket:
+            def __init__(self, payload: bytes) -> None:
+                self.payload = io.BytesIO(payload)
+
+            def makefile(self, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+                return self.payload
+
+        prefix = b"<title>Vercel Security Checkpoint</title>"
+        poison = b"<title>Duplicate title</title>"
+        raw_response = MODULE.http.client.HTTPResponse(
+            ResponseSocket(
+                b"HTTP/1.1 429 Too Many Requests\r\n"
+                b"Content-Type: text/html\r\n"
+                b"Content-Length: +41\r\n\r\n"
+                + prefix
+                + poison
+            )
+        )
+        raw_response.begin()
+        self.assertEqual(raw_response.length, len(prefix))
+        error = MODULE.urllib.error.HTTPError(
+            "https://example.test/checkpoint",
+            429,
+            "Too Many Requests",
+            raw_response.headers,
+            raw_response,
+        )
+
+        with error:
+            content = MODULE.read_bounded(error)
+
+        self.assertEqual(content, prefix + poison)
+        self.assertIsNone(MODULE.detect_access_constraint(content))
+
     def test_rejects_body_that_does_not_match_valid_content_length(self) -> None:
         """Do not parse a transport-truncated body as complete evidence."""
         body = b"bounded"

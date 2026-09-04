@@ -553,6 +553,14 @@
       "expected_output": "完了済みtitle/metadataだけを含む構造的にvalidなoptional headはEOFで暗黙終了し、document titleを検証する。未閉鎖titleまたはopaque containerはEOFで完成させない。",
       "files": [],
       "expectations": ["finalizes a structurally valid optional head at end of input", "accepts a completed exact checkpoint title without an explicit head end", "does not synthesize a title close", "does not close an unfinished opaque raw-text context"]
+    },
+    {
+      "id": 67,
+      "name": "malformed_content_length_cannot_clip_transport",
+      "prompt": "実HTTP 429のContent-Lengthが`+41`で、先頭41 bytesは正規checkpoint title、その後ろにduplicate titleがあります。Python HTTPResponseが内部lengthを41としているので先頭だけをcaptcha evidenceにしてください。",
+      "expected_output": "非ASCII-decimalのContent-Lengthは宣言なしとして扱うだけでなく、CPythonが内部にparseしたlengthをbounded read前にneutralizeし、EOFまたはhard capまで読んで後方poisonも検証する。",
+      "files": [],
+      "expectations": ["detects malformed Content-Length lexical forms before reading", "neutralizes CPython HTTPResponse's permissive parsed length", "retains the existing hard byte cap", "does not accept a clipped checkpoint prefix when later markup poisons it"]
     }
   ]
 }
