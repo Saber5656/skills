@@ -601,6 +601,14 @@
       "expected_output": "Content-Length fieldが複数あるresponseはbody read前にtransport framing ambiguityとして拒否し、最初のfieldでclipしたprefixをchallenge evidenceに使わずhttp_429のままfail closedする。",
       "files": [],
       "expectations": ["counts all Content-Length header fields", "rejects duplicate declarations before reading", "does not trust CPython's first parsed length", "does not accept a checkpoint prefix when trailing markup is hidden"]
+    },
+    {
+      "id": 73,
+      "name": "challenge_raw_start_tag_is_prebounded",
+      "prompt": "最大8 MiBのHTTP 429 bodyに、数十万個の短い属性を持つ巨大start tagがあります。Python HTMLParserで全attribute listを生成してからwidget属性だけを長さ検査してください。",
+      "expected_output": "raw start tagを小さい固定長でHTMLParserのattribute tokenization前に上限化し、超過tokenを含むchallenge documentをfail closedにする。workerごとに入力比例のattribute objectを生成しない。",
+      "files": [],
+      "expectations": ["checks raw start-tag length before base HTMLParser parsing", "does not materialize an attacker-sized callback attribute list", "invalidates challenge evidence for an oversized token", "continues to accept a normal bounded widget tag"]
     }
   ]
 }

@@ -2140,6 +2140,7 @@ class AccessConstraintMarkupParser(HTMLParser):
     """Extract explicit challenge evidence from a conservative HTML subset."""
 
     MAX_OPAQUE_DEPTH = 128
+    MAX_RAW_START_TAG_CHARS = 16 * 1024
     MAX_WIDGET_ATTRIBUTE_CHARS = 4096
     FOREIGN_CONTENT_CONTAINERS = frozenset({"svg", "math"})
     RAW_TEXT_CONTAINERS = frozenset({
@@ -2211,6 +2212,16 @@ class AccessConstraintMarkupParser(HTMLParser):
             return super().parse_endtag(index)
         finally:
             self.raw_end_tag_start = None
+
+    def parse_starttag(self, index: int) -> int:
+        """Reject oversized raw tags before HTMLParser materializes attributes."""
+        end = self.check_for_whole_start_tag(index)
+        if end < 0:
+            return end
+        if end - index > self.MAX_RAW_START_TAG_CHARS:
+            self.structure_invalid = True
+            return end
+        return super().parse_starttag(index)
 
     def close(self) -> None:
         """Finalize a structurally complete optional head at end of input."""

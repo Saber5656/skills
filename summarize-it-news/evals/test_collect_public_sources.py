@@ -2923,6 +2923,30 @@ class PublicSourceCollectorTests(unittest.TestCase):
         )
         self.assertEqual(MODULE.detect_access_constraint(bounded), "captcha")
 
+    def test_challenge_raw_start_tag_is_bounded_before_attribute_parsing(self) -> None:
+        """Skip an oversized token before HTMLParser builds its attribute list."""
+        limit = MODULE.AccessConstraintMarkupParser.MAX_RAW_START_TAG_CHARS
+        oversized = "<div " + "a=x " * (limit // 4 + 1) + "class=g-recaptcha>"
+        self.assertGreater(len(oversized), limit)
+
+        with mock.patch.object(
+            MODULE.HTMLParser,
+            "parse_starttag",
+            side_effect=AssertionError("base attribute parser invoked"),
+        ):
+            parsed = MODULE.parse_access_constraint_markup(oversized)
+
+        self.assertIsNotNone(parsed)
+        self.assertTrue(parsed.structure_invalid)
+        self.assertFalse(parsed.captcha_widget)
+        self.assertFalse(parsed.has_captcha_evidence)
+
+        bounded = (
+            b"<html><head><title>Rate limited</title></head><body>"
+            b"<div class='ordinary g-recaptcha'></div></body></html>"
+        )
+        self.assertEqual(MODULE.detect_access_constraint(bounded), "captcha")
+
     def test_invalid_document_title_poisons_widget_evidence(self) -> None:
         """Do not let a valid widget override ambiguous document-title structure."""
         widget = b"<div class='g-recaptcha'></div>"
