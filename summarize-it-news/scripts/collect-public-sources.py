@@ -2434,7 +2434,12 @@ def collect_source(
                 hosts,
             )
             constraint = detect_access_constraint(fetched["content"])
-            if constraint and extract["entry_count"] < 10:
+            verified_http_429_captcha = (
+                fetched["http_status"] == 429 and constraint == "captcha"
+            )
+            if constraint and (
+                verified_http_429_captcha or extract["entry_count"] < 10
+            ):
                 constraint_record = {
                     "method": method, "requested_url": url,
                     "final_url": fetched["final_url"], "constraint": constraint,

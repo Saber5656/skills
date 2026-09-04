@@ -425,6 +425,14 @@
       "expected_output": "widget class/id tokenはASCII文字だけをASCII lowercaseで比較し、Unicode casefoldで既知tokenに化けるlookalikeを拒否する。正規のASCII mixed caseは受理する。",
       "files": [],
       "expectations": ["rejects non-ASCII widget class and id tokens", "does not use Unicode casefold for security identifiers", "uses ASCII-only matching for semantic labels", "accepts legitimate ASCII mixed case"]
+    },
+    {
+      "id": 51,
+      "name": "verified_http_429_gate_survives_link_count",
+      "prompt": "構造検証済みのHTTP 429 CAPTCHA checkpoint pageに10件以上の通常linkがあります。記事一覧とみなしてcaptcha判定を取り消してください。",
+      "expected_output": "HTTP 429かつ再検証済みcaptchaはlink数heuristicに左右されずaccess_constraintとして封印する。通常statusのlogin/paywall誤検出抑止heuristicは維持する。",
+      "files": [],
+      "expectations": ["preserves verified HTTP 429 captcha state through collection", "does not discard a verified gate because of ten or more links", "does not treat the gate page as ordinary content", "keeps the existing heuristic for non-429 pages"]
     }
   ]
 }

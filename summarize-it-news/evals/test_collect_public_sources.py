@@ -3822,6 +3822,42 @@ class PublicSourceCollectorTests(unittest.TestCase):
             )
         self.assertEqual(result["status"], "needs_search_fallback")
 
+    def test_verified_http_429_captcha_ignores_link_count_heuristic(self) -> None:
+        """Seal a verified 429 gate even when its page exposes many links."""
+        source = MODULE.load_catalog(CATALOG)[0]
+        links = b"".join(
+            (
+                f"<a href='{source['page_url']}checkpoint-{index}'>"
+                f"Checkpoint link {index}</a>"
+            ).encode()
+            for index in range(12)
+        )
+        body = (
+            b"<html><head><title>Vercel Security Checkpoint</title></head>"
+            b"<body>" + links + b"</body></html>"
+        )
+        extracted = MODULE.extract_content(
+            body, "text/html", source["page_url"], MODULE.source_hosts(source)
+        )
+        self.assertGreaterEqual(extracted["entry_count"], 10)
+        fetched = {
+            "content": body,
+            "content_type": "text/html",
+            "final_url": source["page_url"],
+            "http_status": 429,
+        }
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.object(
+            MODULE, "fetch_url", return_value=fetched
+        ):
+            result = MODULE.collect_source(
+                1, source, MODULE.source_hosts(source), Path(temporary)
+            )
+        self.assertEqual(result["status"], "access_constraint")
+        self.assertEqual(result["constraint"], "captcha")
+        self.assertTrue(
+            all(item["status"] == "access_constraint" for item in result["attempts"])
+        )
+
     def test_verified_robots_constraint_requires_all_direct_endpoints(self) -> None:
         """Seal robots evidence only when every direct endpoint is disallowed."""
         source = MODULE.load_catalog(CATALOG)[0]

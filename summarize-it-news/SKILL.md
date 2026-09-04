@@ -50,6 +50,8 @@ HTTP 429のchallenge evidenceは、`read_bounded`の8 MiB hard cap内にあるre
 
 CAPTCHA widgetのclass/id tokenとsemantic labelはASCII文字だけをASCIIの大小文字差で比較する。Unicode `casefold`で既知のASCII identifierに変換されるlookalikeはchallenge evidenceとして受理しない。
 
+HTTP 429で構造的に再検証した`captcha` evidenceは、page内のextractable link数に左右されずaccess constraintとして封印する。link数heuristicで通常contentへ戻したり、verified gateを未解決へ戻したりしない。
+
 ### Step 2 — 分析・統合・要約
 
 Step 1の全トピックを俯瞰した上で以下を実行:
