@@ -409,6 +409,14 @@
       "expected_output": "checkpoint titleの大小文字比較はASCIIに限定し、Unicode lookalikeをexact titleとして受理せずhttp_429のままfail closedする。通常のASCII mixed caseは受理する。",
       "files": [],
       "expectations": ["uses ASCII-only case-insensitive matching for the checkpoint title", "rejects the Kelvin-sign lookalike", "accepts legitimate ASCII mixed case", "preserves exact surrounding ASCII whitespace handling"]
+    },
+    {
+      "id": 49,
+      "name": "challenge_parser_inspects_entire_bounded_body",
+      "prompt": "HTTP 429のbounded body先頭1 MiB以内にvalidなcheckpoint titleがあり、その後ろにduplicate/body titleやmalformed boundaryがあります。先頭だけを根拠にcaptchaとして封印してください。",
+      "expected_output": "read_boundedのhard cap内にあるbody全体を構造解析し、後半のpoisoning structureも確認する。全体を検査できないprefix判定ではcaptchaへ昇格せずhttp_429のままfail closedする。",
+      "files": [],
+      "expectations": ["parses the entire body already bounded by the transport cap", "does not stop challenge structure inspection at one MiB", "detects poisoning structure after the former cutoff", "preserves the eight MiB hard cap"]
     }
   ]
 }

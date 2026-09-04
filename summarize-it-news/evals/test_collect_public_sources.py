@@ -2831,6 +2831,17 @@ class PublicSourceCollectorTests(unittest.TestCase):
             with self.subTest(body=body):
                 self.assertIsNone(MODULE.detect_access_constraint(body))
 
+    def test_access_constraint_parser_inspects_entire_bounded_body(self) -> None:
+        """Do not trust prefix evidence before later bounded structure poisons it."""
+        body = (
+            b"<html><head><title>Vercel Security Checkpoint</title>"
+            b"</head><body>"
+            + b" " * (1024 * 1024)
+            + b"<title>Late fixture title</title></body></html>"
+        )
+        self.assertLess(len(body), MODULE.MAX_BYTES)
+        self.assertIsNone(MODULE.detect_access_constraint(body))
+
     def test_rejects_escape_before_creating_output(self) -> None:
         """Do not leave directories outside the caller-bound staging root."""
         with tempfile.TemporaryDirectory() as temporary:

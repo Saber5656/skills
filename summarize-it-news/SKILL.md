@@ -46,6 +46,8 @@ RFC 2822 / ISO 8601 timestampはJSTへ正規化してから暦日を比較する
 
 article card、legacy `p.title`/`p.date`、承認済みinline publisher JavaScript、exact `__NEXT_DATA__`は同一HTML parserのtrust boundaryを共有する。comment、raw/RCDATA、`noscript`、`template`、SVG/MathML、`select`内からはどのchannelも候補化せず、actual `frameset` tokenを含むdocumentは全article channelをdocument-wide fail closedにする。外側に一覧全体の`article`があるlegacy publisherでは、同じtop-level `li`内のtitleとdateだけを結合し、別list itemへ未完了recordを持ち越さない。
 
+HTTP 429のchallenge evidenceは、`read_bounded`の8 MiB hard cap内にあるresponse body全体を構造解析し、旧1 MiB境界より後ろにあるduplicate titleやmalformed boundaryなどのpoisoning structureも確認する。prefixだけを解析してcaptchaへ昇格しない。
+
 ### Step 2 — 分析・統合・要約
 
 Step 1の全トピックを俯瞰した上で以下を実行:
