@@ -76,9 +76,26 @@ public repository は release ではない。未完成でも `pre-alpha` と明�
 | `dry-run` | gh automation 前に確認したい | API payload 生成、実行予定コマンド提示。mutation はしない |
 | `apply` | ユーザーが明示承認した | repository 設定変更、ruleset 作成、Actions 権限変更など。実行前に対象 repo と変更内容を再確認 |
 
-`apply` は必ず個別承認を取る。特に visibility 変更、ruleset 変更、Actions permissions、secret / variable / deploy key、release / package publish は一括自動実行しない。
+`apply` は対象・payload・実行主体が一致する明示承認に紐付ける。有効な既存task承認があれば再質問しない。特に visibility 変更、ruleset 変更、Actions permissions、secret / variable / deploy key、release / package publish は一括自動実行しない。
 
 Mutation を自動化する場合の推奨は manual/browser UI を第一候補、次に selected repository + short expiration の fine-grained PAT を `GH_TOKEN` で一時的に渡す方式。`gh auth login` で保存済みの広い credential を使った mutation は避ける。
+
+## Credential Context Before Automation
+
+診断には `scripts/gh_credential_context.py` と
+`references/gh-credential-context.md` を使う。GH_TOKEN / GITHUB_TOKEN と
+Enterprise用selectorの優先順位をtarget hostごとに判定し、秘密値を表示・保存・hashしない。
+過去の未解明401と現在の成功、権限不足、runtime拒否、機能非対応、通信失敗を分ける。
+無効な選択credentialを保存済み認証へのfallbackで迂回しない。
+診断によるapply資格拡大はしない。選択されたGH_TOKEN以外は既存の明示
+`--allow-stored-gh-auth`を必要とし、このflagの名前に反して実際の選択元を変えない。
+
+ruleset helperのdry-runでは、実際にapplyする環境のprivateな
+`--context-out`を保存する。applyは同じ`--executor-surface`、`--context-in`、
+`--payload-in`と既存の承認条件を使い、環境差分があればmutation前に停止する。
+有効な承認済みtaskの範囲は再質問しない。read成功やtokenの存在だけで
+Administration: write・fine-grained scope・mutation許可があると判断しない。
+同一selector内のtoken交換や同一場所の保存account変更はpresence-onlyでは検知できない。
 
 ## Product Identity Before Public Hardening
 
@@ -257,31 +274,29 @@ gh secret list --repo OWNER/REPO
 
 Ruleset の baseline payload を作る場合は `scripts/apply-default-branch-ruleset.py` を使う。
 
-Dry-run:
+Dry-run (use the intended executor with the user-managed credential already configured):
 
 ```bash
-python3 scripts/apply-default-branch-ruleset.py --repo OWNER/REPO
+python3 scripts/apply-default-branch-ruleset.py --repo OWNER/REPO \
+  --payload-out /PRIVATE/DIR/ruleset.json \
+  --context-out /PRIVATE/DIR/context.private.json
 ```
 
 Apply:
 
 ```bash
-printf 'GitHub fine-grained PAT: '
-IFS= read -r -s GH_TOKEN
-printf '\n'
-export GH_TOKEN
 python3 scripts/apply-default-branch-ruleset.py \
   --repo OWNER/REPO \
   --mode apply \
   --yes \
-  --payload-in /path/to/reviewed-ruleset.json
-unset GH_TOKEN
+  --payload-in /PRIVATE/DIR/ruleset.json \
+  --context-in /PRIVATE/DIR/context.private.json
 ```
 
 Apply には selected repository の short-lived fine-grained PAT と `Administration: write` を要求する。
 保存済み `gh` credential での apply は、ユーザーがそのリスクを明示的に受け入れた場合だけ `--allow-stored-gh-auth` で許可する。
 このスクリプトは token 値を表示しない。apply では dry-run で確認した payload を `--payload-in` で渡す。
-既存 ruleset を置換する場合は、payload review 後に `--replace-existing` を明示する。
+既存 ruleset を置換する場合は、dry-runとapplyの両方に `--replace-existing` を指定し、その置換方針をreviewする。
 
 Baseline payload:
 

@@ -43,7 +43,7 @@ gh secret list --repo OWNER/REPO
 
 ## Mutation Approval Manifest
 
-Before any `POST`, `PUT`, `PATCH`, or `DELETE`, present this manifest and wait for explicit approval.
+Before any `POST`, `PUT`, `PATCH`, or `DELETE`, bind this manifest to explicit approval. An existing valid task grant for the same executor, target and payload satisfies this requirement; do not ask again solely because execution resumes.
 
 ```markdown
 **gh mutation dry-run**
@@ -116,31 +116,29 @@ Do not run this until the user approves the dry-run manifest.
 
 Prefer the bundled helper when creating or updating the standard solo OSS default-branch ruleset.
 
-Dry-run:
+Dry-run (use the intended executor with the user-managed credential already configured):
 
 ```bash
-python3 scripts/apply-default-branch-ruleset.py --repo OWNER/REPO
+python3 scripts/apply-default-branch-ruleset.py --repo OWNER/REPO \
+  --payload-out /PRIVATE/DIR/ruleset.json \
+  --context-out /PRIVATE/DIR/context.private.json
 ```
 
 Apply with a short-lived fine-grained PAT:
 
 ```bash
-printf 'GitHub fine-grained PAT: '
-IFS= read -r -s GH_TOKEN
-printf '\n'
-export GH_TOKEN
 python3 scripts/apply-default-branch-ruleset.py \
   --repo OWNER/REPO \
   --mode apply \
   --yes \
-  --payload-in /path/to/reviewed-ruleset.json
-unset GH_TOKEN
+  --payload-in /PRIVATE/DIR/ruleset.json \
+  --context-in /PRIVATE/DIR/context.private.json
 ```
 
 The token must be selected to the target repository and have `Administration: write`.
 Do not print the token, put it in the command line, or leave it in the shell environment after use.
 
-The script refuses apply mode without `GH_TOKEN` unless `--allow-stored-gh-auth` is explicitly passed.
+The diagnostic selects the host-appropriate credential, including GITHUB_TOKEN. Apply retains selected GH_TOKEN eligibility; all other selected sources require the existing explicit `--allow-stored-gh-auth` in both reviewed dry-run and apply. Despite its legacy name, this override does not select or fall back to stored auth.
 That override is for deliberate permission tests or exceptional cases only.
 Read access to `repos/OWNER/REPO/rulesets` does not prove write access to `PUT /repos/OWNER/REPO/rulesets/{ruleset_id}`; a stored token may read rulesets and still fail mutation with HTTP 403.
 Use `--payload-in` for apply so the reviewed dry-run payload is the exact payload sent to GitHub.
@@ -155,3 +153,18 @@ If the endpoint is `PUT`, `--replace-existing` is also required because replacin
 - GitHub Actions secure use: https://docs.github.com/en/actions/reference/security/secure-use
 - GitHub token authentication in workflows: https://docs.github.com/en/actions/tutorials/authenticate-with-github_token
 - Fine-grained PAT permissions: https://docs.github.com/en/rest/authentication/permissions-required-for-fine-grained-personal-access-tokens
+
+## Credential diagnostics and execution binding
+
+Use the shared [credential context contract](gh-credential-context.md). A successful
+read is not proof of Administration: write, token scope, runtime authority or
+product eligibility. Diagnose the current executor without printing or hashing
+secrets or bypassing a failed selected credential. Keep historical unresolved
+401 evidence separate from later success.
+
+For the helper, add `--context-out /PRIVATE/DIR/context.private.json` to dry-run.
+Apply requires that reviewed file via `--context-in` and the reviewed payload via
+`--payload-in`. Use the same declared `--executor-surface` and credential selectors
+in both phases. Set up any user-managed credential before creating this snapshot;
+changing selectors after review requires a new snapshot and appropriate review.
+Do not use the diagnostic as proof of authentication or an authenticated grant.
