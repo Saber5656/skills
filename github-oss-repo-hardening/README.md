@@ -19,7 +19,9 @@ Ask for public OSS repository hardening or invoke the skill directly, then provi
 Ruleset dry-run:
 
 ```bash
-python3 scripts/apply-default-branch-ruleset.py --repo OWNER/REPO
+python3 scripts/apply-default-branch-ruleset.py --repo OWNER/REPO \
+  --payload-out /PRIVATE/DIR/ruleset.json \
+  --context-out /PRIVATE/DIR/context.private.json
 ```
 
 Key Actions baseline:
@@ -49,3 +51,7 @@ Advanced Security UI baseline:
 - Use a valid `.github/dependabot.yml`; do not keep the empty `package-ecosystem: ""` starter template.
 - Start CodeQL with Default setup and Default query suite.
 - Do not add CodeQL/code scanning to ruleset required gates until the first successful run is visible.
+
+For apply, pass the reviewed `--payload-in` and `--context-in` in the same executor
+with the existing confirmation flags. See the [credential context contract](references/gh-credential-context.md)
+for private evidence, drift checks and presence-only limitations.
