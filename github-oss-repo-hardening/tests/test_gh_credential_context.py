@@ -176,3 +176,28 @@ def test_windows_observer_initializes_actual_dry_apply(windows_observer, monkeyp
     assert len(calls) == 1 and 'POST' in calls[0]
     assert windows_observer['calls'] >= 3
     assert 'SECRET_MARKER' not in str(capsys.readouterr())
+
+
+@pytest.mark.parametrize('host,selector', [('github.com', 'GH_TOKEN'),
+    ('github.com', 'GITHUB_TOKEN'), ('git.example.test', 'GH_ENTERPRISE_TOKEN'),
+    ('git.example.test', 'GITHUB_ENTERPRISE_TOKEN')])
+def test_token_only_missing_config_root_is_explicit(host, selector):
+    result = snapshot(environ={selector: 'SECRET_MARKER'}, target_host=host)
+    assert result['credential_source'] == selector
+    assert result['config_source'] == 'unavailable'
+    assert result['config_dir'] is None and result['config_resolved'] is None
+    assert 'SECRET_MARKER' not in json.dumps(result)
+
+
+@pytest.mark.parametrize('env', [{}, {'GH_TOKEN': ''}, {'GH_ENTERPRISE_TOKEN': 'fixture'}])
+def test_missing_root_without_applicable_token_still_fails(env):
+    with pytest.raises(context.ContextError, match='^config_home_unknown$'):
+        snapshot(environ=env)
+
+
+@pytest.mark.parametrize('root_key', ['HOME', 'XDG_CONFIG_HOME', 'GH_CONFIG_DIR'])
+def test_token_only_root_appearing_is_context_drift(root_key):
+    previous = snapshot(environ={'GH_TOKEN': 'fixture'})
+    current = snapshot(environ={'GH_TOKEN': 'fixture', root_key: '/fixture/new'})
+    with pytest.raises(context.ContextError, match='context_drift'):
+        context.require_same_context(previous, current)

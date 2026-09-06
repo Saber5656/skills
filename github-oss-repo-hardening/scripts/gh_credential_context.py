@@ -42,14 +42,17 @@ def describe_context(*, environ: Mapping[str, str], surface: str,
     elif os.name == 'nt' and environ.get('AppData'):
         source, config = 'AppData', str(Path(environ['AppData']) / 'GitHub CLI')
     else:
-        if not environ.get('HOME'):
+        if environ.get('HOME'):
+            source, config = 'HOME', str(Path(environ['HOME']) / '.config/gh')
+        elif selected_source(target_host, environ) != 'stored':
+            source, config = 'unavailable', None
+        else:
             raise ContextError('config_home_unknown')
-        source, config = 'HOME', str(Path(environ['HOME']) / '.config/gh')
     return dict(schema_version=1, surface=surface, target_host=target_host.lower(),
                 effective_user=effective_user, executor_host=executor_host,
                 gh_path=str(Path(gh_path).resolve()), gh_version=gh_version,
-                config_source=source, config_dir=str(Path(config).absolute()),
-                config_resolved=str(Path(config).resolve()),
+                config_source=source, config_dir=str(Path(config).absolute()) if config is not None else None,
+                config_resolved=str(Path(config).resolve()) if config is not None else None,
                 gh_host=environ.get('GH_HOST', ''),
                 selectors={name: bool(environ.get(name)) for name in SELECTORS},
                 credential_source=selected_source(target_host, environ))

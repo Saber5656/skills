@@ -182,3 +182,34 @@ def test_malformed_context_root_is_bounded_failure(cli, root_value):
     assert 'context_drift' in result.stderr
     assert 'Traceback' not in result.stderr
     assert not (cli[1] / 'calls').exists()
+
+
+def test_token_only_without_home_initializes_dry_apply(cli):
+    cli[2]['HOME'] = ''
+    payload, binding = prepare(cli)
+    context = json.loads(binding.read_text())['context']
+    assert context['config_source'] == 'unavailable'
+    assert context['config_dir'] is None
+    result = apply(cli, payload, binding)
+    assert result.returncode == 0, result.stderr
+    assert 'SECRET_MARKER' not in result.stdout + result.stderr
+    assert 'POST' in (cli[1] / 'calls').read_text()
+
+
+def test_token_only_root_change_blocks_actual_apply(cli):
+    cli[2]['HOME'] = ''
+    payload, binding = prepare(cli)
+    result = apply(cli, payload, binding, changes={'HOME': str(cli[1])})
+    assert result.returncode == 2
+    assert 'context_drift' in result.stderr
+    assert not (cli[1] / 'calls').exists()
+
+
+def test_token_only_invalid_credential_no_fallback(cli):
+    run, root, env = cli
+    env['HOME'] = ''
+    result = run('--payload-out', str(root/'payload.json'), changes={'FAIL': '1'})
+    assert result.returncode == 2
+    assert 'authentication_failed' in result.stderr
+    assert 'SECRET_MARKER' not in result.stdout + result.stderr
+    assert len((root/'calls').read_text().splitlines()) == 1

@@ -38,6 +38,13 @@ GITHUB_ENTERPRISE_TOKEN. Empty selectors do not override a nonempty selector.
 A selected invalid credential is never bypassed by removing variables or trying
 stored auth. Config directory precedence is GH_CONFIG_DIR, XDG_CONFIG_HOME/gh,
 Windows AppData/GitHub CLI, then HOME/.config/gh.
+If none is configured and a host-applicable environment token is selected,
+`config_source` is `unavailable` and both config paths are null. This observation
+can continue without inventing a home directory or reading stored credentials.
+Stored-source observation with no config root still fails with
+`config_home_unknown`. If a config root appears later, context equality rejects
+the changed observation. Token presence is not authentication or permission
+proof; a failed selected credential is still rejected without fallback.
 Source: [GitHub CLI environment manual](https://cli.github.com/manual/gh_help_environment).
 
 ## Binding and limits
