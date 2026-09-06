@@ -48,6 +48,12 @@ MINIMUM_GITLEAKS_VERSION = (8, 19, 0)
 # catalog load is covered by the same bounded window.
 CONTEXT_RETRY_ATTEMPTS = 30
 CONTEXT_RETRY_DELAY_SECONDS = 1.0
+# A fresh interpreter is the fallback after the short in-process window. It
+# reopens the canonical files and reloads their validators, never a cached
+# context. At most four recovery workers follow the original attempt window.
+CONTEXT_RECOVERY_DELAYS_SECONDS = (30, 60, 120, 300)
+CONTEXT_RECOVERY_TIMEOUT_SECONDS = 120
+EXIT_TRANSIENT_CONTEXT = 75
 RETRYABLE_FILESYSTEM_ERRNOS = frozenset(
     errno_value
     for errno_value in (
@@ -549,19 +555,62 @@ def resolve_context_once(local_config: Path, workdir: Path) -> dict[str, str]:
 
 
 def resolve_context(local_config: Path, workdir: Path) -> dict[str, str]:
-    """Resolve context with bounded retries across every existing Vault read."""
-    return retry_read_only_context(
-        lambda: resolve_context_once(local_config, workdir)
-    )
+    """Use delayed, fresh read-only workers after transient short-window failure."""
+    try:
+        return retry_read_only_context(
+            lambda: resolve_context_once(local_config, workdir)
+        )
+    except (OSError, subprocess.CalledProcessError) as exc:
+        if not is_retryable_file_provider_error(exc):
+            raise
+
+    for attempt, delay in enumerate(CONTEXT_RECOVERY_DELAYS_SECONDS, start=1):
+        # Local diagnostics only; do not invoke notification or publication.
+        print(
+            f"runtime context recovery:attempt={attempt};delay_seconds={delay}",
+            file=sys.stderr,
+        )
+        time.sleep(delay)
+        try:
+            result = run_local_command(
+                [sys.executable, str(Path(__file__).resolve()), "--recovery-once",
+                 str(local_config.resolve()), str(workdir.resolve())],
+                capture_output=True,
+                text=True,
+                timeout=CONTEXT_RECOVERY_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired:
+            # Only entered after a positively classified transient file error.
+            # Each recovery worker has a deadline and no mutation privileges
+            # added by this wrapper. Never restart the daily runner itself.
+            continue
+        if result.returncode == EXIT_TRANSIENT_CONTEXT:
+            continue
+        if result.returncode != 0:
+            # A new permanent error must not be hidden by an earlier transient
+            # one. Avoid copying potentially private child stderr into errors.
+            raise ContextError("recovery worker rejected current context")
+        context = json.loads(result.stdout)
+        if not isinstance(context, dict) or not context or any(
+            not isinstance(key, str) or not isinstance(value, str) or not value
+            for key, value in context.items()
+        ):
+            raise ContextError("recovery worker returned malformed context")
+        return context
+    raise ContextError("runtime context recovery exhausted four fresh attempts")
 
 
 def main(argv: list[str]) -> int:
     """Resolve context and print JSON without exporting path variables."""
+    recovery_once = len(argv) == 4 and argv[1] == "--recovery-once"
+    if recovery_once:
+        argv = [argv[0], *argv[2:]]
     if len(argv) != 3:
         print("usage: resolve-runtime-context.py LOCAL_CONFIG WORKDIR", file=sys.stderr)
         return 64
     try:
-        context = resolve_context(Path(argv[1]), Path(argv[2]))
+        resolver = resolve_context_once if recovery_once else resolve_context
+        context = resolver(Path(argv[1]), Path(argv[2]))
     except (
         ContextError,
         OSError,
@@ -571,6 +620,9 @@ def main(argv: list[str]) -> int:
         subprocess.SubprocessError,
         KeyError,
     ) as exc:
+        if recovery_once and is_retryable_file_provider_error(exc):
+            print("runtime context recovery:transient_file_access", file=sys.stderr)
+            return EXIT_TRANSIENT_CONTEXT
         print(f"runtime context resolution failed:{exc}", file=sys.stderr)
         return 78
     print(json.dumps(context, ensure_ascii=False))
