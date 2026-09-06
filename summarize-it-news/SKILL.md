@@ -38,13 +38,63 @@ Python callback parserの自己閉じflagだけで、`select`、`template`、`no
 
 interactive manualでは`references/it-news-sources.json`を正本として同じ順序で確認する。helperを使える場合は使用し、使えない場合もRSS、公開ページ、site-scoped検索、公式代替URLをすべて試す。
 
-ログイン、cookie/session流用、paywall、robots、CAPTCHAを回避しない。`アクセス制約`として扱えるのは、これらの制約を実際に確認した場合だけとする。genericな401/403やtool failureは検索fallbackへ進む。
+ログイン、cookie/session流用、paywall、robots、CAPTCHAを回避しない。`アクセス制約`として扱えるのは、これらの制約を実際に確認した場合だけとする。genericな401/403やtool failureは検索fallbackへ進む。HTTP 429もstatus codeだけではアクセス制約と推定せず、bounded response bodyを構造解析し、ASCII decimal digitだけからなる有効な`Content-Length`がある場合はgzip展開前のtransport bytesとの完全一致を要求する。符号、区切り文字、Unicode数字、空白などを含む不正な`Content-Length`は長さ宣言なしとして扱い、既存のbyte capを保ったbounded readと構造検証を続ける。body開始前に一度だけ現れる`head`内のattribute-freeな単一document titleが、前後のHTML5 ASCII whitespaceとASCIIの大小文字差だけを許してexactな`Vercel Security Checkpoint`である、またはstrictにparseした既知captcha widgetのclass/id/semantic labelがあるなど、明示的なcaptcha/security challenge markupを確認できた場合だけ`captcha`として封印する。Unicode lookalikeはexact titleとして受理しない。429本文にlogin/paywallの語句やmarkupだけがある場合はアクセス制約へ昇格せず、`http_429`を維持する。`script`、`style`、`template`、`noscript`、`select`とSVG/MathML foreign-contentはopaque containerとしてmatching stackで追跡し、その内部のmarkerを証拠にしない。SVG/MathMLのlocal `title`をHTML document titleとして数えない。actual `frameset` tokenを含むchallenge documentはdocument-wide fail closedにし、frameset insertion modeで無視されるiframe風callbackをwidget evidenceとして扱わない。trust boundaryのend tagはraw tokenがexact nameとHTML5 ASCII whitespaceだけであることを再検証する。mismatched/malformed closer、body開始後のhead、duplicate/attributed/body titleをchallenge evidenceとして受理せず、invalidなtitle/head構造は同居するwidget evidenceもpoisonする。comment、script、通常本文、無関係attributeの語句をraw全文検索してevidenceにしない。bodyを安全に読めない場合や、有効な宣言transport lengthと実測値が一致しない場合を含むgenericな429は従来どおり`http_429`でfail closedする。
+
+不正な`Content-Length`を宣言なしとして扱う場合、CPythonが符号付き表記などを`int()`で実`HTTPResponse.length`へ変換済みでも、その内部cacheをbounded read前にneutralizeする。正規checkpoint prefixの後方にあるpoisoning markupまでEOFまたはhard cap内で必ず検査し、内部lengthによるsilent clippingをchallenge evidenceに使わない。
+
+`Content-Length` fieldが複数存在するresponseは、値が同一に見える場合を含めtransport framingが曖昧なためbody read前に拒否する。最初のfieldだけを使うCPython内部lengthや、後続fieldを無視したprefix一致をchallenge evidenceに使わない。
+
+ASCII decimalだけで構成された`Content-Length`も20桁を超える場合は整数変換前に拒否し、変換不能なdecimal値を長さ宣言なしへ降格しない。
+
+Challenge parserのopaque nestingは128段で上限化し、超過時は既出のwidgetを含むchallenge evidence全体を無効化する。
+
+CAPTCHA widget候補の`class`、`id`、`aria-label`、`title`は各4096文字以下の場合だけ解析し、超過した候補はfail closedにする。class/id tokenはboundedなincremental scanで既知ASCII tokenとの一致だけを確認し、空白数に比例するtoken listやsetを作らない。
+
+CAPTCHA widgetの`aria-label`と`title`は独立したsemantic labelとして評価し、一方が無関係な非空文字列でも、もう一方がexactなASCII `Captcha Challenge`ならwidget evidenceとして受理する。
+
+Challenge parserへ渡すraw start tagは16 KiBで上限化し、超過tokenをPython `HTMLParser`のattribute parserへ渡す前にdocument-wide fail closedにする。短い属性を大量に並べた最大bodyからcallback attribute listを生成してworkerごとのmemoryを増幅させない。
+
+Challenge parserの`script` raw-textで`<!--`後、対応する`-->`より前にdelimiter付き`<script`が現れた場合、Python `HTMLParser`の最初の`</script>` callbackをHTML5 double-escaped stateの安全なcloseとして扱わず、document-wide fail closedにする。double-escaped script内のwidget風markupをCAPTCHA evidenceとして露出させない。
+
+上記double-escape検査は各`<!--`から最初の対応`-->`までの区間だけを探索し、閉じたescape segmentごとに残りのbody全体を再走査しない。bounded body内に多数の短いcomment segmentと末尾の`<script`がある場合も、総探索量を入力長に対してlinearに保つ。
+
+Challenge parserがhead内でraw tokenとしてexactな`</br>`または`</html>`を受けた場合はHTML body transitionとしてheadを単調終了し、後続titleをdocument titleとして採用しない。Python callbackだけが認識した属性風suffix等を含むmalformed end tagはdocumentをfail closedにする。
+
+Document headが開始済みでbody start tagだけが省略された場合、最初のexactな`</body>`はimplicit empty bodyを開始して直ちに閉じるtokenとして扱う。open/closed headから安全に遷移するが、重複body closerとmalformed closerはchallenge evidenceをfail closedにする。
+
+`iframe`、`noembed`、`noframes`、`plaintext`、`script`、`style`、`textarea`、`xmp`のself-closing syntaxはnon-void要素を閉じたとは扱わず、実際のmatching end tagまで後続markupをopaqueとして抑止する。`plaintext`はend tagで閉じない。
+
+SVG/MathML rootのself-closing syntaxはforeign-content elementの完了として扱い、後続のbody challenge evidenceを無効化しない。foreign root自身の属性はwidget evidenceとして扱わない。
+
+Challenge documentではHTML form pointerを追跡し、formがopenの間に現れるnested form start tokenの属性をwidget evidenceとして扱わない。無視されたnested startに続くexactな`</form>`は現在openのouter formを閉じ、その後のformは独立要素として検証する。self-closing formのslashはpointerを閉じず、active formを閉じるend tagはexactなHTML5-safe tokenだけを許す。
+
+入力がoptional head内の完了済みtitle/metadata直後に終了した場合は、未閉鎖titleまたはopaque containerがなく構造がvalidなときだけEOFでheadを暗黙終了する。未閉鎖title/raw-textからcheckpoint evidenceを完成させない。
 
 RFC 2822 / ISO 8601 timestampはJSTへ正規化してから暦日を比較する。`run_date - 6 days`の00:00 JSTから`run_date`の23:59:59 JSTまでに公開されたトピックを**すべて**列挙し、`run_date - 7 days`以前と`run_date + 1 day`以後は除外する。この段階では取捨選択・統合・要約を一切行わない。
 各トピックについて以下を内部的に記録:
 - タイトル / 要旨（2〜3文） / 出典（媒体名・URL・公開日） / カテゴリタグ
 
 article card、legacy `p.title`/`p.date`、承認済みinline publisher JavaScript、exact `__NEXT_DATA__`は同一HTML parserのtrust boundaryを共有する。comment、raw/RCDATA、`noscript`、`template`、SVG/MathML、`select`内からはどのchannelも候補化せず、actual `frameset` tokenを含むdocumentは全article channelをdocument-wide fail closedにする。外側に一覧全体の`article`があるlegacy publisherでは、同じtop-level `li`内のtitleとdateだけを結合し、別list itemへ未完了recordを持ち越さない。
+
+HTTP 429のchallenge evidenceは、`read_bounded`の8 MiB hard cap内にあるresponse body全体を構造解析し、旧1 MiB境界より後ろにあるduplicate titleやmalformed boundaryなどのpoisoning structureも確認する。prefixだけを解析してcaptchaへ昇格しない。
+
+CAPTCHA widgetのclass/id tokenとsemantic labelはASCII文字だけをASCIIの大小文字差で比較する。Unicode `casefold`で既知のASCII identifierに変換されるlookalikeはchallenge evidenceとして受理しない。
+
+HTTP 429で構造的に再検証した`captcha` evidenceは、page内のextractable link数に左右されずaccess constraintとして封印する。link数heuristicで通常contentへ戻したり、verified gateを未解決へ戻したりしない。
+
+Direct collectionでHTTP 429の`captcha` evidenceを構造的に再検証した後は、通常記事向けのlink、JSON-LD、publication-date extractionへbodyを渡さず、直ちにaccess-constraint recordへ変換する。newline-heavyな最大bodyを複数の高メモリparserへ重複投入しない。
+
+Fallback resolution verifierでも同じverified HTTP 429 fast pathを適用する。requested constraintが`captcha`と一致する場合はlink-count heuristicと全article/date extractorを迂回して`verified_access_constraint`へ封印し、通常fallback methodならextract前にaccess constrainedとして拒否する。
+
+Challenge parserはbody開始前のinitial head-compatible `title`、metadata、opaque tokenからoptionalなhead開始を推論する。explicitな`body` tagだけでなく、head外のbody-content start/self-closing tagおよびnon-whitespace textからimplicit body開始を単調追跡する。ただし、closed headと単一explicit bodyの間にある`script`、`style`、`template`およびsupported `HEAD_METADATA_TAGS`はHTML after-headのhead-compatible tokenとしてbody開始にせず、opaque内部やmetadata属性内のmarkerを証拠にしない。implicit body開始後の`head`は拒否し、optional body tagが省略されたdocument内のstrictなwidgetはbody evidenceとして検証する。
+
+`noframes`はexplicit/implied head内およびclosed headとbodyの間でhead-compatibleなopaque raw-textとして扱う。要素自身でimplicit bodyを開始せず、内部markerを無視し、matching end tag後の正規titleまたはbody widgetを検証する。
+
+UTF-8 decode後のdocument先頭にある単一U+FEFFだけはencoding BOMとしてchallenge parserへ渡す前に除去する。先頭以外のU+FEFFは通常のnon-whitespace dataとしてbody開始を維持する。
+
+Raw end-tag検証のためにnewlineごとのoffset配列を作らない。HTML parserが現在処理中のbounded raw end-tag indexだけをcallback中に保持し、response body以外の追加raw-token stateをnewline数に対してO(1)に保つ。
+
+最大8 MiBのfull decoded bodyはstructural CAPTCHA parserだけに渡す。既存のraw login/paywall regexは従来どおり先頭1 MiBのbyte prefixをdecodeした範囲に限定し、後半のprose/script fixtureでlegacy access constraint判定を拡張しない。
 
 ### Step 2 — 分析・統合・要約
 

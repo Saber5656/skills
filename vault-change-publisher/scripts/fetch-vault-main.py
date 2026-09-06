@@ -32,9 +32,13 @@ def clean_environment() -> dict[str, str]:
     environment["GIT_NO_LAZY_FETCH"] = "1"
     environment["GIT_NO_REPLACE_OBJECTS"] = "1"
     environment["GIT_OPTIONAL_LOCKS"] = "0"
-    environment["GIT_CONFIG_COUNT"] = "1"
+    environment["GIT_CONFIG_COUNT"] = "3"
     environment["GIT_CONFIG_KEY_0"] = "core.fsmonitor"
     environment["GIT_CONFIG_VALUE_0"] = "false"
+    environment["GIT_CONFIG_KEY_1"] = "core.trustctime"
+    environment["GIT_CONFIG_VALUE_1"] = "false"
+    environment["GIT_CONFIG_KEY_2"] = "core.checkStat"
+    environment["GIT_CONFIG_VALUE_2"] = "minimal"
     return environment
 
 
@@ -85,6 +89,10 @@ def fetch_main(repo: str, git_dir: str, remote_url: str) -> None:
         f"core.hooksPath={os.devnull}",
         "-c",
         "core.fsmonitor=false",
+        "-c",
+        "core.trustctime=false",
+        "-c",
+        "core.checkStat=minimal",
     ]
     existing = run_local_command(
         [*local_command, "rev-parse", "--verify", "refs/remotes/origin/main"],

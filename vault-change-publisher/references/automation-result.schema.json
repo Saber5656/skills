@@ -23,6 +23,7 @@
       "type": ["string", "null"], "pattern": "^[0-9a-f]{40}$"
     },
     "evidence_recovery": {"$ref": "#/$defs/evidenceRecovery"},
+    "evidence_review": {"$ref": "#/$defs/evidenceReview"},
     "next_action": {"type": ["string", "null"]}
   },
   "allOf": [
@@ -136,6 +137,29 @@
         "rollback_candidate_tombstone": {"$ref": "#/$defs/artifactTombstone"},
         "head_updated": {"type": "boolean"},
         "index_updated": {"type": "boolean"}
+      }
+    },
+    "evidenceReview": {
+      "type": "object", "additionalProperties": false,
+      "required": [
+        "process_status", "status", "reason_code", "result_present",
+        "stderr_sha256", "result_sha256"
+      ],
+      "properties": {
+        "process_status": {"type": "integer"},
+        "status": {"type": "integer"},
+        "reason_code": {
+          "enum": [
+            "approved", "input_preparation_failed", "input_too_large",
+            "process_failed", "result_missing", "canonical_validation_failed",
+            "result_rejected", "legacy_failure"
+          ]
+        },
+        "result_present": {"type": "boolean"},
+        "stderr_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "result_sha256": {
+          "type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"
+        }
       }
     },
     "modeMap": {

@@ -2415,9 +2415,129 @@ class PublicSourceCollectorTests(unittest.TestCase):
 
     def test_ignores_malformed_content_length_and_reads_bounded_body(self) -> None:
         """Do not let a malformed upstream header abort fallback verification."""
+        for declared in ("not-a-number", "-1", "+7", "1_0", "７", " 7"):
+            with self.subTest(declared=declared):
+                response = FakeResponse(
+                    b"bounded", "text/plain", "https://example.test"
+                )
+                response.headers = FakeHeaders(
+                    "text/plain", content_length=declared
+                )
+                self.assertEqual(MODULE.read_bounded(response), b"bounded")
+
         response = FakeResponse(b"bounded", "text/plain", "https://example.test")
-        response.headers = FakeHeaders("text/plain", content_length="not-a-number")
+        response.headers = FakeHeaders("text/plain", content_length="0007")
         self.assertEqual(MODULE.read_bounded(response), b"bounded")
+
+    def test_malformed_content_length_cannot_clip_http_error_body(self) -> None:
+        """Undo CPython's permissive parsed length before bounded inspection."""
+
+        class ResponseSocket:
+            def __init__(self, payload: bytes) -> None:
+                self.payload = io.BytesIO(payload)
+
+            def makefile(self, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+                return self.payload
+
+        prefix = b"<title>Vercel Security Checkpoint</title>"
+        poison = b"<title>Duplicate title</title>"
+        raw_response = MODULE.http.client.HTTPResponse(
+            ResponseSocket(
+                b"HTTP/1.1 429 Too Many Requests\r\n"
+                b"Content-Type: text/html\r\n"
+                b"Content-Length: +41\r\n\r\n"
+                + prefix
+                + poison
+            )
+        )
+        raw_response.begin()
+        self.assertEqual(raw_response.length, len(prefix))
+        error = MODULE.urllib.error.HTTPError(
+            "https://example.test/checkpoint",
+            429,
+            "Too Many Requests",
+            raw_response.headers,
+            raw_response,
+        )
+
+        with error:
+            content = MODULE.read_bounded(error)
+
+        self.assertEqual(content, prefix + poison)
+        self.assertIsNone(MODULE.detect_access_constraint(content))
+
+    def test_duplicate_content_length_fields_are_rejected_before_read(self) -> None:
+        """Never trust the first of multiple conflicting transport lengths."""
+
+        class ResponseSocket:
+            def __init__(self, payload: bytes) -> None:
+                self.payload = io.BytesIO(payload)
+
+            def makefile(self, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+                return self.payload
+
+        prefix = b"<title>Vercel Security Checkpoint</title>"
+        poison = b"<title>Duplicate title</title>"
+        raw_response = MODULE.http.client.HTTPResponse(
+            ResponseSocket(
+                b"HTTP/1.1 429 Too Many Requests\r\n"
+                b"Content-Type: text/html\r\n"
+                b"Content-Length: 41\r\n"
+                + f"Content-Length: {len(prefix) + len(poison)}\r\n\r\n".encode()
+                + prefix
+                + poison
+            )
+        )
+        raw_response.begin()
+        self.assertEqual(raw_response.length, len(prefix))
+        self.assertEqual(raw_response.headers.get_all("Content-Length"), [
+            "41",
+            str(len(prefix) + len(poison)),
+        ])
+        error = MODULE.urllib.error.HTTPError(
+            "https://example.test/checkpoint",
+            429,
+            "Too Many Requests",
+            raw_response.headers,
+            raw_response,
+        )
+
+        with error, self.assertRaisesRegex(
+            MODULE.CollectionError,
+            "^response has duplicate Content-Length fields$",
+        ):
+            MODULE.read_bounded(error)
+
+    def test_rejects_decimal_content_length_beyond_conversion_bound(self) -> None:
+        """Reject an oversized decimal field instead of treating it as absent."""
+        response = FakeResponse(
+            b"<title>Vercel Security Checkpoint</title>",
+            "text/html",
+            "https://example.test/checkpoint",
+        )
+        response.headers = FakeHeaders(
+            "text/html",
+            content_length="0" * 4_301,
+        )
+
+        with self.assertRaisesRegex(
+            MODULE.CollectionError,
+            "^response Content-Length field is too long$",
+        ):
+            MODULE.read_bounded(response)
+
+    def test_rejects_body_that_does_not_match_valid_content_length(self) -> None:
+        """Do not parse a transport-truncated body as complete evidence."""
+        body = b"bounded"
+        response = FakeResponse(body, "text/plain", "https://example.test")
+        response.headers = FakeHeaders(
+            "text/plain", content_length=str(len(body) + 1)
+        )
+        with self.assertRaisesRegex(
+            MODULE.CollectionError,
+            "^response length does not match Content-Length$",
+        ):
+            MODULE.read_bounded(response)
 
     def test_reads_explicit_gate_body_from_http_error(self) -> None:
         """Recognize bounded login markup returned with an HTTP gate status."""
@@ -2440,6 +2560,893 @@ class PublicSourceCollectorTests(unittest.TestCase):
             fetched = MODULE.fetch_url(source["page_url"], MODULE.source_hosts(source))
         self.assertEqual(fetched["http_status"], 403)
         self.assertEqual(MODULE.detect_access_constraint(fetched["content"]), "login")
+
+    def test_reads_vercel_security_checkpoint_from_http_429(self) -> None:
+        """Treat an explicit Vercel challenge as a gate, not a generic rate limit."""
+        source = MODULE.load_catalog(CATALOG)[0]
+        body = (
+            b"<!doctype html><html><head>"
+            b"<title>Vercel Security Checkpoint</title>"
+            b"</head><body><main>Security verification</main></body></html>"
+        )
+        error = MODULE.urllib.error.HTTPError(
+            source["page_url"],
+            429,
+            "Too Many Requests",
+            FakeHeaders("text/html", content_length=str(len(body))),
+            io.BytesIO(body),
+        )
+        opener = mock.Mock()
+        opener.open.side_effect = error
+        with mock.patch.object(
+            MODULE,
+            "robots_policy",
+            return_value={"allowed": True, "robots_url": "https://example/robots.txt", "robots_sha256": None},
+        ), mock.patch.object(MODULE.urllib.request, "build_opener", return_value=opener):
+            fetched = MODULE.fetch_url(source["page_url"], MODULE.source_hosts(source))
+        self.assertEqual(fetched["http_status"], 429)
+        self.assertEqual(MODULE.detect_access_constraint(fetched["content"]), "captcha")
+
+    def test_malformed_length_does_not_hide_valid_checkpoint_evidence(self) -> None:
+        """Keep bounded structural inspection when no valid length is declared."""
+        source = MODULE.load_catalog(CATALOG)[0]
+        body = (
+            b"<!doctype html><html><head><title>\t Vercel Security Checkpoint\n"
+            b"</title></head><body></body></html>"
+        )
+        error = MODULE.urllib.error.HTTPError(
+            source["page_url"],
+            429,
+            "Too Many Requests",
+            FakeHeaders("text/html", content_length="not-a-number"),
+            io.BytesIO(body),
+        )
+        opener = mock.Mock()
+        opener.open.side_effect = error
+        with mock.patch.object(
+            MODULE,
+            "robots_policy",
+            return_value={
+                "allowed": True,
+                "robots_url": "https://example/robots.txt",
+                "robots_sha256": None,
+            },
+        ), mock.patch.object(
+            MODULE.urllib.request, "build_opener", return_value=opener
+        ):
+            fetched = MODULE.fetch_url(
+                source["page_url"], MODULE.source_hosts(source)
+            )
+        self.assertEqual(fetched["http_status"], 429)
+        self.assertEqual(MODULE.detect_access_constraint(fetched["content"]), "captcha")
+
+    def test_generic_http_429_remains_fail_closed(self) -> None:
+        """Do not infer a CAPTCHA or login gate from status 429 alone."""
+        source = MODULE.load_catalog(CATALOG)[0]
+        body = b"<html><head><title>Too Many Requests</title></head></html>"
+        error = MODULE.urllib.error.HTTPError(
+            source["page_url"],
+            429,
+            "Too Many Requests",
+            FakeHeaders("text/html", content_length=str(len(body))),
+            io.BytesIO(body),
+        )
+        opener = mock.Mock()
+        opener.open.side_effect = error
+        with mock.patch.object(
+            MODULE,
+            "robots_policy",
+            return_value={"allowed": True, "robots_url": "https://example/robots.txt", "robots_sha256": None},
+        ), mock.patch.object(MODULE.urllib.request, "build_opener", return_value=opener):
+            with self.assertRaisesRegex(MODULE.CollectionError, "^http_429$"):
+                MODULE.fetch_url(source["page_url"], MODULE.source_hosts(source))
+
+    def test_http_429_accepts_only_captcha_constraint_evidence(self) -> None:
+        """Do not seal login/paywall text from a rate-limit response as a gate."""
+        source = MODULE.load_catalog(CATALOG)[0]
+        bodies = (
+            b'<html><body><input type="password">Sign in</body></html>',
+            b"<html><body><p>Subscription required</p></body></html>",
+        )
+        for body in bodies:
+            with self.subTest(body=body):
+                error = MODULE.urllib.error.HTTPError(
+                    source["page_url"],
+                    429,
+                    "Too Many Requests",
+                    FakeHeaders("text/html", content_length=str(len(body))),
+                    io.BytesIO(body),
+                )
+                opener = mock.Mock()
+                opener.open.side_effect = error
+                with mock.patch.object(
+                    MODULE,
+                    "robots_policy",
+                    return_value={
+                        "allowed": True,
+                        "robots_url": "https://example/robots.txt",
+                        "robots_sha256": None,
+                    },
+                ), mock.patch.object(
+                    MODULE.urllib.request, "build_opener", return_value=opener
+                ):
+                    with self.assertRaisesRegex(MODULE.CollectionError, "^http_429$"):
+                        MODULE.fetch_url(
+                            source["page_url"], MODULE.source_hosts(source)
+                        )
+
+    def test_unreadable_http_429_body_remains_fail_closed(self) -> None:
+        """Normalize bounded-body read failures back to the original 429 error."""
+        source = MODULE.load_catalog(CATALOG)[0]
+        error = MODULE.urllib.error.HTTPError(
+            source["page_url"],
+            429,
+            "Too Many Requests",
+            FakeHeaders("text/html"),
+            io.BytesIO(b"unreadable"),
+        )
+        opener = mock.Mock()
+        opener.open.side_effect = error
+        with mock.patch.object(
+            MODULE,
+            "robots_policy",
+            return_value={"allowed": True, "robots_url": "https://example/robots.txt", "robots_sha256": None},
+        ), mock.patch.object(
+            MODULE.urllib.request, "build_opener", return_value=opener
+        ), mock.patch.object(
+            MODULE, "read_bounded", side_effect=OSError("body unavailable")
+        ):
+            with self.assertRaisesRegex(MODULE.CollectionError, "^http_429$"):
+                MODULE.fetch_url(source["page_url"], MODULE.source_hosts(source))
+
+    def test_incomplete_http_429_body_remains_fail_closed(self) -> None:
+        """Normalize a truncated HTTP error body back to the original 429 error."""
+        source = MODULE.load_catalog(CATALOG)[0]
+        error = MODULE.urllib.error.HTTPError(
+            source["page_url"],
+            429,
+            "Too Many Requests",
+            FakeHeaders("text/html"),
+            io.BytesIO(b"partial"),
+        )
+        opener = mock.Mock()
+        opener.open.side_effect = error
+        with mock.patch.object(
+            MODULE,
+            "robots_policy",
+            return_value={"allowed": True, "robots_url": "https://example/robots.txt", "robots_sha256": None},
+        ), mock.patch.object(
+            MODULE.urllib.request, "build_opener", return_value=opener
+        ), mock.patch.object(
+            MODULE,
+            "read_bounded",
+            side_effect=MODULE.http.client.IncompleteRead(b"partial"),
+        ):
+            with self.assertRaisesRegex(MODULE.CollectionError, "^http_429$"):
+                MODULE.fetch_url(source["page_url"], MODULE.source_hosts(source))
+
+    def test_declared_truncated_http_429_checkpoint_remains_fail_closed(self) -> None:
+        """Reject a complete-looking checkpoint when transport bytes are missing."""
+        source = MODULE.load_catalog(CATALOG)[0]
+        body = (
+            b"<html><head><title>Vercel Security Checkpoint</title>"
+            b"</head><body></body></html>"
+        )
+        error = MODULE.urllib.error.HTTPError(
+            source["page_url"],
+            429,
+            "Too Many Requests",
+            FakeHeaders("text/html", content_length=str(len(body) + 64)),
+            io.BytesIO(body),
+        )
+        opener = mock.Mock()
+        opener.open.side_effect = error
+        with mock.patch.object(
+            MODULE,
+            "robots_policy",
+            return_value={
+                "allowed": True,
+                "robots_url": "https://example/robots.txt",
+                "robots_sha256": None,
+            },
+        ), mock.patch.object(
+            MODULE.urllib.request, "build_opener", return_value=opener
+        ):
+            with self.assertRaisesRegex(MODULE.CollectionError, "^http_429$"):
+                MODULE.fetch_url(source["page_url"], MODULE.source_hosts(source))
+
+    def test_vercel_checkpoint_prose_mention_is_not_a_gate(self) -> None:
+        """Require explicit checkpoint markup instead of a prose phrase match."""
+        body = (
+            b"<html><head><title>Cloud security news</title></head>"
+            b"<body><article>Vercel Security Checkpoint behavior changed.</article></body></html>"
+        )
+        self.assertIsNone(MODULE.detect_access_constraint(body))
+
+    def test_vercel_checkpoint_title_in_comment_is_not_a_gate(self) -> None:
+        """Do not recognize title-looking bytes inside an HTML comment."""
+        body = (
+            b"<html><head><!-- <title>Vercel Security Checkpoint</title> -->"
+            b"<title>Ordinary article</title></head><body></body></html>"
+        )
+        self.assertIsNone(MODULE.detect_access_constraint(body))
+
+    def test_vercel_checkpoint_title_in_script_is_not_a_gate(self) -> None:
+        """Do not recognize title-looking text inside a script raw-text element."""
+        body = (
+            b"<html><head><script>"
+            b"const sample = '<title>Vercel Security Checkpoint</title>';"
+            b"</script><title>Ordinary article</title></head><body></body></html>"
+        )
+        self.assertIsNone(MODULE.detect_access_constraint(body))
+
+    def test_challenge_script_double_escape_does_not_expose_widget(self) -> None:
+        """Reject a script end callback that HTML5 keeps double escaped."""
+        double_escaped = (
+            b"<html><head><title>Rate limited</title></head><body>"
+            b"<script><!--<script></script>"
+            b"<div class='g-recaptcha'></div></body></html>"
+        )
+        parsed = MODULE.parse_access_constraint_markup(double_escaped.decode())
+        self.assertIsNotNone(parsed)
+        self.assertTrue(parsed.structure_invalid)
+        self.assertTrue(parsed.captcha_widget)
+        self.assertFalse(parsed.has_captcha_evidence)
+        self.assertIsNone(MODULE.detect_access_constraint(double_escaped))
+
+        escaped_then_closed = (
+            b"<html><head><title>Rate limited</title></head><body>"
+            b"<script><!-- fixture --></script>"
+            b"<div class='g-recaptcha'></div></body></html>"
+        )
+        self.assertEqual(
+            MODULE.detect_access_constraint(escaped_then_closed),
+            "captcha",
+        )
+
+    def test_challenge_script_double_escape_search_is_segment_bounded(self) -> None:
+        """Do not rescan the remaining body for every closed escape segment."""
+        pattern = MODULE.SCRIPT_DOUBLE_ESCAPE_START
+
+        class SearchRecorder:
+            def __init__(self) -> None:
+                self.ranges: list[tuple[int, int]] = []
+
+            def search(
+                self,
+                data: str,
+                start: int,
+                end: int,
+            ) -> object:
+                self.ranges.append((start, end))
+                return pattern.search(data, start, end)
+
+        recorder = SearchRecorder()
+        data = "<!-- -->" * 4096 + "<script>"
+        with mock.patch.object(MODULE, "SCRIPT_DOUBLE_ESCAPE_START", recorder):
+            self.assertFalse(MODULE.script_data_enters_double_escaped_state(data))
+
+        self.assertEqual(len(recorder.ranges), 4096)
+        self.assertLessEqual(
+            sum(end - start for start, end in recorder.ranges),
+            len(data),
+        )
+
+    def test_vercel_checkpoint_requires_plain_document_title_in_head(self) -> None:
+        """Reject title attributes, body placement, and template-contained markup."""
+        bodies = (
+            b"<html><head><title data-test='fixture'>Vercel Security Checkpoint</title></head></html>",
+            b"<html><head></head><body><title>Vercel Security Checkpoint</title></body></html>",
+            b"<html><head><template><title>Vercel Security Checkpoint</title></template></head></html>",
+            b"<html><head><title>Vercel Security Checkpoint</title></head><body/></html>",
+        )
+        for body in bodies:
+            with self.subTest(body=body):
+                self.assertIsNone(MODULE.detect_access_constraint(body))
+
+    def test_vercel_checkpoint_rejects_head_started_after_body(self) -> None:
+        """Do not let a late malformed head re-enable document-title capture."""
+        bodies = (
+            b"<html><body><head><title>Vercel Security Checkpoint</title></head></body></html>",
+            b"<html><head><title>Ordinary article</title></head><body></body>"
+            b"<head><title>Vercel Security Checkpoint</title></head></html>",
+        )
+        for body in bodies:
+            with self.subTest(body=body):
+                self.assertIsNone(MODULE.detect_access_constraint(body))
+
+    def test_vercel_checkpoint_rejects_mismatched_opaque_closers(self) -> None:
+        """Keep an opaque container active until its own matching end tag."""
+        bodies = (
+            b"<html><head><template></noscript>"
+            b"<title>Vercel Security Checkpoint</title></template></head></html>",
+            b"<html><head><noscript></template>"
+            b"<title>Vercel Security Checkpoint</title></noscript></head></html>",
+        )
+        for body in bodies:
+            with self.subTest(body=body):
+                self.assertIsNone(MODULE.detect_access_constraint(body))
+
+    def test_access_constraint_requires_exact_trust_boundary_end_tags(self) -> None:
+        """Reject Python callbacks synthesized from malformed closing tokens."""
+        bodies = (
+            b"<html><head><template></template fixture>"
+            b"<title>Vercel Security Checkpoint</title></head></html>",
+            b"<html><head><title>Vercel Security Checkpoint</title foo>"
+            b"</head></html>",
+            b"<html><head><title>Vercel Security Checkpoint</title>"
+            b"</head fixture><body></body></html>",
+            b"<html><head><title>Rate limited</title></head><body>"
+            b"<div class='g-recaptcha'></div></body fixture></html>",
+        )
+        for body in bodies:
+            with self.subTest(body=body):
+                self.assertIsNone(MODULE.detect_access_constraint(body))
+
+    def test_vercel_checkpoint_requires_one_document_title(self) -> None:
+        """Reject duplicate titles regardless of which one names the checkpoint."""
+        bodies = (
+            b"<html><head><title>Ordinary article</title>"
+            b"<title>Vercel Security Checkpoint</title></head></html>",
+            b"<html><head><title>Vercel Security Checkpoint</title>"
+            b"<title>Ordinary article</title></head></html>",
+            b"<html><head><title>Vercel Security Checkpoint</title>"
+            b"<title>Vercel Security Checkpoint</title></head></html>",
+        )
+        for body in bodies:
+            with self.subTest(body=body):
+                self.assertIsNone(MODULE.detect_access_constraint(body))
+
+    def test_vercel_checkpoint_title_uses_ascii_only_case_folding(self) -> None:
+        """Reject Unicode lookalikes while accepting ordinary ASCII case."""
+        lookalike = (
+            "<html><head><title>Vercel Security Chec\u212apoint</title>"
+            "</head><body></body></html>"
+        ).encode()
+        self.assertIsNone(MODULE.detect_access_constraint(lookalike))
+        ascii_case = (
+            b"<html><head><title>vErCeL sEcUrItY cHeCkPoInT</title>"
+            b"</head><body></body></html>"
+        )
+        self.assertEqual(MODULE.detect_access_constraint(ascii_case), "captcha")
+        ascii_whitespace = (
+            b"<html><head><title>\t Vercel Security Checkpoint\r\n </title>"
+            b"</head><body></body></html>"
+        )
+        self.assertEqual(
+            MODULE.detect_access_constraint(ascii_whitespace), "captcha"
+        )
+
+    def test_generic_captcha_markers_require_structural_widget_markup(self) -> None:
+        """Ignore marker strings in comments, scripts, prose, and unrelated attrs."""
+        bodies = (
+            b"<html><head><title>Rate limited</title><!-- g-recaptcha hcaptcha "
+            b"cf-turnstile captcha challenge --></head><body></body></html>",
+            b"<html><head><title>Rate limited</title><script>"
+            b"const fixture = 'g-recaptcha hcaptcha cf-turnstile captcha challenge';"
+            b"</script></head><body></body></html>",
+            b"<html><head><title>Rate limited</title></head><body><p>"
+            b"g-recaptcha hcaptcha cf-turnstile captcha challenge"
+            b"</p></body></html>",
+            b"<html><head><title>Rate limited</title></head><body>"
+            b"<div data-fixture='hcaptcha'>ordinary content</div></body></html>",
+            b"<html><head><title>Rate limited</title></head><body>"
+            b"<div class='g-recaptcha'/></body></html>",
+            b"<html><head><title>Rate limited</title></head><body>"
+            b"<div class='ordinary' class='h-captcha'></div></body></html>",
+            b"<html><head><title>Rate limited</title></head><body><template>"
+            b"<div class='cf-turnstile'></div></template></body></html>",
+            b"<html><head><title>Rate limited</title></head><body><select>"
+            b"<div class='g-recaptcha'></div></select></body></html>",
+            b"<html><head><title>Rate limited</title></head><body><select>"
+            b"<div class='g-recaptcha'></div></select fixture></body></html>",
+            b"<html><head><title>Rate limited</title></head><body></body>"
+            b"<div class='g-recaptcha'></div></html>",
+        )
+        for body in bodies:
+            with self.subTest(body=body):
+                self.assertIsNone(MODULE.detect_access_constraint(body))
+
+        widgets = (
+            b"<div class='g-recaptcha'></div>",
+            b"<div class='h-captcha'></div>",
+            b"<section id='cf-turnstile'></section>",
+            b"<iframe aria-label='Captcha Challenge'></iframe>",
+        )
+        for widget in widgets:
+            with self.subTest(widget=widget):
+                body = (
+                    b"<html><head><title>Rate limited</title></head><body>"
+                    + widget
+                    + b"</body></html>"
+                )
+                self.assertEqual(MODULE.detect_access_constraint(body), "captcha")
+
+    def test_captcha_widget_tokens_use_ascii_only_case_folding(self) -> None:
+        """Reject Unicode lookalikes while accepting ordinary ASCII token case."""
+        lookalike = (
+            "<html><head><title>Rate limited</title></head><body>"
+            "<section id='cf-turn\u017ftile'></section></body></html>"
+        ).encode()
+        self.assertIsNone(MODULE.detect_access_constraint(lookalike))
+        ascii_case = (
+            b"<html><head><title>Rate limited</title></head><body>"
+            b"<section id='CF-TURNSTILE'></section></body></html>"
+        )
+        self.assertEqual(MODULE.detect_access_constraint(ascii_case), "captcha")
+
+    def test_captcha_widget_checks_both_semantic_label_attributes(self) -> None:
+        """Accept either supported label even when the other is unrelated."""
+        widgets = (
+            b"<iframe aria-label='security widget' "
+            b"title='Captcha Challenge'></iframe>",
+            b"<iframe aria-label='Captcha Challenge' "
+            b"title='security widget'></iframe>",
+        )
+        for widget in widgets:
+            with self.subTest(widget=widget):
+                body = (
+                    b"<html><head><title>Rate limited</title></head><body>"
+                    + widget
+                    + b"</body></html>"
+                )
+                self.assertEqual(
+                    MODULE.detect_access_constraint(body),
+                    "captcha",
+                )
+
+    def test_captcha_widget_attribute_tokenization_is_bounded(self) -> None:
+        """Reject oversized candidate attributes before creating token objects."""
+        limit = MODULE.AccessConstraintMarkupParser.MAX_WIDGET_ATTRIBUTE_CHARS
+        oversized = "x " * (limit // 2) + "g-recaptcha"
+        for name in ("class", "id", "aria-label", "title"):
+            with self.subTest(name=name):
+                body = (
+                    "<html><head><title>Rate limited</title></head><body>"
+                    f"<div {name}='{oversized}'></div></body></html>"
+                ).encode()
+                self.assertIsNone(MODULE.detect_access_constraint(body))
+
+        bounded = (
+            b"<html><head><title>Rate limited</title></head><body>"
+            b"<div class='ordinary g-recaptcha'></div></body></html>"
+        )
+        self.assertEqual(MODULE.detect_access_constraint(bounded), "captcha")
+
+    def test_challenge_raw_start_tag_is_bounded_before_attribute_parsing(self) -> None:
+        """Skip an oversized token before HTMLParser builds its attribute list."""
+        limit = MODULE.AccessConstraintMarkupParser.MAX_RAW_START_TAG_CHARS
+        oversized = "<div " + "a=x " * (limit // 4 + 1) + "class=g-recaptcha>"
+        self.assertGreater(len(oversized), limit)
+
+        with mock.patch.object(
+            MODULE.HTMLParser,
+            "parse_starttag",
+            side_effect=AssertionError("base attribute parser invoked"),
+        ):
+            parsed = MODULE.parse_access_constraint_markup(oversized)
+
+        self.assertIsNotNone(parsed)
+        self.assertTrue(parsed.structure_invalid)
+        self.assertFalse(parsed.captcha_widget)
+        self.assertFalse(parsed.has_captcha_evidence)
+
+        bounded = (
+            b"<html><head><title>Rate limited</title></head><body>"
+            b"<div class='ordinary g-recaptcha'></div></body></html>"
+        )
+        self.assertEqual(MODULE.detect_access_constraint(bounded), "captcha")
+
+    def test_invalid_document_title_poisons_widget_evidence(self) -> None:
+        """Do not let a valid widget override ambiguous document-title structure."""
+        widget = b"<div class='g-recaptcha'></div>"
+        bodies = (
+            b"<html><head><title data-fixture='1'>Rate limited</title></head><body>"
+            + widget
+            + b"</body></html>",
+            b"<html><head><title>Rate limited</title><title>Second</title></head><body>"
+            + widget
+            + b"</body></html>",
+            b"<html><head><title>Rate limited</title></head><body>"
+            b"<title>Fixture title</title>"
+            + widget
+            + b"</body></html>",
+            b"<html><body><head><title>Rate limited</title></head>"
+            + widget
+            + b"</body></html>",
+        )
+        for body in bodies:
+            with self.subTest(body=body):
+                self.assertIsNone(MODULE.detect_access_constraint(body))
+
+    def test_access_constraint_parser_inspects_entire_bounded_body(self) -> None:
+        """Do not trust prefix evidence before later bounded structure poisons it."""
+        body = (
+            b"<html><head><title>Vercel Security Checkpoint</title>"
+            b"</head><body>"
+            + b" " * (1024 * 1024)
+            + b"<title>Late fixture title</title></body></html>"
+        )
+        self.assertLess(len(body), MODULE.MAX_BYTES)
+        self.assertIsNone(MODULE.detect_access_constraint(body))
+
+    def test_access_constraint_tracks_implicit_body_tokens(self) -> None:
+        """Reject late heads and recognize widgets when the body tag is omitted."""
+        late_heads = (
+            b"<html><div>body content</div><head>"
+            b"<title>Vercel Security Checkpoint</title></head></html>",
+            b"<html>body text<head>"
+            b"<title>Vercel Security Checkpoint</title></head></html>",
+        )
+        for body in late_heads:
+            with self.subTest(body=body):
+                self.assertIsNone(MODULE.detect_access_constraint(body))
+
+        implicit_body_widgets = (
+            b"<html><head><title>Rate limited</title></head>"
+            b"<div class='g-recaptcha'></div></html>",
+            b"<html><head><title>Rate limited</title></head>body text"
+            b"<section id='cf-turnstile'></section></html>",
+        )
+        for body in implicit_body_widgets:
+            with self.subTest(body=body):
+                self.assertEqual(MODULE.detect_access_constraint(body), "captcha")
+
+        post_document_script = (
+            b"<html><head><title>Vercel Security Checkpoint</title></head>"
+            b"<body></body></html><script type='module'>challenge()</script>"
+        )
+        self.assertEqual(
+            MODULE.detect_access_constraint(post_document_script), "captcha"
+        )
+
+    def test_after_head_opaque_tokens_do_not_start_the_body(self) -> None:
+        """Apply head rules to script, style, and template before explicit body."""
+        after_head_tokens = (
+            b"<script>const fixture = 'g-recaptcha';</script>",
+            b"<style>.g-recaptcha { display: block; }</style>",
+            b"<template><div class='g-recaptcha'></div></template>",
+        )
+        for token in after_head_tokens:
+            with self.subTest(token=token):
+                body = (
+                    b"<html><head><title>Rate limited</title></head>"
+                    + token
+                    + b"<body><div class='g-recaptcha'></div></body></html>"
+                )
+                self.assertEqual(MODULE.detect_access_constraint(body), "captcha")
+
+        marker_only = (
+            b"<html><head><title>Rate limited</title></head>"
+            b"<template><div class='g-recaptcha'></div></template>"
+            b"<body></body></html>"
+        )
+        self.assertIsNone(MODULE.detect_access_constraint(marker_only))
+
+    def test_foreign_content_titles_do_not_poison_document_evidence(self) -> None:
+        """Ignore local SVG/MathML titles without trusting nested widgets."""
+        foreign_titles = (
+            b"<svg><title>Lock icon</title></svg>",
+            b"<math><title>Formula description</title></math>",
+        )
+        for foreign_title in foreign_titles:
+            with self.subTest(foreign_title=foreign_title):
+                body = (
+                    b"<html><head><title>Rate limited</title></head><body>"
+                    + foreign_title
+                    + b"<div class='g-recaptcha'></div></body></html>"
+                )
+                self.assertEqual(MODULE.detect_access_constraint(body), "captcha")
+
+        foreign_widget = (
+            b"<html><head><title>Rate limited</title></head><body>"
+            b"<svg><foreignObject><div class='g-recaptcha'></div>"
+            b"</foreignObject></svg></body></html>"
+        )
+        self.assertIsNone(MODULE.detect_access_constraint(foreign_widget))
+
+    def test_frameset_documents_cannot_supply_captcha_evidence(self) -> None:
+        """Fail closed for actual framesets without trusting iframe callbacks."""
+        frameset_documents = (
+            b"<html><head><title>Rate limited</title></head>"
+            b"<frameset><iframe aria-label='Captcha Challenge'></iframe></frameset>"
+            b"</html>",
+            b"<html><head><title>Rate limited</title></head><body>"
+            b"<div class='g-recaptcha'></div></body><frameset></frameset></html>",
+            b"<html><head><title>Rate limited</title></head><body>"
+            b"<div class='g-recaptcha'></div></body></frameset></html>",
+        )
+        for body in frameset_documents:
+            with self.subTest(body=body):
+                self.assertIsNone(MODULE.detect_access_constraint(body))
+
+        suppressed_frameset = (
+            b"<html><head><title>Rate limited</title></head><body><template>"
+            b"<frameset><iframe aria-label='Captcha Challenge'></iframe></frameset>"
+            b"</template><div class='g-recaptcha'></div></body></html>"
+        )
+        self.assertEqual(
+            MODULE.detect_access_constraint(suppressed_frameset), "captcha"
+        )
+
+    def test_access_constraint_ignores_only_a_leading_utf8_bom(self) -> None:
+        """Allow the encoding signature without ignoring later body data."""
+        checkpoint = (
+            b"<html><head><title>Vercel Security Checkpoint</title>"
+            b"</head><body></body></html>"
+        )
+        self.assertEqual(
+            MODULE.detect_access_constraint(b"\xef\xbb\xbf" + checkpoint),
+            "captcha",
+        )
+        self.assertIsNone(
+            MODULE.detect_access_constraint(b" \xef\xbb\xbf" + checkpoint)
+        )
+
+    def test_access_constraint_infers_an_optional_initial_head(self) -> None:
+        """Recognize head-compatible tokens before body without an explicit head."""
+        implied_heads = (
+            b"<!doctype html><title>Vercel Security Checkpoint</title><body></body>",
+            b"<!doctype html><meta charset='utf-8'>"
+            b"<title>Vercel Security Checkpoint</title><body></body>",
+            b"<!doctype html><meta charset='utf-8'/>"
+            b"<title>Vercel Security Checkpoint</title><body></body>",
+            b"<!doctype html><script>const fixture = '<body>';</script>"
+            b"<title>Vercel Security Checkpoint</title><body></body>",
+        )
+        for body in implied_heads:
+            with self.subTest(body=body):
+                self.assertEqual(MODULE.detect_access_constraint(body), "captcha")
+
+        late_title = (
+            b"<!doctype html><div>body content</div>"
+            b"<title>Vercel Security Checkpoint</title>"
+        )
+        self.assertIsNone(MODULE.detect_access_constraint(late_title))
+
+    def test_access_constraint_uses_constant_space_raw_tag_tracking(self) -> None:
+        """Do not retain one Python offset object for every response newline."""
+        body = (
+            b"<html><head><title>Rate limited</title></head><body>"
+            + b"\n" * (512 * 1024)
+            + b"<div class='g-recaptcha'></div></body></html>"
+        )
+        parsed = MODULE.parse_access_constraint_markup(body.decode())
+        self.assertIsNotNone(parsed)
+        self.assertTrue(parsed.has_captcha_evidence)
+        self.assertNotIn("line_offsets", vars(parsed))
+        self.assertNotIn("source_text", vars(parsed))
+        self.assertIsNone(parsed.raw_end_tag_start)
+
+    def test_access_constraint_bounds_opaque_container_nesting(self) -> None:
+        """Poison challenge evidence instead of retaining unbounded nesting."""
+        body = (
+            b"<html><head><title>Rate limited</title></head><body>"
+            b"<div class='g-recaptcha'></div>"
+            + b"<template>" * (MODULE.AccessConstraintMarkupParser.MAX_OPAQUE_DEPTH + 1)
+            + b"</body></html>"
+        )
+        parsed = MODULE.parse_access_constraint_markup(body.decode())
+        self.assertIsNotNone(parsed)
+        self.assertTrue(parsed.structure_invalid)
+        self.assertTrue(parsed.captcha_widget)
+        self.assertLessEqual(
+            len(parsed.opaque_containers),
+            MODULE.AccessConstraintMarkupParser.MAX_OPAQUE_DEPTH,
+        )
+        self.assertFalse(parsed.has_captcha_evidence)
+        self.assertIsNone(MODULE.detect_access_constraint(body))
+
+    def test_self_closing_raw_text_start_suppresses_following_widgets(self) -> None:
+        """Treat a slash on non-void raw/RCDATA starts as non-closing."""
+        containers = (
+            b"iframe",
+            b"noembed",
+            b"noframes",
+            b"plaintext",
+            b"script",
+            b"style",
+            b"textarea",
+            b"xmp",
+        )
+        for container in containers:
+            with self.subTest(container=container):
+                body = (
+                    b"<html><head><title>Rate limited</title></head><body><"
+                    + container
+                    + b"/><div class='g-recaptcha'></div></body></html>"
+                )
+                self.assertIsNone(MODULE.detect_access_constraint(body))
+
+        closed_iframe = (
+            b"<html><head><title>Rate limited</title></head><body><iframe/>"
+            b"<div class='g-recaptcha'></div></iframe>"
+            b"<section id='cf-turnstile'></section></body></html>"
+        )
+        self.assertEqual(MODULE.detect_access_constraint(closed_iframe), "captcha")
+
+    def test_noframes_remains_head_compatible_in_challenge_documents(self) -> None:
+        """Process noframes with head rules before the document body begins."""
+        documents = (
+            b"<html><head><noframes>fallback</noframes>"
+            b"<title>Vercel Security Checkpoint</title></head></html>",
+            b"<noframes>fallback</noframes>"
+            b"<title>Vercel Security Checkpoint</title>",
+            b"<html><head><title>Rate limited</title></head>"
+            b"<noframes><div class='g-recaptcha'></div></noframes>"
+            b"<body><section id='cf-turnstile'></section></body></html>",
+        )
+        for body in documents:
+            with self.subTest(body=body):
+                parsed = MODULE.parse_access_constraint_markup(body.decode())
+                self.assertIsNotNone(parsed)
+                self.assertFalse(parsed.structure_invalid)
+                self.assertEqual(MODULE.detect_access_constraint(body), "captcha")
+
+    def test_self_closing_foreign_content_closes_immediately(self) -> None:
+        """Honor the self-closing flag on SVG and MathML roots."""
+        for foreign_root in (b"<svg/>", b"<math/>"):
+            with self.subTest(foreign_root=foreign_root):
+                body = (
+                    b"<html><head><title>Rate limited</title></head><body>"
+                    + foreign_root
+                    + b"<div class='g-recaptcha'></div></body></html>"
+                )
+                self.assertEqual(MODULE.detect_access_constraint(body), "captcha")
+
+        marker_attribute = (
+            b"<html><head><title>Rate limited</title></head><body>"
+            b"<svg class='g-recaptcha'/><math id='cf-turnstile'/>"
+            b"</body></html>"
+        )
+        self.assertIsNone(MODULE.detect_access_constraint(marker_attribute))
+
+    def test_nested_form_start_cannot_supply_captcha_evidence(self) -> None:
+        """Ignore a nested form token while the HTML form pointer is occupied."""
+        rejected = (
+            b"<html><head><title>Rate limited</title></head><body>"
+            b"<form><form class='g-recaptcha'></form></form></body></html>",
+            b"<html><head><title>Rate limited</title></head><body>"
+            b"<form/><form class='g-recaptcha'></form></body></html>",
+            b"<html><head><title>Rate limited</title></head><body>"
+            b"<form></form fixture><form class='g-recaptcha'></form>"
+            b"</body></html>",
+        )
+        for body in rejected:
+            with self.subTest(body=body):
+                self.assertIsNone(MODULE.detect_access_constraint(body))
+
+        later_form = (
+            b"<html><head><title>Rate limited</title></head><body>"
+            b"<form><form></form><form class='g-recaptcha'></form>"
+            b"</body></html>"
+        )
+        self.assertEqual(MODULE.detect_access_constraint(later_form), "captcha")
+
+        direct_form = (
+            b"<html><head><title>Rate limited</title></head><body>"
+            b"<form class='h-captcha'></form></body></html>"
+        )
+        self.assertEqual(MODULE.detect_access_constraint(direct_form), "captcha")
+
+    def test_access_constraint_finalizes_a_valid_head_at_eof(self) -> None:
+        """Apply the implied head transition when a minimal document ends."""
+        valid = (
+            b"<title>Vercel Security Checkpoint</title>",
+            b"<html><head><title>Vercel Security Checkpoint</title>",
+            b"<meta charset='utf-8'><title>Vercel Security Checkpoint</title>",
+        )
+        for body in valid:
+            with self.subTest(body=body):
+                parsed = MODULE.parse_access_constraint_markup(body.decode())
+                self.assertIsNotNone(parsed)
+                self.assertFalse(parsed.in_head)
+                self.assertTrue(parsed.head_closed)
+                self.assertTrue(parsed.vercel_checkpoint)
+                self.assertEqual(MODULE.detect_access_constraint(body), "captcha")
+
+        incomplete = (
+            b"<title>Vercel Security Checkpoint",
+            b"<script><title>Vercel Security Checkpoint</title>",
+        )
+        for body in incomplete:
+            with self.subTest(body=body):
+                self.assertIsNone(MODULE.detect_access_constraint(body))
+
+    def test_body_transition_end_tags_close_the_challenge_head(self) -> None:
+        """Do not accept a document title after in-head br/html end tokens."""
+        for transition in (b"</br>", b"</html>"):
+            with self.subTest(transition=transition):
+                body = (
+                    b"<html><head>"
+                    + transition
+                    + b"<title>Vercel Security Checkpoint</title></head>"
+                )
+                parsed = MODULE.parse_access_constraint_markup(body.decode())
+                self.assertIsNotNone(parsed)
+                self.assertFalse(parsed.in_head)
+                self.assertTrue(parsed.head_closed)
+                self.assertTrue(parsed.body_started)
+                self.assertIsNone(MODULE.detect_access_constraint(body))
+
+        malformed = (
+            b"<html><head></br fixture>"
+            b"<title>Vercel Security Checkpoint</title></head>"
+        )
+        self.assertIsNone(MODULE.detect_access_constraint(malformed))
+
+    def test_body_end_tag_can_close_an_implied_empty_body(self) -> None:
+        """Honor a safe body closer when the optional start tag was omitted."""
+        valid = (
+            b"<html><head><title>Vercel Security Checkpoint</title></head>"
+            b"</body></html>",
+            b"<title>Vercel Security Checkpoint</title></body></html>",
+        )
+        for body in valid:
+            with self.subTest(body=body):
+                parsed = MODULE.parse_access_constraint_markup(body.decode())
+                self.assertIsNotNone(parsed)
+                self.assertTrue(parsed.body_started)
+                self.assertTrue(parsed.body_closed)
+                self.assertTrue(parsed.head_closed)
+                self.assertEqual(MODULE.detect_access_constraint(body), "captcha")
+
+        invalid = (
+            b"<html><head><title>Vercel Security Checkpoint</title></head>"
+            b"</body></body></html>",
+            b"<html><head><title>Vercel Security Checkpoint</title></head>"
+            b"</body fixture></html>",
+        )
+        for body in invalid:
+            with self.subTest(body=body):
+                self.assertIsNone(MODULE.detect_access_constraint(body))
+
+    def test_legacy_login_and_paywall_matching_keeps_its_prefix_bound(self) -> None:
+        """Use the full body only for structural CAPTCHA verification."""
+        suffix_only = (
+            b"<html><head><title>Ordinary page</title></head><body>"
+            + b"x" * MODULE.LEGACY_CONSTRAINT_TEXT_BYTES
+            + b"<input type='password'>Sign in. Subscription required."
+            + b"</body></html>"
+        )
+        self.assertIsNone(MODULE.detect_access_constraint(suffix_only))
+
+        prefix_login = b"<input type='password'>Sign in"
+        prefix_paywall = b"Subscription required"
+        self.assertEqual(MODULE.detect_access_constraint(prefix_login), "login")
+        self.assertEqual(MODULE.detect_access_constraint(prefix_paywall), "paywall")
+
+        late_structural_widget = (
+            b"<html><head><title>Rate limited</title></head><body>"
+            + b" " * MODULE.LEGACY_CONSTRAINT_TEXT_BYTES
+            + b"<div class='g-recaptcha'></div></body></html>"
+        )
+        self.assertEqual(
+            MODULE.detect_access_constraint(late_structural_widget), "captcha"
+        )
+
+    def test_after_head_metadata_does_not_start_the_body(self) -> None:
+        """Apply head rules to supported metadata before an explicit body."""
+        after_head_metadata = (
+            b"<meta charset='utf-8'>",
+            b"<link rel='stylesheet' href='/checkpoint.css'>",
+            b"<base href='https://example.test/'>",
+            b"<meta charset='utf-8'/>",
+        )
+        for token in after_head_metadata:
+            with self.subTest(token=token):
+                body = (
+                    b"<html><head><title>Rate limited</title></head>"
+                    + token
+                    + b"<body><div class='g-recaptcha'></div></body></html>"
+                )
+                self.assertEqual(MODULE.detect_access_constraint(body), "captcha")
+
+        metadata_marker = (
+            b"<html><head><title>Rate limited</title></head>"
+            b"<meta class='g-recaptcha'><body></body></html>"
+        )
+        self.assertIsNone(MODULE.detect_access_constraint(metadata_marker))
 
     def test_rejects_escape_before_creating_output(self) -> None:
         """Do not leave directories outside the caller-bound staging root."""
@@ -3407,6 +4414,133 @@ class PublicSourceCollectorTests(unittest.TestCase):
                 1, source, MODULE.source_hosts(source), Path(temporary)
             )
         self.assertEqual(result["status"], "needs_search_fallback")
+
+    def test_verified_http_429_captcha_ignores_link_count_heuristic(self) -> None:
+        """Seal a verified 429 gate even when its page exposes many links."""
+        source = MODULE.load_catalog(CATALOG)[0]
+        links = b"".join(
+            (
+                f"<a href='{source['page_url']}checkpoint-{index}'>"
+                f"Checkpoint link {index}</a>"
+            ).encode()
+            for index in range(12)
+        )
+        body = (
+            b"<html><head><title>Vercel Security Checkpoint</title></head>"
+            b"<body>" + links + b"</body></html>"
+        )
+        extracted = MODULE.extract_content(
+            body, "text/html", source["page_url"], MODULE.source_hosts(source)
+        )
+        self.assertGreaterEqual(extracted["entry_count"], 10)
+        fetched = {
+            "content": body,
+            "content_type": "text/html",
+            "final_url": source["page_url"],
+            "http_status": 429,
+        }
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.object(
+            MODULE, "fetch_url", return_value=fetched
+        ):
+            result = MODULE.collect_source(
+                1, source, MODULE.source_hosts(source), Path(temporary)
+            )
+        self.assertEqual(result["status"], "access_constraint")
+        self.assertEqual(result["constraint"], "captcha")
+        self.assertTrue(
+            all(item["status"] == "access_constraint" for item in result["attempts"])
+        )
+
+    def test_verified_http_429_captcha_bypasses_article_extraction(self) -> None:
+        """Do not send a bounded gate body through higher-memory article parsers."""
+        source = MODULE.load_catalog(CATALOG)[0]
+        body = (
+            b"<html><head><title>Vercel Security Checkpoint</title></head><body>"
+            + b"\n" * 10000
+            + b"</body></html>"
+        )
+        fetched = {
+            "content": body,
+            "content_type": "text/html",
+            "final_url": source["page_url"],
+            "http_status": 429,
+        }
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.object(
+            MODULE, "fetch_url", return_value=fetched
+        ), mock.patch.object(
+            MODULE,
+            "extract_content",
+            side_effect=AssertionError("verified 429 gate reached article extraction"),
+        ) as extract:
+            result = MODULE.collect_source(
+                1, source, MODULE.source_hosts(source), Path(temporary)
+            )
+
+        extract.assert_not_called()
+        self.assertEqual(result["status"], "access_constraint")
+        self.assertEqual(result["constraint"], "captcha")
+
+    def test_resolution_verifier_preserves_verified_http_429_captcha(self) -> None:
+        """Keep a verified gate without link heuristics or article extraction."""
+        source = MODULE.load_catalog(CATALOG)[0]
+        links = b"".join(
+            f"<a href='/checkpoint-{index}'>link</a>".encode()
+            for index in range(12)
+        )
+        body = (
+            b"<html><head><title>Vercel Security Checkpoint</title></head><body>"
+            + links
+            + b"</body></html>"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manifest = root / "manifest.json"
+            request = root / "request.json"
+            output = root / "verified.json"
+            write_bound_manifest(
+                manifest, {source["name"]: "needs_search_fallback"}
+            )
+            request.write_text(
+                json.dumps({
+                    "version": 1,
+                    "resolutions": [{
+                        "name": source["name"],
+                        "method": "access_constraint",
+                        "url": source["page_url"],
+                        "constraint": "captcha",
+                    }],
+                    "date_evidence": [],
+                }),
+                encoding="utf-8",
+            )
+            fetched = {
+                "content": body,
+                "content_type": "text/html",
+                "final_url": source["page_url"],
+                "http_status": 429,
+            }
+            with mock.patch.dict(
+                os.environ, {"COLLECTION_OUTPUT_ROOT": str(root)}
+            ), mock.patch.object(
+                MODULE, "fetch_url", return_value=fetched
+            ), mock.patch.object(
+                MODULE,
+                "extract_content",
+                side_effect=AssertionError("verified gate reached article extraction"),
+            ) as extract, mock.patch.object(
+                MODULE,
+                "extract_primary_publication_evidence",
+                side_effect=AssertionError("verified gate reached date extraction"),
+            ) as primary:
+                MODULE.verify_resolutions(CATALOG, manifest, request, output)
+
+            extract.assert_not_called()
+            primary.assert_not_called()
+            verified = json.loads(output.read_text())["resolutions"][0]
+            self.assertEqual(verified["status"], "verified_access_constraint")
+            self.assertEqual(verified["constraint"], "captcha")
+            self.assertEqual(verified["extracted_entry_count"], 0)
+            self.assertEqual(verified["candidate_entry_count"], 0)
 
     def test_verified_robots_constraint_requires_all_direct_endpoints(self) -> None:
         """Seal robots evidence only when every direct endpoint is disallowed."""

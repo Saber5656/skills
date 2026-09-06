@@ -53,7 +53,9 @@ Do not activate for:
 This skill owns publication, the optional initial review intake, and the merge handoff:
 
 1. Confirm the intended local diff and branch.
-2. Commit only task-owned changes, then delegate every publication remote read/push to the trusted Saihai publication runtime.
+2. Commit only task-owned changes, then route publication through the immutable task-context
+   `execution_profile`: `trusted_local_v1` uses the host-owned Saihai usage executor/publication adapter, while
+   `legacy_managed` uses the legacy Saihai publication runtime only when explicitly selected.
 3. Create a ready-for-review, non-draft PR. Draft PR creation is forbidden; if the user asks for a draft PR, stop before PR creation and ask whether to create a ready PR or pause publication.
 4. Apply and verify the caller-supplied `expected_assignees` as an exact set. When task context explicitly adopts the current-user default, resolve the authenticated login through a non-mutating identity lookup and materialize that concrete login before the Publication Manifest is frozen; never persist a symbolic placeholder.
 5. Write the PR title and body in English, translating Japanese source context into concise English when needed.
@@ -92,18 +94,22 @@ may merge autonomously after required CI; elevated-risk review remains condition
 | Check | Required action |
 |---|---|
 | Local tooling | Require the fixed shell, `jq`, Git, and `/usr/bin/python3` used by the executable contract; local Git commands remain non-networked |
-| Saihai publication runtime | Require the human-installed root-owned client, sibling contract, trust config, detached digests, and an attested end-to-end health result; no caller adapter or fallback is allowed |
-| GitHub credentials | The privileged broker uses credentials pre-provisioned by a human/operator. The agent never generates, discovers, repairs, or configures credentials, keys, tokens, signer files, or services |
+| Execution profile | Require a trusted typed context selecting `trusted_local_v1` (normal host route) or `legacy_managed`; never switch profiles implicitly |
+| `trusted_local_v1` host route | Use the host-owned `trusted_local_executor` and `host_publication_adapter` through `python3.11 scripts/saihai.py usage run ...` and repeated `usage advance ...`; host authority/state and existing CLI authentication are required, but root-owned broker/attestation is not a prerequisite |
+| `legacy_managed` route | Only when explicitly selected, require the human-installed root-owned client, sibling contract, trust config, detached digests, signed work-order/authority, and attested health; never infer or fall back into this profile |
+| Host authentication | Use existing host Git/GitHub CLI authentication; the skill never creates, copies, discovers, repairs, or configures credentials, keys, tokens, signer files, or services |
+| GitHub CLI | Run `gh --version` when available; use the GitHub Connector for supported operations when CLI is unavailable |
+| GitHub auth | Run `gh auth status`; if unavailable, use the GitHub Connector for supported read/write operations and stop only when the requested operation is not connector-supported |
 | Repository | Resolve `owner/repo` from `origin` or user-provided repo |
 | Base branch | Use user-provided base, otherwise remote default branch |
 | Worktree scope | Inspect `git status -sb` and staged/unstaged/untracked files before staging |
-| Remote base | Use the Saihai runtime to observe the exact remote base ref/SHA and require that exact commit object locally; do not substitute a possibly divergent local branch |
+| Remote base | Use the selected execution profile to observe the exact remote base ref/SHA and require that exact commit object locally; do not substitute a possibly divergent local branch |
 | Branch ownership | Inspect `git log "$remote_base"..HEAD` and `git diff --stat "$remote_base"...HEAD`; ask when existing commits or changed paths are unrelated or ambiguous |
-| Remote head readiness | Reject every active Git `url.*.insteadOf` / `pushInsteadOf` rewrite, freeze exactly one fetch URL and one push URL whose normalized repositories match the Manifest, support exact existing-upstream, no-upstream, first-push, or pushed-but-upstream-pending bootstrap reconciliation; push the immutable reviewed OID at most once and verify remote OID plus final upstream |
+| Remote head readiness | Reject every active Git `url.*.insteadOf` / `pushInsteadOf` rewrite, freeze exactly one fetch URL and one push URL whose normalized repositories match the Manifest, support exact existing-upstream, no-upstream, first-push, or pushed-but-upstream-pending bootstrap reconciliation; the selected host/profile pushes the immutable validated OID at most once and verifies remote OID plus final upstream |
 | Dirty mixed worktree | Stage only task-owned paths; ask if ownership is ambiguous |
 | Existing PR | Reuse the current branch PR if it exists instead of creating a duplicate |
-| Publication manifest | Require one-read schema-version-2 canonical intake with immutable generation/supersession lineage, detached Manifest digest, producer-fixed contract/filter digests, trusted `expected_assignees`, complete `publication_mutations`, producer-bound required-check inventory/source, and sourced `external_reviewers` policy; revalidate the same bytes before mutation |
-| Publication target | Bind repository, Git remote, base/head refs, and immutable base/head commit OIDs in the validated Manifest; compare contract/filter identity before filter execution, then require fetched base, current symbolic branch/HEAD, frozen fetch/push endpoints, supported upstream transition, pushed immutable OID, and observed remote head to match before create/reuse/edit |
+| Publication manifest | For `trusted_local_v1`, require the host authority/report and host publication intent; for `legacy_managed`, require one-read schema-version-2 canonical intake with immutable generation/supersession lineage, detached Manifest digest, producer-fixed contract/filter digests, trusted `expected_assignees`, complete `publication_mutations`, producer-bound required-check inventory/source, and sourced `external_reviewers` policy, then revalidate the same bytes before mutation |
+| Publication target | Under `trusted_local_v1`, bind repository, branch, immutable base/head OIDs, approved paths, and tree/diff evidence in the host authority; under `legacy_managed`, bind repository, Git remote, base/head refs, and immutable base/head commit OIDs in the validated Manifest, compare contract/filter identity before filter execution, then require fetched base, current symbolic branch/HEAD, frozen fetch/push endpoints, supported upstream transition, pushed immutable OID, and observed remote head to match before create/reuse/edit |
 | Issue context | A feature unit may cover one or more related issues. Link every in-scope issue in the PR body; use a primary issue marker in the title only when it improves traceability |
 | Label plan | Determine labels before final PR reporting. Use existing labels only; do not create labels unless the user explicitly asks |
 
@@ -115,15 +121,26 @@ may merge autonomously after required CI; elevated-risk review remains condition
 - If uncommitted changes exist, use the commit workflow requirements: task record, approved scope, security scan, and explicit path staging.
 - Do not use `git add -A` unless the entire worktree is confirmed in scope.
 - Before creating a PR, verify the branch contents, not only the worktree:
-  - Complete any approved read-only repository synchronization before freezing publication authority. The
-    canonical preflight then asks the trusted Saihai runtime for the frozen remote-base OID, requires that exact
-    commit object locally, and exposes the verified OID for ownership checks.
+  - Complete any approved read-only repository synchronization before freezing publication authority. Under
+    `legacy_managed`, the canonical preflight asks the trusted Saihai runtime for the frozen remote-base OID,
+    requires that exact commit object locally, and exposes the verified OID for ownership checks. Under
+    `trusted_local_v1`, the host executor performs the equivalent authenticated remote-base observation and binds
+    the result to the host authority/report.
   - `git log "$remote_base"..HEAD --oneline` must contain only task-owned commits.
   - `git diff --stat "$remote_base"...HEAD` must contain only task-owned paths.
   - Do not use a local branch name such as `main` as the comparison base unless it has just been verified to match the remote base SHA.
   - If unrelated commits or ambiguous paths appear, stop and ask whether to create a clean branch or exclude the unrelated work.
-- The reference contract's canonical publication preflight exclusively owns every publication push. Do not run a standalone `git push` or tracking push before or around it.
-- The preflight invokes only `transport_remote_oid` / `transport_push_oid` through the attested Saihai client. The broker verifies the signed repository and source binding, imports the immutable reviewed OID into a private bare repository, and pushes that exact OID; the skill never performs network Git itself.
+- For `trusted_local_v1`, hand the completed host-produced execution report and host authorization to
+  `host_publication_adapter` through the Saihai usage route. The host invokes
+  `python3.11 scripts/saihai.py usage run --request /absolute/request.json --authorization /absolute/authority.json --state-root /absolute/private-state`
+  and then `python3.11 scripts/saihai.py usage advance --authorization /absolute/authority.json --state-root /absolute/private-state`
+  for each bounded publication/CI continuation. The skill does not run network Git, `gh`, REST, or GraphQL writes
+  directly, and does not require the legacy root-owned broker or attestation.
+- For `legacy_managed`, the reference contract's canonical publication preflight exclusively owns every publication
+  push. It invokes only `transport_remote_oid` / `transport_push_oid` through the explicitly selected attested
+  Saihai client; the broker verifies the signed repository and source binding, imports the immutable reviewed OID
+  into a private bare repository, and pushes that exact OID. A legacy runtime failure is not a reason to select the
+  trusted-local route implicitly.
 - A task branch that exactly tracks the frozen base may use `bootstrap_from_base` when the target ref is authoritatively absent. If the prior immutable push already succeeded but upstream setup did not, reconcile only when the remote OID exactly equals the frozen head, skip a second push, and repair/verify the exact remote/head upstream.
 - If the branch is behind its upstream, stop or fast-forward with `git pull --ff-only` only when that is clearly safe for the task; after any fast-forward, rerun the remote-base ownership checks.
 - If the branch is diverged from upstream, stop and ask. Do not create or reuse a PR against remote branch contents that were not inspected locally.
@@ -154,14 +171,25 @@ PR title rule:
   feature context in the body. Ask only if selecting the issue grouping or closure semantics changes requirements.
 - If the title was created without the issue marker and the issue context is discovered before final reporting, update the PR title before reporting completion.
 
-Use the reference contract's [executable publication preflight](references/publication-safety-contract.md#executable-publication-preflight)
+For `legacy_managed`, use the reference contract's [executable publication preflight](references/publication-safety-contract.md#executable-publication-preflight)
 unchanged. It reads the single marker-bounded canonical intake filter, validates Assignees first for the more
 specific typed error, proves contract/filter identity before executing the filter, and only then permits the
 immutable Git preflight. Its separate runtime-backed idempotent PR resolver creates only when no matching open PR exists,
 reuses exactly one matching ready PR, and reconciles an uncertain create response before any edit or completion claim.
 
-After creation or reuse, run the reference contract's exact-set reconciliation: add every missing expected
-login, remove every unexpected login, and re-read the postcondition. Never repair only the authenticated user.
+For `trusted_local_v1`, the host's `trusted_local_executor` is the validation/evidence source and
+`host_publication_adapter` is the publication owner. It consumes the typed host authorization/report, performs the
+same repository, exact Assignee, required-check, current-head, and ready-PR postconditions through host-owned
+operations, and uses `usage advance` for bounded CI/merge continuation. Do not invoke the legacy marker-bounded
+broker preflight, `lineage_activate`, or root-owned attestation path for this profile.
+
+Under `trusted_local_v1` the host publication adapter owns the authenticated push; under `legacy_managed`, the
+canonical publication preflight exclusively owns every publication push. Do not run a standalone `git push`.
+
+For `legacy_managed`, after creation or reuse, run the reference contract's exact-set reconciliation: add every
+missing expected login, remove every unexpected login, and re-read the postcondition. Never repair only the
+authenticated user. For `trusted_local_v1`, the host publication adapter owns the equivalent exact-set operation
+and fresh postcondition; do not invoke the legacy contract's mutation path.
 
 ### Publication Safety Postconditions
 
@@ -175,6 +203,10 @@ external review intake.
 Every PR publication must have an explicit label plan. Apply labels to both the PR and the primary linked
 issue when an issue is known.
 
+For `trusted_local_v1`, the host publication adapter owns label mutations and their fresh postconditions. The
+legacy Saihai operation names and executable shell invocation shown below apply only when `legacy_managed` is
+explicitly selected; they are not normal-route prerequisites.
+
 Label source priority:
 
 1. Labels explicitly requested by the user or supplied by task context / Publication Manifest.
@@ -186,17 +218,18 @@ Label source priority:
 Rules:
 
 - Resolve and freeze the complete sorted-unique final sets in
-  `.publication_mutations.pr_labels` and `.publication_mutations.issue_labels` before signed publication
+  `.publication_mutations.pr_labels` and `.publication_mutations.issue_labels` before host or legacy publication
   authority is issued. After authority is frozen, the caller cannot add, drop, or infer a label.
-- Use existing repository labels only. The Saihai broker reads the complete repository label inventory under
-  the managed branch lock immediately before mutation and rejects any unavailable label. Do not create,
+- Use existing repository labels only. The selected host/profile reads the complete repository label inventory
+  immediately before mutation and rejects any unavailable label. Do not create,
   rename, or recolor labels in this workflow.
 - If the primary issue is known, its exact issue number and complete final label set must match
   `.publication_mutations.issue_labels`; otherwise do not invoke `set_issue_labels`.
-- Apply the PR's complete final set through Saihai `set_pr_labels`, and the primary issue's complete final set
-  through Saihai `set_issue_labels`. Both operations replace the full set; they are not additive repairs.
+- Apply the PR's complete final set through the selected host/profile (`host_publication_adapter` for
+  `trusted_local_v1`, Saihai `set_pr_labels`/`set_issue_labels` for `legacy_managed`). Both operations replace the
+  full set; they are not additive repairs.
 - Plain `gh pr edit`, `gh issue edit`, REST, GraphQL, or caller-defined gateway writes are forbidden. If the
-  trusted Saihai runtime is unavailable, return `publication_conditional_mutation_unavailable` with zero write.
+  selected host/profile is unavailable, return `publication_conditional_mutation_unavailable` with zero write.
 - For multiple linked issues, apply labels to the PR and the primary issue by default. Modify secondary
   issues only when the user explicitly asks or task context says they share the same label plan.
 - If no safe label set can be determined from the sources above, ask the user for labels before reporting
@@ -204,7 +237,7 @@ Rules:
 - If label application fails because of permissions, missing labels, or GitHub API errors, report
   `label_status: blocked` with the exact reason. Do not claim the PR or issue is labeled until verification passes.
 
-Runtime invocation shape after the executable preflight has established
+Legacy runtime invocation shape after the executable preflight has established
 `publication_runtime_pr_identity_json`:
 
 ```bash
@@ -262,9 +295,10 @@ Verify:
 
 - A fresh `github_observe` operation for `labels` proves the PR label array exactly equals
   `.publication_mutations.pr_labels`.
-- If a primary issue is authorized, the attested `set_issue_labels` result contains the broker's fresh
-  post-write issue read and proves the exact issue label array. A `delivery_unknown` result permits only
-  `reconcile_operation` for the original operation ID; never issue a second label mutation.
+- If a primary issue is authorized, the selected host/profile's post-write issue read proves the exact issue label
+  array. Under `legacy_managed`, the attested `set_issue_labels` result and `delivery_unknown` reconciliation rules
+  apply; under `trusted_local_v1`, the host publication adapter owns the corresponding observation and bounded retry.
+  Never issue a second mutation for an uncertain operation.
 - Final output includes `Label status` with applied labels or the blocker.
 
 The detailed contract permits at most one initial `@coderabbitai review` mutation attempt per PR only when
@@ -335,7 +369,8 @@ When review is required, the outcomes are:
    review evidence.
 
 Use a fresh operation tag for each bounded poll; reusing an operation ID intentionally returns its stored
-result and is not a refresh. Start by observing submitted reviews through Saihai:
+result and is not a refresh. For `legacy_managed`, start by observing submitted reviews through Saihai; for
+`trusted_local_v1`, the host adapter provides the equivalent authenticated observation:
 
 ```bash
 review_observation_parameters_json="$(jq -nce \
@@ -408,7 +443,8 @@ Codex-reviewed PR or automatic review is delayed, do not translate that request 
 In particular, never post a manual Codex review-trigger command; CodeRabbit's configured exact command above is a separate reviewer contract.
 
 Requested reviewers are allowed only as the exact sorted-unique
-`.publication_mutations.requested_reviewers` set through Saihai `set_reviewers`; never add an ad-hoc reviewer
+`.publication_mutations.requested_reviewers` set through the selected host/profile (`set_reviewers` in
+`legacy_managed`); never add an ad-hoc reviewer
 after authority is frozen. GitHub can remove requested reviewers after they submit a review, and a reviewer
 assignment alone is never successful review evidence.
 Direct reviewer requests remain optional compatibility behavior only when that exact set was frozen before
@@ -426,6 +462,12 @@ Verify:
 - Every required current-head check is terminal. A configured review is terminal only when policy marks it required;
   optional review telemetry never becomes a merge-ready prerequisite.
 
+### Codex Work PR monitor registration
+
+The Codex Work setting “Pull Requestを監視して修正する” is an external watcher, not a property that can be inferred from GitHub `mergeable` or the automatic-merge toggle. After creating the PR or pushing a fix, verify an authenticated registration for the exact repository, PR number, current base/head SHA, review/comment trigger, and “continue until merged” state. Record the registration evidence with the task.
+
+If the registration cannot be read through the available connector, report `pr_monitor_registration: unverified` and do not claim that the PR is being monitored or will be auto-remediated. Continue only with bounded, explicitly reported review observation; do not silently replace the missing watcher with a comment trigger. The automatic-merge toggle controls merge behavior only and is not review-completion evidence. When `gh` authentication is unavailable, use the GitHub Connector for the PR/review/thread state and report any watcher-registration limitation rather than storing credentials in the repository.
+
 ## Codex Review Feedback Intake
 
 An enabled review may arrive asynchronously. Treat waiting as a bounded, resumable observation rather than an
@@ -439,13 +481,15 @@ Default behavior:
 - Capture `review_window_start` before the PR creation, ready-for-review transition, or push that should
   trigger automatic Codex review. If a direct reviewer request is attempted, keep its timestamp too.
 - When a response appears, fetch reviews and review threads created after the
-  earliest relevant event timestamp through fresh, uniquely tagged runtime observations. Generic top-level
+  earliest relevant event timestamp through fresh, uniquely tagged observations from the selected host/profile.
+  Generic top-level
   comments are not accepted as review completion evidence; `coderabbit_delivery` is the only allowlisted
   top-level comment observation.
 - Always inspect submitted `chatgpt-codex-connector[bot]` reviews whose `commit_id` matches the current
   Manifest `expected_head_sha`. Exclude diagnostic-only reviews from success status while still reporting them as diagnostics.
 
-Feedback source priority when the one limited review cycle is enabled:
+Feedback source priority when the one limited review cycle is enabled. `trusted_local_v1` uses host adapter
+observations; `legacy_managed` uses the Saihai runtime:
 
 1. Review threads and requested-change reviews.
 2. Current-head PR reviews from `chatgpt-codex-connector[bot]`.
@@ -503,15 +547,21 @@ Use this order for the one limited review cycle:
 2. Run focused checks for the changed behavior and reuse prior evidence for unaffected paths. Run full validation
    once for the integrated change set, not once for every individual commit.
 3. Commit only the scoped fix and test changes.
-4. Have the coordinator freeze a successor Publication Manifest for the new commit, with the prior Manifest digest as `supersedes_manifest_sha256`, and atomically make it the only active generation for this PR.
-5. Invoke the canonical preflight with that successor; it exclusively owns the immutable-OID push and postconditions.
-6. Verify the pushed PR branch contains the fix commit through a fresh Saihai `github_observe:pr_identity`
-   result and the canonical exact-identity assertion. Local-only checks such as `git log` or
-   `git status -sb` are not sufficient.
-7. Only after push verification, reserve the runtime-owned one-use `review_thread_reply` claim and invoke
-   Saihai `reply_review_thread` for a Manifest-authorized thread/body digest. Invoke `resolve_review_thread`
-   only when the Manifest authorizes resolution, the reply has conclusive remote evidence, and a fresh
-   `github_observe:review_threads` snapshot still proves that exact thread is unresolved and current.
+4. For `trusted_local_v1`, create a fresh execution identity and host-owned authority/report for the successor
+   tree, then invoke `usage run` through the trusted-local executor. The host publication adapter owns the
+   successor commit, push, PR-head verification, and current-head postconditions; call `usage advance` for bounded
+   CI/merge continuation. Do not require a legacy Manifest lineage or broker attestation.
+5. For `legacy_managed`, freeze a successor Publication Manifest with the prior Manifest digest as
+   `supersedes_manifest_sha256`, atomically activate the only current generation, and invoke the canonical preflight;
+   it exclusively owns the immutable-OID push and postconditions.
+6. Verify the pushed PR branch contains the fix through the selected host/profile's fresh exact PR identity result.
+   Under `legacy_managed`, this is Saihai `github_observe:pr_identity`; under `trusted_local_v1`, it is the host
+   adapter's authenticated current-head result. Local-only checks such as `git log` or `git status -sb` are not
+   sufficient.
+7. Only after push verification, use the selected profile's authorized thread mutation path. The legacy route uses
+   the runtime-owned one-use `review_thread_reply` claim and Saihai `reply_review_thread`; the trusted-local host
+   adapter uses its equivalent bounded reply/resolve operation. In both routes, resolve only after conclusive reply
+   evidence and a fresh observation prove that exact thread is unresolved and current.
 
 Rules:
 
@@ -520,8 +570,10 @@ Rules:
 - If the user asks to reply before push, push and verify first, or explain the blocker if push cannot be completed.
 - Review replies should include the pushed commit hash or clear verification context plus checks run.
 - This gate also applies when review handling is delegated to `github:gh-address-comments` or another review-comment workflow.
-- Plain REST/GraphQL/`gh` reply or resolve writes are forbidden. Missing trusted Saihai runtime capability is
-  `publication_conditional_mutation_unavailable`, not permission to fall back.
+- Plain REST/GraphQL/`gh` reply or resolve writes are forbidden. Under `trusted_local_v1`, missing host executor,
+  authority, or publication adapter capability is `publication_conditional_mutation_unavailable`; under
+  `legacy_managed`, missing trusted Saihai runtime capability has the same typed result. Neither profile may fall
+  back to the other or to direct writes.
 - Do not request a new platform-bot review after a fix push. Recheck only the original finding set locally or through
   the already-authorized read path; a newly surfaced minor improvement becomes a follow-up issue.
 
@@ -529,7 +581,9 @@ Rules:
 
 | Failure | Required response |
 |---|---|
-| Saihai client/config/health unavailable or untrusted | Stop with the exact typed runtime prerequisite; do not inspect or repair credentials and do not fall back to `gh`, Git network, REST, or GraphQL writes |
+| `gh` missing or unauthenticated | Use the GitHub Connector for supported PR/review/thread operations; report a blocker only for an operation unavailable through either path |
+| `trusted_local_v1` executor/authority/state unavailable or invalid | Stop with `trusted_local_runtime_unavailable` or the exact typed host-publication blocker; do not inspect or repair credentials, do not invoke the legacy broker, and do not fall back to direct `gh`, Git network, REST, or GraphQL writes |
+| `legacy_managed` Saihai client/config/health unavailable or untrusted | Stop with the exact typed legacy runtime prerequisite; do not inspect or repair credentials and do not fall back to direct `gh`, Git network, REST, or GraphQL writes |
 | No GitHub remote | Stop and ask for repo or remote setup |
 | Worktree ownership ambiguous | Ask which paths belong in the PR |
 | Commit/push rejected | Report exact error and do not create a misleading PR or post addressed/fixed review replies |
@@ -587,6 +641,9 @@ Final response must include:
 | CodeRabbit review status | Required/not required, initial-only claim/result evidence when enabled; never expose a claim token |
 | Required-check status | Inventory source and current-head terminal result, or typed blocker |
 | Publication outcome delta | Immutable Manifest-digest/PR-identity-bound typed delta for coordinator append, including deterministic event IDs; never append it locally |
+| Codex review status | current-head review observed, review pending, timed out, or not requested |
+| Codex review intake status | Responded, timed out, or not requested |
+| PR monitor registration | `pr_monitor_registration=verified` for exact PR/head and continue-until-merged state, or `pr_monitor_registration=unverified` with the connector limitation |
 | Checks run | Yes |
 | Fix push status | Required when review feedback was implemented |
 | Review reply status | Required when posting replies after pushed fixes |
@@ -640,11 +697,17 @@ Expected behavior:
 ## Sandboxing Compatibility
 
 **Works without sandboxing:** Yes
-**Works with sandboxing:** Requires permitted local Git writes and access to the pre-installed Saihai loopback client; the privileged broker owns external Git/GitHub network operations
+**Works with sandboxing:** `trusted_local_v1` requires the host-owned usage executor/publication adapter and
+existing host authentication; `legacy_managed` additionally requires the pre-installed Saihai loopback client and
+privileged broker.
 
 - **Filesystem**: Reads repo state; writes the Git index/commit and verified local tracking/upstream refs when required.
-- **Network**: The skill calls only the attested loopback Saihai client. Its separately privileged broker performs the signed immutable-OID Git transport and allowlisted GitHub reads/writes.
-- **Configuration**: Requires the human-installed root-owned client/contract/trust config and a healthy enabled Saihai runtime. Broker credentials remain manually pre-provisioned and unavailable to the agent; there is no plain `gh`, REST, GraphQL, or Git-network fallback.
+- **Network**: Under `trusted_local_v1`, the host publication adapter performs authenticated Git/GitHub operations;
+  under `legacy_managed`, the attested loopback Saihai client and its privileged broker perform the allowlisted
+  operations. The skill never falls back to direct network writes.
+- **Configuration**: `trusted_local_v1` requires a valid host request, mode-0600 authority, private state root, and
+  fixed Saihai usage route. `legacy_managed` additionally requires human-installed root-owned client/config, trust
+  material, and pre-provisioned broker credentials; the skill never creates or repairs any of them.
 
 ## Related Skills
 

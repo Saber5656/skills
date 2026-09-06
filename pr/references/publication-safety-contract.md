@@ -3,7 +3,37 @@
 This reference defines the detailed fail-closed postconditions for exact Assignee state, current-head checks,
 and optional configured external reviewer intake. Read it before PR creation or reuse.
 
-## Canonical publication intake
+The publication profile is selected by trusted task context before this contract is consumed. The normal
+`trusted_local_v1` profile uses Saihai's host-owned `trusted_local_executor` and `host_publication_adapter` through
+`saihai.py usage run` and bounded `usage advance`; it does not require this file's root-owned broker, lineage
+registry, or managed-domain attestation. The executable filter and preflight below are the `legacy_managed`
+compatibility route only. A missing or malformed profile is a typed blocker, never an implicit profile switch.
+
+### Trusted-local publication route
+
+For `trusted_local_v1`, the host owns the request, authority, private state, and publication mutations. The host
+must invoke the exact usage entry point
+
+```text
+python3.11 scripts/saihai.py usage run --request /absolute/request.json --authorization /absolute/authority.json --state-root /absolute/private-state
+```
+
+and invoke the bounded continuation for pending publication or CI:
+
+```text
+python3.11 scripts/saihai.py usage advance --authorization /absolute/authority.json --state-root /absolute/private-state
+```
+
+The report must identify `profile: "trusted_local_v1"`, the task/request/run/execution identities, approved scope,
+changed paths, tree and diff digests, host process evidence, and passed validation evidence. The
+`host_publication_adapter` performs authenticated commit/branch publication, PR creation or reuse, Assignee/label
+reconciliation, required-check observation, and head-pinned merge according to the host publication contract.
+Each call makes one bounded observation; pending CI is resumed by a later `usage advance`, not by an unbounded wait.
+The worker cannot authorize publication, and this route never falls back to direct `gh`, REST, GraphQL, network Git,
+or the legacy broker. Normal-risk work records review as `not_required`; the parent's one scoped risk review is used
+only for permission expansion, credentials/authentication, or data-loss risk.
+
+## Canonical publication intake (`legacy_managed` only)
 
 Consume one caller-owned Publication Manifest with `manifest_version: "1"` and
 `publication_intake_schema_version: "2"`; do not combine a finalized manifest with a sidecar or wrapper. Its
@@ -21,7 +51,7 @@ authenticated-creator-bound commit statuses only. A ruleset `required_workflow` 
 head move creates a new immutable generation instead of mutating or reusing old-head intake. The lineage ID
 is the durable key before and after PR resolution; it is never re-keyed from branch identity to PR identity.
 
-This file owns the single executable version-1 filter. The manifest builder and `pr` extract the exact bytes
+This file owns the single executable version-1 filter for `legacy_managed`. The manifest builder and `pr` extract the exact bytes
 between its markers; sibling skills must link here rather than copy the predicate. The filter validates carrier
 shape and binding, not source truth. The caller/user authenticates each source before freezing the manifest.
 
@@ -1245,9 +1275,10 @@ printf '%s' "$fresh_assignees_result_json" | jq -e \
 ```
 <!-- publication-cli-bash-end -->
 
-### Saihai publication runtime boundary
+### Saihai publication runtime boundary (`legacy_managed` only)
 
-The executable block uses the versioned Saihai publication runtime directly; it does not accept caller-defined
+The executable block uses the versioned Saihai publication runtime directly for the explicitly selected
+`legacy_managed` profile; it does not accept caller-defined
 lineage, claim, transport, or GitHub-write shell adapters. A human/operator installs the reviewed
 `publication_gateway_client.py` and sibling `publication_contract.py` as root-owned, non-writable files and
 pre-provisions the root-owned client trust config and channel token. The skill verifies the fixed
@@ -1262,7 +1293,7 @@ loopback channel, pinned SSHSIG verifier, capability/result attestation, and res
 binds operation ID, active Manifest digest/generation, runtime-config digest, and broker-profile digest again.
 There is no `git`, `gh`, REST, GraphQL, credential-helper, or caller-adapter fallback for network operations.
 
-### Durable PR-create claim
+### Durable PR-create claim (`legacy_managed` only)
 
 `claim_reserve` receives only `claim_kind: ready_pr_create` and a bounded lease. Saihai derives the canonical
 claim key from the signed Manifest and returns that key plus an opaque token. The skill passes those exact
@@ -1277,7 +1308,7 @@ second create. Reclaim is allowed only for a prior exact expired ready-PR reserv
 a fresh attested zero-PR observation; the normal publication path does not infer expiry from caller time.
 CodeRabbit and review-reply claims are never reclaimable.
 
-### Active Manifest lineage
+### Active Manifest lineage (`legacy_managed` only)
 
 The producer initializes generation 1 in a durable compare-and-set registry keyed only by the random
 64-hex `publication_lineage_id`. A successor atomically replaces exactly the active digest/generation with
@@ -1296,7 +1327,7 @@ PR binding, or unavailable runtime CAS returns `publication_manifest_inactive` o
 `publication_manifest_lineage_conflict` with zero mutation. The intake filter validates only carrier shape;
 it does not authorize a generation.
 
-### Conditional GitHub mutation operations
+### Conditional GitHub mutation operations (`legacy_managed` only)
 
 Saihai executes every Git/GitHub operation while holding one managed branch lock and passes its locked file
 descriptor to the privileged broker. At each mutation it reopens the signed authority, verifies the active
@@ -1329,7 +1360,7 @@ observations remain mandatory evidence and postconditions, but the broker's same
 closes the mutation race. External human changes are detected as conflicts and are never described as
 atomically preventable by the client.
 
-### Exact PR identity lifecycle
+### Exact PR identity lifecycle (`legacy_managed` only)
 
 The canonical runtime-backed `assert_publication_pr_identity` is mandatory immediately before and after every downstream
 PR/issue Assignee, label, reviewer, comment, reply, or thread mutation and before every pending or terminal

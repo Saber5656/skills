@@ -72,16 +72,18 @@ fetch、commit、stash、`git merge`を実行しない。つまり、git merge�
 
 - GitHub pull request URL（`github.com/.../pull/<number>`または`pull/`を含む入力）
 - `PR #12をマージ`、`pull requestをmerge`、merge queue、auto-mergeなどのGitHub PR context
-- repository、PR番号、immutable base/head、manifest digest、authorization referenceを持つtyped Saihai merge-readiness envelope
+- repository、PR番号、immutable base/head、または`trusted_local_v1` host authority/reportを持つprofile-bound
+  GitHub PR merge handoff
 
-この場合は`context_status: unsupported_context`を返す。完全なtyped Saihai envelopeが同じtrusted
+この場合は`context_status: unsupported_context`を返す。完全なtyped Saihai envelope（profile-bound merge handoff）が同じtrusted
 task contextに存在する場合だけ`pr-merge-gate`へhandoffする。PR URL、PR番号、`mergeable`、`CLEAN`、
 または単なる「mergeして」だけの場合はhandoffせず、`required_handoff: typed_saihai_merge_envelope`
 を返す。これらをPR merge authorizationとして扱うことはneverである。
 
 local managed repositoryとGitHub PR mergeが同じ依頼に含まれる場合は`mixed_context`としてfail closedし、
 local側を候補化せず、fetch、commit、stash、`git merge`を含む全mutationを実行しない。このスキルは
-GitHub PRのmergeを直接実行せず、既存のSaihai finalized envelopeが同じtask contextにある場合だけ
+GitHub PRのmergeを直接実行せず、既存の`trusted_local_v1` host handoffまたは`legacy_managed` Saihai
+finalized envelopeが同じtask contextにある場合だけ
 `pr-merge-gate`へ渡す。別のtask/processを要求し直すのは、identity、scope、merge order、または権限の
 選択が必要な場合だけとする。
 

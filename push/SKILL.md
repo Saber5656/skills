@@ -27,6 +27,18 @@ commit、PR 作成、branch 作成、GitHub ruleset 設定は担当しない。
 authentication secret、data-loss riskだけは、指定済みproviderによる一度の限定reviewを先に完了する。通常の内部reviewと
 PR bot reviewを二重に起動しない。default branchへの直接push禁止と、PR publicationを`pr`へ渡すnegative boundaryは常に維持する。
 
+## Execution profile routing
+
+The task context must select exactly one `execution_profile`: `trusted_local_v1` or `legacy_managed`.
+For `trusted_local_v1`, this skill performs only local scope/branch preflight for an external publication and
+returns a typed handoff to the host-owned Saihai usage route. The host invokes
+`python3.11 scripts/saihai.py usage run --request /absolute/request.json --authorization /absolute/authority.json --state-root /absolute/private-state`
+and bounded `usage advance`; `host_publication_adapter` owns the authenticated push and its postcondition. This
+skill never creates or copies credentials and never switches to the legacy broker when the host route is missing.
+For an explicitly selected `legacy_managed` profile, retain the repository's existing branch-policy and runtime
+contract, including any root-owned/attested prerequisites declared by that profile. Missing or malformed profile
+context is `publication_execution_profile_missing` and performs no network mutation.
+
 ## Task Context Precondition
 
 人間起点で呼ばれた場合でも、task context または Publication Manifest が必要。
@@ -53,8 +65,9 @@ task contextを検出した場合、このskillはremote read、`git ls-remote`�
 `blocked_reason: pr_publication_transport_owned_by_pr`、`required_handoff: pr_canonical_publication_preflight`
 を返す。`push_required: true`が同時に存在しても、このnegative boundaryを上書きしない。
 
-PR publicationでは、`pr`のmarker-bounded canonical preflightがfrozen endpoint、immutable source OID、
-URL-rewrite-free transport、remote-head/upstream postconditionを一体で所有する。callerは同じManifestを
+PR publicationでは、選択されたprofileがfrozen endpoint、immutable source OID、
+URL-rewrite-free transport、remote-head/upstream postconditionを一体で所有する。`trusted_local_v1`では
+host publication adapterが担当し、`legacy_managed`では`pr`のmarker-bounded canonical preflightが担当する。callerは同じManifestを
 `push`と`pr`へ分岐させず、commit resultをappendした後に`pr`だけへ渡す。このskillの通常のworking-
 branch/default-branch policyは、PRを作らない明示pushやnon-PR publicationにのみ適用する。
 
@@ -204,7 +217,9 @@ environment constraints. They are not policy-level push confirmations.
 5. Confirm current branch and upstream, or validate initial upstream creation eligibility including remote branch absence.
 6. Reject dirty task-owned paths. Repo-wide dirty state is allowed only when every dirty path is outside the approved task scope and is recorded as `unrelated_dirty_paths`.
 7. Reject default branch not in whitelist, default branch matching deny pattern, and protected branches.
-8. Execute plain `git push` for branches with upstream, or `git push -u origin <current_branch>` for eligible first non-PR working-branch publication.
+8. For `trusted_local_v1`, return the host-publication handoff after local preflight; do not execute network Git.
+   For `legacy_managed`, execute plain `git push` for branches with upstream, or `git push -u origin <current_branch>`
+   for eligible first non-PR working-branch publication.
 9. Record `Push Result` with status, remote branch, policy decision, and failure reason if any.
 
 ## Stop Rules
@@ -223,7 +238,7 @@ environment constraints. They are not policy-level push confirmations.
 | protected branch | `push_status: blocked`, reason `protected_branch_push_denied` |
 | force push requested | `push_status: blocked`, reason `force_push_forbidden` |
 | non-fast-forward rejection | stop; do not pull/rebase automatically |
-| auth/network failure | stop and record error |
+| auth/network failure | stop and record error; `trusted_local_v1` routes the operation to the host adapter rather than falling back to direct writes |
 
 ## Push Result
 
@@ -242,18 +257,22 @@ environment constraints. They are not policy-level push confirmations.
 | `default_branch_deny_pattern` | Yes when matched | deny pattern と理由 |
 | `policy_decision` | Yes | allow / deny と理由 |
 | `blocked_reason` | When blocked | 停止理由 |
-| `required_handoff` | When PR publication is rejected | `pr_canonical_publication_preflight` |
+| `execution_profile` | Yes | `trusted_local_v1` / `legacy_managed` |
+| `required_handoff` | When publication is delegated | `pr_canonical_publication_preflight` or host `usage run` / `usage advance` via `host_publication_adapter` |
 | `task_owned_dirty_paths` | When blocked | push 前に残っている task-owned dirty paths |
 | `unrelated_dirty_paths` | When repo-wide dirty | push 対象外として許容した dirty paths |
 
 ## Sandboxing Compatibility
 
 **Works without sandboxing:** Yes
-**Works with sandboxing:** Network push usually requires approval
+**Works with sandboxing:** `trusted_local_v1` requires the host usage executor/publication adapter; direct network push
+is available only for an explicitly selected `legacy_managed` non-PR flow.
 
 - **Filesystem**: repo read/write
-- **Network**: `git push`
-- **Configuration**: remote must already exist. Upstream may be created only for eligible first working branch publication after confirming the remote branch does not already exist.
+- **Network**: `trusted_local_v1` uses host-owned authenticated publication; `legacy_managed` may use `git push` under
+  the existing branch policy.
+- **Configuration**: the selected profile and its host/runtime authority must already exist. Upstream may be created
+  only for an eligible first working branch publication after confirming the remote branch does not already exist.
 
 ## Related References
 

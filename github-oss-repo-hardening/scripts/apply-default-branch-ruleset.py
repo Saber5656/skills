@@ -3,7 +3,8 @@
 
 The default mode is dry-run. Applying changes requires both:
 
-- a temporary GH_TOKEN environment variable, unless explicitly overridden
+- a selected GH_TOKEN credential, or the existing explicit auth override
+- a reviewed context snapshot and payload
 - the --yes flag
 
 This script never prints token values.
@@ -12,6 +13,7 @@ This script never prints token values.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -21,6 +23,13 @@ import sys
 import tempfile
 from pathlib import Path
 from typing import Any
+
+from gh_credential_context import (ContextError, observe_context, selected_source,
+                                   require_same_context, classify_observation)
+
+ACTIVE_CONTEXT = None
+EXECUTOR_SURFACE = "cli"
+TARGET_HOST = "github.com"
 
 
 DEFAULT_RULESET_NAME = "protect-main-branch-of-OSS"
@@ -108,7 +117,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--allow-stored-gh-auth",
         action="store_true",
-        help="Allow apply mode to use the stored gh credential instead of GH_TOKEN.",
+        help="Explicit legacy override for a selected source other than GH_TOKEN; never switches credentials.",
     )
     parser.add_argument(
         "--replace-existing",
@@ -120,6 +129,10 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Required with --mode apply. Confirms the mutation manifest.",
     )
+    parser.add_argument("--hostname", help="Explicit target host (otherwise GH_HOST or github.com).")
+    parser.add_argument("--executor-surface", default="cli", choices=("cli", "codex-app", "ide", "worker", "ci"))
+    parser.add_argument("--context-out", help="Create a new private reviewed-context file during dry-run.")
+    parser.add_argument("--context-in", help="Reviewed private context file; required for apply.")
     return parser.parse_args()
 
 
@@ -260,17 +273,29 @@ def write_payload(payload: dict[str, Any], path: Path) -> None:
 
 
 def run_gh_api(endpoint: str, *, method: str | None = None, input_path: Path | None = None) -> str:
-    command = ["gh", "api"]
+    if ACTIVE_CONTEXT is not None:
+        try:
+            require_same_context(ACTIVE_CONTEXT, observe_context(surface=EXECUTOR_SURFACE, target_host=TARGET_HOST))
+        except ContextError as exc:
+            fail(str(exc))
+    command = [ACTIVE_CONTEXT["gh_path"] if ACTIVE_CONTEXT else "gh", "api", "--hostname", TARGET_HOST]
     if method:
         command.extend(["--method", method])
     command.append(endpoint)
     if input_path:
         command.extend(["--input", str(input_path)])
 
-    result = subprocess.run(command, capture_output=True, text=True, check=False)
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, check=False, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        fail("transport_failure; check connectivity in this executor context manually.")
     if result.returncode != 0:
-        stderr = result.stderr.strip() or "unknown gh api error"
-        fail(stderr, exit_code=result.returncode)
+        # Consume only a status code, never forward raw stderr, auth headers or body.
+        match = re.search(r"\bHTTP (\d{3})\b", result.stderr)
+        status = int(match[1]) if match else None
+        diagnostic = classify_observation(http_status=status)
+        fail(diagnostic + "; manually check the selected credential and target host in this executor. "
+             "No credential fallback was attempted.")
     return result.stdout
 
 
@@ -323,11 +348,10 @@ def choose_mutation(args: argparse.Namespace) -> tuple[str, str]:
 
 
 def auth_source(args: argparse.Namespace) -> str:
-    if os.environ.get("GH_TOKEN"):
-        return "GH_TOKEN environment variable"
-    if args.allow_stored_gh_auth:
-        return "stored gh credential explicitly allowed"
-    return "stored gh credential, read-only discovery only"
+    source = selected_source(getattr(args, "hostname", None) or os.environ.get("GH_HOST") or "github.com", os.environ)
+    if source != "stored":
+        return source + " environment variable"
+    return "stored gh credential explicitly allowed" if args.allow_stored_gh_auth else "stored gh credential, read-only discovery only"
 
 
 def apply_command(args: argparse.Namespace, method: str, payload_path: Path) -> list[str]:
@@ -342,11 +366,15 @@ def apply_command(args: argparse.Namespace, method: str, payload_path: Path) -> 
         "--payload-in",
         str(payload_path),
     ]
+    command.extend(["--hostname", TARGET_HOST, "--executor-surface", args.executor_surface,
+                    "--context-in", args.context_out or "REVIEWED_CONTEXT_FILE"])
+    if args.allow_stored_gh_auth:
+        command.append("--allow-stored-gh-auth")
     if args.operation != "upsert":
         command.extend(["--operation", args.operation])
     if args.ruleset_id:
         command.extend(["--ruleset-id", args.ruleset_id])
-    if method == "PUT":
+    if args.replace_existing:
         command.append("--replace-existing")
     return command
 
@@ -363,14 +391,17 @@ def print_manifest(
     print(f"Target repository: {args.repo}")
     print(f"Endpoint: {method} /{endpoint}")
     print(f"Auth source: {auth_source(args)}")
+    if args.allow_stored_gh_auth:
+        print("Legacy auth override: accepts the actual selected source; does not switch to stored credentials")
     print("Required permission: repository Administration: write")
     print("Change summary: create or update an active default-branch ruleset")
     print("Reversible: yes")
     print("Rollback: edit or delete the ruleset in GitHub UI, or apply a saved previous payload with --payload-in")
-    print("Token hygiene: enter GH_TOKEN without echo, unset it after use, and revoke the temporary token")
+    print("Context: review a private --context-out snapshot in the intended executor before apply")
+    print("Authentication/read access does not prove Administration: write or mutation authority")
     print(f"Payload: {payload_path}")
     if method == "PUT" and not args.replace_existing:
-        print("Replacement guard: apply requires --replace-existing before replacing an existing ruleset")
+        print("Replacement guard: review a new dry-run with --replace-existing before applying replacement")
     print()
     print("Payload rules:")
     target_include = payload.get("conditions", {}).get("ref_name", {}).get("include", [])
@@ -391,21 +422,16 @@ def print_manifest(
         else:
             print(f"- {rule_type}")
     print()
-    print("History-safe apply command shape:")
-    print("printf 'GitHub fine-grained PAT: '")
-    print("IFS= read -r -s GH_TOKEN")
-    print("printf '\\n'")
-    print("export GH_TOKEN")
+    print("Apply command for the same reviewed executor and credential selectors:")
     print(shlex.join(apply_command(args, method, payload_path)))
-    print("unset GH_TOKEN")
 
 
 def guard_apply_auth(args: argparse.Namespace) -> None:
     if not args.yes:
         fail("--mode apply requires --yes after reviewing the dry-run manifest.")
-    if not os.environ.get("GH_TOKEN") and not args.allow_stored_gh_auth:
+    if selected_source(TARGET_HOST, os.environ) != "GH_TOKEN" and not args.allow_stored_gh_auth:
         fail(
-            "--mode apply requires GH_TOKEN. "
+            "--mode apply requires selected GH_TOKEN or explicit --allow-stored-gh-auth for the actual selected source (including stored). "
             "Use a short-lived fine-grained PAT with Administration: write, "
             "or pass --allow-stored-gh-auth intentionally."
         )
@@ -420,11 +446,19 @@ def guard_replace(args: argparse.Namespace, method: str) -> None:
 
 
 def main() -> int:
+    global ACTIVE_CONTEXT, EXECUTOR_SURFACE, TARGET_HOST
     args = parse_args()
     validate_args(args)
-
-    if args.mode == "apply":
-        guard_apply_auth(args)
+    EXECUTOR_SURFACE = args.executor_surface
+    TARGET_HOST = args.hostname or os.environ.get("GH_HOST") or "github.com"
+    if args.mode == "apply" and (not args.context_in or not args.payload_in or args.context_out):
+        fail("apply requires --context-in and --payload-in, and forbids --context-out.")
+    if args.mode == "dry-run" and args.context_in:
+        fail("--context-in is only for apply.")
+    try:
+        ACTIVE_CONTEXT = observe_context(surface=EXECUTOR_SURFACE, target_host=TARGET_HOST)
+    except ContextError as exc:
+        fail(str(exc))
 
     if args.payload_in:
         payload_path = Path(args.payload_in)
@@ -438,17 +472,50 @@ def main() -> int:
         payload_path = Path(args.payload_out) if args.payload_out else default_payload_path(args.repo)
         write_payload(payload, payload_path)
 
+    # A context file is a reviewed precondition, not a grant or token-scope proof.
+    binding = {"context": ACTIVE_CONTEXT, "repo": args.repo,
+               "payload_sha256": hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
+               "operation": args.operation, "ruleset_id": args.ruleset_id,
+               "allow_stored_gh_auth": args.allow_stored_gh_auth,
+               "replace_existing": args.replace_existing}
+    if args.mode == "apply":
+        try:
+            reviewed = json.loads(Path(args.context_in).read_text(encoding="utf-8"))
+            if not isinstance(reviewed, dict):
+                raise ContextError("context_drift")
+            require_same_context({k: v for k, v in reviewed.items() if k not in ("method", "endpoint")}, binding)
+        except (OSError, ValueError):
+            fail("context_drift; reviewed context is missing, invalid, or differs from this execution.")
+    if args.mode == "apply":
+        guard_apply_auth(args)
     method, endpoint = choose_mutation(args)
+    binding.update(method=method, endpoint=endpoint)
+    if args.mode == "apply":
+        try:
+            require_same_context(reviewed, binding)
+        except ContextError:
+            fail("context_drift; mutation destination changed since review.")
+    if args.context_out:
+        try:
+            fd = os.open(args.context_out, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                json.dump(binding, stream, sort_keys=True, indent=2)
+                stream.write("\n")
+        except OSError:
+            fail("context_output_unavailable; choose a new private file in a trusted directory.")
     print_manifest(args, method, endpoint, payload_path, payload)
 
     if args.mode == "dry-run":
         return 0
 
     guard_replace(args, method)
-    output = run_gh_api(endpoint, method=method, input_path=payload_path)
+    # Execute the reviewed in-memory payload, not a caller-editable file reread.
+    with tempfile.TemporaryDirectory(prefix="gh-reviewed-payload-") as directory:
+        pinned_payload = Path(directory) / "payload.json"
+        write_payload(payload, pinned_payload)
+        run_gh_api(endpoint, method=method, input_path=pinned_payload)
     print()
-    print("Applied ruleset:")
-    print(output)
+    print("Applied ruleset: request succeeded")
     return 0
 
 

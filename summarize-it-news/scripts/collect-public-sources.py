@@ -7,6 +7,7 @@ import concurrent.futures
 import gzip
 import html
 import hashlib
+import http.client
 import ipaddress
 import io
 import json
@@ -22,6 +23,7 @@ import urllib.parse
 import urllib.request
 import urllib.robotparser
 import xml.etree.ElementTree as ET
+import zlib
 from datetime import date, datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
@@ -31,6 +33,8 @@ from zoneinfo import ZoneInfo
 
 MAX_BYTES = 8 * 1024 * 1024
 MAX_JSON_BYTES = 1024 * 1024
+MAX_CONTENT_LENGTH_DIGITS = 20
+LEGACY_CONSTRAINT_TEXT_BYTES = 1024 * 1024
 TIMEOUT_SECONDS = 20
 JSON_LD_MAX_DEPTH = 64
 JSON_LD_MAX_NODES = 10_000
@@ -86,6 +90,9 @@ RFC_PUBLICATION_DATE = re.compile(
 )
 AMBIGUOUS_SCRIPT_CLOSER = re.compile(
     r"</[\t\n\f\r ]+script(?:[\t\n\f\r />])", re.IGNORECASE
+)
+SCRIPT_DOUBLE_ESCAPE_START = re.compile(
+    r"<script(?=[\t\n\f\r />])", re.IGNORECASE | re.ASCII
 )
 ENGLISH_MONTHS = {
     name: number
@@ -279,17 +286,51 @@ def robots_policy(url: str, hosts: set[str]) -> dict[str, object]:
 
 def read_bounded(response) -> bytes:  # type: ignore[no-untyped-def]
     """Read a response with a hard size cap and optional gzip decoding."""
-    declared = response.headers.get("Content-Length")
-    if declared:
+    get_all = getattr(response.headers, "get_all", None)
+    if callable(get_all):
+        declared_values = get_all("Content-Length") or []
+        if len(declared_values) > 1:
+            raise CollectionError("response has duplicate Content-Length fields")
+        declared = declared_values[0] if declared_values else None
+    else:
+        declared = response.headers.get("Content-Length")
+    declared_size = None
+    valid_declared_length = bool(
+        isinstance(declared, str)
+        and re.fullmatch(r"[0-9]+", declared, re.ASCII)
+    )
+    if valid_declared_length:
+        if len(declared) > MAX_CONTENT_LENGTH_DIGITS:
+            raise CollectionError("response Content-Length field is too long")
         try:
             declared_size = int(declared)
-        except (TypeError, ValueError):
-            declared_size = None
+        except (TypeError, ValueError) as exc:
+            raise CollectionError("response Content-Length is invalid") from exc
         if declared_size is not None and declared_size > MAX_BYTES:
             raise CollectionError("response exceeds size limit")
+    elif declared is not None:
+        # CPython accepts forms such as ``+41`` when it initializes an
+        # HTTPResponse and then silently clips read(amt) to that parsed length.
+        # The collector treats non-ASCII-decimal field values as absent, so
+        # clear only that implementation cache before the bounded read.
+        reader = response
+        seen_readers: set[int] = set()
+        for _depth in range(3):
+            if isinstance(reader, http.client.HTTPResponse):
+                reader.length = None
+                break
+            reader_id = id(reader)
+            if reader_id in seen_readers:
+                break
+            seen_readers.add(reader_id)
+            reader = getattr(reader, "fp", None)
+            if reader is None:
+                break
     content = response.read(MAX_BYTES + 1)
     if len(content) > MAX_BYTES:
         raise CollectionError("response exceeds size limit")
+    if declared_size is not None and len(content) != declared_size:
+        raise CollectionError("response length does not match Content-Length")
     if response.headers.get("Content-Encoding", "").lower() == "gzip":
         with gzip.GzipFile(fileobj=io.BytesIO(content)) as decompressor:
             content = decompressor.read(MAX_BYTES + 1)
@@ -351,9 +392,21 @@ def fetch_url(url: str, hosts: set[str]) -> dict[str, Any]:
                 validate_url(redirected, hosts)
                 request = urllib.request.Request(redirected, headers=dict(request.header_items()))
                 continue
-            if exc.code in (401, 402, 403, 407):
-                content = read_bounded(exc)
-                if detect_access_constraint(content):
+            if exc.code in (401, 402, 403, 407, 429):
+                try:
+                    content = read_bounded(exc)
+                except (
+                    CollectionError,
+                    OSError,
+                    EOFError,
+                    http.client.HTTPException,
+                    zlib.error,
+                ):
+                    if exc.code == 429:
+                        break
+                    raise
+                constraint = detect_access_constraint(content)
+                if constraint and (exc.code != 429 or constraint == "captcha"):
                     return {
                         "content": content,
                         "content_type": exc.headers.get_content_type().lower(),
@@ -361,8 +414,6 @@ def fetch_url(url: str, hosts: set[str]) -> dict[str, Any]:
                         "http_status": exc.code,
                         "attempt": attempt,
                     }
-                break
-            if exc.code == 429:
                 break
         except (CollectionError, OSError, urllib.error.URLError, socket.timeout) as exc:
             last_error = str(exc)
@@ -2091,11 +2142,534 @@ def extract_content(
     }
 
 
+def script_data_enters_double_escaped_state(data: str) -> bool:
+    """Detect a script end tag that HTMLParser would close too early."""
+    position = 0
+    while True:
+        escape_start = data.find("<!--", position)
+        if escape_start < 0:
+            return False
+        escaped_position = escape_start + 4
+        escape_end = data.find("-->", escaped_position)
+        scan_end = escape_end if escape_end >= 0 else len(data)
+        nested_script = SCRIPT_DOUBLE_ESCAPE_START.search(
+            data,
+            escaped_position,
+            scan_end,
+        )
+        if nested_script is not None:
+            return True
+        if escape_end < 0:
+            return False
+        position = escape_end + 3
+
+
+class AccessConstraintMarkupParser(HTMLParser):
+    """Extract explicit challenge evidence from a conservative HTML subset."""
+
+    MAX_OPAQUE_DEPTH = 128
+    MAX_RAW_START_TAG_CHARS = 16 * 1024
+    MAX_WIDGET_ATTRIBUTE_CHARS = 4096
+    FOREIGN_CONTENT_CONTAINERS = frozenset({"svg", "math"})
+    RAW_TEXT_CONTAINERS = frozenset({
+        "iframe",
+        "noembed",
+        "noframes",
+        "plaintext",
+        "script",
+        "style",
+        "textarea",
+        "xmp",
+    })
+    OPAQUE_CONTAINERS = frozenset(
+        {"template", "noscript", "select"}
+    ) | FOREIGN_CONTENT_CONTAINERS | RAW_TEXT_CONTAINERS
+    HEAD_OPAQUE_CONTAINERS = frozenset(
+        {"script", "style", "template", "noscript", "noframes"}
+    )
+    AFTER_HEAD_OPAQUE_CONTAINERS = frozenset(
+        {"script", "style", "template", "noframes"}
+    )
+    HEAD_METADATA_TAGS = frozenset(
+        {"base", "basefont", "bgsound", "link", "meta"}
+    )
+    IMPLIED_HEAD_START_TAGS = (
+        HEAD_METADATA_TAGS | HEAD_OPAQUE_CONTAINERS | {"title"}
+    )
+    CAPTCHA_WIDGET_TAGS = frozenset({"div", "form", "iframe", "section"})
+    CAPTCHA_WIDGET_TOKENS = frozenset({
+        "cf-turnstile",
+        "g-recaptcha",
+        "h-captcha",
+        "hcaptcha",
+    })
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.raw_end_tag_start: Optional[int] = None
+        self.head_seen = False
+        self.head_closed = False
+        self.in_head = False
+        self.body_started = False
+        self.body_closed = False
+        self.form_open = False
+        self.opaque_containers: list[str] = []
+        self.capture_title = False
+        self.invalid_title = False
+        self.title_elements = 0
+        self.title_parts: list[str] = []
+        self.document_title: Optional[str] = None
+        self.title_structure_invalid = False
+        self.structure_invalid = False
+        self.captcha_widget = False
+
+    def current_raw_end_tag(self) -> Optional[str]:
+        """Recover the raw end-tag token at the current parser position."""
+        start = self.raw_end_tag_start
+        if start is None or start < 0 or start >= len(self.rawdata):
+            return None
+        end = self.rawdata.find(">", start)
+        if end == -1:
+            return None
+        return self.rawdata[start : end + 1]
+
+    def parse_endtag(self, index: int) -> int:
+        """Expose the parser's bounded raw token index only during its callback."""
+        self.raw_end_tag_start = index
+        try:
+            return super().parse_endtag(index)
+        finally:
+            self.raw_end_tag_start = None
+
+    def parse_starttag(self, index: int) -> int:
+        """Reject oversized raw tags before HTMLParser materializes attributes."""
+        end = self.check_for_whole_start_tag(index)
+        if end < 0:
+            return end
+        if end - index > self.MAX_RAW_START_TAG_CHARS:
+            self.structure_invalid = True
+            return end
+        return super().parse_starttag(index)
+
+    def close(self) -> None:
+        """Finalize a structurally complete optional head at end of input."""
+        super().close()
+        if (
+            self.in_head
+            and not self.capture_title
+            and not self.opaque_containers
+            and not self.structure_invalid
+            and not self.title_structure_invalid
+            and not self.body_started
+            and not self.body_closed
+        ):
+            self.in_head = False
+            self.head_closed = True
+
+    def has_safe_end_tag(self, tag: str) -> bool:
+        """Require an exact end-tag name plus HTML5 ASCII whitespace only."""
+        raw_tag = self.current_raw_end_tag()
+        return bool(
+            raw_tag
+            and re.fullmatch(
+                rf"</{re.escape(tag)}[\t\n\f\r ]*>",
+                raw_tag,
+                re.IGNORECASE,
+            )
+        )
+
+    def strict_callback_attributes(
+        self, tag: str
+    ) -> Optional[dict[str, Optional[str]]]:
+        """Reparse the raw tag and reject ambiguous or duplicate attributes."""
+        raw_tag = self.get_starttag_text() or ""
+        parsed = strict_html_attributes(raw_tag, tag)
+        if parsed is None:
+            return None
+        attributes: dict[str, Optional[str]] = {}
+        for name, value in parsed:
+            if name in attributes:
+                return None
+            attributes[name] = value
+        return attributes
+
+    def start_implicit_body(self) -> None:
+        """Advance monotonically when a token belongs to the document body."""
+        if self.body_closed:
+            return
+        if self.capture_title:
+            self.invalid_title = True
+        if self.in_head:
+            self.in_head = False
+            self.head_closed = True
+        self.body_started = True
+
+    def start_implied_head(self) -> None:
+        """Infer the optional head start for an initial head-compatible token."""
+        if (
+            not self.head_seen
+            and not self.head_closed
+            and not self.in_head
+            and not self.body_started
+            and not self.body_closed
+        ):
+            self.head_seen = True
+            self.in_head = True
+
+    def is_after_head_compatible(self, tag: str) -> bool:
+        """Recognize supported tokens processed with head rules after </head>."""
+        return bool(
+            self.head_seen
+            and self.head_closed
+            and not self.body_started
+            and not self.body_closed
+            and tag in self.AFTER_HEAD_OPAQUE_CONTAINERS | self.HEAD_METADATA_TAGS
+        )
+
+    def record_captcha_widget(self, tag: str) -> None:
+        """Accept known widget tokens only from strict structural attributes."""
+        if tag not in self.CAPTCHA_WIDGET_TAGS:
+            return
+        attributes = self.strict_callback_attributes(tag)
+        if attributes is None:
+            return
+        relevant_values = [
+            attributes.get(name) for name in ("class", "id", "aria-label", "title")
+        ]
+        if any(
+            isinstance(value, str)
+            and len(value) > self.MAX_WIDGET_ATTRIBUTE_CHARS
+            for value in relevant_values
+        ):
+            return
+        widget_token = False
+        for name in ("class", "id"):
+            value = attributes.get(name)
+            if not value or not value.isascii():
+                continue
+            if any(
+                match.group(0).lower() in self.CAPTCHA_WIDGET_TOKENS
+                for match in re.finditer(r"[^\t\n\f\r ]+", value, re.ASCII)
+            ):
+                widget_token = True
+                break
+        semantic_labels = (
+            attributes.get("aria-label"),
+            attributes.get("title"),
+        )
+        if widget_token or (
+            any(
+                isinstance(semantic_label, str)
+                and semantic_label.isascii()
+                and re.fullmatch(
+                    r"[\t\n\f\r ]*captcha challenge[\t\n\f\r ]*",
+                    semantic_label,
+                    re.IGNORECASE | re.ASCII,
+                )
+                for semantic_label in semantic_labels
+            )
+        ):
+            self.captcha_widget = True
+
+    def push_opaque_container(self, tag: str) -> None:
+        """Bound parser state and poison evidence when nesting is excessive."""
+        if len(self.opaque_containers) >= self.MAX_OPAQUE_DEPTH:
+            self.structure_invalid = True
+            return
+        self.opaque_containers.append(tag)
+
+    def handle_starttag(
+        self, tag: str, _attrs: list[tuple[str, Optional[str]]]
+    ) -> None:
+        normalized = tag.lower()
+        if self.opaque_containers:
+            if self.opaque_containers[-1] == "plaintext":
+                return
+            if normalized in self.OPAQUE_CONTAINERS:
+                self.push_opaque_container(normalized)
+            return
+        if normalized == "frameset":
+            self.structure_invalid = True
+            return
+        if normalized in self.IMPLIED_HEAD_START_TAGS:
+            self.start_implied_head()
+        if normalized == "body":
+            if self.body_started or self.body_closed:
+                self.structure_invalid = True
+                return
+            if self.capture_title:
+                self.invalid_title = True
+            if self.in_head:
+                self.in_head = False
+                self.head_closed = True
+            self.body_started = True
+            return
+        if normalized == "head":
+            if self.head_seen or self.head_closed or self.body_started or self.in_head:
+                self.structure_invalid = True
+                self.title_structure_invalid = True
+                return
+            self.head_seen = True
+            self.in_head = True
+            return
+        if normalized in self.OPAQUE_CONTAINERS:
+            after_head_opaque = bool(
+                normalized in self.AFTER_HEAD_OPAQUE_CONTAINERS
+                and self.is_after_head_compatible(normalized)
+            )
+            if not after_head_opaque and (
+                normalized not in self.HEAD_OPAQUE_CONTAINERS or not self.in_head
+            ):
+                self.start_implicit_body()
+            if self.capture_title:
+                self.invalid_title = True
+            if (
+                normalized == "iframe"
+                and self.body_started
+                and not self.body_closed
+            ):
+                self.record_captcha_widget(normalized)
+            self.push_opaque_container(normalized)
+            return
+        if normalized == "title":
+            if not self.in_head or self.body_started:
+                self.start_implicit_body()
+                self.title_structure_invalid = True
+                return
+            self.title_elements += 1
+            attributes = self.strict_callback_attributes(normalized)
+            if (
+                self.title_elements == 1
+                and attributes == {}
+                and not self.capture_title
+            ):
+                self.capture_title = True
+                self.invalid_title = False
+                self.title_parts = []
+            else:
+                self.title_structure_invalid = True
+                if self.capture_title:
+                    self.invalid_title = True
+            return
+        if self.capture_title:
+            self.invalid_title = True
+            return
+        head_metadata = bool(
+            normalized in self.HEAD_METADATA_TAGS
+            and (self.in_head or self.is_after_head_compatible(normalized))
+        )
+        if normalized != "html" and not head_metadata:
+            self.start_implicit_body()
+        if self.body_started and not self.body_closed:
+            if normalized == "form":
+                if self.form_open:
+                    return
+                self.form_open = True
+            self.record_captcha_widget(normalized)
+
+    def handle_startendtag(
+        self, tag: str, _attrs: list[tuple[str, Optional[str]]]
+    ) -> None:
+        normalized = tag.lower()
+        if self.capture_title:
+            self.invalid_title = True
+        if self.opaque_containers:
+            if self.opaque_containers[-1] == "plaintext":
+                return
+            if normalized in self.RAW_TEXT_CONTAINERS:
+                self.push_opaque_container(normalized)
+            return
+        if normalized == "frameset":
+            self.structure_invalid = True
+            return
+        if normalized in self.IMPLIED_HEAD_START_TAGS:
+            self.start_implied_head()
+        if normalized in self.FOREIGN_CONTENT_CONTAINERS:
+            self.start_implicit_body()
+            return
+        if normalized in self.RAW_TEXT_CONTAINERS:
+            after_head_opaque = bool(
+                normalized in self.AFTER_HEAD_OPAQUE_CONTAINERS
+                and self.is_after_head_compatible(normalized)
+            )
+            if not after_head_opaque and (
+                normalized not in self.HEAD_OPAQUE_CONTAINERS or not self.in_head
+            ):
+                self.start_implicit_body()
+            self.push_opaque_container(normalized)
+            return
+        if normalized in self.OPAQUE_CONTAINERS or normalized in {"body", "head", "title"}:
+            self.structure_invalid = True
+            self.title_structure_invalid = True
+            return
+        if normalized == "form":
+            self.start_implicit_body()
+            if self.body_started and not self.body_closed and not self.form_open:
+                # HTML ignores the slash for this non-void element.  Retain the
+                # form pointer, but keep the conservative no-widget policy for
+                # a self-closing callback.
+                self.form_open = True
+            return
+        head_metadata = bool(
+            normalized in self.HEAD_METADATA_TAGS
+            and (self.in_head or self.is_after_head_compatible(normalized))
+        )
+        if normalized != "html" and not head_metadata:
+            self.start_implicit_body()
+        # Every supported widget element is non-void in HTML.  A callback for
+        # self-closing syntax does not prove a stable widget node, so it is
+        # never accepted as challenge evidence.
+
+    def handle_endtag(self, tag: str) -> None:
+        normalized = tag.lower()
+        if self.opaque_containers and self.opaque_containers[-1] == "plaintext":
+            return
+        if not self.opaque_containers and normalized == "frameset":
+            self.structure_invalid = True
+            return
+        if (
+            normalized in self.OPAQUE_CONTAINERS | {"body", "br", "head", "html", "title"}
+            and not self.has_safe_end_tag(normalized)
+        ):
+            self.structure_invalid = True
+            if normalized in {"head", "title"}:
+                self.title_structure_invalid = True
+            if self.capture_title:
+                self.invalid_title = True
+            return
+        if self.opaque_containers:
+            if normalized in self.OPAQUE_CONTAINERS:
+                if self.opaque_containers[-1] != normalized:
+                    self.structure_invalid = True
+                    return
+                self.opaque_containers.pop()
+            return
+        if normalized in self.OPAQUE_CONTAINERS:
+            self.structure_invalid = True
+            return
+        if normalized in {"br", "html"} and self.in_head:
+            self.start_implicit_body()
+            return
+        if normalized == "form":
+            if self.form_open:
+                if not self.has_safe_end_tag(normalized):
+                    self.structure_invalid = True
+                    return
+                self.form_open = False
+            return
+        if normalized == "title":
+            if not self.capture_title:
+                if self.in_head:
+                    self.title_structure_invalid = True
+                return
+            if self.invalid_title:
+                self.title_structure_invalid = True
+            else:
+                self.document_title = "".join(self.title_parts)
+            self.capture_title = False
+            self.invalid_title = False
+            self.title_parts = []
+            return
+        if self.capture_title:
+            self.invalid_title = True
+        if normalized == "head":
+            if not self.in_head:
+                self.structure_invalid = True
+                self.title_structure_invalid = True
+                return
+            self.in_head = False
+            self.head_closed = True
+        elif normalized == "body":
+            if not self.body_started and self.head_seen and (
+                self.in_head or self.head_closed
+            ):
+                self.start_implicit_body()
+            if not self.body_started or self.body_closed:
+                self.structure_invalid = True
+                return
+            self.body_closed = True
+
+    def handle_data(self, data: str) -> None:
+        if (
+            self.opaque_containers
+            and self.opaque_containers[-1] == "script"
+            and script_data_enters_double_escaped_state(data)
+        ):
+            self.structure_invalid = True
+        if self.capture_title:
+            self.title_parts.append(data)
+            return
+        if self.opaque_containers:
+            return
+        if re.search(r"[^\t\n\f\r ]", data):
+            self.start_implicit_body()
+
+    def handle_comment(self, _data: str) -> None:
+        if self.capture_title:
+            self.invalid_title = True
+
+    @property
+    def vercel_checkpoint(self) -> bool:
+        """Return true only for one completed, unambiguous document title."""
+        return bool(
+            not self.structure_invalid
+            and not self.title_structure_invalid
+            and not self.capture_title
+            and not self.in_head
+            and not self.opaque_containers
+            and self.head_seen
+            and self.head_closed
+            and self.title_elements == 1
+            and isinstance(self.document_title, str)
+            and re.fullmatch(
+                r"[\t\n\f\r ]*vercel security checkpoint[\t\n\f\r ]*",
+                self.document_title,
+                re.IGNORECASE | re.ASCII,
+            )
+        )
+
+    @property
+    def has_captcha_evidence(self) -> bool:
+        """Reject evidence when opaque-container structure remains ambiguous."""
+        return bool(
+            not self.structure_invalid
+            and not self.title_structure_invalid
+            and not self.capture_title
+            and not self.opaque_containers
+            and (self.vercel_checkpoint or self.captcha_widget)
+        )
+
+
+def parse_access_constraint_markup(
+    text: str,
+) -> Optional[AccessConstraintMarkupParser]:
+    """Parse challenge markup once and return no evidence on parser failure."""
+    parser = AccessConstraintMarkupParser()
+    try:
+        parser.feed(text)
+        parser.close()
+    except (AssertionError, ValueError):
+        return None
+    return parser
+
+
+def has_vercel_security_checkpoint_title(text: str) -> bool:
+    """Require a parsed title element instead of a matching raw byte sequence."""
+    parser = parse_access_constraint_markup(text)
+    return bool(parser and parser.vercel_checkpoint)
+
+
 def detect_access_constraint(content: bytes) -> Optional[str]:
     """Recognize explicit gate markup without treating generic HTTP errors as proof."""
-    text = content[: 1024 * 1024].decode("utf-8", errors="replace").lower()
-    if re.search(r"g-recaptcha|hcaptcha|cf-turnstile|captcha challenge", text):
+    decoded = content.decode("utf-8", errors="replace")
+    if decoded.startswith("\ufeff"):
+        decoded = decoded[1:]
+    parsed_constraint = parse_access_constraint_markup(decoded)
+    if parsed_constraint and parsed_constraint.has_captcha_evidence:
         return "captcha"
+    text = content[:LEGACY_CONSTRAINT_TEXT_BYTES].decode(
+        "utf-8", errors="replace"
+    ).lower()
     if re.search(r"<input[^>]+type=[\"']password[\"']", text) and re.search(
         r"sign[ -]?in|log[ -]?in|ログイン", text
     ):
@@ -2125,13 +2699,28 @@ def collect_source(
             continue
         try:
             fetched = fetch_url(url, hosts)
+            constraint = detect_access_constraint(fetched["content"])
+            verified_http_429_captcha = (
+                fetched["http_status"] == 429 and constraint == "captcha"
+            )
+            if verified_http_429_captcha:
+                constraint_record = {
+                    "method": method, "requested_url": url,
+                    "final_url": fetched["final_url"], "constraint": constraint,
+                    "http_status": fetched["http_status"],
+                }
+                attempts.append({
+                    "method": method, "url": url, "status": "access_constraint",
+                    **constraint_record,
+                })
+                constraints.append(constraint_record)
+                continue
             extract = extract_content(
                 fetched["content"],
                 fetched["content_type"],
                 fetched["final_url"],
                 hosts,
             )
-            constraint = detect_access_constraint(fetched["content"])
             if constraint and extract["entry_count"] < 10:
                 constraint_record = {
                     "method": method, "requested_url": url,
@@ -2451,42 +3040,54 @@ def verify_resolutions(
         hosts = source_hosts(by_name[name])
         fetched = fetch_url(validate_url(url, hosts), hosts)
         constraint = detect_access_constraint(fetched["content"])
-        extract = extract_content(
-            fetched["content"], fetched["content_type"], fetched["final_url"], hosts
+        verified_http_429_captcha = (
+            fetched["http_status"] == 429 and constraint == "captcha"
         )
-        if extract["entry_count"] >= 10:
-            constraint = None
-        if method == "access_constraint":
-            if item["constraint"] not in {"login", "paywall", "captcha"} or constraint != item["constraint"]:
-                raise CollectionError("access constraint lacks verified gate evidence")
+        if verified_http_429_captcha:
+            if method != "access_constraint" or item["constraint"] != "captcha":
+                raise CollectionError("fallback URL is access constrained")
             status = "verified_access_constraint"
-        elif constraint:
-            raise CollectionError("fallback URL is access constrained")
+            extracted_entry_count = 0
+            candidates: list[dict[str, Any]] = []
+            published_dates: list[Optional[str]] = []
         else:
-            status = "verified_fallback"
-            if extract["entry_count"] == 0:
-                raise CollectionError("verified fallback extract is empty")
-        primary_published, primary_provenance = extract_primary_publication_evidence(
-            fetched["content"], fetched["final_url"], hosts
-        )
-        if extract["format"] == "html_links" and primary_published:
-            candidates = [{
-                "url": fetched["final_url"],
-                "candidate_provenance": primary_provenance,
-                "published": primary_published,
-            }]
-        else:
-            candidates = (
-                extract["entries"]
-                if extract["format"] == "feed"
-                else [
-                    entry for entry in extract["entries"]
-                    if entry.get("candidate_provenance") in {"article", "json_ld"}
-                ]
+            extract = extract_content(
+                fetched["content"], fetched["content_type"], fetched["final_url"], hosts
             )
-        published_dates = [
-            validated_publication_date(entry.get("published")) for entry in candidates
-        ]
+            if extract["entry_count"] >= 10:
+                constraint = None
+            if method == "access_constraint":
+                if item["constraint"] not in {"login", "paywall", "captcha"} or constraint != item["constraint"]:
+                    raise CollectionError("access constraint lacks verified gate evidence")
+                status = "verified_access_constraint"
+            elif constraint:
+                raise CollectionError("fallback URL is access constrained")
+            else:
+                status = "verified_fallback"
+                if extract["entry_count"] == 0:
+                    raise CollectionError("verified fallback extract is empty")
+            primary_published, primary_provenance = extract_primary_publication_evidence(
+                fetched["content"], fetched["final_url"], hosts
+            )
+            if extract["format"] == "html_links" and primary_published:
+                candidates = [{
+                    "url": fetched["final_url"],
+                    "candidate_provenance": primary_provenance,
+                    "published": primary_published,
+                }]
+            else:
+                candidates = (
+                    extract["entries"]
+                    if extract["format"] == "feed"
+                    else [
+                        entry for entry in extract["entries"]
+                        if entry.get("candidate_provenance") in {"article", "json_ld"}
+                    ]
+                )
+            published_dates = [
+                validated_publication_date(entry.get("published")) for entry in candidates
+            ]
+            extracted_entry_count = extract["entry_count"]
         if status == "verified_fallback" and (
             not published_dates or any(not value for value in published_dates)
         ):
@@ -2499,7 +3100,7 @@ def verify_resolutions(
             "final_url": fetched["final_url"],
             "http_status": fetched["http_status"],
             "constraint": constraint,
-            "extracted_entry_count": extract["entry_count"],
+            "extracted_entry_count": extracted_entry_count,
             "candidate_entry_count": len(candidates),
             "date_evidence_count": sum(bool(value) for value in published_dates),
             "published_dates": published_dates,

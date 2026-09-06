@@ -17,7 +17,9 @@
 - 各コメントについて、現状の問題/デメリットと対応メリット/解決される課題を明記する。
 - 通常のvalid blocking findingは追加承認なしで実装handoffへ渡し、要件・スコープ・互換性・設計の選択が必要なものだけ個別に確認する。permission expansion、authentication secret、data-loss riskだけは指定providerによる一度の限定review対象にする。
 - 実装用スキルへhandoffする。code changeではpush・remote-head確認後、explanation-onlyでは新規commit/pushを作らず説明検証後に、対象threadを再取得して個別返信し、返信成功後の再取得を経てresolveし、`isResolved`を確認する。reviewを使う場合も初回reviewと初回findingの再確認を一回だけ行い、修正後にPR botを再起動しない。
-- Saihaiまたは認可済みローカルautomationのprivate watchからboundedに再開し、毎回一意なoperation IDでattested current-head review/thread stateを取得する。
+- 選択された`execution_profile`のprivate watchからboundedに再開する。通常の`trusted_local_v1`はhost usage/
+  `host_publication_adapter`、明示された`legacy_managed`はSaihaiを使い、毎回一意なoperation IDでauthenticated
+  current-head review/thread stateを取得する。
 
 ## What It Does Not Do
 
@@ -27,8 +29,9 @@
 - handoff後の実装用スキルは、scopeに含めたreview threadごとに対応内容、commitまたは差分、検証結果を返信し、その返信成功後にthreadをresolveする。
 - explanation-onlyではcommit/push/remote-head確認を`not_applicable`とし、空commitを作らない。
 - reply直前とresolve直前にSaihai runtimeからthread identityと`isResolved`/`isOutdated`を再取得する。push後を含めoutdatedになったthreadにはruntime v1から自動返信・resolveしない。
-- 後続handoffにはstable lineage ID、active Manifest digest/generation、完全なPR/base/head identity、
-  signed Saihai work-order/authorityとroot-owned client/config identityを含める。reply/resolveをplain GitHub APIへfallbackしない。
+- 後続handoffには`execution_profile`、task/run/execution identity、完全なPR/base/head identity、選択profileの
+  authority/report referenceを含める。`legacy_managed`ではstable lineage ID、active Manifest digest/generation、
+  signed Saihai work-order/authorityとroot-owned client/config identityも含める。reply/resolveをplain GitHub APIへfallbackしない。
 - 対象化前またはpush後にoutdated、未対応、除外、identity不一致となったthreadにはmutationを行わない。
 - top-level PR commentsはreview threadではないためresolve対象外とし、`not_applicable`として報告する。
 - reply、resolve、`isResolved`確認のどこかが失敗したthreadを完了扱いしない。

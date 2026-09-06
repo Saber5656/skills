@@ -100,7 +100,7 @@ def capture_complete(runtime_file: str) -> dict[str, object]:
     """Capture the exact two-Vault baseline before evidence mutation."""
     helper = Path(__file__).with_name("capture-vault-state.py")
     completed = run_local_command(
-        [str(helper), "--include-local-history", runtime_file],
+        [str(helper), "--index-only", "--include-local-history", runtime_file],
         check=True,
         capture_output=True,
         text=True,
@@ -125,9 +125,13 @@ def clean_git_environment() -> dict[str, str]:
             "GIT_NO_LAZY_FETCH": "1",
             "GIT_NO_REPLACE_OBJECTS": "1",
             "GIT_OPTIONAL_LOCKS": "0",
-            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_COUNT": "3",
             "GIT_CONFIG_KEY_0": "core.fsmonitor",
             "GIT_CONFIG_VALUE_0": "false",
+            "GIT_CONFIG_KEY_1": "core.trustctime",
+            "GIT_CONFIG_VALUE_1": "false",
+            "GIT_CONFIG_KEY_2": "core.checkStat",
+            "GIT_CONFIG_VALUE_2": "minimal",
         }
     )
     return environment
@@ -140,6 +144,8 @@ def git_bytes(repo: str, git_dir: str, *arguments: str) -> bytes:
             "git", f"--git-dir={git_dir}", f"--work-tree={repo}",
             "-c", f"core.hooksPath={os.devnull}",
             "-c", "core.fsmonitor=false",
+            "-c", "core.trustctime=false",
+            "-c", "core.checkStat=minimal",
             *arguments,
         ],
         cwd="/",
@@ -645,6 +651,7 @@ def main(argv: list[str]) -> int:
             ),
             "publication_mode": initial["publication_mode"],
             "deferred_cleanup": initial["deferred_cleanup"],
+            "notification_result": initial["notification_result"],
         }
         marker = f"vault-change-publisher:{argv[5]}"
         block = (

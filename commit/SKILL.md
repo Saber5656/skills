@@ -54,6 +54,18 @@ role、approval owner、review provider、routing、publication ownership を独
 task record または task scope がない場合は、このスキルを実行せず `task_scope_missing` として停止する。
 `approved_scope` または `approved_diff_snapshot` がない commit handoff は `unscoped_commit_forbidden` として拒否し、git 操作へ進まない。
 
+## Execution profile boundary
+
+Publication handoffs must carry exactly one typed `execution_profile`: `trusted_local_v1` or `legacy_managed`.
+The profile controls external publication, not the local scope/snapshot checks owned by this skill. Under
+`trusted_local_v1`, the host may run this skill inside
+`python3.11 scripts/saihai.py usage run --request /absolute/request.json --authorization /absolute/authority.json --state-root /absolute/private-state`;
+after this local commit/validation result, `host_publication_adapter` and bounded `usage advance` own branch push,
+PR, CI, and merge. Existing host authentication is used; this skill does not require, create, copy, or repair a
+root-owned broker, signer, or attestation. Under `legacy_managed`, preserve the explicitly selected legacy
+publication/runtime contract. A missing or malformed profile is `publication_execution_profile_missing` for a
+publication handoff; never switch profiles implicitly.
+
 ## When I Activate
 
 - ✅ Task Change Manifest に approved scope / snapshot / commit_required があるとき
@@ -87,6 +99,7 @@ task context から受け取った Task Change Manifest を最初に確認する
 | `owned_paths` | Yes | この task が所有する path |
 | `excluded_paths` | Yes | scope 外、別タスク、生成物など |
 | `approved_diff_snapshot` | Yes | validation対象として固定した task-owned diff |
+| `execution_profile` | When invoked by publication flow | `trusted_local_v1` or `legacy_managed`; immutable and provenance-bound |
 | `reviewed_artifacts` | Yes | validation evidence。conditional reviewを実施した場合だけreview evidenceも含める |
 | `commit_required` | Yes | `true` |
 | `commit_hashes` | Later | commit 後に記録 |
@@ -331,6 +344,7 @@ EOF
 | `security_stop_reason` | P0 または review 不備で停止した場合 |
 | `commit_not_required_reason` | commit 不要判断の場合 |
 | `next_step` | publication flow に戻す、または publication_not_required を記録する |
+| `execution_profile` | When publication flow | selected profile and host/legacy handoff status |
 
 Publication Manifest から呼ばれた場合、commit 完了後は caller に commit result を返す。
 commit hash と `committed_diff_matches_snapshot: true` 記録前に push / PR / `done` へ進めない。記録するのは

@@ -11,6 +11,7 @@ import subprocess
 import sys
 import os
 import time
+import re
 from pathlib import Path
 
 from isolated_git_transport import (
@@ -23,6 +24,14 @@ from isolated_git_transport import (
 MAX_GIT_METADATA_BYTES = 1024 * 1024
 MAX_LOCAL_COMMITS = 256
 MAX_TOTAL_HISTORY_METADATA_BYTES = 8 * 1024 * 1024
+# File Provider placeholders can block a Git hash-object call while the
+# directory itself remains writable.  A residual path is never part of an
+# own-only publication, so bound this probe independently from the longer
+# control-plane deadline and defer the residual instead of blocking the whole
+# Vault snapshot.
+DIRTY_ENTRY_TIMEOUT_SECONDS = 5
+UNAVAILABLE_DIRTY_MODE = "unavailable"
+OID_PATTERN = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 
 
 class HistoryUnavailable(RuntimeError):
@@ -42,9 +51,13 @@ def clean_git_environment() -> dict[str, str]:
     # A repository-local fsmonitor command must never execute while a state
     # snapshot is being captured, including during a config-change race after
     # runtime-context validation.
-    environment["GIT_CONFIG_COUNT"] = "1"
+    environment["GIT_CONFIG_COUNT"] = "3"
     environment["GIT_CONFIG_KEY_0"] = "core.fsmonitor"
     environment["GIT_CONFIG_VALUE_0"] = "false"
+    environment["GIT_CONFIG_KEY_1"] = "core.trustctime"
+    environment["GIT_CONFIG_VALUE_1"] = "false"
+    environment["GIT_CONFIG_KEY_2"] = "core.checkStat"
+    environment["GIT_CONFIG_VALUE_2"] = "minimal"
     return environment
 
 
@@ -179,6 +192,14 @@ def is_ancestor(repo: str, ancestor: str, descendant: str) -> bool:
     return result.returncode == 0
 
 
+def validated_blob_oid(value: str) -> str:
+    """Accept only a complete Git object ID from a bounded hash command."""
+    candidate = value.strip()
+    if OID_PATTERN.fullmatch(candidate) is None:
+        raise ValueError("Git worktree object ID is invalid")
+    return candidate
+
+
 def commit_patch(repo: str, commit: str, parents: list[str]) -> bytes:
     """Return a bounded deterministic patch for focused verification callers."""
     if parents:
@@ -257,8 +278,14 @@ def local_commit_metadata(
     return result
 
 
-def capture(repo: str, include_local_history: bool = False) -> dict[str, object]:
-    """Capture branch, heads, operation markers, and all dirty paths."""
+def capture(
+    repo: str,
+    include_local_history: bool = False,
+    worktree_scope: str = "full",
+) -> dict[str, object]:
+    """Capture Git control state and either full or index-only residual state."""
+    if worktree_scope not in {"full", "index_only"}:
+        raise ValueError("worktree capture scope is invalid")
     git_dir = Path(git(repo, "rev-parse", "--absolute-git-dir"))
     common_dir = Path(
         git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir")
@@ -354,7 +381,6 @@ def capture(repo: str, include_local_history: bool = False) -> dict[str, object]
                     else:
                         control.update(path.read_bytes())
                     control.update(b"\0")
-    status = git(repo, "status", "--porcelain=v1", "--untracked-files=all")
     staged_paths = [
         value
         for value in git(
@@ -363,32 +389,74 @@ def capture(repo: str, include_local_history: bool = False) -> dict[str, object]
         if value
     ]
     staged_paths = sorted(staged_paths)
-    worktree_paths = [
-        value
-        for value in git(
-            repo, "diff", "--name-only", "--no-renames", "-z"
-        ).split("\0")
-        if value
-    ]
-    head_worktree_paths = [
-        value
-        for value in git(
-            repo, "diff", "--name-only", "--no-renames", "-z", "HEAD"
-        ).split("\0")
-        if value
-    ]
-    untracked_paths = [
-        value
-        for value in git(
-            repo, "ls-files", "--others", "--exclude-standard", "-z"
-        ).split("\0")
-        if value
-    ]
+    if worktree_scope == "full":
+        status = git(repo, "status", "--porcelain=v1", "--untracked-files=all")
+        worktree_paths = [
+            value
+            for value in git(
+                repo, "diff", "--name-only", "--no-renames", "-z"
+            ).split("\0")
+            if value
+        ]
+        head_worktree_paths = [
+            value
+            for value in git(
+                repo, "diff", "--name-only", "--no-renames", "-z", "HEAD"
+            ).split("\0")
+            if value
+        ]
+        untracked_paths = [
+            value
+            for value in git(
+                repo, "ls-files", "--others", "--exclude-standard", "-z"
+            ).split("\0")
+            if value
+        ]
+    else:
+        # The daily publisher creates only collision-reserved artifacts from a
+        # private index. Walking an iCloud worktree cannot strengthen that
+        # transaction and may hydrate unrelated existing files, so capture the
+        # shared index/control plane and deterministically force own_only.
+        status = ""
+        worktree_paths = []
+        head_worktree_paths = []
+        untracked_paths = []
     dirty_paths = sorted(set(staged_paths + worktree_paths + untracked_paths))
     dirty_entries = []
     dirty_metadata = []
     repo_path = Path(repo)
+    # Once a worktree read is unavailable, do not keep probing later
+    # File-Provider paths.  Retroactively sealing the already-probed residuals
+    # makes the snapshot deterministic across repeated CAS checks while still
+    # preserving the exact porcelain path/metadata contract.
+    worktree_materializable_paths: set[str] = set()
+    worktree_materialization_deferred = False
     for relative in dirty_paths:
+        if worktree_scope == "index_only":
+            index_entry = git(repo, "ls-files", "--stage", "--", relative).split()
+            if index_entry:
+                if len(index_entry) < 4:
+                    raise ValueError(
+                        f"staged path index entry is unavailable: {relative}"
+                    )
+                mode = index_entry[0]
+                blob_oid = index_entry[1]
+            else:
+                mode = None
+                blob_oid = None
+            dirty_entries.append(
+                {"path": relative, "git_blob_oid": blob_oid, "mode": mode}
+            )
+            dirty_metadata.append(
+                {
+                    "path": relative,
+                    "exists": None,
+                    "size": None,
+                    "mtime_ns": None,
+                    "st_mode": None,
+                }
+            )
+            continue
         path = repo_path / relative
         if not os.path.lexists(path):
             dirty_entries.append(
@@ -416,21 +484,56 @@ def capture(repo: str, include_local_history: bool = False) -> dict[str, object]
             blob_oid = index_entry[1]
         else:
             metadata = path.lstat()
-            if path.is_symlink():
+            is_symlink = stat.S_ISLNK(metadata.st_mode)
+            is_regular = stat.S_ISREG(metadata.st_mode)
+            requires_worktree_materialization = is_symlink or is_regular
+            if requires_worktree_materialization:
+                worktree_materializable_paths.add(relative)
+            if worktree_materialization_deferred and requires_worktree_materialization:
+                mode = UNAVAILABLE_DIRTY_MODE
+                blob_oid = None
+            elif is_symlink:
                 mode = "120000"
-                blob_oid = run_local_command(
-                    ["git", "-C", repo, "hash-object", "--stdin"],
-                    input=os.fsencode(os.readlink(path)),
-                    check=True,
-                    capture_output=True,
-                    env=clean_git_environment(),
-                    timeout=LOCAL_COMMAND_TIMEOUT_SECONDS,
-                ).stdout.decode("ascii").strip()
-            elif path.is_file():
+                try:
+                    blob_oid = run_local_command(
+                        ["git", "-C", repo, "hash-object", "--stdin"],
+                        input=os.fsencode(os.readlink(path)),
+                        check=True,
+                        capture_output=True,
+                        env=clean_git_environment(),
+                        timeout=DIRTY_ENTRY_TIMEOUT_SECONDS,
+                    ).stdout.decode("ascii")
+                    blob_oid = validated_blob_oid(blob_oid)
+                except (OSError, UnicodeError, ValueError, subprocess.SubprocessError):
+                    worktree_materialization_deferred = True
+                    mode = UNAVAILABLE_DIRTY_MODE
+                    blob_oid = None
+            elif is_regular:
                 mode = "100755" if metadata.st_mode & 0o111 else "100644"
-                # Snapshot the literal reviewed bytes.  --path would apply a
-                # repository-controlled clean filter from .gitattributes.
-                blob_oid = git(repo, "hash-object", "--no-filters", "--", relative)
+                if worktree_materialization_deferred:
+                    mode = UNAVAILABLE_DIRTY_MODE
+                    blob_oid = None
+                else:
+                    try:
+                        # Snapshot the literal reviewed bytes.  --path would
+                        # apply a repository-controlled clean filter from
+                        # .gitattributes.
+                        blob_oid = run_local_command(
+                            [
+                                "git", "-C", repo, "hash-object", "--no-filters",
+                                "--", relative,
+                            ],
+                            check=True,
+                            capture_output=True,
+                            text=True,
+                            env=clean_git_environment(),
+                            timeout=DIRTY_ENTRY_TIMEOUT_SECONDS,
+                        ).stdout
+                        blob_oid = validated_blob_oid(blob_oid)
+                    except (OSError, UnicodeError, ValueError, subprocess.SubprocessError):
+                        worktree_materialization_deferred = True
+                        mode = UNAVAILABLE_DIRTY_MODE
+                        blob_oid = None
             else:
                 mode = "unsupported"
                 blob_oid = None
@@ -447,6 +550,16 @@ def capture(repo: str, include_local_history: bool = False) -> dict[str, object]
                 "st_mode": metadata.st_mode,
             }
         )
+    if worktree_materialization_deferred:
+        for entry in dirty_entries:
+            if entry["path"] in worktree_materializable_paths:
+                entry["mode"] = UNAVAILABLE_DIRTY_MODE
+                entry["git_blob_oid"] = None
+    deferred_dirty_paths = sorted(
+        entry["path"]
+        for entry in dirty_entries
+        if entry.get("mode") == UNAVAILABLE_DIRTY_MODE
+    )
     local_head = git(repo, "rev-parse", "HEAD")
     remote_head = git(repo, "rev-parse", "origin/main")
     remote_is_ancestor = is_ancestor(repo, remote_head, local_head)
@@ -513,19 +626,25 @@ def capture(repo: str, include_local_history: bool = False) -> dict[str, object]
                 "stage": int(fields[2]),
             }
         )
+    dirty_worktree_value = {"entries": dirty_entries, "metadata": dirty_metadata}
+    if worktree_scope == "index_only":
+        dirty_worktree_value["worktree_capture_scope"] = worktree_scope
     dirty_worktree = json.dumps(
-        {"entries": dirty_entries, "metadata": dirty_metadata},
+        dirty_worktree_value,
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
+    diff_snapshot_value = {
+        "dirty_lines": status.splitlines() if status else [],
+        "dirty_entries": dirty_entries,
+        "dirty_metadata": dirty_metadata,
+        "staged_paths": staged_paths,
+    }
+    if worktree_scope == "index_only":
+        diff_snapshot_value["worktree_capture_scope"] = worktree_scope
     diff_snapshot = json.dumps(
-        {
-            "dirty_lines": status.splitlines() if status else [],
-            "dirty_entries": dirty_entries,
-            "dirty_metadata": dirty_metadata,
-            "staged_paths": staged_paths,
-        },
+        diff_snapshot_value,
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
@@ -545,18 +664,40 @@ def capture(repo: str, include_local_history: bool = False) -> dict[str, object]
         "history_snapshot_sha256": hashlib.sha256(history_snapshot).hexdigest(),
         "operation_in_progress": operation,
         "git_control_sha256": control.hexdigest(),
+        "worktree_capture_scope": worktree_scope,
         "dirty_lines": status.splitlines() if status else [],
         "dirty_paths": dirty_paths,
         "dirty_entries": dirty_entries,
         "dirty_metadata": dirty_metadata,
+        "dirty_materialization": (
+            {
+                "status": "deferred",
+                "deferred_paths": [],
+                "reason": "worktree_scan_intentionally_omitted",
+            }
+            if worktree_scope == "index_only"
+            else {
+                "status": "deferred" if deferred_dirty_paths else "available",
+                "deferred_paths": deferred_dirty_paths,
+                "reason": (
+                    "dirty_entry_snapshot_unavailable"
+                    if deferred_dirty_paths
+                    else None
+                ),
+            }
+        ),
         "staged_paths": staged_paths,
         "index_entries": index_entries,
         "index_sha256": index_sha256,
         "index_identity": index_identity,
         "dirty_worktree_sha256": hashlib.sha256(dirty_worktree).hexdigest(),
-        "dirty_digest": hashlib.sha256(
-            (status + ("\n" if status else "")).encode("utf-8")
-        ).hexdigest(),
+        "dirty_digest": (
+            hashlib.sha256(b"index_only\0" + diff_snapshot).hexdigest()
+            if worktree_scope == "index_only"
+            else hashlib.sha256(
+                (status + ("\n" if status else "")).encode("utf-8")
+            ).hexdigest()
+        ),
         "diff_snapshot_sha256": hashlib.sha256(diff_snapshot).hexdigest(),
     }
 
@@ -579,10 +720,16 @@ def blocked_capture(repo: object, reason: BaseException) -> dict[str, object]:
         "history_snapshot_sha256": zero_digest,
         "operation_in_progress": True,
         "git_control_sha256": zero_digest,
+        "worktree_capture_scope": "unavailable",
         "dirty_lines": [],
         "dirty_paths": [],
         "dirty_entries": [],
         "dirty_metadata": [],
+        "dirty_materialization": {
+            "status": "blocked",
+            "deferred_paths": [],
+            "reason": "vault_state_capture_unavailable",
+        },
         "staged_paths": [],
         "index_entries": [],
         "index_sha256": zero_digest,
@@ -595,15 +742,24 @@ def blocked_capture(repo: object, reason: BaseException) -> dict[str, object]:
 
 def main(argv: list[str]) -> int:
     """Read runtime context and emit both Vault states."""
-    if len(argv) not in {2, 3} or (len(argv) == 3 and argv[1] != "--include-local-history"):
+    arguments = argv[1:]
+    flags = [value for value in arguments if value.startswith("--")]
+    paths = [value for value in arguments if not value.startswith("--")]
+    if (
+        len(paths) != 1
+        or len(flags) != len(set(flags))
+        or any(value not in {"--include-local-history", "--index-only"} for value in flags)
+    ):
         print(
-            "usage: capture-vault-state.py [--include-local-history] CONTEXT_JSON",
+            "usage: capture-vault-state.py [--index-only] "
+            "[--include-local-history] CONTEXT_JSON",
             file=sys.stderr,
         )
         return 64
     try:
-        include_local_history = len(argv) == 3
-        context_path = argv[2] if include_local_history else argv[1]
+        include_local_history = "--include-local-history" in flags
+        worktree_scope = "index_only" if "--index-only" in flags else "full"
+        context_path = paths[0]
         context = json.loads(Path(context_path).read_text(encoding="utf-8"))
         result = {}
         for key, context_key in (
@@ -612,7 +768,7 @@ def main(argv: list[str]) -> int:
         ):
             repo = context[context_key]
             try:
-                result[key] = capture(repo, include_local_history)
+                result[key] = capture(repo, include_local_history, worktree_scope)
             except (OSError, ValueError, UnicodeError, subprocess.SubprocessError) as exc:
                 result[key] = blocked_capture(repo, exc)
     except (OSError, KeyError, ValueError, subprocess.SubprocessError) as exc:

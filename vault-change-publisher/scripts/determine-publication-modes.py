@@ -23,10 +23,12 @@ STATE_CHANGE_FIELDS = (
     "local_head",
     "operation_in_progress",
     "git_control_sha256",
+    "worktree_capture_scope",
     "index_entries",
     "dirty_worktree_sha256",
     "dirty_digest",
     "diff_snapshot_sha256",
+    "dirty_materialization",
 )
 
 VOLATILE_INDEX_FIELDS = frozenset({"index_sha256", "index_identity"})
@@ -120,6 +122,12 @@ def vault_mode(
     if mode != "blocked" and current.get("staged_paths"):
         mode = "own_only"
         reasons.append("existing_staged_changes")
+    if (
+        mode != "blocked"
+        and current.get("worktree_capture_scope") == "index_only"
+    ):
+        mode = "own_only"
+        reasons.append("worktree_scan_intentionally_omitted")
     if not reasons:
         reasons.append("stable_sweep_candidate")
     return {
