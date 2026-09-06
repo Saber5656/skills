@@ -52,9 +52,9 @@
     {
       "id": 9,
       "prompt": "https://github.com/acme/app/pull/42 をマージして",
-      "expected_output": "Rejects the GitHub PR context as unsupported_context, performs no local git merge, and routes only to pr-merge-gate with a Saihai envelope.",
+      "expected_output": "Rejects the bare GitHub PR URL as unsupported_context, performs no local git merge or PR handoff, and returns required_handoff: typed_saihai_merge_envelope; it routes to pr-merge-gate only after that complete trusted envelope is supplied.",
       "files": [],
-      "expectations": ["Detects GitHub PR negative trigger", "Does not run local merge", "Routes to pr-merge-gate"]
+      "expectations": ["Detects GitHub PR negative trigger", "Does not run local merge", "Does not hand off a bare URL", "Names the typed Saihai envelope requirement"]
     },
     {
       "id": 10,
@@ -62,6 +62,13 @@
       "expected_output": "Returns mixed_context and performs no fetch, commit, stash, local git merge, or PR handoff; it requires separately authorized local and Saihai PR-merge processes.",
       "files": [],
       "expectations": ["Rejects mixed context as one ambiguous request", "Performs no local mutation", "Performs no PR handoff", "Requires separate authorization"]
+    },
+    {
+      "id": 11,
+      "prompt": "cleanなworking branchで通常リスクのlocal mergeをして。agent reviewやbot reviewは待たなくてよい。",
+      "expected_output": "The merge skill confirms task context, runs focused validation for the local integration and one integrated full validation as applicable, and performs the safe local merge without waiting for an agent or bot review. It does not push or invoke the GitHub PR merge gate.",
+      "files": [],
+      "expectations": ["Does not add a normal-risk review wait", "Runs the local validation gate", "Keeps the no-push and local-only boundary"]
     }
   ]
 }

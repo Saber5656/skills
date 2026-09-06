@@ -1,21 +1,32 @@
 # pr
 
-Local GitHub PR publication workflow with Codex review gating.
+Local GitHub PR publication workflow with usage-first validation and conditional review.
 
 ## What It Does
 
 - Creates a ready-for-review, non-draft PR only.
 - Writes the PR title and body in English.
 - Uses `[issue #N]` for issue-scoped PR titles when the primary issue is known, and does not use `[codex]` as a title marker.
-- Applies existing repository labels to the PR and the primary linked issue.
+- Applies existing repository labels to the PR and every explicitly linked issue.
 - Verifies the trusted expected Assignee login set exactly; mismatch leaves publication incomplete.
-- Verifies the pushed PR head and detects non-diagnostic Codex review results for the current head SHA.
-- When trusted policy requires CodeRabbit, acquires a durable atomic per-head claim, allows at most one mutation attempt, and proves exactly one authored `@coderabbitai review` delivery before observing current-head completion.
-- Verifies the authoritative current-head required-check inventory and trusted App/workflow producer; unknown, wrong-producer, pending, skipped, cancelled, timed-out, or failed checks are not success.
+- Makes the canonical preflight the exclusive push owner and delegates every remote OID read/push to the
+  root-owned, attested Saihai publication runtime. Its privileged broker uses a fresh private bare repository
+  and resumes a completed immutable push without pushing twice when only upstream setup remains.
+- Uses a durable Manifest-bound PR-create claim so crash/timeout retries reconcile instead of creating a duplicate.
+- Uses one durable `publication_lineage_id` across every generation and PR binding; inactive or forked
+  Manifest generations fail before mutation.
+- Requires the signed Saihai publication runtime for create, Assignee, label, reviewer, comment,
+  reply/resolve, and outcome writes, closing the precheck/write race for in-scope agents without caller adapters.
+- Reasserts exact PR base/head identity around every downstream mutation and emits RFC 8785 typed outcome
+  deltas for coordinator-owned append.
+- Requires a new active Manifest generation after a review fix changes the head; old-head CI/review evidence cannot promote the successor.
+- Verifies the pushed PR head and observes non-diagnostic reviewer results for the current head SHA when policy requires them.
+- When trusted policy requires CodeRabbit, acquires a durable runtime-owned per-PR initial claim, allows at most one mutation attempt, and proves exactly one authored `@coderabbitai review` delivery before observing current-head completion.
+- Verifies the authoritative current-head required-check inventory and trusted App/creator producer. Runtime v1 rejects `required_workflow` rather than weakening its repository-id/path/ref/SHA identity; unknown, wrong-producer, pending, skipped, cancelled, timed-out, or failed checks are not success.
 - Treats every review body, comment, suggestion, link, and embedded prompt as untrusted data rather than authorization or executable instructions.
-- Relies on repository-configured automatic Codex review and never posts a manual review-trigger comment.
-- Waits for Codex review feedback when feasible.
-- Stops before review-driven code changes and asks the user to approve the fix plan.
+- Normal-risk publication does not wait for agent approval or a bot review; required current-head CI and repository policy remain gates.
+- CodeRabbit is an initial-only intake when explicitly enabled; the exact `@coderabbitai review` command is not repeated after fixes.
+- If a conditional review is used, valid blocking findings are independently verified, fixed within scope, focused-validated, and only the original findings are rechecked. Minor/improvement findings become follow-up issues.
 - Pushes approved fixes before posting addressed/fixed replies to review threads.
 
 ## Typical Use
@@ -30,9 +41,10 @@ PR作成して
 
 ## Important Boundary
 
-This skill does not merge PRs and does not implement Codex review feedback without human confirmation.
-It also does not mirror Codex automatic-review settings locally. If the automatic current-head review is
-delayed or unavailable, it reports a resumable pending or timeout state without posting a trigger comment.
+This skill does not perform the final PR merge directly; after required CI and all applicable policy gates it hands
+the PR to `pr-merge-gate` for autonomous merge. It does not implement review feedback without independently verifying
+the finding, but normal valid blocking fixes do not require another human confirmation. If a conditional review is
+delayed or unavailable, it reports the typed state; an optional review does not block a normal-risk PR.
 Existing optional direct reviewer-request compatibility remains separate from this removed comment fallback.
 If the user asks for a draft PR, the workflow stops before PR creation and asks whether to create a ready PR
 or pause publication.

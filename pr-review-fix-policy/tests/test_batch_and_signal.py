@@ -313,24 +313,25 @@ class ConsumerTests(unittest.TestCase):
 
 
 class WorkflowSafetyTests(unittest.TestCase):
-    def test_receiver_has_dedupe_retry_and_no_untrusted_comment_trigger(self):
+    def test_legacy_receiver_is_fail_closed_and_read_only(self):
         workflow = (ROOT / "assets/review-signal.yml").read_text()
-        self.assertIn("getCombinedStatusForRef", workflow)
-        self.assertIn("failed after 3 attempts", workflow)
+        self.assertIn("Deprecated fail-closed reference", workflow)
+        self.assertIn("statuses: read", workflow)
+        self.assertIn("if: ${{ false }}", workflow)
+        self.assertNotIn("statuses: write", workflow)
         self.assertNotIn("issue_comment:", workflow)
         self.assertNotIn("pull_request_target", workflow)
         self.assertNotIn("actions/checkout", workflow)
 
-    def test_signal_identity_includes_comment_and_review_update_metadata(self):
-        workflow = (ROOT / "assets/review-signal.yml").read_text()
-        self.assertIn("nodes { id updatedAt }", workflow)
-        self.assertIn("reviewDigest", workflow)
-        self.assertIn("commentMetadata", workflow)
-        self.assertIn("reviews(first:100, after:$cursor)", workflow)
-        self.assertIn("head_changed_during_fetch", workflow)
-        self.assertIn("pre-delivery head lookup", workflow)
-        self.assertIn("repositoryIdentity", workflow)
-        self.assertIn("statuses.length < 100", workflow)
+    def test_skill_deprecates_commit_status_signal_as_evidence(self):
+        skill = (ROOT / "SKILL.md").read_text()
+        readme = (ROOT / "README.md").read_text()
+        for phrase in [
+            "commit-status方式はruntime v1では廃止済み",
+            "review-intake/signal",
+            "github_observe:review_threads",
+        ]:
+            self.assertIn(phrase, skill + "\n" + readme)
 
 
 if __name__ == "__main__":

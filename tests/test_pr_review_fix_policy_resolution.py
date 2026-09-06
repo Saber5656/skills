@@ -16,17 +16,29 @@ class PrReviewFixPolicyResolutionTests(unittest.TestCase):
     def test_policy_phase_remains_read_only(self) -> None:
         self.assertIn("このスキルではGitHubへ返信しない", SKILL_TEXT)
         self.assertIn("このスキルではreview threadをresolveしない", SKILL_TEXT)
-        self.assertIn("ユーザーが実装を承認したら", SKILL_TEXT)
+        self.assertIn("方針化したscopeをhandoffとして出し", SKILL_TEXT)
 
     def test_code_change_operations_have_safe_order(self) -> None:
         self.assertIn(
-            "capture approved thread snapshot → implement → validate → commit → push → verify remote head → refresh thread state and prove fix provenance → reply → refresh thread state → resolve → verify isResolved",
+            "capture approved thread snapshot → implement → validate → commit → pr canonical edit_only publication (Saihai runtime push) → verify remote head → freeze successor thread mutation policy → fresh Saihai thread observation → conditional reply → fresh Saihai thread observation → conditional resolve → verify isResolved",
             NORMALIZED_SKILL,
         )
 
+    def test_handoff_binds_active_lineage_and_conditional_mutation(self) -> None:
+        for phrase in [
+            "publication_lineage_id",
+            "active Publication Manifest SHA-256 and generation",
+            "base/head OIDs",
+            "signed work-order and authority identity",
+            ".publication_mutations.review_threads",
+            "reply_review_thread",
+            "publication_conditional_mutation_unavailable",
+        ]:
+            self.assertIn(phrase, SKILL_TEXT)
+
     def test_explanation_only_does_not_require_empty_commit(self) -> None:
         self.assertIn(
-            "validate explanation → mark commit/push/remote-head not_applicable → refresh thread state → reply → refresh thread state → resolve → verify isResolved",
+            "validate explanation → mark commit/push/remote-head not_applicable → freeze thread mutation policy → fresh Saihai thread observation → conditional reply → fresh Saihai thread observation → conditional resolve → verify isResolved",
             NORMALIZED_SKILL,
         )
         self.assertIn("コード変更がない場合に空commitや不要なpushを作らない", SKILL_TEXT)
@@ -38,28 +50,28 @@ class PrReviewFixPolicyResolutionTests(unittest.TestCase):
         self.assertIn("完了扱いしない", SKILL_TEXT)
 
     def test_thread_state_is_refreshed_before_each_mutation(self) -> None:
-        self.assertIn("reply直前とresolve直前にthread-aware stateを再取得", SKILL_TEXT)
+        self.assertIn("reply直前とresolve直前にSaihaiのfresh identity/scope/stateを再取得", SKILL_TEXT)
         self.assertIn("GraphQL thread node ID、path、original line", SKILL_TEXT)
-        self.assertIn("その他の確認失敗やstate変化時は次のmutationを行わない", SKILL_TEXT)
+        self.assertIn("確認失敗やstate変化時は次のmutationを行わない", SKILL_TEXT)
 
     def test_excluded_and_preexisting_outdated_threads_keep_fetched_state(self) -> None:
         self.assertIn("取得時の状態を変更しない", SKILL_TEXT)
         self.assertNotIn("outdated threadはopenのまま", SKILL_TEXT)
         self.assertIn("resolve_status: not_applicable", SKILL_TEXT)
 
-    def test_push_induced_outdated_thread_requires_fix_provenance(self) -> None:
-        self.assertIn("outdated_by_approved_fix", SKILL_TEXT)
+    def test_push_induced_outdated_thread_is_a_runtime_v1_blocker(self) -> None:
+        self.assertIn("review_thread_outdated_after_fix", SKILL_TEXT)
         self.assertIn("pre-fix head", SKILL_TEXT)
-        self.assertIn("commitの差分がthreadのpathと指摘内容に対応", SKILL_TEXT)
-        self.assertIn("単にoutdatedであることやpath一致だけ", SKILL_TEXT)
+        self.assertIn("runtime v1", SKILL_TEXT)
+        self.assertNotIn("outdated_by_approved_fix", SKILL_TEXT)
 
-    def test_option_a_explicitly_authorizes_reply_and_resolution(self) -> None:
+    def test_option_a_records_reply_and_resolution_authority(self) -> None:
         self.assertIn(
             "including per-thread replies, resolution after each successful reply",
             SKILL_TEXT,
         )
         self.assertIn(
-            "approval of this handoff explicitly authorizes per-thread replies and resolution",
+            "the signed authority in this handoff explicitly authorizes per-thread replies and resolution",
             SKILL_TEXT,
         )
 
@@ -71,11 +83,10 @@ class PrReviewFixPolicyResolutionTests(unittest.TestCase):
 
     def test_completion_evidence_is_reported_per_item(self) -> None:
         self.assertIn("Required completion evidence per item", SKILL_TEXT)
-        self.assertIn("reply status and URL when available", SKILL_TEXT)
+        self.assertIn("reply status and comment ID when available", SKILL_TEXT)
         self.assertIn("verified `isResolved`/`isOutdated` value or `not_applicable`", SKILL_TEXT)
-        self.assertIn("matched diff/hunk or lines", SKILL_TEXT)
-        self.assertIn("finding-to-fix rationale", SKILL_TEXT)
-        self.assertIn("provenance verdict", SKILL_TEXT)
+        self.assertIn("Manifest reply-body digest/resolve authorization", SKILL_TEXT)
+        self.assertIn("Saihai operation/result/evidence digests", SKILL_TEXT)
 
     def test_resolution_edge_cases_have_objective_evals(self) -> None:
         expected_markers = {
@@ -85,10 +96,10 @@ class PrReviewFixPolicyResolutionTests(unittest.TestCase):
             12: "Classifies top-level PR comment resolution as not_applicable",
             13: "Does not create an empty commit or require a new push for explanation-only work",
             14: "Keeps the thread unresolved when resolve mutation or verification fails",
-            15: "Replies to and resolves a thread that became outdated only because the approved pushed fix changed its reviewed lines",
+            15: "Stops automatic reply and resolution when the approved pushed fix makes the thread outdated",
             16: "Does not invoke a duplicate resolve mutation when isResolved is already true",
             17: "Does not reply to or resolve a thread that was already outdated before approval",
-            18: "Does not treat path matching alone as proof that an outdated thread was fixed",
+            18: "Does not mutate an outdated thread even when path or fix provenance appears to match",
         }
         for eval_id, marker in expected_markers.items():
             case = next(item for item in EVALS["evals"] if item["id"] == eval_id)

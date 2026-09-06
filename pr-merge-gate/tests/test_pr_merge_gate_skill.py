@@ -50,6 +50,20 @@ class PrMergeGateSkillTest(unittest.TestCase):
         ]:
             self.assertIn(phrase, text)
 
+    def test_conflict_repair_is_not_a_merge_gate_or_readiness_bypass(self) -> None:
+        text = (SKILL_DIR / "SKILL.md").read_text(encoding="utf-8")
+        for phrase in [
+            "conflict repair",
+            "base/head change",
+            "invalidates the prior envelope",
+            "fresh validation, review, and current CI",
+            "never performs conflict repair",
+            "does not authorize merge",
+        ]:
+            self.assertIn(phrase, text)
+        self.assertIn("policy_merge_ready", text)
+        self.assertIn("Never run `gh pr merge`", text)
+
     def test_contract_route_and_executor_invocation_failures_are_distinct(self) -> None:
         text = (SKILL_DIR / "SKILL.md").read_text(encoding="utf-8")
         self.assertIn("fixed Saihai-owned validator route cannot be resolved", text)
@@ -69,23 +83,28 @@ class PrMergeGateSkillTest(unittest.TestCase):
     def test_artifact_boundary_and_redaction_are_fail_closed(self) -> None:
         text = (SKILL_DIR / "SKILL.md").read_text(encoding="utf-8")
         for phrase in [
-            "remain within one of",
+            "trusted directory",
+            "open the artifact exactly once",
+            "beneath-root and no-follow semantics",
+            "same opened descriptor",
+            "Never validate a lexical",
             "reject symlink components",
-            "non-regular files",
+            "component/final-entry swaps",
             "contract-defined maximum size",
             "bearer-sensitive",
             "authorization_reference",
             "merge_gate_artifact_invalid",
         ]:
             self.assertIn(phrase, text)
+        self.assertRegex(text, r"non-regular\s+files")
         self.assertNotIn("authorization_id: <opaque id>\nauthorization_status", text)
 
     def test_evals_cover_positive_and_adversarial_cases(self) -> None:
         data = json.loads((SKILL_DIR / "evals" / "evals.json").read_text(encoding="utf-8"))
         self.assertEqual(data["skill_name"], "pr-merge-gate")
-        self.assertGreaterEqual(len(data["evals"]), 15)
+        self.assertGreaterEqual(len(data["evals"]), 19)
         prompts = "\n".join(item["prompt"] for item in data["evals"])
-        for phrase in ["CLEAN", "期限切れ", "2回目", "gh pr merge", "dirty", "timeout", "result integrity", "symlink"]:
+        for phrase in ["CLEAN", "期限切れ", "2回目", "gh pr merge", "dirty", "timeout", "result integrity", "symlink", "swap"]:
             self.assertIn(phrase, prompts)
 
     def test_trigger_eval_has_balanced_near_misses(self) -> None:

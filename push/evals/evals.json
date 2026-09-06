@@ -96,6 +96,18 @@
       "name": "skills_repo_alias_fallback_whitelist",
       "prompt": "SKILLS_REPO は export されておらず .directory-path.local.md も読めないが、skills/push/SKILL.md を含む repository root は解決でき、target repo も同じ skills repo。main-push-repos.md の whitelist 行は ${SKILLS_REPO}。current_branch main、worktree clean、upstream origin/main がある。push skill としてどうする？",
       "expected_output": "${SKILLS_REPO} を literal として比較せず、skills/push/SKILL.md を含む repository root から deterministic fallback で解決して whitelist 比較する。解決できた場合は main_push_whitelisted true で plain git push を許可する。target repository が別 repo の場合は、その target repo の git toplevel を ${SKILLS_REPO} fallback として使わない。解決できない場合は default_branch_not_whitelisted ではなく whitelist_alias_unresolved で blocked にする。"
+    },
+    {
+      "id": 17,
+      "name": "ready_pr_publication_uses_pr_transport_only",
+      "prompt": "finalized Publication Manifest は push_required true かつ pr_required true、publication_flow ready_pull_request、handoff_to pr。working branchはcleanで初回upstreamがまだない。push skillとして先に git push -u してよい？",
+      "expected_output": "push_required trueでもPR publication negative boundaryを優先する。git ls-remote、plain git push、git push -uを一切実行せず、push_status not_required、blocked_reason pr_publication_transport_owned_by_pr、required_handoff pr_canonical_publication_preflightを返す。同じManifestをpushとprへ分岐せず、prのcanonical preflightだけがfrozen endpointとimmutable OIDをpushする。"
+    },
+    {
+      "id": 18,
+      "name": "elevated_push_uses_one_conditional_review",
+      "prompt": "permission expansionを含むworking branchの変更をpushして。caller contextには指定providerによる一度のreview結果がある。追加の内部reviewやPR bot reviewは起動せず進めて。",
+      "expected_output": "指定された一度のreview結果の完全性とcurrent snapshotへのbindingを確認し、focused validationとintegrated full validationが通ればplain git pushを実行する。別の内部reviewやPR bot reviewを重ねず、P0/data-loss blockerやprovenance不備だけを停止理由にする。"
     }
   ]
 }

@@ -61,7 +61,10 @@ have entered Git history.
 
 ## Development
 
-Create or update one skill at a time, keep supporting tests and evals with the
-behavior they verify, and run the narrowest relevant validation before committing.
+Create or update one feature unit at a time. A feature unit may include a
+coordinated set of related skills when their contracts must change together;
+keep supporting tests and evals with the behavior they verify, and run focused
+validation for each behavior plus one integrated validation for the feature unit
+before committing.
 Use task-specific branches/worktrees and publish changes through pull requests;
 do not push directly to the default branch.

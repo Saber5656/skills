@@ -30,6 +30,13 @@ argument-hint: "[--dry-run | --execute] [--stash] [--message <text>]"
 ユーザーの短縮依頼「マージして」は、`pull` がブロックした管理 repo の
 **commit-first → merge --no-edit → 衝突時 abort** を意味する。
 
+## usage-first development operations
+
+このスキルはローカル管理 repo の統合だけを扱う。通常のローカル変更では、同じ変更を再レビューしたり
+追加承認を待ったりせず、task scope、focused validation、必要な統合確認が揃えば進める。権限拡大、認証
+secret、データ消失リスクがある場合だけ一度の限定レビューを適用する。既存PRの競合修復は `pr` の
+history-preserving repair contract、GitHub PRのmergeは `pr-merge-gate` のSaihai handoffが所有する。
+
 ## Task Context Precondition
 
 人間起点で呼ばれた場合でも、task record と実行 scope を確認する。
@@ -65,15 +72,18 @@ fetch、commit、stash、`git merge`を実行しない。つまり、git merge�
 
 - GitHub pull request URL（`github.com/.../pull/<number>`または`pull/`を含む入力）
 - `PR #12をマージ`、`pull requestをmerge`、merge queue、auto-mergeなどのGitHub PR context
-- repositoryとPR番号/head/candidateを持つSaihai merge-readiness envelope
+- repository、PR番号、immutable base/head、manifest digest、authorization referenceを持つtyped Saihai merge-readiness envelope
 
-この場合は`context_status: unsupported_context`を返し、`pr-merge-gate`へhandoffする。単なる
-「mergeして」という語をPR merge authorizationとして扱うことはneverである。
+この場合は`context_status: unsupported_context`を返す。完全なtyped Saihai envelopeが同じtrusted
+task contextに存在する場合だけ`pr-merge-gate`へhandoffする。PR URL、PR番号、`mergeable`、`CLEAN`、
+または単なる「mergeして」だけの場合はhandoffせず、`required_handoff: typed_saihai_merge_envelope`
+を返す。これらをPR merge authorizationとして扱うことはneverである。
 
 local managed repositoryとGitHub PR mergeが同じ依頼に含まれる場合は`mixed_context`としてfail closedし、
-local側を候補化せず、fetch、commit、stash、`git merge`を含む全mutationを実行しない。Local mergeと
-Saihai PR mergeをそれぞれ独立したtask/processとして明示的に再承認・再依頼するよう返す。PR側にfinalized
-manifestとone-shot authorizationがある場合でも、このmixed requestから直接handoffしない。
+local側を候補化せず、fetch、commit、stash、`git merge`を含む全mutationを実行しない。このスキルは
+GitHub PRのmergeを直接実行せず、既存のSaihai finalized envelopeが同じtask contextにある場合だけ
+`pr-merge-gate`へ渡す。別のtask/processを要求し直すのは、identity、scope、merge order、または権限の
+選択が必要な場合だけとする。
 
 ## What I Do
 
@@ -153,10 +163,13 @@ python3 skills/merge/scripts/merge_managed_repos.py --execute --json
 
 Run `pull` first; if it reports `dirty_worktree` blockers, run `merge` to resolve them.
 
-## Review Requirements
+## Validation and Review Requirements
 
-- If task policy requires review, reviewer selection is supplied by task context.
-- This skill records repo inventory, no-push boundary, command output, and Vault/task evidence.
+- Run focused validation for the affected local integration and reuse evidence for unaffected paths. Full validation
+  belongs once to the integrated change set, not to every commit or merge operation.
+- If the elevated-risk task policy requires review, reviewer selection is supplied by task context and the one
+  limited review is recorded; normal-risk local merge does not wait for an agent or bot review.
+- This skill records repo inventory, no-push boundary, command output, and the minimal task evidence.
 - Completion record must include Git Publication Result or publication-not-required reason when a publication flow exists.
 
 ## Sandboxing Compatibility

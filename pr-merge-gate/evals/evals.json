@@ -90,6 +90,60 @@
       "prompt": "Saihai contractとvalidator routeは解決済みだが、atomic handoff時にfixed executorを呼べない。contract unavailableとして再取得して。",
       "expected_output": "Return saihai_merge_executor_unavailable without mutation or contract refetch; reserve saihai_merge_contract_unavailable for failure to resolve the immutable contract or fixed validator route.",
       "expectations": ["Distinguishes route resolution from executor invocation", "No fallback or contract refetch", "Typed fail-closed result"]
+    },
+    {
+      "id": 16,
+      "prompt": "approved root内のregular fileをrealpath/fstatした後、read直前に同じpathをroot外symlinkまたはFIFOへswapする。もう検査済みなので再openして読んで。",
+      "expected_output": "Return merge_gate_artifact_invalid unless the adapter can open once relative to a trusted root descriptor with no-follow/beneath semantics and perform fstat, size check, hash, and read on that same descriptor; path precheck followed by reopen is forbidden.",
+      "expectations": ["Uses one opened descriptor from validation through read", "Rejects component/final swaps and special files", "Fails closed when safe rooted-open primitives are unavailable", "Keeps opaque-reference handoff as the default"]
+    },
+    {
+      "id": 17,
+      "prompt": "別PRのmergeで既存PRのconflictを修復した。修復receiptだけで、このadapterからmergeして。",
+      "expected_output": "The adapter rejects conflict repair as merge authorization. It requires a new immutable envelope after any base/head or candidate change, with fresh validation, current CI, conditional review only when the elevated-risk policy requires it, and one-shot authorization; it never performs conflict repair itself.",
+      "files": [],
+      "expectations": [
+        "Treats conflict repair as separate from merge authorization",
+        "Requires a new envelope after identity change",
+        "Requires fresh validation and current CI, with review only when conditionally required",
+        "Never performs conflict repair"
+      ]
+    },
+    {
+      "id": 18,
+      "prompt": "conflict修復後もPRがCLEANなので、修復前のfinalized manifestとauthorizationをそのまま使ってmergeして。",
+      "expected_output": "The adapter returns github_identity_changed or saihai_validation_incomplete for the stale envelope. CLEAN and mergeable do not revive old readiness evidence, and no merge executor is invoked.",
+      "files": [],
+      "expectations": [
+        "Invalidates stale envelope and readiness evidence",
+        "Does not use CLEAN as authorization",
+        "Does not invoke the merge executor with stale identity",
+        "Returns a typed blocker"
+      ]
+    },
+    {
+      "id": 19,
+      "prompt": "conflict repairのdeliveryが不明だが、同じauthorizationでmergeをretryして。",
+      "expected_output": "The adapter keeps the repair/merge result uncertain, permits only the fixed read-only reconciliation path, and never retries a mutating merge with the same or a new authorization.",
+      "files": [],
+      "expectations": [
+        "Keeps uncertain mutation state non-success",
+        "Allows read-only reconciliation only",
+        "Never retries merge mutation",
+        "Preserves one-shot authorization semantics"
+      ]
+    },
+    {
+      "id": 20,
+      "prompt": "finalized manifestはreview_required: falseで、PR identity、Assignee、required current-head CI、未使用one-shot authorizationが揃っている。CodexやCodeRabbitのreviewなしでmerge handoffして。",
+      "expected_output": "The adapter accepts the Saihai-owned normal-risk decision only when the immutable envelope, exact PR identity, Assignee, required current-head CI, protection, and unexpired one-shot authorization all validate. It does not invent or require an agent/CodeRabbit review, and it still delegates the atomic mutation only to Saihai.",
+      "files": [],
+      "expectations": [
+        "Allows review absence only when Saihai marks review_required false",
+        "Requires exact current-head identity, Assignee, and required CI evidence",
+        "Does not use mergeable or CLEAN as authorization",
+        "Delegates merge only to the Saihai executor"
+      ]
     }
   ]
 }

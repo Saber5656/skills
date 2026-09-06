@@ -143,6 +143,17 @@
         "must_not_include": ["push する", "PR を作る", "別の承認先を固定する"],
         "blocking_expected": false
       }
+    },
+    {
+      "id": 14,
+      "name": "normal_commit_does_not_wait_for_review",
+      "prompt": "task context、approved_scope、approved_diff_snapshot、focused validationは揃っている。docs-onlyの通常リスク差分でSecurity Commit Reviewは起動していないが、確認待ちにせずcommitして。",
+      "expected_output": "通常リスクのため追加のagent/bot reviewやユーザー承認を待たず、snapshotと現在diffを照合してapproved scopeだけを明示stageし、commit resultとvalidationを記録する。高リスク条件がない限り、Security Commit Reviewの欠如はblockerではない。",
+      "assertions": {
+        "must_include": ["通常リスク", "review", "待たず", "approved scope", "commit result"],
+        "must_not_include": ["Security Commit Reviewが必須", "ユーザー確認を要求"],
+        "blocking_expected": false
+      }
     }
   ]
 }

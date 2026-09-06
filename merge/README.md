@@ -29,8 +29,12 @@ python3 skills/merge/scripts/merge_managed_repos.py --execute --stash
 - No deletion or cleanup.
 - Local work is preserved commit-first (default) or by stash before merging.
 - Merge conflicts are aborted and reported, never auto-resolved.
+- Normal-risk local integration does not wait for an agent/bot review; focused validation and the integrated change
+  set's full validation are the quality gates.
+- Permission expansion, authentication secrets, and data-loss risk receive at most one limited review.
 - GitHub PR URLs, PR-number merge requests, merge queues, and auto-merge are explicit negative triggers.
-- Mixed local/PR requests fail closed with no fetch, commit, stash, local merge, or PR handoff; each process must be requested separately.
-- GitHub PR merge is routed only to `pr-merge-gate` with a Saihai-finalized manifest and one-shot authorization.
+- Mixed local/PR requests fail closed with no fetch, commit, stash, or local merge. A complete trusted Saihai PR
+  envelope may be handed to `pr-merge-gate`; otherwise ask only for the missing identity/scope/authorization choice.
+- GitHub PR merge is routed to `pr-merge-gate` only when a complete typed Saihai envelope carries the finalized manifest identity and one-shot authorization; a bare PR URL/number returns the envelope requirement without handoff.
 
 See [SKILL.md](SKILL.md) for full workflow details.

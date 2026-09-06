@@ -1,5 +1,8 @@
-name: Review intake signal
-run-name: Review signal for PR #${{ github.event.pull_request.number || inputs.pr_number }}
+# Deprecated fail-closed reference. Runtime v1 does not authorize commit-status
+# signal writes. Do not install this workflow; use a private Saihai watch and
+# fresh github_observe operations instead.
+name: DEPRECATED - Review intake signal
+run-name: Deprecated review signal (no-op)
 
 on:
   pull_request_review:
@@ -16,7 +19,7 @@ on:
 permissions:
   contents: read
   pull-requests: read
-  statuses: write
+  statuses: read
 
 concurrency:
   group: review-signal-${{ github.repository }}-${{ github.event.pull_request.number || inputs.pr_number }}
@@ -24,6 +27,7 @@ concurrency:
 
 jobs:
   signal:
+    if: ${{ false }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
