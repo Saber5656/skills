@@ -6840,6 +6840,30 @@ def load_environment(*, checkout_root, environ, require_catalog):
                 )
         sleep.assert_not_called()
 
+    def test_resolver_fresh_worker_revalidates_real_fixture(self) -> None:
+        """The alternate process performs a full resolution, not a cached return."""
+        expected = subprocess.run(
+            [str(SCRIPTS / "resolve-runtime-context.py"), str(self.config), str(self.workdir)],
+            check=True, capture_output=True, text=True,
+        )
+        transient = OSError(RESOLVER_MODULE.errno.EDEADLK, "Resource deadlock avoided")
+        with mock.patch.object(RESOLVER_MODULE.time, "sleep"):
+            with mock.patch.object(RESOLVER_MODULE, "retry_read_only_context", side_effect=transient):
+                actual = RESOLVER_MODULE.resolve_context(self.config, self.workdir)
+        self.assertEqual(actual, json.loads(expected.stdout))
+
+    def test_resolver_fresh_worker_rejects_changed_authorization(self) -> None:
+        """Transient failure cannot let the fallback reuse previously valid authority."""
+        values = RESOLVER_MODULE.parse_local_config(self.config)
+        authorization = self.agents / values["AUTHORIZATION_TASK_RELATIVE"]
+        authorization.write_text("changed authorization after short retry window\n")
+        transient = OSError(RESOLVER_MODULE.errno.EDEADLK, "Resource deadlock avoided")
+        with mock.patch.object(RESOLVER_MODULE.time, "sleep") as sleep:
+            with mock.patch.object(RESOLVER_MODULE, "retry_read_only_context", side_effect=transient):
+                with self.assertRaisesRegex(RESOLVER_MODULE.ContextError, "rejected current context"):
+                    RESOLVER_MODULE.resolve_context(self.config, self.workdir)
+        sleep.assert_called_once_with(30)
+
     def test_resolver_sanitizes_gitleaks_version_probe_environment(self) -> None:
         """Do not let ambient Git or Gitleaks variables control the version probe."""
         self.fake_gitleaks.write_text(

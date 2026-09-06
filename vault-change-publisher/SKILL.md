@@ -36,6 +36,8 @@ Web入力を扱う収集phaseからプロセスとsandbox権限を分離し、�
 
 ## Process Isolation
 
+日次起動時のruntime context読込は、File Provider由来の`EDEADLK` / `EAGAIN` / `EBUSY`に限り、従来の30回・1秒間隔の再試行後に予備経路へ進む。予備経路は30・60・120・300秒の待機後、毎回新しいPython processで正本catalog、現在の承認file digest、VaultとGit設定を一度だけ読み直す（最大4 process、各120秒上限）。新たな恒久エラーは直ちに拒否し、全予備経路を使い切った場合だけ起動失敗とする。過去context、別Vault、古い承認情報を代用しない。予備経路は収集・mutation前のread-only resolverだけに適用し、日次runner全体、commit/push、Discord送信を再実行しない。回復経過はローカルstderrへ記録し、失敗内容のDiscord通知は追加しない。
+
 Gitleaksは`git` / `dir` / `stdin`コマンドを備えた8.19.0以上のv8に限定する。
 
 publication review processはread-only/no-networkで実行し、artifact配置やGit mutationより前にdigest-bound Task Change Manifestを完成させる。review inputをsealedする際、deterministic residual guardがHEADとの差分へ新規machine-home path、`.obsidian/`、pinned gitleaksを検査し、不合格entryをbytes非公開の`deferred`へ変換して当該Vaultのmode hintを`own_only`へ固定する。全Gitleaks scanはdigest固定した`[extend] useDefault = true` config bytesを匿名file descriptorへ封印し、そのfdをscanner processへ継承して`/dev/fd/N`から読む。検証後のpathname再lookupやVault内`.gitleaks.toml`をconfig sourceにしない。reviewerが誤って`sweep`へ戻すことはvalidatorが拒否する。local publication processにはVault working treeと対応gitdirだけを与え、networkを無効にし、承認済みManifestを変更させない。初回固定push後のevidence hunkは別のread-only/no-network processで再レビューする。いずれにも`--search`を付けず、収集phaseと同じCodex processを再利用しない。pushはagent外の検証済みrunnerが、review、local result、実history、blob hash、Git control-plane digestを照合して固定refspecだけで行う。
