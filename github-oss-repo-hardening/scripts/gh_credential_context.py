@@ -55,6 +55,27 @@ def describe_context(*, environ: Mapping[str, str], surface: str,
                 credential_source=selected_source(target_host, environ))
 
 
+def effective_user() -> str:
+    """Observe the OS user; never trust environment usernames as identity."""
+    try:
+        if os.name == 'nt':
+            import ctypes
+            from ctypes import wintypes
+
+            get_user = ctypes.WinDLL('advapi32.dll', use_last_error=True).GetUserNameW
+            get_user.argtypes = [wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
+            get_user.restype = wintypes.BOOL
+            # UNLEN (256) plus terminator, per the Windows API contract.
+            buffer = ctypes.create_unicode_buffer(257)
+            size = wintypes.DWORD(len(buffer))
+            if not get_user(buffer, ctypes.byref(size)) or not buffer.value:
+                raise ContextError('effective_user_unavailable')
+            return buffer.value
+        return str(os.geteuid())
+    except (OSError, AttributeError):
+        raise ContextError('effective_user_unavailable') from None
+
+
 def observe_context(*, surface: str, target_host: str) -> dict:
     """Observe this executor without running auth commands or reading config."""
     gh = shutil.which('gh')
@@ -69,7 +90,7 @@ def observe_context(*, surface: str, target_host: str) -> dict:
     if result.returncode or not match:
         raise ContextError('gh_version_unavailable')
     return describe_context(environ=os.environ, surface=surface, target_host=target_host,
-                            effective_user=str(os.geteuid()), executor_host=socket.gethostname(),
+                            effective_user=effective_user(), executor_host=socket.gethostname(),
                             gh_path=gh, gh_version=match[1])
 
 

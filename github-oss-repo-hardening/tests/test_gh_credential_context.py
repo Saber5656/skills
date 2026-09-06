@@ -96,3 +96,83 @@ def test_version_failure_discards_raw_output(monkeypatch):
                         subprocess.CompletedProcess([], 1, 'SECRET_MARKER', 'SECRET_MARKER'))
     with pytest.raises(context.ContextError, match='^gh_version_unavailable$'):
         context.observe_context(surface='cli', target_host='github.com')
+
+
+@pytest.fixture
+def windows_observer(monkeypatch, tmp_path):
+    """Windows API contract stub on the host OS; not native Windows QA."""
+    import ctypes
+    import subprocess
+    from types import SimpleNamespace
+
+    state = {'user': 'observed-user', 'ok': True, 'calls': 0}
+
+    class GetUserName:
+        def __call__(self, buffer, size):
+            state['calls'] += 1
+            assert size._obj.value == 257
+            if state['ok']:
+                buffer.value = state['user']
+            return int(state['ok'])
+
+    def load_api(name, **kwargs):
+        assert name == 'advapi32.dll'
+        return SimpleNamespace(GetUserNameW=GetUserName())
+
+    monkeypatch.setattr(ctypes, 'WinDLL', load_api, raising=False)
+    monkeypatch.setattr(context, 'os', SimpleNamespace(name='nt', environ={
+        'AppData': str(tmp_path), 'USERNAME': 'untrusted-name', 'GH_TOKEN': 'SECRET_MARKER'}))
+    monkeypatch.setattr(context.shutil, 'which', lambda _: '/fixture/gh')
+    monkeypatch.setattr(context.subprocess, 'run', lambda *a, **k:
+                        subprocess.CompletedProcess(a[0], 0, 'gh version 2.80.0 (fixture)', ''))
+    return state
+
+
+def test_windows_actual_observer_uses_os_identity(windows_observer):
+    result = context.observe_context(surface='cli', target_host='github.com')
+    assert result['effective_user'] == 'observed-user'
+    assert result['config_source'] == 'AppData'
+    assert windows_observer['calls'] == 1
+    assert 'untrusted-name' not in json.dumps(result)
+    assert 'SECRET_MARKER' not in json.dumps(result)
+
+
+@pytest.mark.parametrize('state', [{'ok': False}, {'user': ''}])
+def test_windows_identity_failure_is_typed(windows_observer, state):
+    windows_observer.update(state)
+    with pytest.raises(context.ContextError, match='^effective_user_unavailable$'):
+        context.observe_context(surface='cli', target_host='github.com')
+
+
+def test_windows_user_change_is_context_drift(windows_observer):
+    previous = context.observe_context(surface='cli', target_host='github.com')
+    windows_observer['user'] = 'another-user'
+    with pytest.raises(context.ContextError, match='context_drift'):
+        context.require_same_context(previous, context.observe_context(surface='cli', target_host='github.com'))
+
+
+def test_windows_observer_initializes_actual_dry_apply(windows_observer, monkeypatch, tmp_path, capsys):
+    import subprocess
+    spec = importlib.util.spec_from_file_location('windows_helper', SCRIPTS/'apply-default-branch-ruleset.py')
+    helper = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(helper)
+    calls = []
+
+    def transport(args, **kwargs):
+        if args[1:] == ['--version']:
+            return subprocess.CompletedProcess(args, 0, 'gh version 2.80.0 (fixture)', '')
+        calls.append(args)
+        return subprocess.CompletedProcess(args, 0, '{}', '')
+
+    monkeypatch.setattr(context.subprocess, 'run', transport)
+    # The helper's environment selection must use the same synthetic selectors.
+    monkeypatch.setenv('GH_TOKEN', 'SECRET_MARKER')
+    payload, binding = tmp_path/'payload.json', tmp_path/'context.json'
+    common = ['helper', '--repo', 'fixture/repo', '--operation', 'create', '--hostname', 'github.com']
+    monkeypatch.setattr(sys, 'argv', common+['--payload-out', str(payload), '--context-out', str(binding)])
+    assert helper.main() == 0
+    monkeypatch.setattr(sys, 'argv', common+['--mode', 'apply', '--yes', '--payload-in', str(payload), '--context-in', str(binding)])
+    assert helper.main() == 0
+    assert len(calls) == 1 and 'POST' in calls[0]
+    assert windows_observer['calls'] >= 3
+    assert 'SECRET_MARKER' not in str(capsys.readouterr())

@@ -9,7 +9,14 @@ reads config contents or Keychain secret values, or hashes token values.
 `describe_context(environ=..., surface=..., target_host=..., effective_user=...,
 executor_host=..., gh_path=..., gh_version=...)` is the pure adapter entrypoint.
 `observe_context(surface=..., target_host=...)` observes the local effective UID,
-OS hostname, resolved executable and parsed `gh --version`. Adapters must supply
+OS hostname, resolved executable and parsed `gh --version`. On Windows the local
+observer uses `GetUserNameW` for the current OS thread user (including impersonation),
+not USERNAME or another environment username. Unavailable OS user observation
+fails with `effective_user_unavailable`. This observed name is diagnostic evidence,
+not a SID, account authorization or a credential proof. Windows API contract
+stubs on another OS are not native Windows acceptance. See the
+[Microsoft API contract](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-getusernamew).
+Adapters must supply
 their actual surface from trusted execution context; a caller label is not proof
 of isolation or authenticated provider identity. The standalone helper records
 `--executor-surface` (default `cli`) as a declared label.
