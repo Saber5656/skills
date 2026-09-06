@@ -6,7 +6,7 @@ description: >
   または /commit を実行したときに必ず使うこと。
   approved_scope / approved_diff_snapshot 付き Task Change Manifest または
   Publication Manifest が渡された場合も必ず使うこと。
-  混在する変更（複数の関心事が混ざっている場合）は適切なスコープに自動分割し、
+  通常の変更はレビュー承認を待たずに、検証済みのスコープから自動でコミットする。混在する変更（複数の関心事が混ざっている場合）は適切なスコープに自動分割し、
   アトミックなコミットを複数作成する。
 user-invocable: true
 allowed-tools: Bash, Read, Skill
@@ -14,14 +14,17 @@ category: Dev
 created: 2026-03-01
 updated: 2026-06-16
 status: active
-purpose: task-owned approved diff だけをConventional Commitsで自動コミットし、scope外差分を混ぜない
+purpose: task-owned validated diffだけをConventional Commitsで自動コミットし、scope外差分と高リスク未確認を混ぜない
 argument-hint: "[追加のコンテキスト or コミット方針]"
 ---
 
 # Git Auto Commit
 
 git の未コミット変更を解析し、Task Change Manifest の `approved_scope` / `approved_diff_snapshot` に含まれる task-owned diff だけを、**Conventional Commits** 形式のコミットメッセージでコミットする。
-変更が複数の関心事にまたがる場合は、自動的に分割してアトミックなコミットを作成する。
+変更が複数の関心事にまたがる場合は、自動的に分割してアトミックなコミットを作成する。通常の変更は
+`usage-first development operations` に従い、focused validationが済めばcommitできる。レビューは
+permission expansion、authentication secret、data-loss risk、または明示的なpolicyがある場合だけ一度
+行い、PR botとの重複レビューはしない。
 
 このスキルは repo 全体を clean にする責務を持たない。別タスク由来の dirty diff は `unrelated_dirty_paths` / `excluded_diffs` として記録し、この task の commit 対象へ混ぜない。
 
@@ -41,7 +44,8 @@ role、approval owner、review provider、routing、publication ownership を独
 |---|---|
 | `task_record_present` | Yes |
 | `task_scope_confirmed` | Yes |
-| `review_or_validation_status` | Yes |
+| `validation_status` | Yes for behavior changes; explicit non-impact evidence is sufficient for docs-only changes |
+| `review_or_validation_status` | Conditional; required only when an elevated-risk review was actually dispatched |
 | `publication_manifest_present` | Yes, when invoked by a publication flow |
 | `task_change_manifest_present` | Yes |
 | `approved_scope_present` | Yes |
@@ -49,6 +53,18 @@ role、approval owner、review provider、routing、publication ownership を独
 
 task record または task scope がない場合は、このスキルを実行せず `task_scope_missing` として停止する。
 `approved_scope` または `approved_diff_snapshot` がない commit handoff は `unscoped_commit_forbidden` として拒否し、git 操作へ進まない。
+
+## Execution profile boundary
+
+Publication handoffs must carry exactly one typed `execution_profile`: `trusted_local_v1` or `legacy_managed`.
+The profile controls external publication, not the local scope/snapshot checks owned by this skill. Under
+`trusted_local_v1`, the host may run this skill inside
+`python3.11 scripts/saihai.py usage run --request /absolute/request.json --authorization /absolute/authority.json --state-root /absolute/private-state`;
+after this local commit/validation result, `host_publication_adapter` and bounded `usage advance` own branch push,
+PR, CI, and merge. Existing host authentication is used; this skill does not require, create, copy, or repair a
+root-owned broker, signer, or attestation. Under `legacy_managed`, preserve the explicitly selected legacy
+publication/runtime contract. A missing or malformed profile is `publication_execution_profile_missing` for a
+publication handoff; never switch profiles implicitly.
 
 ## When I Activate
 
@@ -64,9 +80,11 @@ task record または task scope がない場合は、このスキルを実行�
 1. Task Change Manifest と現在 diff を照合する
 2. 変更の全体像を把握する（staged/unstaged/untracked）
 3. 最小関心事ごとにグループ化し、コミット単位を決める
-4. security review contract または secret scan で P0 リスクの有無を確認する
+4. permission expansion、authentication secret、data-loss riskがある場合だけ、task context指定の一度の
+   security review contractを確認する。通常の変更はsecret scan/focused validationの結果で進める
 5. 確認フェーズを挟まず、各グループを順番にステージ・コミットする
-6. commit hash、対象ファイル、snapshot 照合結果、security review、未コミット残差分、コミット不要判断を task record に記録する
+6. commit hash、対象ファイル、snapshot 照合結果、validation、必要なsecurity review、未コミット残差分、
+   コミット不要判断を task record に記録する
 
 ---
 
@@ -80,13 +98,15 @@ task context から受け取った Task Change Manifest を最初に確認する
 | `task_id` | Yes | 親 task |
 | `owned_paths` | Yes | この task が所有する path |
 | `excluded_paths` | Yes | scope 外、別タスク、生成物など |
-| `approved_diff_snapshot` | Yes | review / validation OK 後の task-owned diff |
-| `reviewed_artifacts` | Yes | snapshot を承認した review / validation 証跡 |
+| `approved_diff_snapshot` | Yes | validation対象として固定した task-owned diff |
+| `execution_profile` | When invoked by publication flow | `trusted_local_v1` or `legacy_managed`; immutable and provenance-bound |
+| `reviewed_artifacts` | Yes | validation evidence。conditional reviewを実施した場合だけreview evidenceも含める |
 | `commit_required` | Yes | `true` |
 | `commit_hashes` | Later | commit 後に記録 |
 | `unrelated_dirty_paths` | When applicable | repo に残る別タスク差分 |
 
-現在の diff と `approved_diff_snapshot` を照合する。
+現在の diff と `approved_diff_snapshot` を照合する。`approved` は人間またはreviewerの承認を意味せず、
+commit対象として固定されたscopeを意味する。
 
 | 判定 | 動作 |
 |---|---|
@@ -153,13 +173,15 @@ scope 外 hunk を分離できない場合は `scope_mismatch` として停止�
 
 ---
 
-## Security Commit Review
+## Conditional Security Commit Review
 
-コミット実行前に、全コミット対象差分について `Security Commit Review` contract を必ず満たす。
-この review は「コミット計画の人間確認」の代替ではなく、秘密情報や重大リスク混入を止めるための自動ゲートである。
+通常のcommitにはreview承認を要求しない。permission expansion、authentication secret、data-loss risk、
+または明示的なsecurity policyに該当する場合だけ、統合変更セットに対して一度の `Security Commit Review`
+contractを適用する。PR botや別の通常reviewと同じ目的で重複させない。
 
-review provider の決定は caller-supplied Saihai task context に記録された方針に従う。
-スキル側は provider を選択・推測・fallback せず、ステージ予定のファイル、差分概要、security-sensitive な変更点、除外予定差分に対して次の fields が揃っていることだけを検証する。
+review providerの決定はcaller-supplied Saihai task contextに記録された方針に従う。スキル側はproviderを
+選択・推測・fallbackせず、該当する場合だけ、ステージ予定のファイル、差分概要、security-sensitiveな
+変更点、除外予定差分に対して次のfieldsが揃っていることを検証する。
 
 | Field | Required | 内容 |
 |---|---:|---|
@@ -168,19 +190,20 @@ review provider の決定は caller-supplied Saihai task context に記録され
 | `commit_blocking` | Yes | `true` は `P0` 検出時のみ |
 | `verdict` | Yes | `security_clear` / `security_notes` / `security_blocked` / `security_insufficient_input` |
 
-Security Commit Review の出力が欠けている、Priority が不正、`commit_blocking` と `max_priority` が矛盾する、または `verdict: security_insufficient_input` の場合は、コミットせず `security_review_invalid` として task record に記録する。
+該当レビューを実施した場合、その出力が欠けている、Priorityが不正、`commit_blocking`と`max_priority`が
+矛盾する、または`verdict: security_insufficient_input`の場合は、コミットせず`security_review_invalid`と
+してtask recordに記録する。レビュー対象外の通常変更では、このcontractを欠くこと自体をblockerにしない。
 
 ### Security Stop Rule
 
 | Priority | commit 動作 |
 |---|---|
-| `P0` | コミットを停止し、対象差分、検知理由、推奨対応をユーザーに確認する |
-| `P1` | task record に記録してコミットを継続する |
-| `P2` | task record に記録してコミットを継続する |
-| `P3` | task record に記録してコミットを継続する |
+| `P0` / data-loss | コミットを停止し、対象差分、検知理由、推奨対応を人間の要件判断へ返す |
+| `P1` / `P2` / `P3` | task recordに記録し、scope内で修正可能ならfocused validation後に継続する |
 | `none` | コミットを継続する |
 
-P0 以外では、通常の「実行しますか？」確認に戻さない。
+高リスクの要件・設計選択が不要なら、通常の「実行しますか？」確認に戻さない。validなblocking findingは
+一度だけ修正・focused validation・元のfinding再確認を行い、minor/improvementはfollow-up issueにする。
 
 ---
 
@@ -235,7 +258,9 @@ P0 以外では、通常の「実行しますか？」確認に戻さない。
 ## Step 5: Autonomous Commit Policy
 
 人間起点の `/commit` や「コミットして」では、コミット前の計画提示と確認質問を挟まない。
-task context、approved scope、approved diff snapshot、差分分析、Security Commit Review の P0 判定をもとに、スキルが自動でコミット単位とメッセージを決めて実行する。
+task context、validated scope、diff snapshot、focused validation、および該当時のSecurity Commit Reviewの
+P0判定をもとに、スキルが自動でコミット単位とメッセージを決めて実行する。通常の変更ではagentやbotの
+review/approvalを待たない。
 
 `approved_scope` なしの unscoped commit は禁止する。repo 全体の dirty state をそのまま commit 対象にしてはならない。
 
@@ -244,15 +269,15 @@ Publication Manifest からの handoff では、次を満たす場合に review 
 | 条件 | Required |
 |---|---|
 | task record がある | Yes |
-| review / validation status が `quality_ok` 相当 | Yes |
+| validation status が `focused_ok` 相当 | Yes |
 | Git Publication Manifest がある | Yes |
 | publication flow が `commit_required: true` を検証している | Yes |
 | Task Change Manifest がある | Yes |
 | Approved Scope と対象ファイルが明示されている | Yes |
 | Approved Diff Snapshot がある | Yes |
 | 現在 diff が snapshot と一致、または approved hunk だけ明示 stage 可能 | Yes |
-| `Security Commit Review` がある | Yes |
-| `max_priority` が `P0` ではない | Yes |
+| `Security Commit Review` が必要な場合は存在する | Yes |
+| 必要なsecurity reviewの`max_priority`が`P0`ではない | Yes |
 
 unrelated diff、untracked file、scope 外の変更、別タスク由来の変更は自動で混ぜず、対象ファイルまたは hunk だけを明示 stage する。
 判断した分類、除外差分、unrelated dirty paths、security notes は task record に記録する。
@@ -263,13 +288,14 @@ unrelated diff、untracked file、scope 外の変更、別タスク由来の変�
 |---|---|
 | `approved_scope` / `approved_diff_snapshot` がない | `unscoped_commit_forbidden` として差し戻す |
 | 現在 diff と approved snapshot が不一致で、approved hunk だけ安全に stage できない | `scope_mismatch` として差し戻す |
-| Security Commit Review が `P0` を検出 | ユーザー確認へ戻す |
-| Security review contract が欠けている / 不正 / 情報不足 | `security_review_invalid` として差し戻す |
+| 必要なSecurity Commit Review が `P0` を検出 | ユーザー確認へ戻す |
+| 必要なsecurity review contract が欠けている / 不正 / 情報不足 | `security_review_invalid` として差し戻す |
 | merge / rebase / conflict 中 | 状態と次アクションを記録する |
 | pre-commit hook 失敗 | 原因を調査し、必要なら修正担当へ差し戻す |
 | git 権限や環境エラー | エラー内容を記録する |
 
-P1 以下の security note、未追跡ファイルの自動除外、scope 外差分の自動除外、repo に残る unrelated dirty diff では、ユーザー確認に戻さない。
+P1以下のsecurity note、未追跡ファイルの自動除外、scope外差分の自動除外、repoに残るunrelated dirty diffでは、
+ユーザー確認に戻さない。full validationは個々のcommitではなく統合変更セットで一度実施する。
 
 ---
 
@@ -309,8 +335,8 @@ EOF
 | `committed_files` | Yes |
 | `committed_diff_matches_snapshot` | Yes |
 | `commit_message` | Yes |
-| `security_review` | Yes |
-| `security_max_priority` | Yes |
+| `security_review` | When elevated-risk review applies |
+| `security_max_priority` | When elevated-risk review applies |
 | `unrelated_dirty_paths` | scope 外 dirty diff が残る場合 |
 | `excluded_diffs` | scope 外差分がある場合 |
 | `scope_mismatch_reason` | snapshot 不一致で停止した場合 |
@@ -318,9 +344,11 @@ EOF
 | `security_stop_reason` | P0 または review 不備で停止した場合 |
 | `commit_not_required_reason` | commit 不要判断の場合 |
 | `next_step` | publication flow に戻す、または publication_not_required を記録する |
+| `execution_profile` | When publication flow | selected profile and host/legacy handoff status |
 
 Publication Manifest から呼ばれた場合、commit 完了後は caller に commit result を返す。
-commit hash と `committed_diff_matches_snapshot: true` 記録前に push / PR / `done` へ進めない。
+commit hash と `committed_diff_matches_snapshot: true` 記録前に push / PR / `done` へ進めない。記録するのは
+purpose、decision、validation、limitations、linksを中心とし、commit自体への追加reviewは要求しない。
 
 ---
 

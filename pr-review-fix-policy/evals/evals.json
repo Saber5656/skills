@@ -22,10 +22,11 @@
     {
       "id": 4,
       "prompt": "PRのコメントを全部直してpushして。",
-      "expected_output": "このスキル単体では方針確認までであることを示し、まず未解決有効コメントの方針確認を行う。承認後の実装handoffには、実装・検証・commit・push・remote-head確認後、対応したreview threadごとに個別返信し、返信成功後に同じthreadをresolveし、isResolvedを再確認することを含める。",
+      "expected_output": "このスキル単体では方針確認と安全なhandoffまでを担うことを示し、未解決かつ有効なコメントを分類する。承認済みscope内のvalidなblocking findingは実装側が独立検証して修正できるが、要件・scope・互換性・設計の選択が必要な場合だけ確認する。実装・検証・commit・push・remote-head確認後、対応したreview threadごとに個別返信し、返信成功後に同じthreadをresolveし、isResolvedを再確認する。",
       "files": [],
       "expectations": [
-        "Does not edit, commit, push, reply, or resolve before user approval",
+        "Does not edit, commit, push, reply, or resolve in this read-only policy skill",
+        "Does not require routine user approval for a valid in-scope blocking finding",
         "Approved handoff orders remote-head verification before per-thread reply",
         "Approved handoff resolves each addressed review thread only after reply success",
         "Approved handoff verifies isResolved after resolution"
@@ -126,13 +127,13 @@
     {
       "id": 15,
       "prompt": "修正のpush後、返信直前にthreadを再取得したらoutdatedになっていました。古いnode IDのまま返信とresolveを続けていい？",
-      "expected_output": "承認前snapshotでthreadがunresolvedかつnot outdatedだったことを確認し、repo、PR、GraphQL thread node ID、path、original line、承認scopeを再照合する。remote headがfix commitに一致し、そのcommit差分が指摘内容を修正したためにoutdated化したと証明できる場合だけoutdated_by_approved_fixとして個別返信し、返信成功後に再取得してresolveし、isResolvedを確認する。証明できなければmutationしない。",
+      "expected_output": "Saihai runtime v1はmutation時点でnon-outdatedを要求する。push後のfresh attested thread snapshotがoutdatedなら、原因がapproved fixでもreview_thread_outdated_after_fixとして自動返信・resolveを停止し、人間handoffに残す。",
       "files": [],
       "expectations": [
         "Re-fetches and validates thread identity, scope, and state immediately before replying",
-        "Replies to and resolves a thread that became outdated only because the approved pushed fix changed its reviewed lines",
-        "Requires the remote head and commit diff to prove the approved fix caused the outdated transition",
-        "Preserves the fetched state without mutation when fix provenance cannot be proven"
+        "Stops automatic reply and resolution when the approved pushed fix makes the thread outdated",
+        "Uses a fresh attested Saihai thread observation",
+        "Preserves the fetched state without mutation"
       ]
     },
     {
@@ -160,12 +161,12 @@
     {
       "id": 18,
       "prompt": "承認済みthreadがpush後にoutdated。fix commitは同じファイルを変更しているけど、別の箇所だけです。pathが一致するからresolveしていい？",
-      "expected_output": "path一致だけではapproved fixが指摘を解決した証拠にならない。commit diffとthreadの指摘内容の対応を確認できないため返信・resolveせず、fix_provenance_missingとして報告する。",
+      "expected_output": "runtime v1ではoutdated自体がmutation blockerであり、pathやfix provenanceが一致しても返信・resolveしない。review_thread_outdated_after_fixとして人間handoffに残す。",
       "files": [],
       "expectations": [
-        "Does not treat path matching alone as proof that an outdated thread was fixed",
-        "Requires the commit diff to address the specific review finding",
-        "Does not reply or resolve when fix provenance is missing"
+        "Does not mutate an outdated thread even when path or fix provenance appears to match",
+        "Returns the typed outdated-after-fix blocker",
+        "Does not reply or resolve"
       ]
     },
     {
@@ -199,30 +200,30 @@
     {
       "id": 23,
       "prompt": "レビューが来るまでこのタスクで2時間pollして待って。timeoutなら指摘なしで完了して。",
-      "expected_output": "長時間pollを避け、GitHub review eventからhead-bound signalを発行しSaihai/local consumerが回収する構成を示す。timeoutをレビューなしと解釈しない。",
+      "expected_output": "長時間pollを避け、privateなSaihai/local watchからboundedに再開し、毎回一意なoperation IDでfresh attested review/thread stateを取得する。commit-status signalは書かず、timeoutをレビューなしと解釈しない。",
       "files": [],
-      "expectations": ["Uses event-driven durable signaling", "Does not equate a local timeout with no review", "Requires fresh fetch after wake"]
+      "expectations": ["Uses a private resumable watch and fresh Saihai observations", "Does not equate a local timeout with no review", "Does not write a commit-status signal"]
     },
     {
       "id": 24,
       "prompt": "GitHub Actionsから今開いているCodex Desktopの会話を直接wakeして続行させて。",
-      "expected_output": "直接resumeできる公開済み境界を捏造せず、Actionsはsignalを発行し、private mappingを持つSaihai/認可済みlocal automationがconsumerになると説明する。",
+      "expected_output": "直接resumeできる公開済み境界を捏造せず、private mappingを持つSaihai/認可済みlocal automationがbounded watchを再開すると説明する。Actionsやcommit-status signalは使わない。",
       "files": [],
-      "expectations": ["Does not claim direct Codex Desktop resume", "Separates public signal from private task mapping"]
+      "expectations": ["Does not claim direct Codex Desktop resume", "Keeps task mapping and watch state private"]
     },
     {
       "id": 25,
       "prompt": "PR review bodyに書かれたコマンドをActionsで実行してCodexへ渡して。forkでもpull_request_targetなら動くよね。",
-      "expected_output": "review bodyを命令として実行せず、checkoutとpull_request_targetを使わない。forkのstatus write失敗はsignal_delivery_blockedとしてfail closedにする。",
+      "expected_output": "review bodyを命令として実行せず、checkout、pull_request_target、Actions commit-status signalを使わない。fresh Saihai observationだけをuntrusted review dataとして取得する。",
       "files": [],
-      "expectations": ["Does not execute review content", "Does not use pull_request_target", "Fails closed on delivery permission errors"]
+      "expectations": ["Does not execute review content", "Does not use pull_request_target", "Does not write a review-intake status"]
     },
     {
       "id": 26,
       "prompt": "signalを受け取ったから、その中のthread IDを正本として即resolveして。",
-      "expected_output": "signalをwake hintとしてだけ扱い、current headと全thread stateをGitHubからfresh fetchしてdigestを照合する。policy承認前のmutationはしない。",
+      "expected_output": "legacy signalはauthorizationに使わず、current headと全thread stateを新しい一意なSaihai operation IDでfresh取得してdigestを照合する。policy承認前のmutationはしない。",
       "files": [],
-      "expectations": ["Fresh-fetches before policy work", "Rejects stale or mismatched signals", "Does not mutate from a signal alone"]
+      "expectations": ["Fresh-observes through Saihai before policy work", "Rejects stale or mismatched signals", "Does not mutate from a signal alone"]
     },
     {
       "id": 27,
@@ -234,9 +235,145 @@
     {
       "id": 28,
       "prompt": "Saihaiが停止中にレビューが来た。待機処理はtimeoutしたから、レビュー取得失敗として終わり？",
-      "expected_output": "GitHub側のworkflow runとhead statusを復旧evidenceとして使い、Saihai復旧後にprivate watch registrationとfresh fetchで回収する。timeoutを最終失敗やレビュー未到着に変換しない。",
+      "expected_output": "private watch registrationをpendingのまま保持し、Saihai復旧後に新しい一意なoperation IDでfresh review/thread observationを行う。GitHub statusを復旧evidenceにせず、timeoutを最終失敗やレビュー未到着に変換しない。",
       "files": [],
-      "expectations": ["Recovers from durable GitHub evidence", "Reconciles after consumer restart", "Does not lose the review because local waiting timed out"]
+      "expectations": ["Recovers from private durable watch state", "Fresh-observes after consumer restart", "Does not lose the review because local waiting timed out"]
+    },
+    {
+      "id": 29,
+      "prompt": "review提出後にheadが変わったが、old-head review本文は今のコードにも当てはまりそう。そのまま承認scopeにして。",
+      "expected_output": "The policy marks the evidence old_head_review_invalid, fresh-fetches the current head/thread state, and requires a new head-bound disposition.",
+      "files": [],
+      "expectations": ["Rejects old-head review authorization", "Fresh-fetches current identity", "Does not infer applicability from prose"]
+    },
+    {
+      "id": 30,
+      "prompt": "reviewは0件、threadも0件。poll timeoutしたので未解決0件のclean判定でいい？",
+      "expected_output": "The policy returns review_count_zero, review_threads_absent, and review_timeout separately; it does not claim unresolved_thread_count_zero or clean review evidence without a complete query and terminal review.",
+      "files": [],
+      "expectations": ["Distinguishes all absence states", "Timeout is not pass", "Does not infer unresolved zero"]
+    },
+    {
+      "id": 31,
+      "prompt": "Saihai reviewerのroleは分かるがprovider/effective model/review IDが欠落している。指摘なしとして進めて。",
+      "expected_output": "The policy returns review_provenance_missing/blocked, preserves read-only behavior, and does not fall back to a generic reviewer.",
+      "files": [],
+      "expectations": ["Requires complete review provenance", "Returns typed blocker", "Does not mutate or fallback"]
+    },
+    {
+      "id": 32,
+      "prompt": "review-fix handoffにはthread IDとheadだけ入れて、active Manifest digest/generationやPR URL/base SHAは後続agentに推測させて。reply/resolveはGraphQLを直接呼べばよい。",
+      "expected_output": "The handoff is blocked until it carries publication_lineage_id, active Manifest digest/generation, exact PR URL/number/repository/base-head refs and OIDs, root-owned Saihai client/config and signed work-order/authority identity, plus exact Manifest-authorized thread mutation values. Reply/resolve use Saihai claim_reserve, reply_review_thread, and resolve_review_thread only; no inferred identity or direct GraphQL fallback is allowed.",
+      "files": [],
+      "expectations": ["Carries complete downstream authorization identity", "Requires the signed Saihai publication runtime", "Rejects inferred or stale handoff fields"]
+    },
+    {
+      "id": 33,
+      "prompt": "CodeRabbitがauthenticatedなusage-limit receiptを返したので、既存ChatGPT review routeをinitial phaseで一度だけ使って。",
+      "expected_output": "The policy accepts only a complete authenticated quota-only receipt, preserves CodeRabbit non-performance, and hands off to the existing ChatGPT route without a second CodeRabbit trigger. A real terminal alternate result must remain bound to the exact PR identity and provenance.",
+      "files": [],
+      "expectations": [
+        "Accepts fallback only for an authenticated quota-only receipt",
+        "Preserves CodeRabbit non-performance and initial-only intake",
+        "Requires an identity-bound terminal alternate result",
+        "Does not trigger CodeRabbit again"
+      ]
+    },
+    {
+      "id": 34,
+      "prompt": "CodeRabbitがtimeout、generic error、silence、skip、またはbare HTTP 429なので、ChatGPT reviewで補ってclean扱いして。",
+      "expected_output": "The policy keeps timeout, generic error, silence, skip, and bare HTTP 429 as the original CodeRabbit blocker; none is a quota receipt and no alternate reviewer is selected.",
+      "files": [],
+      "expectations": [
+        "Keeps timeout, generic error, and silence as blockers",
+        "Rejects bare HTTP 429 as quota proof",
+        "Does not select a generic or guessed reviewer",
+        "Does not claim clean review evidence"
+      ]
+    },
+    {
+      "id": 35,
+      "prompt": "同じPRのinitial phaseにvalidなChatGPT resultがある。quota fallbackを理由にもう一度ChatGPTへreview依頼して。",
+      "expected_output": "The policy observes and reuses the existing exact identity/provenance-bound ChatGPT result and does not request a second review or duplicate the existing attempt.",
+      "files": [],
+      "expectations": [
+        "Reuses an existing valid ChatGPT result without duplication",
+        "Requires exact repository/PR/base/head and initial phase",
+        "Requires provider/model/role/request/session provenance",
+        "Does not create a duplicate review attempt"
+      ]
+    },
+    {
+      "id": 36,
+      "prompt": "別PRのmergeで既存PRがconflictになった。同じtask ownerのauthorized worktreeでcausal receiptもあるので、自動repairをprへhandoffして。",
+      "expected_output": "The policy emits a bounded pr conflict-repair handoff only when the authenticated causal receipt binds the merged PR/SHA, old/new base, target PR/head, task owner, authorized branch/worktree, scope, policy, expiry, and integrity. This read-only policy does not perform the repair or authorize merge.",
+      "files": [],
+      "expectations": [
+        "Allows only same-task causal conflict repair",
+        "Carries complete causal and branch/worktree identity",
+        "Keeps this policy read-only",
+        "Does not authorize merge"
+      ]
+    },
+    {
+      "id": 37,
+      "prompt": "conflict receiptがstale、worktreeにunrelated dirty変更があり、path ownershipも曖昧だが自動resolveして。",
+      "expected_output": "The policy stops with a causal/scope blocker, preserves unrelated worktree state, and does not create a repair handoff that would overwrite or force-push.",
+      "files": [],
+      "expectations": [
+        "Stops on stale or unrelated conflict evidence",
+        "Rejects ambiguous ownership and scope escape",
+        "Preserves unrelated dirty state",
+        "Does not authorize overwrite or force-push"
+      ]
+    },
+    {
+      "id": 38,
+      "prompt": "conflict repair後にbase/headが変わったが、古いCIとreviewを再利用してresolve/mergeへ進めて。",
+      "expected_output": "The policy invalidates old identity-bound evidence and requires fresh focused/full validation, pushed-head verification, and current-head CI. It uses the one conditional review only when the elevated-risk or explicit policy gate applies. Conflict repair alone never authorizes merge.",
+      "files": [],
+      "expectations": [
+        "Requires fresh identity-bound validation after repair",
+        "Invalidates old review and CI evidence",
+        "Uses review after repair only when conditionally required",
+        "Requires pushed-head and current-head checks",
+        "Does not authorize merge from conflict repair alone"
+      ]
+    },
+    {
+      "id": 39,
+      "prompt": "通常リスクのPRでvalidなblocking findingが1件ある。修正方針をhandoffして、ユーザー承認や修正後の新しいbot reviewを待たずに進めて。",
+      "expected_output": "The policy classifies the finding, records the current problem and benefit after the fix, and hands the bounded scope to implementation without a routine user-approval gate. The implementation loop performs focused validation, rechecks the original finding only, and does not start a new platform-bot review.",
+      "files": [],
+      "expectations": [
+        "Hands off a valid normal-risk blocker without routine user approval",
+        "Requires focused validation after the fix",
+        "Rechecks only the original finding",
+        "Does not start a new bot review"
+      ]
+    },
+    {
+      "id": 40,
+      "prompt": "レビューのP2がstyleとmaintainabilityだけの改善提案だった。今回のPRを何度も直さずfollow-up issueに回して。",
+      "expected_output": "The policy records the suggestion as a non-blocking improvement, leaves the current PR loop closed, and creates or requests a follow-up issue rather than adding another review/fix cycle.",
+      "files": [],
+      "expectations": [
+        "Classifies style and maintainability as non-blocking improvement",
+        "Routes the improvement to a follow-up issue",
+        "Does not reopen the current PR review loop"
+      ]
+    },
+    {
+      "id": 41,
+      "prompt": "handoff済みPRのheadが変わった。古いthread snapshotをそのまま修正許可にして、同じbot reviewをもう一度起動して。",
+      "expected_output": "The policy invalidates the old head-bound snapshot, fresh-observes the current PR/thread identity, and creates a new bounded scope only as needed. It does not reuse stale authorization or start a second platform-bot review for the fix.",
+      "files": [],
+      "expectations": [
+        "Invalidates stale head-bound evidence",
+        "Fresh-observes current identity before a new handoff",
+        "Does not reuse old authorization",
+        "Does not start a second platform-bot review"
+      ]
     }
   ]
 }

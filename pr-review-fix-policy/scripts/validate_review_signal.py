@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
-"""Validate a review signal envelope and recompute its deterministic signal id."""
+"""Deprecated signal validator retained only for fixture compatibility.
+
+The CLI fails closed because runtime v1 does not authorize the commit-status
+signal channel.
+"""
 
 from __future__ import annotations
 
-import argparse
 import datetime as dt
 import hashlib
-import json
 import re
 import sys
-from pathlib import Path
 
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 SHA40 = re.compile(r"^[0-9a-fA-F]{40}$")
@@ -68,20 +69,11 @@ def validate(payload: object) -> list[str]:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("envelope", type=Path)
-    args = parser.parse_args()
-    try:
-        payload = json.loads(args.envelope.read_text())
-    except (OSError, json.JSONDecodeError) as error:
-        print(f"invalid envelope: {error}", file=sys.stderr)
-        return 2
-    errors = validate(payload)
-    if errors:
-        for error in errors: print(error, file=sys.stderr)
-        return 1
-    print(payload["signal_id"])
-    return 0
+    print(
+        "review_signal_status_unsupported: use fresh attested Saihai github_observe operations",
+        file=sys.stderr,
+    )
+    return 1
 
 
 if __name__ == "__main__":

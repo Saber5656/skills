@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
-"""One-shot reconciler for a private watch registration and a GitHub review signal."""
+"""Deprecated review-status reconciler retained only for fixture compatibility.
+
+Runtime v1 does not authorize the commit-status signal channel. The CLI fails
+closed; production review intake must use fresh Saihai ``github_observe``
+operations.
+"""
 
 from __future__ import annotations
 
-import argparse
 import datetime as dt
 import fcntl
 import hashlib
@@ -256,16 +260,13 @@ def locked_reconcile(path: Path) -> dict[str, Any]:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("watch_registration", type=Path)
-    args = parser.parse_args()
-    try:
-        result = locked_reconcile(args.watch_registration)
-    except (OSError, json.JSONDecodeError, RuntimeError, ValueError) as error:
-        result = {"status": "reconcile_blocked", "blocker": str(error)}
+    result = {
+        "status": "review_signal_status_unsupported",
+        "blocker": "use fresh attested Saihai github_observe operations",
+    }
     json.dump(result, sys.stdout, indent=2, ensure_ascii=False)
     sys.stdout.write("\n")
-    return 0 if result["status"] in {"ready", "duplicate_signal", "no_actionable_review", "no_signal"} else 1
+    return 1
 
 
 if __name__ == "__main__":

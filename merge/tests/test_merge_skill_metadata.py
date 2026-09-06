@@ -24,6 +24,22 @@ class MergeSkillMetadataTest(unittest.TestCase):
         self.assertIn("commit-first", text)
         self.assertIn("conflict_aborted", text)
 
+    def test_skill_rejects_github_pr_merge_context(self) -> None:
+        text = (SKILL_DIR / "SKILL.md").read_text(encoding="utf-8")
+        for phrase in ["GitHub PR merge", "unsupported_context", "mixed_context", "pr-merge-gate"]:
+            self.assertIn(phrase, text)
+        self.assertIn("git merge`を実行しない", text)
+        self.assertIn("local側を候補化せず", text)
+        self.assertIn("fetch、commit、stash、`git merge`を含む全mutationを実行しない", text)
+        self.assertIn("別のtask/processを要求し直すのは", text)
+        self.assertIn("required_handoff: typed_saihai_merge_envelope", text)
+        self.assertIn("完全なtyped Saihai envelope", text)
+
+        evals = json.loads((SKILL_DIR / "evals" / "evals.json").read_text(encoding="utf-8"))
+        bare_url = next(case for case in evals["evals"] if case["id"] == 9)
+        self.assertIn("no local git merge or PR handoff", bare_url["expected_output"])
+        self.assertIn("typed_saihai_merge_envelope", bare_url["expected_output"])
+
     def test_evals_cover_positive_and_negative_cases(self) -> None:
         evals = json.loads((SKILL_DIR / "evals" / "evals.json").read_text(encoding="utf-8"))
         prompts = [case["prompt"] for case in evals["evals"]]

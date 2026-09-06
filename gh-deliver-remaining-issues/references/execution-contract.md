@@ -1,6 +1,9 @@
 # Parallel Issue Delivery Contract
 
-Read this reference before dispatching implementation or review workers. The coordinator must complete context hydration before validating the delivery manifest or returning a missing-context result.
+Read this reference before dispatching implementation or review workers. The operating policy is
+`usage-first development operations`: optimize for useful delivery while retaining focused validation and the
+security boundary. A review is conditional, not a default tax on every change. The coordinator must complete
+trusted context hydration before validating the delivery manifest or returning a missing-context result.
 
 ## Contents
 
@@ -116,6 +119,11 @@ issue_scope:
   selector_value: "<id/url>"
   selector_value_provenance: "<typed provenance object for issue_scope.selector_value>"
   snapshot_at: "<ISO-8601>"
+feature_units:
+  - id: "feature-unit-1"
+    issue_numbers: [123, 124]
+    rationale: "shared behavior, interface, tests, or merge order"
+    branch_plan: "one branch/worktree per active feature unit"
 authorization:
   implement:
     allowed: true
@@ -161,7 +169,7 @@ coordination:
   publication_owner_provenance: "<typed provenance object for coordination.publication_owner>"
   concurrency_limit: 3
   concurrency_limit_provenance: "<typed provenance object for coordination.concurrency_limit>"
-  reviewer_capacity_reserved: 1
+  reviewer_capacity_reserved: 0
   reviewer_capacity_reserved_provenance: "<typed provenance object for coordination.reviewer_capacity_reserved>"
   context_owner_route:
     role: "<Vault-designated context owner, Gate, TPM, or Director>"
@@ -209,8 +217,8 @@ issues:
         merge_base_sha: "<resume only; must equal base_sha>"
         issue_owned_commits: "<resume only; true when every base_sha..HEAD commit is issue-owned>"
         issue_owned_paths: "<resume only; true when every changed path/symbol is issue-owned>"
-        review_provenance_status: "<resume only; verified | recovery_review_required>"
-        review_provenance_evidence:
+        review_provenance_status: "<resume only; not_required | verified | conditional_review_required>"
+        review_provenance_evidence: # optional historical/conditional evidence; not required for normal-risk resume
           - commit_sha: "<existing issue commit>"
             snapshot_digest: "<snapshot that produced this commit>"
             validation_evidence: []
@@ -295,17 +303,22 @@ scope_resolution:
       evidence: []
 ```
 
-Do not dispatch when any required organization decision or per-action authorization source is missing after hydration and internal handoff. Repository restrictions may deny an allowed action but cannot change `allowed: false` to `true`. For `fresh`, require both `after_prepare_head` and `before_dispatch_head` to equal `branch_plan.base_sha`. For `resume`, require the issue/branch/worktree identity to match, `merge_base_sha` to equal `branch_plan.base_sha`, every commit and changed path after the base to be issue-owned, no unrelated dirty path, and snapshot-bound validation plus technical and security review provenance for every existing commit. Task-owned uncommitted state may resume only when it will be included in the next complete snapshot. A branch name alone is never sufficient evidence.
+Do not dispatch when any required organization decision or per-action authorization source is missing after hydration and internal handoff. Repository restrictions may deny an allowed action but cannot change `allowed: false` to `true`. For `fresh`, require both `after_prepare_head` and `before_dispatch_head` to equal `branch_plan.base_sha`. For `resume`, require the issue/branch/worktree identity to match, `merge_base_sha` to equal `branch_plan.base_sha`, every commit and changed path after the base to be issue-owned, and no unrelated dirty path. Validate the current feature-unit snapshot before continuing; historical review provenance is conditional and is not required for normal-risk resume. Task-owned uncommitted state may resume only when it will be included in the next complete snapshot. A branch name alone is never sufficient evidence.
 
-When resume review provenance is missing, return `recovery_review_required`, preserve the state, and prohibit commit, push, and PR creation. Build a canonical clean full-issue recovery snapshot covering exactly the committed `base_sha..head_sha` range, excluding every dirty byte, then run validation and both reviews and route the recovery disposition through `approval_owner`. After approval, append the `recovery_review` event defined below for the already-existing commits; do not fabricate retrospective `commit_handoff` or `commit_result` events. Task-owned dirty state requires a separate prospective snapshot, validation, both reviews, and normal commit handoff/result. Resume only after the approved disposition and append-only recovery evidence are recorded.
+The resume gate does not require retrospective review provenance for every existing commit. If old evidence is missing,
+preserve the workspace and record the limitation; run the current feature-unit validation and the one conditional review
+only when the current risk policy requires it. Do not invent retrospective commit handoffs/results or discard valid state.
+Task-owned uncommitted state resumes through the next complete focused snapshot and the integrated feature-unit validation.
 
 The canonical missing-context result is the typed object in the hydration section above. Older consumers may read `missing_fields` as an alias for `missing_sources[*].field` and `discoverable_fields_checked` as an alias for `checked_sources`, but the result must still include the attempted internal owners, retry count, and required Vault artifacts. `question_owner` is `caller` for internal context recovery; never emit an internal role-selection question to the user.
 
-Route later requirement, review, security, and publication decisions through the owners declared in the manifest:
+Route later requirement, compatibility, security-design, and publication decisions through the owners declared in the manifest.
+Valid blocking findings within an already authorized scope are not a decision gate; only a finding that changes a
+requirement, scope, compatibility, design, or data-handling decision is routed to an owner:
 
 ```yaml
 status: waiting_owner_decision
-decision_type: requirement | review_finding | security_finding | publication
+decision_type: requirement | compatibility | security_design | publication
 decision_owner: caller | user
 affected_issues: []
 evidence: []
@@ -327,17 +340,20 @@ owned_paths: []
 excluded_paths: []
 acceptance_criteria: []
 required_checks: []
-review_focus: "api-contract"
+review_required: false
+review_focus: null
 review_assignment:
-  role: "<trusted-context assigned role>"
-  provider: "<trusted-context assigned provider>"
-  rationale: "<why this assignment covers the focus>"
-  source: "<trusted source object with provenance>"
+  role: null
+  provider: null
+  effective_model: null
+  rationale: null
+  source: null
 security_review_assignment:
-  role: "<trusted-context assigned security role>"
-  provider: "<trusted-context assigned security provider>"
-  rationale: "<why this assignment covers the unit risk>"
-  source: "<trusted source object with provenance>"
+  role: null
+  provider: null
+  effective_model: null
+  rationale: null
+  source: null
 state: planned
 diff_snapshot:
   version: "1"
@@ -346,8 +362,8 @@ diff_snapshot:
   binary_patch_sha256: "<sha256>"
   snapshot_digest: "<sha256 of canonical payload>"
 validation_evidence: []
-review_evidence: null
-security_review_evidence: null
+review_evidence: null # required only when review_required is true
+security_review_evidence: null # required only for the elevated-risk review
 commit_hash: null
 ```
 
@@ -357,18 +373,19 @@ Use these state transitions:
 planned
 → implemented
 → locally_validated
-→ review_pending
-→ waiting_owner_finding_policy (only when needed)
+→ conditional_review_pending (only when the elevated-risk/explicit policy applies)
+→ finding_verified (only for a valid blocking finding)
 → reimplemented
 → locally_revalidated
-→ rereview_pending
-→ reviewed_snapshot_approved
+→ original_findings_rechecked
 → committed
 ```
 
 ## Commit and publication handoff
 
-Maintain one append-only Git Publication Manifest per issue. After validation and both reviews approve a unit's identical snapshot, build its Task Change Manifest and append a `commit_handoff` event to the issue manifest.
+Maintain one append-only Git Publication Manifest per feature unit. After focused validation (and the conditional
+review cycle when applicable) confirms the current snapshot, build its Task Change Manifest and append a
+`commit_handoff` event to the feature-unit manifest.
 
 ```yaml
 task_change_manifest:
@@ -380,17 +397,87 @@ task_change_manifest:
   approved_diff_snapshot: "<exact reviewed snapshot digest>"
   reviewed_artifacts:
     validation_evidence: []
-    technical_review: "<evidence bound to the snapshot digest>"
-    security_review: "<evidence bound to the snapshot digest>"
+    technical_review: null # populated only when the conditional review runs
+    security_review: null # populated only for the elevated-risk review
   commit_required: true
   unrelated_dirty_paths: []
 
 git_publication_manifest:
   manifest_version: "1"
+  publication_intake_schema_version: "2"
+  execution_profile: "trusted_local_v1 | legacy_managed"
+  execution_profile_provenance: "<typed provenance object for git_publication_manifest.execution_profile>"
+  # `publication_lineage_id` and the legacy intake fields below are required only for `legacy_managed`.
+  # `trusted_local_v1` binds the host authority/report and private state through the host publication contract.
+  publication_lineage_id: "<random 64-hex durable lineage id>"
+  publication_manifest_generation: 1
+  supersedes_manifest_sha256: null
+  publication_pr_number: null
   task_id: "<parent task id>"
-  issue_number: 123
+  feature_unit_id: "feature-unit-1"
+  issue_numbers: [123, 124]
   repo_root: "<absolute repository root>"
   branch_plan: "<validated issue Branch Plan>"
+  publication_target:
+    repository: "<owner/name>"
+    remote: "<validated Git remote name>"
+    base_ref: "<validated base ref>"
+    head_ref: "<validated working-branch ref>"
+    base_sha: "<immutable verified remote-base commit>"
+    head_sha: "<immutable reviewed and committed publication commit>"
+  # Required only for `legacy_managed`; `trusted_local_v1` uses the host publication contract.
+  publication_intake_contract:
+    contract_path: "pr/references/publication-safety-contract.md"
+    normalization: "utf8_text_without_trailing_lf"
+    contract_sha256: "<SHA-256 of the one-read normalized pr contract>"
+    filter_sha256: "<SHA-256 of the marker-extracted canonical jq bytes>"
+  expected_assignees: ["<concrete GitHub login>"]
+  expected_assignees_source:
+    authority: "caller | user"
+    evidence: ["<immutable trusted-context reference>"]
+  required_checks:
+    - name: "<required check name>"
+      mechanism: "check_run"
+      producer:
+        app_id: 123
+        evidence: ["<authoritative producer-binding evidence>"]
+      current_head_required: true
+  required_check_inventory_source:
+    repository: "<owner/name>"
+    base_ref: "<validated base ref>"
+    policy_sources: ["<ruleset or trusted task-manifest source>"]
+    evidence: ["<authoritative inventory evidence, including evidence of an empty inventory>"]
+  external_reviewers:
+    policy_source:
+      authority: "caller | user"
+      evidence: ["<immutable trusted-context reference>"]
+    coderabbit:
+      required: false
+      command: "@coderabbitai review"
+      current_head_required: true
+      attempt_policy: "at_most_once_per_pr_initial_review"
+      policy_source:
+        authority: "caller | user"
+        evidence: ["<immutable trusted-context reference>"]
+    codex:
+      required: false
+      trigger_mode: "repository_automatic_only"
+      manual_trigger_forbidden: true
+      current_head_required: true
+      policy_source:
+        authority: "caller | user"
+        evidence: ["<immutable trusted-context reference>"]
+  publication_mutations:
+    ready_pr:
+      creation_allowed: true
+      title_digest: "sha256:<Saihai canonical-JSON digest of the exact English title string>"
+      body_digest: "sha256:<Saihai canonical-JSON digest of the exact English body string>"
+    pr_labels: ["<complete sorted-unique exact PR label set>"]
+    issue_labels:
+      issue_number: 123
+      labels: ["<complete sorted-unique exact primary-issue label set>"]
+    requested_reviewers: ["<complete sorted-unique exact login set>"]
+    review_threads: [] # successor generation freezes exact approved thread/reply/resolve rows
   authorization:
     push: "<trusted authorization.push object>"
     create_ready_pr: "<trusted authorization.create_ready_pr object>"
@@ -405,7 +492,7 @@ git_publication_manifest:
       commit_hash: "<sha>"
       committed_diff_matches_snapshot: true
       snapshot_digest: "<same approved snapshot digest>"
-    - event: "recovery_review"
+    - event: "recovery_review" # optional retrospective evidence for an explicitly elevated-risk task
       recovery_id: "issue-123-recovery-1"
       base_sha: "<branch_plan.base_sha>"
       head_sha: "<reviewed existing HEAD>"
@@ -414,13 +501,13 @@ git_publication_manifest:
         - unit_id: "issue-123-recovered-u1"
           commit_hash: "<one covered commit SHA>"
           commit_diff_sha256: "<sha256 of that immutable commit diff>"
-      cumulative_snapshot_digest: "<approved full-issue recovery snapshot digest>"
+      snapshot_digest: "<recovery snapshot digest>"
       validation_evidence: []
-      technical_review: "<approved evidence bound to cumulative_snapshot_digest>"
-      security_review: "<permitted evidence bound to cumulative_snapshot_digest>"
+      review_evidence: "<optional evidence bound to snapshot_digest>"
+      security_review: "<optional evidence bound to snapshot_digest>"
       owner_disposition:
         owner: caller | user
-        decision: approve_recovery
+        decision: record_recovery
         evidence: []
   finalization:
     status: "open | finalized"
@@ -429,7 +516,11 @@ git_publication_manifest:
     recovery_attested_unit_ids: []
     all_units_committed_or_recovery_attested: false
     all_acceptance_criteria_satisfied: false
-    required_checks: []
+    prepublication_checks: []
+    all_prepublication_checks_passed: false
+    postpublication_gate_inventory_frozen: false
+    review_required: false
+    publication_intake_validated: false
     finalized_evidence: []
   review_or_validation_status: "quality_ok"
   commit_required: true
@@ -440,17 +531,196 @@ git_publication_manifest:
   handoff_to: "<trusted-context publication route>"
 ```
 
-Bind each `commit_handoff` event and Task Change Manifest to the same issue, unit, Branch Plan, approved scope, and snapshot. Pass the current unit's Task Change Manifest and the issue manifest to `commit`; the Task Change Manifest alone does not satisfy a publication-flow commit handoff. After commit succeeds, append a matching `commit_result` event. Never rewrite or remove prior unit events.
+Every value that can be written remotely is frozen before the corresponding host authority or legacy signed Saihai
+authority is issued by the selected execution profile. The initial generation normally has `review_threads: []`.
+Review-thread mutation rows are added only for
+the one conditional review cycle and only when a valid fix/reply is in scope; do not create them for normal-risk
+work. The agent never creates or configures credentials, signer material, channel tokens, or service definitions.
 
-A `recovery_review` event is the only valid post-commit substitute for missing prospective review provenance. Bind it to the same issue and Branch Plan, require its base and head to match the reviewed clean committed range, exclude dirty state from its cumulative snapshot digest, list every immutable covered commit in order, map each recovered unit to exactly one covered commit and its exact commit-diff digest, and bind validation plus both reviews to the cumulative snapshot digest. Its `owner_disposition.owner` must equal the manifest's `approval_owner`. The event attests that existing commits were approved by recovery review; it must never claim they were committed from a prospectively approved snapshot. Across all unit events, each unit ID and each commit SHA may appear in exactly one delivery mode: either one prospective handoff/result pair or one recovered-unit mapping. A commit may appear in only one recovery event. Any task-owned dirty state remains outside the recovery attestation until it completes the normal unit loop.
+### Execution profile routing
 
-Do not pass the issue manifest to `push` or `pr` while `finalization.status` is `open`. Finalize only after every `expected_unit_id` is satisfied exactly once by either a unique prospective handoff/result pair or a unique recovered-unit mapping in an approved `recovery_review` event; the union of every prospective `commit_result.commit_hash` and recovered-unit `commit_hash` contains no duplicate; every prospective committed diff matches its approved snapshot; every recovered commit and clean cumulative `base_sha..head_sha` range matches its recorded digest; no dirty task-owned state remains; all acceptance criteria are satisfied; and all required checks pass. Set `all_units_committed_or_recovery_attested` only after those checks. Only the finalized issue manifest is the publication source of truth.
+`git_publication_manifest.execution_profile` is an immutable, provenance-bound task-context field. It must be
+selected before publication intake validation and may not change implicitly during retry or recovery. The normal
+profile is `trusted_local_v1` and uses the host-owned Saihai trusted-local contract:
+
+1. The trusted host creates the exact request object and host-owned mode-0600 authorization, including the approved
+   model, validation command, review policy, executable digest, repository, worktree, branch, and allowed paths.
+2. The host invokes the fixed executor with
+   `python3.11 scripts/saihai.py usage run --request /absolute/request.json --authorization /absolute/authority.json --state-root /absolute/private-state`.
+3. When publication or required CI remains pending, the host invokes the bounded continuation with
+   `python3.11 scripts/saihai.py usage advance --authorization /absolute/authority.json --state-root /absolute/private-state`
+   and repeats it only while the typed result is pending. The host publication adapter owns commit, branch push, PR,
+   current-head checks, and the head-pinned merge mutation according to the trusted-local contract.
+4. A completed result is accepted only when the host-produced execution/validation evidence is bound to the exact
+   tree and diff and the host adapter reports the corresponding publication or merge postcondition. Release remains
+   a separate gate.
+
+The `legacy_managed` profile is an explicit compatibility route only. It may use the historical root-owned Saihai
+broker/client, signed work-order or authority, `lineage_activate`/`lineage_read`, detached runtime digests, and
+attestation requirements described below. Missing legacy capability must not switch a `trusted_local_v1` task into
+the legacy route, and missing/malformed profile context is `publication_execution_profile_missing` with zero
+publication mutation.
+
+For `legacy_managed`, `finalization.status: finalized` means the immutable publication intake is complete enough for
+`pr` to push and create or reuse the ready PR; it does not mean PR-only CI has completed. Keep that
+finalized Manifest byte-for-byte unchanged after its detached digest is handed off. Record post-publication
+facts as immutable deltas which `pr` emits and this coordinator alone appends to the active generation's
+outcome record:
+A PR-only check or external review that cannot exist before PR creation is not a finalization prerequisite.
+
+For `trusted_local_v1`, finalization instead means that the host-owned request, mode-0600 authority, validated
+trusted-local report, exact tree/diff evidence, and host publication intent are complete. The host invokes
+`usage advance` through `host_publication_adapter` for the bounded commit/push/PR/CI/merge continuation and keeps
+its private progress state; the legacy detached lineage/outcome reducer below is not required.
+
+### Legacy publication outcome reducer (`legacy_managed` only)
+
+```yaml
+publication_outcome_delta:
+  delta_version: "1"
+  canonicalization: "RFC 8785 JSON Canonicalization Scheme (JCS), UTF-8"
+  delta_id: "sha256:<canonical delta payload digest excluding delta_id>"
+  publication_lineage_id: "<stable 64-hex lineage id>"
+  publication_manifest_sha256: "<detached frozen Manifest SHA-256>"
+  publication_manifest_generation: 1
+  repository: "<same owner/name>"
+  base_ref: "<same frozen base ref>"
+  base_sha: "<same frozen base SHA>"
+  head_ref: "<same frozen head ref>"
+  head_sha: "<same frozen head SHA>"
+  pr_number: 123
+  events:
+    - event_id: "sha256:<canonical event payload digest excluding event_id>"
+      event_index: 0
+      event: "pr_created_or_reused | assignee_postcondition | required_check_observation | review_observation"
+      observed_at: "<ISO-8601>"
+      pr_number: 123
+      base_sha: "<observed PR baseRefOid>"
+      head_sha: "<observed PR headRefOid>"
+      postcondition: "pr_identity | exact_assignees | required_checks_current_head | configured_reviews_current_head | unresolved_threads_current_head"
+      result: "pending | success | failed | unknown"
+      evidence_digests: ["sha256:<authenticated private evidence digest>"]
+
+publication_outcome_record:
+  outcome_version: "1"
+  publication_lineage_id: "<same stable lineage id>"
+  active_publication_manifest_sha256: "<same active Manifest digest>"
+  publication_manifest_generation: 1
+  next_append_sequence: 1
+  accepted_deltas:
+    - delta_id: "<accepted delta ID>"
+      payload_sha256: "<canonical delta payload SHA-256>"
+  events:
+    - append_sequence: 0
+      delta_id: "<accepted delta ID>"
+      event: "<complete copied immutable event object>"
+  contradictions: []
+```
+
+For `legacy_managed`, `pr` returns the complete immutable `publication_outcome_delta`; it never edits the coordinator's record.
+Within one delta, `event_index` starts at zero and is contiguous, evidence-digest arrays are sorted/unique, and
+both ID payloads use the declared RFC 8785 UTF-8 bytes with only their own ID member omitted. The coordinator validates both canonical
+digests, exact active Manifest generation, repository/base/head/PR identity, and authenticated evidence before
+mapping them to the Saihai runtime's monotonically increasing compact outcome-event sequence. Replaying the
+same ID and byte-identical payload is an idempotent no-op. Reusing a delta/event ID with different bytes,
+observing a second PR identity for one Manifest, or receiving incompatible terminal results for the same
+postcondition is `publication_outcome_contradiction`; retain all evidence and do not promote or synthesize a
+winner. For `legacy_managed`, missing prior attested runtime outcome digest, sequence continuity, or runtime append availability is
+`publication_outcome_append_unavailable`.
+
+The exact promotion predicate is: the record is bound to the one active Manifest; `pr_identity`,
+`exact_assignees`, and `required_checks_current_head` each have authenticated `success` evidence for the exact
+frozen head and PR; when `finalization.review_required` is true, the configured-review and unresolved-thread
+postconditions must also be successful; there is no unresolved contradiction or later `failed`/`unknown` event;
+and the live exact-identity assertion still passes. Normal-risk work may move from `pr_created_ci_pending` to
+`pr_created` without a reviewer response. Outcome events never rewrite authorization, target, reviewer policy,
+check inventory, or any other frozen intake field.
+
+### Publication Manifest supersession (`legacy_managed` only)
+
+The following durable lineage/attestation procedure is retained for the explicitly selected `legacy_managed`
+profile. It is not a prerequisite for `trusted_local_v1`, whose host-owned private state and
+`host_publication_adapter` provide the corresponding task-local identity and continuation boundary.
+
+The Saihai publication runtime owns the durable append-only lineage registry keyed only by a random 64-hex
+`publication_lineage_id`; no coordinator file, shell adapter, or caller database is an authorization source.
+The key never changes when a PR is discovered or created. Exactly one Manifest digest/generation is active for
+that ID. Generation 1 has `supersedes_manifest_sha256: null`; every later generation increments by one and
+names the immediately preceding active digest. `publication_pr_number` is a monotonic runtime binding: it may
+move only from `null` to one exact positive integer through `lineage_bind_pr` with the canonical digest of an
+attested create/reconciliation result, and can never be replaced.
+
+For `legacy_managed`, before handing generation 1 to `pr`, invoke signed Saihai `lineage_activate` for `absent -> M1`; it binds the
+lineage ID, digest/generation/predecessor, repository, base/head refs and OIDs, and optional PR number under the
+managed branch lock. A valid fix that moves H1 to H2 must freeze M2(H2), preserve already-authorized scope/policies,
+rerun focused validation and the integrated full validation, and invoke
+`lineage_activate` for exact `M1 -> M2`. Then invoke a separately identified `lineage_read` and require an
+attested byte-for-byte match before handoff. Failure, ambiguity, skipped generation, predecessor mismatch,
+arbitrary fork, or unavailable runtime returns `publication_manifest_supersession_required` without push or
+GitHub mutation.
+
+Supersession never rewrites M1. Runtime state marks M1 inactive, prevents every M1 outcome from satisfying
+completion, and gives M2 a distinct head-bound claim/reviewer lifecycle. Only deltas bound to the current
+lineage ID and active digest/generation may append or promote. Every consumer uses fresh `lineage_read` before
+mutation; carrier-shape validation alone never authorizes M1 or M2.
+This closes the bounded fix loop without
+reusing old-head CI, Assignee, unresolved-thread, or review evidence.
+
+Before setting `finalization.status: finalized`, a `legacy_managed` publication must resolve the installed `pr` skill,
+read its publication contract exactly once, strip trailing LF bytes as Bash command substitution does, extract its single version-1
+[canonical publication-intake filter](../../pr/references/publication-safety-contract.md#canonical-publication-intake-filter)
+from that immutable buffer, and freeze the normalized contract/filter SHA-256 values into
+`publication_intake_contract`. Run the extracted bytes with `jq -cse` against the exact one-value JSON
+serialization of the issue manifest. The producer and consumer must extract and hash the same marker-bounded
+bytes; do not copy or fork the predicate inside this coordinator. If `pr` or its filter cannot be resolved, return
+`publication_incomplete: publication_intake_contract_unavailable` without publication mutation.
+
+The manifest itself cannot establish trust: every source/evidence value is supplied and authenticated by the
+caller or user, and the filter only proves that the frozen carrier is complete and producer-bound. Any false
+result, parse error, missing source, unbound producer, target/source mismatch, or malformed conditional reviewer policy
+returns `publication_incomplete: publication_intake_invalid`. Do not invent a sidecar, wrapper, default
+Assignee, check producer, or reviewer policy. Set `finalization.publication_intake_validated: true` only after
+the canonical filter passes. After the exact task diff is committed, freeze the verified remote-base and
+committed publication OIDs as `publication_target.base_sha` and `publication_target.head_sha`; a branch name
+alone is not a publication identity. Serialize exactly one JSON manifest, remove trailing LF bytes, compute its
+SHA-256, and hand that detached trusted value to `pr` as `expected_publication_manifest_sha256` together with
+this unchanged versioned issue manifest. This detached digest binds bytes but carries no policy fields and is
+not a sidecar carrier. `pr` reads each input once, compares the manifest/contract/filter identities, and reruns
+the same filter before any fetch, push, PR create/reuse, or edit. A digest mismatch returns
+`publication_incomplete: publication_intake_identity_mismatch` with zero publication mutation.
+
+For `trusted_local_v1`, do not invoke the legacy marker-bounded filter or require its lineage/broker fields. The
+host validates the trusted-local report and authority against the host publication contract, including the exact
+repository, `codex/...` branch, pre-publication head/base, approved paths, required-check inventory, tree/diff
+digests, process evidence, and passed validation evidence. The host then invokes `usage advance` through
+`host_publication_adapter`; an invalid, stale, or absent report returns a typed host-publication blocker with zero
+publication mutation.
+
+Bind each `commit_handoff` event and Task Change Manifest to the same feature unit, linked issues, Branch Plan,
+approved scope, and snapshot. Pass the current unit's Task Change Manifest and the feature-unit manifest to
+`commit`; the Task Change Manifest alone does not satisfy a publication-flow commit handoff. After commit succeeds,
+append a matching `commit_result` event. Never rewrite or remove prior unit events.
+
+A `recovery_review` event is optional and is used only when an elevated-risk task explicitly needs retrospective
+evidence. Do not require it merely because an older commit lacks a review record. Across all unit events, each
+unit ID and each commit SHA may appear in exactly one delivery mode. Any task-owned dirty state remains outside the
+recovery attestation until it completes the normal unit loop.
+
+Do not pass the feature-unit manifest to `push` or `pr` while `finalization.status` is `open`. Finalize only after
+every expected unit is satisfied exactly once, no dirty task-owned state remains, all acceptance criteria are
+satisfied, focused validation is recorded, one integrated full validation passes, and the selected profile's
+required-check inventory and producer identity are frozen. `legacy_managed` additionally requires the canonical
+publication intake filter and immutable lineage/outcome evidence; `trusted_local_v1` requires the host report,
+authority, exact tree/diff evidence, and host publication intent instead. Conditional review evidence is required
+only when `review_required` is true. A PR-only check that cannot exist before PR creation is a required
+post-publication outcome event; an optional external review is telemetry. Only the finalized feature-unit manifest
+and its selected profile-bound authority/report are the immutable publication-intake sources of truth.
 
 `authorization.create_ready_pr.allowed: true` with its own trusted source and the matching issue's `publication.approved: true` authorize automatic ready-PR creation for that bounded scope. `publication_owner` is the trusted-context execution route, not an additional per-PR approval gate. Do not ask for another publication decision when these authorizations and all deterministic gates remain valid. Return `waiting_owner_decision` only when authorization is absent or the approved scope, base, stacking, merge order, or publication plan must change.
 
 ## Immutable review snapshot
 
-Bind review approval to the exact intended commit bytes, independent of whether a path is currently staged. Build one canonical payload containing:
+Bind conditional review evidence to the exact intended commit bytes, independent of whether a path is currently staged. Build one canonical payload containing:
 
 ```yaml
 snapshot_version: "1"
@@ -467,9 +737,13 @@ Include every task-owned staged, unstaged, previously untracked, binary, and del
 
 Before commit, stage only approved paths/hunks, derive the same canonical payload from the index, and require its digest to equal the approved `snapshot_digest`. Also require no unstaged or untracked task-owned remainder. Stop on any mismatch, extra task-owned path, missing deletion, or changed mode/content. Any change creates a new digest and invalidates technical, security, and integration review evidence.
 
-## Review focus and assignment
+## Conditional review focus and assignment
 
-Identify the narrow technical focus from the unit, but do not choose an organization role or provider. Accept assignments only from explicit user instructions, caller-supplied typed context, or provenance-bound Vault context. If the assignment is absent, route the gap to the hydrated context owner and do not ask the user solely because the initial caller payload omitted it.
+Identify the narrow technical focus from the unit only when the conditional review rule applies, but do not choose an
+organization role or provider. Normal-risk units leave the assignment null and proceed on validation evidence alone.
+Conditional review assignments are accepted only from explicit user instructions, caller-supplied typed context, or
+provenance-bound Vault context; if such an assignment is absent, route the gap to the hydrated context owner and do
+not ask the user solely because the initial caller payload omitted it.
 
 | Change | Suggested `review_focus` | Review concern |
 |---|---|---|
@@ -496,6 +770,486 @@ C. Defer this Issue — <dependency or delivery impact>.
 Recommended: A
 ```
 
+## Canonical review evidence carrier
+
+Conditional technical, security, and explicitly requested recovery reviews use one common provenance carrier. Preserve the
+caller/Saihai dispatcher values exactly; this coordinator does not select, infer, translate, or invent them.
+Bind a pre-commit review to both the immutable current parent HEAD and the canonical intended-tree snapshot.
+Bind a post-commit/recovery review to the exact reviewed commit/range and its snapshot digest.
+
+```yaml
+review_evidence_version: "1"
+review_id: "<opaque review id>"
+request_id: "<opaque dispatch request id>"
+session_id: "<opaque provider session id>"
+reviewer_role: "<caller-assigned role>"
+provider: "<actual provider>"
+effective_model: "<actual effective model>"
+dispatch_facade: "<trusted caller/Saihai facade identity and version>"
+review_target:
+  repository: "owner/repo"
+  base_sha: "<immutable base SHA>"
+  reviewed_head_sha: "<immutable HEAD at dispatch>"
+  target_kind: "intended_tree | commit | committed_range"
+  target_identity: "<snapshot digest, commit SHA, or range digest>"
+  snapshot_digest: "sha256:<canonical snapshot digest>"
+  artifact_digest: "sha256:<digest of the complete reviewable artifact bundle>"
+terminal_status: "success | findings | insufficient_input | error"
+terminal_result:
+  schema_version: "1"
+  status: "<same terminal status>"
+  verdict: "<typed role verdict>"
+  findings: []
+result_integrity:
+  algorithm: "sha256"
+  payload: "review_evidence_without_result_integrity.digest"
+  canonicalization: "RFC 8785 JSON Canonicalization Scheme (JCS), UTF-8"
+  digest: "<digest of the canonical complete carrier with only this digest member omitted>"
+```
+
+Every carrier value must be JSON-compatible under RFC 8785; reject duplicate keys, non-finite numbers, or
+values that cannot be represented canonically. To compute or verify the digest, deep-copy the complete carrier,
+remove only `.result_integrity.digest`, require the remaining algorithm/payload/canonicalization values to equal
+the literals above, canonicalize that complete object with RFC 8785, and SHA-256 the UTF-8 bytes. Excluding only
+the digest slot makes the construction detached and never self-referential while binding `review_id`,
+request/session IDs, role, provider, effective model, dispatch facade, complete target, terminal status/result,
+and integrity metadata. Transplanting a valid `terminal_result` under different outer provenance therefore
+invalidates the digest. Tests must verify a known complete-carrier vector and independently mutate every
+semantic outer-field group to prove the digest changes.
+
+Every field is required once a conditional review is dispatched. An unavailable request/session ID, effective model,
+immutable target identity, artifact digest, terminal result, or result-integrity digest is not a reason to substitute
+a local value: return `review_provenance_incomplete` for that review. A normal-risk unit does not create this
+carrier or a review blocker. Any target bytes, base/head, role/provider/model, dispatcher policy, or result change
+invalidates the carrier and requires a fresh review only for the same bounded review cycle.
+
+### Public-safe review summary projection
+
+The complete review evidence carrier is private, Vault-only evidence. Never copy its `review_id`, `request_id`,
+`session_id`, dispatcher identity, local artifact/Vault paths, opaque evidence references, hidden URLs, or raw
+review body into a public PR title, body, comment, or issue. Derive public text only through this allowlisted
+projection after integrity verification:
+
+```yaml
+public_review_summary_version: "1"
+reviewer_role: "<non-sensitive role label>"
+reviewed_head_sha: "<public commit SHA>"
+verdict: "approved | findings | insufficient_input | error"
+finding_counts:
+  P0: 0
+  P1: 0
+  P2: 0
+  P3: 0
+validation_summary: ["<public, secret-scanned check name and result>"]
+limitations: ["<public, secret-scanned limitation without local identifiers>"]
+```
+
+Reject unknown fields. Each string passes secret and local-path redaction before publication; finding details
+are summarized only when already safe for the public repository. Keep the full carrier and its digest in the
+Vault task record, and store only the projection (or a public GitHub URL) in PR-visible material.
+
+### Executable integrity, outcome, and projection reference
+
+The following marker-bounded Node.js program is the canonical executable reference. Consumers extract these
+exact bytes, run them with a duplicate-key-preserving raw JSON input boundary, and pin the containing contract
+digest. Python `json.dumps(sort_keys=True)`, jq key sorting, locale sorting, or ad-hoc stable stringify is not
+RFC 8785 and must not be substituted. This parser rejects duplicate decoded member names and lone surrogates;
+the canonicalizer uses ECMAScript number serialization (including `-0` → `0`) and UTF-16 member ordering.
+Application records restrict counters/indices/IDs to non-negative safe integers even though the canonicalizer
+also accepts other finite IEEE-754 values. If the pinned contract bytes or a compatible Node.js runtime cannot
+be resolved, return `publication_integrity_runtime_unavailable`; do not use a fallback serializer or reducer.
+
+<!-- publication-integrity-js-start -->
+```javascript
+const crypto = require("node:crypto");
+
+function fail(code) {
+  const error = new Error(code);
+  error.code = code;
+  throw error;
+}
+
+function validUnicode(value) {
+  for (let index = 0; index < value.length; index += 1) {
+    const unit = value.charCodeAt(index);
+    if (unit >= 0xd800 && unit <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (!(next >= 0xdc00 && next <= 0xdfff)) fail("jcs_lone_surrogate");
+      index += 1;
+    } else if (unit >= 0xdc00 && unit <= 0xdfff) {
+      fail("jcs_lone_surrogate");
+    }
+  }
+}
+
+function parseJsonNoDuplicates(text) {
+  let cursor = 0;
+  const whitespace = () => { while (" \t\n\r".includes(text[cursor] || "\u0000")) cursor += 1; };
+  function stringValue() {
+    const start = cursor;
+    cursor += 1;
+    while (cursor < text.length) {
+      const unit = text.charCodeAt(cursor);
+      if (unit === 0x22) {
+        cursor += 1;
+        const value = JSON.parse(text.slice(start, cursor));
+        validUnicode(value);
+        return value;
+      }
+      if (unit < 0x20) fail("json_control_character");
+      if (unit === 0x5c) {
+        cursor += 1;
+        if (text[cursor] === "u") {
+          if (!/^[0-9a-fA-F]{4}$/u.test(text.slice(cursor + 1, cursor + 5))) fail("json_escape_invalid");
+          cursor += 5;
+        } else {
+          if (!/["\\/bfnrt]/u.test(text[cursor] || "")) fail("json_escape_invalid");
+          cursor += 1;
+        }
+      } else {
+        cursor += 1;
+      }
+    }
+    fail("json_unterminated_string");
+  }
+  function value() {
+    whitespace();
+    if (text[cursor] === "{") {
+      cursor += 1;
+      const result = Object.create(null);
+      const names = new Set();
+      whitespace();
+      if (text[cursor] === "}") { cursor += 1; return result; }
+      while (true) {
+        whitespace();
+        if (text[cursor] !== '"') fail("json_object_key_invalid");
+        const name = stringValue();
+        if (names.has(name)) fail("json_duplicate_key");
+        names.add(name);
+        whitespace();
+        if (text[cursor] !== ":") fail("json_colon_missing");
+        cursor += 1;
+        result[name] = value();
+        whitespace();
+        if (text[cursor] === "}") { cursor += 1; return result; }
+        if (text[cursor] !== ",") fail("json_comma_missing");
+        cursor += 1;
+      }
+    }
+    if (text[cursor] === "[") {
+      cursor += 1;
+      const result = [];
+      whitespace();
+      if (text[cursor] === "]") { cursor += 1; return result; }
+      while (true) {
+        result.push(value());
+        whitespace();
+        if (text[cursor] === "]") { cursor += 1; return result; }
+        if (text[cursor] !== ",") fail("json_comma_missing");
+        cursor += 1;
+      }
+    }
+    if (text[cursor] === '"') return stringValue();
+    for (const [literal, parsed] of [["true", true], ["false", false], ["null", null]]) {
+      if (text.startsWith(literal, cursor)) { cursor += literal.length; return parsed; }
+    }
+    const numberMatch = text.slice(cursor).match(/^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?/u);
+    if (!numberMatch) fail("json_value_invalid");
+    cursor += numberMatch[0].length;
+    const parsed = Number(numberMatch[0]);
+    if (!Number.isFinite(parsed)) fail("jcs_nonfinite_number");
+    return parsed;
+  }
+  const parsed = value();
+  whitespace();
+  if (cursor !== text.length) fail("json_trailing_data");
+  return parsed;
+}
+
+function canonicalize(value) {
+  if (value === null || value === true || value === false) return JSON.stringify(value);
+  if (typeof value === "string") { validUnicode(value); return JSON.stringify(value); }
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) fail("jcs_nonfinite_number");
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) return `[${value.map(canonicalize).join(",")}]`;
+  if (typeof value === "object") {
+    return `{${Object.keys(value).sort().map(
+      (key) => `${canonicalize(key)}:${canonicalize(value[key])}`
+    ).join(",")}}`;
+  }
+  fail("jcs_type_unsupported");
+}
+
+const digest = (value) => crypto.createHash("sha256").update(canonicalize(value), "utf8").digest("hex");
+const deepCopy = (value) => parseJsonNoDuplicates(canonicalize(value));
+const isObject = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
+const exactKeys = (value, keys, code) => {
+  if (!isObject(value) || canonicalize(Object.keys(value).sort()) !== canonicalize([...keys].sort())) fail(code);
+};
+const sha256 = (value) => typeof value === "string" && /^sha256:[0-9a-f]{64}$/u.test(value);
+const hex64 = (value) => typeof value === "string" && /^[0-9a-f]{64}$/u.test(value);
+const oid = (value) => typeof value === "string" && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u.test(value);
+const safeInteger = (value) => Number.isSafeInteger(value) && value >= 0;
+const sortedUnique = (values) => Array.isArray(values)
+  && values.every((value) => typeof value === "string")
+  && canonicalize(values) === canonicalize([...new Set(values)].sort());
+
+function carrierDigest(carrier, verify) {
+  exactKeys(carrier, ["review_evidence_version", "review_id", "request_id", "session_id", "reviewer_role",
+    "provider", "effective_model", "dispatch_facade", "review_target", "terminal_status", "terminal_result",
+    "result_integrity"], "review_provenance_incomplete");
+  exactKeys(carrier.review_target, ["repository", "base_sha", "reviewed_head_sha", "target_kind",
+    "target_identity", "snapshot_digest", "artifact_digest"], "review_provenance_incomplete");
+  exactKeys(carrier.terminal_result, ["schema_version", "status", "verdict", "findings"],
+    "review_provenance_incomplete");
+  exactKeys(carrier.result_integrity, ["algorithm", "payload", "canonicalization", "digest"],
+    "review_provenance_incomplete");
+  const requiredStrings = [carrier.review_id, carrier.request_id, carrier.session_id, carrier.reviewer_role,
+    carrier.provider, carrier.effective_model, carrier.dispatch_facade, carrier.review_target.repository,
+    carrier.review_target.target_kind, carrier.review_target.target_identity, carrier.terminal_result.verdict];
+  if (carrier.review_evidence_version !== "1" || requiredStrings.some(
+    (value) => typeof value !== "string" || value.length === 0
+  ) || !oid(carrier.review_target.base_sha) || !oid(carrier.review_target.reviewed_head_sha)
+    || !sha256(carrier.review_target.snapshot_digest) || !sha256(carrier.review_target.artifact_digest)
+    || carrier.terminal_result.schema_version !== "1" || !Array.isArray(carrier.terminal_result.findings)
+    || !["success", "findings", "insufficient_input", "error"].includes(carrier.terminal_status)
+    || !["intended_tree", "commit", "committed_range"].includes(carrier.review_target.target_kind)
+    || carrier.terminal_status !== carrier.terminal_result.status
+    || carrier.result_integrity.algorithm !== "sha256"
+    || carrier.result_integrity.payload !== "review_evidence_without_result_integrity.digest"
+    || carrier.result_integrity.canonicalization !== "RFC 8785 JSON Canonicalization Scheme (JCS), UTF-8"
+    || !hex64(carrier.result_integrity.digest)) fail("review_provenance_incomplete");
+  const payload = deepCopy(carrier);
+  delete payload.result_integrity.digest;
+  const observed = digest(payload);
+  if (verify && observed !== carrier.result_integrity.digest) fail("review_integrity_mismatch");
+  return observed;
+}
+
+function validateProjection(projection) {
+  exactKeys(projection, ["public_review_summary_version", "reviewer_role", "reviewed_head_sha", "verdict",
+    "finding_counts", "validation_summary", "limitations"], "public_projection_invalid");
+  exactKeys(projection.finding_counts, ["P0", "P1", "P2", "P3"], "public_projection_invalid");
+  const strings = [projection.reviewer_role, ...(projection.validation_summary || []), ...(projection.limitations || [])];
+  const forbidden = /(?:\/(?:Users|home|var|tmp|private|Volumes)\/|[A-Za-z]:\\Users\\|file:\/\/|Agents-Vault|AGENTS_VAULT_ROOT|USER_VAULT_ROOT|\.obsidian|\.codex|\b(?:request|session|review)[_-]?id\b|dispatch_facade|BEGIN (?:RSA |OPENSSH )?PRIVATE KEY|\b(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]+|\bAKIA[0-9A-Z]{16}|\bsk-[A-Za-z0-9_-]{12,})/iu;
+  if (projection.public_review_summary_version !== "1"
+    || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/u.test(projection.reviewer_role)
+    || !oid(projection.reviewed_head_sha)
+    || !["approved", "findings", "insufficient_input", "error"].includes(projection.verdict)
+    || !Object.values(projection.finding_counts).every(safeInteger)
+    || !Array.isArray(projection.validation_summary) || !Array.isArray(projection.limitations)
+    || strings.some((value) => typeof value !== "string" || forbidden.test(value))) fail("public_projection_invalid");
+  return projection;
+}
+
+const eventKeys = ["event_id", "event_index", "event", "observed_at", "pr_number", "base_sha", "head_sha",
+  "postcondition", "result", "evidence_digests"];
+function verifyEvent(event, index) {
+  exactKeys(event, eventKeys, "publication_outcome_invalid");
+  if (!safeInteger(event.event_index) || event.event_index !== index
+    || !safeInteger(event.pr_number) || event.pr_number === 0
+    || !oid(event.base_sha) || !oid(event.head_sha) || !sortedUnique(event.evidence_digests)
+    || event.evidence_digests.length === 0
+    || !event.evidence_digests.every(sha256)
+    || typeof event.observed_at !== "string"
+    || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/u.test(event.observed_at)
+    || !["pr_created_or_reused", "assignee_postcondition", "required_check_observation", "review_observation"].includes(event.event)
+    || !["pr_identity", "exact_assignees", "required_checks_current_head", "configured_reviews_current_head",
+      "unresolved_threads_current_head"].includes(event.postcondition)
+    || !["pending", "success", "failed", "unknown"].includes(event.result)
+    || (event.postcondition === "pr_identity" && event.event !== "pr_created_or_reused")
+    || (event.postcondition === "exact_assignees" && event.event !== "assignee_postcondition")
+    || (event.postcondition === "required_checks_current_head" && event.event !== "required_check_observation")
+    || (["configured_reviews_current_head", "unresolved_threads_current_head"].includes(event.postcondition)
+      && event.event !== "review_observation")) fail("publication_outcome_invalid");
+  const payload = deepCopy(event);
+  delete payload.event_id;
+  if (event.event_id !== `sha256:${digest(payload)}`) fail("publication_outcome_digest_mismatch");
+}
+
+function reduceOutcome(input) {
+  if (!isObject(input)) fail("publication_outcome_invalid");
+  const inputKeys = Object.keys(input).sort();
+  const requiredInputKeys = ["active_lineage", "record", "delta", "expected_next_append_sequence",
+    "live_identity_verified"];
+  const allowedInputKeys = [...requiredInputKeys, "review_required"].sort();
+  if (canonicalize(inputKeys) !== canonicalize([...requiredInputKeys].sort())
+    && canonicalize(inputKeys) !== canonicalize([...allowedInputKeys].sort())) fail("publication_outcome_invalid");
+  if (input.review_required !== undefined && typeof input.review_required !== "boolean") {
+    fail("publication_outcome_invalid");
+  }
+  const {active_lineage: active, record, delta} = input;
+  exactKeys(active, ["publication_lineage_id", "active_publication_manifest_sha256",
+    "publication_manifest_generation", "repository", "base_ref", "head_ref", "base_sha", "head_sha",
+    "publication_pr_number"], "publication_outcome_invalid");
+  exactKeys(delta, ["delta_version", "canonicalization", "delta_id", "publication_lineage_id",
+    "publication_manifest_sha256", "publication_manifest_generation", "repository", "base_ref", "base_sha",
+    "head_ref", "head_sha", "pr_number", "events"], "publication_outcome_invalid");
+  exactKeys(record, ["outcome_version", "publication_lineage_id", "active_publication_manifest_sha256",
+    "publication_manifest_generation", "next_append_sequence", "accepted_deltas", "events", "contradictions"],
+    "publication_outcome_invalid");
+  if (!hex64(active.publication_lineage_id) || !hex64(active.active_publication_manifest_sha256)
+    || !safeInteger(active.publication_manifest_generation) || active.publication_manifest_generation === 0
+    || !safeInteger(active.publication_pr_number) || active.publication_pr_number === 0
+    || !oid(active.base_sha) || !oid(active.head_sha)
+    || delta.delta_version !== "1"
+    || delta.canonicalization !== "RFC 8785 JSON Canonicalization Scheme (JCS), UTF-8"
+    || !hex64(delta.publication_lineage_id) || !hex64(delta.publication_manifest_sha256)
+    || !safeInteger(delta.publication_manifest_generation) || delta.publication_manifest_generation === 0
+    || !safeInteger(delta.pr_number) || delta.pr_number === 0
+    || !oid(delta.base_sha) || !oid(delta.head_sha)
+    || !Array.isArray(delta.events) || delta.events.length === 0
+    || !Array.isArray(record.events) || !Array.isArray(record.accepted_deltas)
+    || !Array.isArray(record.contradictions) || record.outcome_version !== "1"
+    || !safeInteger(record.next_append_sequence)
+    || input.expected_next_append_sequence !== record.next_append_sequence
+    || typeof input.live_identity_verified !== "boolean") fail("publication_outcome_append_unavailable");
+  record.accepted_deltas.forEach((item) => {
+    exactKeys(item, ["delta_id", "payload_sha256"], "publication_outcome_invalid");
+    if (!sha256(item.delta_id) || !hex64(item.payload_sha256)) fail("publication_outcome_invalid");
+  });
+  record.events.forEach((item, index) => {
+    exactKeys(item, ["append_sequence", "delta_id", "event"], "publication_outcome_invalid");
+    if (item.append_sequence !== index || !sha256(item.delta_id)) fail("publication_outcome_append_unavailable");
+    verifyEvent(item.event, item.event.event_index);
+  });
+  record.contradictions.forEach((item) => {
+    exactKeys(item, ["postcondition", "prior_event_id", "conflicting_event_id"],
+      "publication_outcome_invalid");
+    if (!sha256(item.prior_event_id) || !sha256(item.conflicting_event_id)) fail("publication_outcome_invalid");
+  });
+  if (record.next_append_sequence !== record.events.length
+    || new Set(record.accepted_deltas.map((item) => item.delta_id)).size !== record.accepted_deltas.length
+    || record.events.some((item) => !record.accepted_deltas.some(
+      (accepted) => accepted.delta_id === item.delta_id
+    ))
+    || record.accepted_deltas.some((accepted) => !record.events.some(
+      (item) => item.delta_id === accepted.delta_id
+    )))
+    fail("publication_outcome_append_unavailable");
+  for (const accepted of record.accepted_deltas) {
+    const indexes = record.events.filter((item) => item.delta_id === accepted.delta_id)
+      .map((item) => item.event.event_index);
+    if (indexes.some((value, index) => value !== index)) fail("publication_outcome_append_unavailable");
+  }
+  const identityEqual = delta.publication_lineage_id === active.publication_lineage_id
+    && delta.publication_manifest_sha256 === active.active_publication_manifest_sha256
+    && delta.publication_manifest_generation === active.publication_manifest_generation
+    && delta.repository === active.repository && delta.base_ref === active.base_ref
+    && delta.base_sha === active.base_sha
+    && delta.head_ref === active.head_ref && delta.head_sha === active.head_sha
+    && delta.pr_number === active.publication_pr_number
+    && record.publication_lineage_id === active.publication_lineage_id
+    && record.active_publication_manifest_sha256 === active.active_publication_manifest_sha256
+    && record.publication_manifest_generation === active.publication_manifest_generation;
+  if (!identityEqual) fail("publication_manifest_inactive");
+  delta.events.forEach((event, index) => {
+    verifyEvent(event, index);
+    if (event.pr_number !== active.publication_pr_number || event.base_sha !== active.base_sha
+      || event.head_sha !== active.head_sha) fail("publication_outcome_contradiction");
+  });
+  const deltaPayload = deepCopy(delta);
+  delete deltaPayload.delta_id;
+  if (delta.delta_id !== `sha256:${digest(deltaPayload)}`) fail("publication_outcome_digest_mismatch");
+  const existingDelta = record.accepted_deltas.find((item) => item.delta_id === delta.delta_id);
+  if (existingDelta) {
+    if (existingDelta.payload_sha256 !== digest(deltaPayload)) fail("publication_outcome_contradiction");
+    return {status: "idempotent_no_op", promotion_status: "unchanged", record};
+  }
+  const next = deepCopy(record);
+  let contradiction = false;
+  for (const event of delta.events) {
+    const payload = deepCopy(event);
+    const existing = next.events.find((item) => item.event.event_id === event.event_id);
+    if (existing) {
+      if (canonicalize(existing.event) !== canonicalize(event)) fail("publication_outcome_contradiction");
+      continue;
+    }
+    const priorTerminal = next.events.filter((item) => item.event.postcondition === event.postcondition
+      && ["success", "failed", "unknown"].includes(item.event.result)).at(-1);
+    if (priorTerminal && ["success", "failed", "unknown"].includes(event.result)
+      && priorTerminal.event.result !== event.result) {
+      contradiction = true;
+      next.contradictions.push({postcondition:event.postcondition,
+        prior_event_id:priorTerminal.event.event_id, conflicting_event_id:event.event_id});
+    }
+    next.events.push({append_sequence:next.next_append_sequence, delta_id:delta.delta_id, event:payload});
+    next.next_append_sequence += 1;
+  }
+  next.accepted_deltas.push({delta_id:delta.delta_id, payload_sha256:digest(deltaPayload)});
+  const required = ["pr_identity", "exact_assignees", "required_checks_current_head"];
+  if (input.review_required !== false) {
+    required.push("configured_reviews_current_head", "unresolved_threads_current_head");
+  }
+  const allSuccess = required.every((postcondition) => {
+    const latest = next.events.filter((item) => item.event.postcondition === postcondition).at(-1);
+    return latest && latest.event.result === "success";
+  });
+  const promotable = !contradiction && next.contradictions.length === 0 && allSuccess
+    && input.live_identity_verified;
+  return {status: contradiction ? "publication_outcome_contradiction" : "appended",
+    promotion_status: promotable ? "pr_created" : (input.review_required === false
+      ? "pr_created_ci_pending" : "pr_created_review_pending"), record:next};
+}
+
+function main() {
+  const operation = process.argv[1];
+  const raw = require("node:fs").readFileSync(0, "utf8");
+  const input = parseJsonNoDuplicates(raw);
+  if (operation === "canonicalize") process.stdout.write(canonicalize(input));
+  else if (operation === "carrier-digest") process.stdout.write(carrierDigest(input, false));
+  else if (operation === "verify-carrier") process.stdout.write(JSON.stringify({digest:carrierDigest(input, true)}));
+  else if (operation === "validate-projection") process.stdout.write(canonicalize(validateProjection(input)));
+  else if (operation === "reduce-outcome") process.stdout.write(canonicalize(reduceOutcome(input)));
+  else fail("publication_integrity_operation_invalid");
+}
+
+try { main(); } catch (error) {
+  process.stderr.write(`${error.code || "publication_integrity_error"}\n`);
+  process.exit(1);
+}
+```
+<!-- publication-integrity-js-end -->
+
+`reduce-outcome` is a pure local verifier for the explicitly selected `legacy_managed` profile; its output is not
+append authority. First run it against the current detailed record, exact `expected_next_append_sequence`, and a
+fresh attested Saihai PR identity observation. `trusted_local_v1` does not invoke this legacy reducer; it records
+the host adapter's typed outcome in host-owned private state.
+For every accepted detailed event, build one compact runtime event with the same `event_id`, global positive
+`sequence`, allowlisted `event_type`, a `sha256:` canonical identity digest, and a `sha256:` canonical digest of
+the complete detailed event. The runtime event type is exactly one of `pr_created_or_reused`,
+`assignee_postcondition`, `required_check_observation`, or `review_observation`. Compute its identity digest by
+running this contract's RFC 8785 canonicalizer over exactly the following ASCII-only object and prefixing the
+SHA-256 hex with `sha256:`:
+
+```json
+{
+  "identity_version": "1",
+  "publication_lineage_id": "<active 64-hex lineage id>",
+  "publication_manifest_sha256": "<active 64-hex manifest digest>",
+  "publication_manifest_generation": 1,
+  "repository": "owner/repo",
+  "base_ref": "refs/heads/main",
+  "base_sha": "<active base oid>",
+  "head_ref": "refs/heads/topic",
+  "head_sha": "<active head oid>",
+  "pr_number": 123
+}
+```
+
+Every value comes from the separately attested active `lineage_read` result; the caller never substitutes a
+newly observed head or PR. Then invoke signed Saihai `append_publication_outcome` with those rows and the
+exact prior attested runtime `outcome_digest` (or null only for the first append). Persist the detailed next
+record only after the attested runtime result is `applied` or an exact operation replay is
+`idempotent_no_op`, has the expected event count, and returns the new outcome digest. On restart, recover the
+prior result only by replaying its exact global operation ID; missing prior digest is a blocker, not permission
+to guess. An unbound PR, unknown event type, or runtime rejection of the active identity digest is a blocker.
+`promotion_status: pr_created` is valid only when the pure reducer also received a fresh exact
+identity success for that same active Manifest. An old lineage, bad ID, missing sequence, duplicate-key input,
+conflicting terminal result, unknown schema member, or runtime/local digest mismatch is typed and fail-closed.
+
 ## Reviewer input and output
 
 Give the reviewer raw evidence, not the intended answer:
@@ -510,9 +1264,7 @@ Require read-only output:
 
 ```yaml
 unit_id: "issue-123-u1"
-reviewer_role: "<assigned role>"
-reviewer_provider: "<assigned provider>"
-snapshot_digest: "<canonical snapshot digest>"
+review_evidence: "<complete canonical review evidence carrier>"
 verdict: "approved | findings | insufficient_input"
 scope_ok: true
 acceptance_criteria_ok: true
@@ -525,35 +1277,45 @@ findings:
 notes: []
 ```
 
-A finding is actionable when it recommends a code, test, configuration, documentation, or behavior change. For every actionable finding, obtain a fix policy from `approval_owner` before editing. Pure observations may be recorded as notes only when they require no change and do not undermine acceptance criteria.
+A finding is actionable when it identifies a correctness, security, data-loss, build, or ruleset blocker. Independently
+verify it before editing. A valid finding within the approved scope may be fixed without another user approval. Style,
+maintainability, documentation, test-improvement, and other minor findings become a follow-up issue. Ask
+`ambiguity_owner` only when the finding requires a new requirement, scope, compatibility, design, or data-handling
+choice. Pure observations may be recorded as notes.
 
-## Security Commit Review
+## Conditional Security Commit Review
 
-Require a trusted-context security role and provider for every unit before review dispatch. Run it against the same raw snapshot artifacts and `snapshot_digest` as technical review.
+Require a trusted-context or caller-assigned security role and provider only for permission expansion, authentication
+secrets, data-loss risk, or an explicit security-review policy. Run the one limited review against the integrated
+change-set snapshot; do not duplicate it with a separate routine review or a PR-bot review.
 
 ```yaml
 unit_id: "issue-123-u1"
-security_reviewer_role: "<assigned role>"
-security_reviewer_provider: "<assigned provider>"
-snapshot_digest: "<canonical snapshot digest>"
+review_evidence: "<complete canonical review evidence carrier>"
 max_priority: "P0 | P1 | P2 | P3 | none"
 commit_blocking: false # Set true iff max_priority is P0.
 verdict: "security_clear | security_notes | security_blocked | security_insufficient_input"
 findings: []
 ```
 
-`commit_blocking` is required. It must be `true` exactly when `max_priority` is `P0`, and `false` for `P1`, `P2`, `P3`, or `none`. A missing or inconsistent value makes the review contract invalid; return `security_review_invalid` and do not invoke `commit`.
+`commit_blocking` is required. It must be `true` exactly when `max_priority` is `P0`, and `false` for `P1`, `P2`, `P3`, or `none`. A missing or inconsistent value makes the review contract invalid; return `security_review_invalid` and do not invoke `commit`. A missing or inconsistent canonical carrier returns `review_provenance_incomplete` before this verdict is considered.
 
-Route every actionable security finding through `approval_owner`. Do not commit on `security_blocked`, `security_insufficient_input`, a P0 finding, a missing assignment, an invalid review contract, or a digest mismatch. After any approved fix, generate a new digest and rerun technical and security review.
+Route a valid blocking security finding through the one fix cycle. Do not commit on `security_blocked`, a P0/data-loss
+finding, an invalid review contract, or a digest mismatch. After the bounded fix, generate a new digest, rerun focused
+validation, and recheck only the original findings. Do not start another platform-bot review.
 
-## Cumulative integration review
+## Integrated change-set review
 
-When interacting units or high-risk boundaries require a cumulative review, create an issue-level contract with a trusted-context separate reviewer assignment, the canonical digest of the full issue diff, raw unit/validation evidence, and the same read-only verdict schema. Route findings through `approval_owner`; invalidate and rerun the cumulative review whenever the issue diff changes. Self-review, a unit reviewer operating as implementer, or review of an unfixed/mismatched digest cannot satisfy this gate.
+When an elevated-risk integrated boundary requires a review, create one feature-unit contract with the
+caller-supplied reviewer assignment, the canonical digest of the integrated diff, raw validation evidence, and
+the complete canonical review carrier. Recovery review is optional and only for an elevated-risk task that explicitly
+needs it. Invalidate and rerun the same review only when its target changes; do not add a second internal/PR review.
+Self-review, missing provenance, or review of an unfixed/mismatched digest cannot satisfy this conditional gate.
 
 ## Finding policy handoff
 
 ```markdown
-### Issue #123 / unit u1 / finding R1
+### Feature unit 1 / linked issue(s) #123, #124 / finding R1
 
 | Item | Detail |
 |---|---|
@@ -563,12 +1325,14 @@ When interacting units or high-risk boundaries require a cumulative review, crea
 | Validation after change | ... |
 | Risk | ... |
 
-A. Apply the proposed response, then revalidate and rereview. (Recommended)
-B. Choose a different response; specify the behavior to preserve.
-C. Reject/defer the finding with a recorded reason; leave this unit uncommitted if Done would be false.
+A. Apply the proposed response, then revalidate and recheck only the original finding. (Recommended)
+B. Choose a different response because a requirement/design decision is needed.
+C. Reject/defer the finding with a recorded reason and create a follow-up issue.
 ```
 
-Route the handoff through `approval_owner`; ask the displayed question only when that owner is `user`. Do not let one waiting issue stop unrelated workers. Never interpret silence as approval.
+Route the handoff through `ambiguity_owner` only when a requirement/design choice is needed. Do not let one waiting
+feature unit stop unrelated units. Routine review absence and silence are not approval gates because normal-risk work
+does not require a review.
 
 ## Worker evidence return
 
